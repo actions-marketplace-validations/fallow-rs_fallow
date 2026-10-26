@@ -83,7 +83,9 @@ pub struct LicenseClaims {
     pub features: Vec<String>,
     /// Issued-at, seconds since UNIX epoch.
     pub iat: i64,
-    /// Expiration, seconds since UNIX epoch.
+    /// Expiration, seconds since UNIX epoch. A `0` here is not "expired at the
+    /// epoch": [`grace_state`] treats it as no expiry at all. See that
+    /// function for the open question about what the issuer means by it.
     pub exp: i64,
     /// Unique JWT ID (used for refresh + revocation).
     pub jti: String,
@@ -366,6 +368,15 @@ pub fn verify_jwt_with_skew(
 
 /// Map a verified [`LicenseClaims`] to a [`LicenseStatus`] using the 7/cap/hard-fail
 /// ladder.
+///
+/// `exp == 0` is a special case: the `i64::from(claims.exp != 0)` factor forces
+/// `delta_seconds` to 0, so the status is `Valid { days_until_expiry: 0 }` at
+/// any `now`, and [`LicenseStatus::permits`] therefore keeps returning true
+/// indefinitely. That branch has been here since the crate was scaffolded and
+/// nothing in this repository states whether the issuer ever signs `exp = 0`,
+/// so it is documented as-is rather than reinterpreted. Whether `exp == 0`
+/// means a perpetual license or a malformed claim is a question for the
+/// issuer; this function does not decide it.
 #[must_use]
 pub fn grace_state(claims: LicenseClaims, now: i64, hard_fail_days: u64) -> LicenseStatus {
     let delta_seconds = i64::from(claims.exp != 0) * (claims.exp - now);
@@ -637,20 +648,18 @@ mod tests {
     #[test]
     fn tampered_payload_fails_signature() {
         let (signing, verifying) = fixed_keypair();
-        let claims = make_claims(2_000_000_000);
-        let mut jwt = sign_jwt(&signing, &claims);
-        let mid = jwt.find('.').unwrap() + 5;
-        let bad: String = jwt
-            .chars()
-            .enumerate()
-            .map(|(i, c)| if i == mid { 'X' } else { c })
-            .collect();
-        jwt = bad;
-        let err = verify_jwt(&jwt, &verifying, 1_900_000_000, DEFAULT_HARD_FAIL_DAYS).unwrap_err();
-        assert!(matches!(
-            err,
-            LicenseError::BadSignature | LicenseError::BadPayload(_)
-        ));
+        let mut claims = make_claims(2_000_000_000);
+        let jwt = sign_jwt(&signing, &claims);
+        let mut parts: Vec<String> = jwt.split('.').map(str::to_owned).collect();
+        // Keep a valid payload and the original signature, so JSON parsing cannot
+        // reject the token in place of signature verification.
+        claims.seats += 1;
+        parts[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let tampered = parts.join(".");
+
+        let err =
+            verify_jwt(&tampered, &verifying, 1_900_000_000, DEFAULT_HARD_FAIL_DAYS).unwrap_err();
+        assert!(matches!(err, LicenseError::BadSignature));
     }
 
     #[test]

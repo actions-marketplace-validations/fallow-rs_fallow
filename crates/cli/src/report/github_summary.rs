@@ -1,9 +1,13 @@
 //! `--format github-summary`: GitHub Actions job-summary markdown, written
 //! by workflows as `fallow ... --format github-summary >> "$GITHUB_STEP_SUMMARY"`.
 //!
-//! Sections, ordering, and truncation caps are ported from the bundled
+//! Sections, ordering, and truncation caps were first ported from the bundled
 //! action's jq renderers (`action/jq/summary-{check,dupes,health,audit,
-//! security,fix,combined}.jq`). Deviations from the jq layer: em dashes in
+//! security,fix,combined}.jq`). This renderer is now the source of truth for
+//! fallow 3.4.2 and later. The action keeps the jq files as frozen legacy
+//! renderers for older binaries, so new issue kinds go here and not into the
+//! jq files (`summary-fix.jq` still serves `fix` on every version). Deviations
+//! from the jq layer: em dashes in
 //! the jq templates render as plain hyphens (repo style rule), and the
 //! combined view's dupes file links read `GH_REPO` / `GITHUB_REPOSITORY` and
 //! `PR_HEAD_SHA` / `GITHUB_SHA` (the jq layer read only the action-set
@@ -19,16 +23,17 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fallow_output::{markdown_code_span, markdown_table_code_span, markdown_table_text};
+use fallow_types::output_dead_code::caveat_labels_for_tokens;
 use serde_json::Value;
 
 use super::github::{PathRebase, arr, b, fmt_num, num, resolve_render_options, s, u};
 use super::github_annotations::EnvelopeKind;
 use crate::report::sink::outln;
 
-const DEAD_CODE_DOCS: &str = "https://docs.fallow.tools/explanations/dead-code";
-const HEALTH_DOCS: &str = "https://docs.fallow.tools/explanations/health";
-const DUPES_DOCS: &str = "https://docs.fallow.tools/explanations/duplication";
-const SUPPRESSION_DOCS: &str = "https://docs.fallow.tools/configuration/suppression";
+const DEAD_CODE_DOCS: &str = "https://fallow.tools/docs/explanations/dead-code/";
+const HEALTH_DOCS: &str = "https://fallow.tools/docs/explanations/health/";
+const DUPES_DOCS: &str = "https://fallow.tools/docs/explanations/duplication/";
+const SUPPRESSION_DOCS: &str = "https://fallow.tools/docs/configuration/suppression/";
 
 /// Environment-derived context for the combined view's dupes file links.
 #[derive(Debug, Default, Clone)]
@@ -68,6 +73,27 @@ pub(crate) fn print_summary(kind: EnvelopeKind, envelope: &Value, root: &Path) -
     let options = resolve_render_options(root);
     let links = LinkContext::from_env(&options.rebase);
     outln!("{}", render_summary(kind, envelope, &links));
+    // The unmatched config patterns follow the findings, as in `--format
+    // markdown`. The section reads the envelope, so a live summary and one
+    // from `fallow report --from` list the same patterns.
+    if let Some(section) = crate::report::config_pattern_text::markdown_section(
+        &crate::report::config_pattern_text::envelope_diagnostics(envelope),
+    ) {
+        outln!("{section}");
+    }
+    // Appended rather than folded into each per-kind renderer: the verdict is
+    // one fact about the run, not a section of the report, and every kind
+    // reports it the same way.
+    if let Some(line) = crate::report::gate_outcome_text::summary_line(envelope) {
+        outln!("");
+        outln!("{line}");
+    }
+    // Same reasoning, one fact further: whether the run did what it was asked
+    // belongs beside what it concluded, not inside a per-kind section.
+    if let Some(line) = crate::report::request_outcome_text::summary_line(envelope) {
+        outln!("");
+        outln!("{line}");
+    }
     ExitCode::SUCCESS
 }
 
@@ -84,7 +110,7 @@ pub(crate) fn print_fix_summary(envelope: &Value) -> ExitCode {
 #[must_use]
 pub fn render_summary(kind: EnvelopeKind, envelope: &Value, links: &LinkContext) -> String {
     match kind {
-        EnvelopeKind::DeadCode => render_check_summary(envelope),
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => render_check_summary(envelope),
         EnvelopeKind::Dupes => render_dupes_summary(envelope),
         EnvelopeKind::Health => render_health_summary(envelope),
         EnvelopeKind::Audit => render_audit_summary(envelope),
@@ -169,6 +195,22 @@ fn code_cell(item: &Value, key: &str) -> String {
     markdown_table_code_span(s(item, key))
 }
 
+/// The italic caveat marker appended inside a dead-code table cell when the
+/// verdict behind the row rests on a file this run never fully read. Empty when
+/// the finding carries no `reachability_caveats[]`, so a clean run's summary is
+/// byte-identical to what it was before this hedge existed.
+///
+/// The job summary is where a reviewer decides what to delete, so the row that
+/// names the finding is the row that has to carry the qualifier. It rides
+/// inside an existing cell rather than in a new column: adding a column would
+/// change every table's shape, including the rows that carry no caveat.
+fn caveat_cell_suffix(item: &Value) -> String {
+    caveat_labels_for_tokens(arr(item, "reachability_caveats").filter_map(Value::as_str))
+        .map_or_else(String::new, |labels| {
+            format!(" *(caveat: {})*", markdown_table_text(&labels))
+        })
+}
+
 /// `` `path:line` `` cell with the audit-flavor path shortening.
 fn rel_path_line_cell(item: &Value, path_key: &str) -> String {
     markdown_table_code_span(&format!(
@@ -188,10 +230,12 @@ fn backtick_join(item: &Value, key: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // Dead-code category table (shared by the check summary and the combined
-// code-issues breakdown; labels and docs anchors from the jq layer).
+// code-issues breakdown). Labels, result keys, and docs anchors come from the
+// issue registry; a unit test below holds the two equal.
 // ---------------------------------------------------------------------------
 
 const DEAD_CODE_CATEGORIES: &[(&str, &str, &str)] = &[
+    ("Prop drilling", "prop_drilling_chains", "prop-drilling"),
     ("Unused files", "unused_files", "unused-files"),
     ("Unused exports", "unused_exports", "unused-exports"),
     ("Unused types", "unused_types", "unused-types"),
@@ -199,6 +243,11 @@ const DEAD_CODE_CATEGORIES: &[(&str, &str, &str)] = &[
         "Private type leaks",
         "private_type_leaks",
         "private-type-leaks",
+    ),
+    (
+        "Deprecated exports in use",
+        "deprecated_exports_in_use",
+        "deprecated-exports-in-use",
     ),
     (
         "Unused dependencies",
@@ -251,6 +300,7 @@ const DEAD_CODE_CATEGORIES: &[(&str, &str, &str)] = &[
         "circular-dependencies",
     ),
     ("Re-export cycles", "re_export_cycles", "re-export-cycles"),
+    ("Package cycles", "package_cycles", "package-cycles"),
     (
         "Boundary violations",
         "boundary_violations",
@@ -289,7 +339,7 @@ const DEAD_CODE_CATEGORIES: &[(&str, &str, &str)] = &[
     (
         "Unused server actions",
         "unused_server_actions",
-        "unused-server-action",
+        "unused-server-actions",
     ),
     ("Route collisions", "route_collisions", "route-collisions"),
     (
@@ -300,42 +350,62 @@ const DEAD_CODE_CATEGORIES: &[(&str, &str, &str)] = &[
     (
         "Unrendered components",
         "unrendered_components",
-        "unrendered-component",
+        "unrendered-components",
     ),
     (
         "Unused component props",
         "unused_component_props",
-        "unused-component-prop",
+        "unused-component-props",
+    ),
+    (
+        "Absent optional component props",
+        "absent_component_props",
+        "absent-component-props",
     ),
     (
         "Unused component emits",
         "unused_component_emits",
-        "unused-component-emit",
+        "unused-component-emits",
     ),
     (
         "Unused component inputs",
         "unused_component_inputs",
-        "unused-component-input",
+        "unused-component-inputs",
     ),
     (
         "Unused component outputs",
         "unused_component_outputs",
-        "unused-component-output",
+        "unused-component-outputs",
     ),
     (
         "Unused Svelte events",
         "unused_svelte_events",
-        "unused-svelte-event",
+        "unused-svelte-events",
+    ),
+    (
+        "Unused Effect layers",
+        "unused_effect_layers",
+        "unused-effect-layers",
+    ),
+    (
+        "Unused tagged errors",
+        "unused_tagged_errors",
+        "unused-tagged-errors",
+    ),
+    (
+        "Unproduced catch tags",
+        "unproduced_catch_tags",
+        "unproduced-catch-tags",
     ),
     (
         "Unprovided injects",
         "unprovided_injects",
-        "unprovided-inject",
+        "unprovided-injects",
     ),
     (
         "Unused load data keys",
         "unused_load_data_keys",
-        "unused-load-data-key",
+        "unused-load-data-keys",
     ),
     (
         "Type-only dependencies",
@@ -392,7 +462,11 @@ fn dead_code_category_table(env: &Value) -> String {
     DEAD_CODE_CATEGORIES
         .iter()
         .filter_map(|(name, key, anchor)| {
-            let n = arr(env, key).count();
+            let n = arr(env, key)
+                .filter(|item| {
+                    *key != "prop_drilling_chains" || s(item, "effective_severity") == "error"
+                })
+                .count();
             (n > 0).then(|| format!("| [{name}]({}) | {n} |", dead_code_docs(anchor)))
         })
         .collect::<Vec<_>>()
@@ -411,21 +485,26 @@ struct SectionSpec {
 }
 
 fn render_check_section(env: &Value, spec: &SectionSpec) -> String {
-    let items: Vec<&Value> = arr(env, spec.key).collect();
+    // The job summary is one flat document, so its rows follow the flat path
+    // order of the live render. A saved `--group-by` envelope lists its items
+    // group by group, and `report --from` flattens them in that order. The sort
+    // gives both renders one order. The serialized item breaks ties, so the
+    // order is total and does not depend on the input order.
+    let items = rows_in_path_order(env, spec.key);
     let n = items.len();
     if n == 0 {
         return String::new();
     }
     let rows = items
         .iter()
-        .take(25)
+        .take(CHECK_SECTION_ROW_LIMIT)
         .map(|item| (spec.row)(item))
         .collect::<Vec<_>>()
         .join("\n");
-    let tail = if n > 25 {
+    let tail = if n > CHECK_SECTION_ROW_LIMIT {
         format!(
             "\n\n> {} more - run `fallow` locally for the full list",
-            n - 25
+            n - CHECK_SECTION_ROW_LIMIT
         )
     } else {
         String::new()
@@ -436,8 +515,61 @@ fn render_check_section(env: &Value, spec: &SectionSpec) -> String {
     )
 }
 
+/// Rows a check section renders before it prints the count of the rest.
+const CHECK_SECTION_ROW_LIMIT: usize = 25;
+
+/// The items of `key` in (path, line, serialized item) order.
+///
+/// Path and line are read once per item, not once per comparison. The
+/// serialized item only breaks a tie on path and line, and only for the tie
+/// groups that reach the rendered rows, because serializing is costly and
+/// the rows past [`CHECK_SECTION_ROW_LIMIT`] are only counted.
+fn rows_in_path_order<'a>(env: &'a Value, key: &str) -> Vec<&'a Value> {
+    let mut keyed: Vec<(Option<&str>, Option<u64>, &Value)> = arr(env, key)
+        .map(|item| {
+            (
+                row_sort_path(item),
+                item.get("line").and_then(Value::as_u64),
+                item,
+            )
+        })
+        .collect();
+    keyed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut start = 0;
+    for run in keyed.chunk_by_mut(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        if start >= CHECK_SECTION_ROW_LIMIT {
+            break;
+        }
+        if run.len() > 1 {
+            run.sort_by_cached_key(|(_, _, item)| item.to_string());
+        }
+        start += run.len();
+    }
+    keyed.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// The path a dead-code row sorts on: `path`, the source file of a boundary
+/// violation, or the first file of a cycle. Rows with none (a duplicate export
+/// or an unlisted dependency) sort on the serialized item, which starts with
+/// the name.
+fn row_sort_path(item: &Value) -> Option<&str> {
+    item.get("path")
+        .or_else(|| item.get("from_path"))
+        .or_else(|| item.get("files").and_then(|files| files.get(0)))
+        .and_then(Value::as_str)
+}
+
 fn check_workspace_context(item: &Value) -> String {
-    backtick_join(item, "used_in_workspaces")
+    let workspaces = backtick_join(item, "used_in_workspaces");
+    if !workspaces.is_empty() {
+        return workspaces;
+    }
+    let declaring = backtick_join(item, "declared_and_imported_in");
+    if declaring.is_empty() {
+        String::new()
+    } else {
+        format!("declared and imported in {declaring}")
+    }
 }
 
 #[expect(
@@ -450,7 +582,7 @@ fn check_sections_core() -> Vec<SectionSpec> {
             name: "Unused files",
             key: "unused_files",
             header: "Files not reachable from any entry point.\n\n| File |\n|------|\n",
-            row: |it| format!("| {} |", code_cell(it, "path")),
+            row: |it| format!("| {}{} |", code_cell(it, "path"), caveat_cell_suffix(it)),
         },
         SectionSpec {
             name: "Unused exports",
@@ -458,7 +590,7 @@ fn check_sections_core() -> Vec<SectionSpec> {
             header: "Exported symbols with no known consumers.\n\n| File | Line | Export |\n|------|-----:|--------|\n",
             row: |it| {
                 format!(
-                    "| {} | {} | {}{} |",
+                    "| {} | {} | {}{}{} |",
                     code_cell(it, "path"),
                     num(it, "line"),
                     code_cell(it, "export_name"),
@@ -467,6 +599,7 @@ fn check_sections_core() -> Vec<SectionSpec> {
                     } else {
                         ""
                     },
+                    caveat_cell_suffix(it),
                 )
             },
         },
@@ -476,10 +609,11 @@ fn check_sections_core() -> Vec<SectionSpec> {
             header: "Type exports with no known consumers.\n\n| File | Line | Type |\n|------|-----:|------|\n",
             row: |it| {
                 format!(
-                    "| {} | {} | {} |",
+                    "| {} | {} | {}{} |",
                     code_cell(it, "path"),
                     num(it, "line"),
                     code_cell(it, "export_name"),
+                    caveat_cell_suffix(it),
                 )
             },
         },
@@ -498,13 +632,28 @@ fn check_sections_core() -> Vec<SectionSpec> {
             },
         },
         SectionSpec {
+            name: "Deprecated exports in use",
+            key: "deprecated_exports_in_use",
+            header: "Exports marked `@deprecated` that still have consumers.\n\n| File | Line | Export | Consumers |\n|------|-----:|--------|----------:|\n",
+            row: |it| {
+                format!(
+                    "| {} | {} | {} | {} |",
+                    code_cell(it, "path"),
+                    num(it, "line"),
+                    code_cell(it, "export_name"),
+                    num(it, "consumer_count"),
+                )
+            },
+        },
+        SectionSpec {
             name: "Unused dependencies",
             key: "unused_dependencies",
             header: "Listed in `dependencies` but never imported by the declaring workspace.\n\n| Package | Imported elsewhere |\n|---------|--------------------|\n",
             row: |it| {
                 format!(
-                    "| {} | {} |",
+                    "| {}{} | {} |",
                     code_cell(it, "package_name"),
+                    caveat_cell_suffix(it),
                     check_workspace_context(it),
                 )
             },
@@ -515,8 +664,9 @@ fn check_sections_core() -> Vec<SectionSpec> {
             header: "Listed in `devDependencies` but never imported or referenced by the declaring workspace.\n\n| Package | Imported elsewhere |\n|---------|--------------------|\n",
             row: |it| {
                 format!(
-                    "| {} | {} |",
+                    "| {}{} | {} |",
                     code_cell(it, "package_name"),
+                    caveat_cell_suffix(it),
                     check_workspace_context(it),
                 )
             },
@@ -527,8 +677,9 @@ fn check_sections_core() -> Vec<SectionSpec> {
             header: "Listed in `optionalDependencies` but never imported by the declaring workspace.\n\n| Package | Imported elsewhere |\n|---------|--------------------|\n",
             row: |it| {
                 format!(
-                    "| {} | {} |",
+                    "| {}{} | {} |",
                     code_cell(it, "package_name"),
+                    caveat_cell_suffix(it),
                     check_workspace_context(it),
                 )
             },
@@ -637,13 +788,18 @@ fn check_sections_core() -> Vec<SectionSpec> {
     ]
 }
 
+/// Shared by the enum, class, and store member sections. `caveat_cell_suffix`
+/// renders nothing for an array the analysis pass does not stamp, so the three
+/// sections stay correct without each knowing which set it belongs to, and a
+/// future array that starts carrying caveats needs no change here.
 fn member_row(it: &Value) -> String {
     format!(
-        "| {} | {} | {} | {} |",
+        "| {} | {} | {} | {}{} |",
         code_cell(it, "path"),
         num(it, "line"),
         code_cell(it, "parent_name"),
         code_cell(it, "member_name"),
+        caveat_cell_suffix(it),
     )
 }
 
@@ -678,6 +834,36 @@ fn check_sections_architecture() -> Vec<SectionSpec> {
                     "| {cycle} | {} | {} |",
                     markdown_table_text(s(it, "kind")),
                     arr(it, "files").count()
+                )
+            },
+        },
+        SectionSpec {
+            name: "Package cycles",
+            key: "package_cycles",
+            header: "Workspace packages that import each other in a loop. Packages in a cycle cannot be built in dependency order.\n\n| Cycle | Example import | Packages |\n|-------|----------------|---------:|\n",
+            row: |it| {
+                let mut chain: Vec<String> = arr(it, "packages")
+                    .filter_map(Value::as_str)
+                    .map(markdown_table_code_span)
+                    .collect();
+                if let Some(first) = chain.first().cloned() {
+                    chain.push(first);
+                }
+                let example = arr(it, "edges")
+                    .next()
+                    .map_or_else(String::new, path_line_cell);
+                let note = if it.get("group_truncated").and_then(Value::as_bool) == Some(true) {
+                    format!(
+                        " ({})",
+                        fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "| {}{note} | {example} | {} |",
+                    chain.join(" \u{2192} "),
+                    arr(it, "packages").count()
                 )
             },
         },
@@ -825,6 +1011,28 @@ fn check_sections_frameworks_and_hygiene() -> Vec<SectionSpec> {
             },
         },
         SectionSpec {
+            name: "Absent optional component props",
+            key: "absent_component_props",
+            header: "Known reachable callers omit this used optional prop. Review defaults and API intent manually; static analysis does not prove runtime unreachability.\n\n| File | Component prop | Default | Inspected callers |\n|------|----------------|---------|-------------------|\n",
+            row: |it| {
+                let callers = arr(it, "inspected_call_sites")
+                    .map(path_line_cell)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "| {} | {} | {} | {} |",
+                    path_line_cell(it),
+                    component_member_item(it, "prop_name"),
+                    if it.get("has_default").and_then(Value::as_bool) == Some(true) {
+                        "present"
+                    } else {
+                        "absent"
+                    },
+                    callers
+                )
+            },
+        },
+        SectionSpec {
             name: "Unused component props",
             key: "unused_component_props",
             header: "Vue `defineProps` props referenced nowhere inside their own single-file component (neither script nor template).\n\n| File | Component | Prop |\n|------|-----------|------|\n",
@@ -853,6 +1061,31 @@ fn check_sections_frameworks_and_hygiene() -> Vec<SectionSpec> {
             key: "unused_svelte_events",
             header: "Svelte components dispatching a `createEventDispatcher` event listened to nowhere in the project (cross-file dead-output direction).\n\n| File | Component | Event |\n|------|-----------|-------|\n",
             row: |it| component_detail_row(it, "event_name"),
+        },
+        SectionSpec {
+            name: "Unused Effect layers",
+            key: "unused_effect_layers",
+            header: "Effect layers composed only into layers that nothing uses.\n\n| File | Layer |\n|------|-------|\n",
+            row: |it| format!("| {} | {} |", path_line_cell(it), code_cell(it, "name")),
+        },
+        SectionSpec {
+            name: "Unused tagged errors",
+            key: "unused_tagged_errors",
+            header: "Effect tagged errors that no code constructs or fails with.\n\n| File | Class | Tag |\n|------|-------|-----|\n",
+            row: |it| {
+                format!(
+                    "| {} | {} | {} |",
+                    path_line_cell(it),
+                    code_cell(it, "name"),
+                    code_cell(it, "tag")
+                )
+            },
+        },
+        SectionSpec {
+            name: "Unproduced catch tags",
+            key: "unproduced_catch_tags",
+            header: "`catchTag` handlers for a project tag that no code produces.\n\n| File | Tag |\n|------|-----|\n",
+            row: |it| format!("| {} | {} |", path_line_cell(it), code_cell(it, "tag")),
         },
         SectionSpec {
             name: "Unprovided injects",
@@ -1041,8 +1274,29 @@ fn check_tips(env: &Value) -> String {
     tips
 }
 
-/// Port of `summary-check.jq`.
 #[must_use]
+fn prop_drilling_section(env: &Value) -> String {
+    let rows = arr(env, "prop_drilling_chains")
+        .filter(|item| s(item, "effective_severity") == "error")
+        .filter_map(|item| {
+            let source = arr(item, "hops").next()?;
+            Some(format!(
+                "| {} | {} | {} |",
+                markdown_table_code_span(s(source, "file")),
+                code_cell(item, "prop"),
+                u(item, "depth")
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n### Prop drilling\n\n| Source | Prop | Components |\n|:-------|:-----|-----------:|\n{}\n\nReview composition, colocation or context, or suppress the source prop declaration.\n",
+        rows.join("\n")
+    )
+}
+
 fn render_check_summary(env: &Value) -> String {
     let elapsed = num(env, "elapsed_ms");
     let total_issues = u(env, "total_issues");
@@ -1062,6 +1316,7 @@ fn render_check_summary(env: &Value) -> String {
             sections.push_str(&render_check_section(env, spec));
         }
     }
+    sections.push_str(&prop_drilling_section(env));
     let issue_noun = if total_issues == 1 { "issue" } else { "issues" };
     format!(
         "# Fallow Analysis\n\n> [!WARNING]\n> **{total_issues} {issue_noun}** found \u{b7} {elapsed}ms\n\n| Category | Count |\n|----------|------:|\n{}\n\n---\n{sections}{}",
@@ -1079,7 +1334,7 @@ fn dupes_family_entry(family: &Value) -> String {
         .filter_map(Value::as_str)
         .map(markdown_code_span)
         .collect();
-    let shown = files.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let shown = files[..files.len().min(3)].join(", ");
     let more = if files.len() > 3 {
         format!(" (+{} more)", files.len() - 3)
     } else {
@@ -1195,6 +1450,36 @@ fn sorted_clone_families(env: &Value) -> Vec<&Value> {
     families
 }
 
+/// What the measured corpus holds, which is what the headline beside this block
+/// counts: the entries that reached the envelope plus the ones a presentation
+/// cap such as `--top` withheld before it got here.
+///
+/// `clone_groups_omitted` / `clone_families_omitted` are `0` on an untruncated
+/// run, so this is the plain array length in the common case.
+fn dupes_corpus_total(env: &Value, listed: usize, omitted_key: &str) -> usize {
+    listed.saturating_add(u(env, omitted_key) as usize)
+}
+
+/// Name what this listing does not show, so the corpus total in the headline is
+/// never read as the size of the list below it.
+///
+/// `withheld` is measured against the corpus, not against the envelope array:
+/// two caps stack here, `--top` before the envelope was built and this block's
+/// own display limit after, and a reader who acts on the listing needs the
+/// total of both. Empty when the listing is complete, which keeps an
+/// untruncated run's summary byte-identical.
+fn dupes_omission_tail(withheld: usize, capped_by_top: usize, noun: &str) -> String {
+    if withheld == 0 {
+        return String::new();
+    }
+    if capped_by_top == 0 {
+        return format!("\n- *... and {withheld} more {noun}*");
+    }
+    format!(
+        "\n- *... and {withheld} more {noun}, {capped_by_top} of them withheld by a display limit before this report*"
+    )
+}
+
 fn dupes_details(env: &Value) -> String {
     let families = sorted_clone_families(env);
     if families.is_empty() {
@@ -1215,11 +1500,15 @@ fn dupes_details(env: &Value) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let tail = if groups.len() > 20 {
-            format!("\n- *... and {} more groups*", groups.len() - 20)
-        } else {
-            String::new()
-        };
+        // Subtract what this listing actually rendered, not the display limit:
+        // a `--top` below the limit leaves fewer rows than 20, and measuring
+        // the withholding against the limit would under-report it.
+        let total = dupes_corpus_total(env, groups.len(), "clone_groups_omitted");
+        let tail = dupes_omission_tail(
+            total.saturating_sub(groups.len().min(20)),
+            u(env, "clone_groups_omitted") as usize,
+            "groups",
+        );
         format!("{rows}{tail}")
     } else {
         let entries = families
@@ -1228,12 +1517,13 @@ fn dupes_details(env: &Value) -> String {
             .map(|family| dupes_family_entry(family))
             .collect::<Vec<_>>()
             .join("\n");
-        let tail = if families.len() > 15 {
-            format!("\n- *... and {} more families*", families.len() - 15)
-        } else {
-            String::new()
-        };
-        format!("**Clone Families ({})**\n\n{entries}{tail}", families.len())
+        let total = dupes_corpus_total(env, families.len(), "clone_families_omitted");
+        let tail = dupes_omission_tail(
+            total.saturating_sub(families.len().min(15)),
+            u(env, "clone_families_omitted") as usize,
+            "families",
+        );
+        format!("**Clone Families ({total})**\n\n{entries}{tail}")
     }
 }
 
@@ -1328,6 +1618,26 @@ fn health_score_header(score_env: &Value) -> String {
                 signed(f_or_zero(cx_delta, "delta")),
             );
         }
+    } else if let Some(compared) = score_env
+        .get("health_trend")
+        .and_then(|trend| trend.get("compared_to"))
+    {
+        let previous_formula = compared
+            .get("score_formula_version")
+            .and_then(Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok());
+        let current_formula = score
+            .get("formula_version")
+            .and_then(Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok());
+        let note = compared
+            .get("score")
+            .and_then(Value::as_f64)
+            .and_then(|_| {
+                fallow_output::health_score_comparison_note(previous_formula, current_formula)
+            })
+            .unwrap_or("Score comparison unavailable for this snapshot.");
+        let _ = write!(header, "\n> _{note}_");
     } else {
         header.push_str("\n> _Enable `save-snapshot: true` to track score trends over time._");
     }
@@ -1410,18 +1720,51 @@ fn runtime_finding_row(it: &Value) -> String {
     )
 }
 
+/// The functions above a threshold after a loaded health baseline, and the
+/// functions that the baseline accepts.
+///
+/// `summary.functions_above_threshold` counts the functions before the
+/// baseline. `baseline_staleness.remaining_findings` counts them after it.
+/// `None` without a baseline, and in an envelope from a fallow version before
+/// `remaining_findings`, so those runs render as before.
+fn baselined_complexity(summary: &Value) -> Option<(u64, u64)> {
+    let remaining = summary
+        .get("baseline_staleness")?
+        .get("remaining_findings")?
+        .as_u64()?;
+    let accepted = u(summary, "functions_above_threshold").saturating_sub(remaining);
+    Some((remaining, accepted))
+}
+
 fn render_health_complexity_only(env: &Value, complex: usize, elapsed: &str) -> String {
     let summary = env.get("summary").cloned().unwrap_or(Value::Null);
+    let above = u(&summary, "functions_above_threshold");
+    let listing = complexity_listing(env, &summary, complex, above);
+    if listing.count_unlisted() {
+        return render_health_complexity_not_listed(&summary, above, &listing, elapsed);
+    }
+    let baselined = baselined_complexity(&summary).filter(|&(_, accepted)| accepted > 0);
     if complex == 0 {
+        // Only when the baseline accepts every function. A run that lists none
+        // of its remaining functions keeps the old line.
+        let headline = baselined
+            .filter(|&(remaining, _)| remaining == 0)
+            .map_or_else(
+                || "No functions exceed complexity thresholds".to_owned(),
+                |(_, accepted)| {
+                    format!(
+                        "No new functions exceed complexity thresholds ({accepted} in the baseline)"
+                    )
+                },
+            );
         return format!(
-            "## Fallow - Code Complexity\n\n> [!NOTE]\n> **No functions exceed complexity thresholds** \u{b7} {elapsed}ms\n\n{} functions analyzed (max cyclomatic: {}, max cognitive: {}, max CRAP: {})",
+            "## Fallow - Code Complexity\n\n> [!NOTE]\n> **{headline}** \u{b7} {elapsed}ms\n\n{} functions analyzed (max cyclomatic: {}, max cognitive: {}, max CRAP: {})",
             num(&summary, "functions_analyzed"),
             num(&summary, "max_cyclomatic_threshold"),
             num(&summary, "max_cognitive_threshold"),
             threshold_or(&summary, "max_crap_threshold", "30"),
         );
     }
-    let above = u(&summary, "functions_above_threshold");
     let findings: Vec<&Value> = arr(env, "findings").collect();
     let tail = if complex > 25 {
         format!(
@@ -1431,12 +1774,66 @@ fn render_health_complexity_only(env: &Value, complex: usize, elapsed: &str) -> 
     } else {
         String::new()
     };
+    let (shown, new, baseline_note) = baselined
+        .map_or((above, "", String::new()), |(remaining, accepted)| {
+            (remaining, "new ", format!(" ({accepted} in the baseline)"))
+        });
     format!(
-        "## Fallow - Code Complexity\n\n> [!WARNING]\n> **{above} function{} exceed{} thresholds** \u{b7} {elapsed}ms\n\n{COMPLEXITY_TABLE_HEADER}{}{tail}{}",
-        if above == 1 { "" } else { "s" },
-        if above == 1 { "s" } else { "" },
+        "## Fallow - Code Complexity\n\n> [!WARNING]\n> **{shown} {new}function{} exceed{} thresholds{baseline_note}** \u{b7} {elapsed}ms\n\n{COMPLEXITY_TABLE_HEADER}{}{tail}{}",
+        if shown == 1 { "" } else { "s" },
+        if shown == 1 { "s" } else { "" },
         complexity_rows(&findings, 25),
         health_thresholds_footer(env),
+    )
+}
+
+/// The complexity listing facts of a health envelope. The Markdown section
+/// builds the same facts from the typed report.
+fn complexity_listing(
+    env: &Value,
+    summary: &Value,
+    complex: usize,
+    above: u64,
+) -> fallow_api::ComplexityListing {
+    let staleness = summary
+        .get("baseline_staleness")
+        .filter(|value| !value.is_null());
+    fallow_api::ComplexityListing {
+        listed: complex,
+        above: usize::try_from(above).unwrap_or(usize::MAX),
+        // An envelope from an older fallow has no `sections`.
+        complexity_section: env
+            .get("sections")
+            .and_then(Value::as_array)
+            .map(|sections| sections.iter().any(|s| s.as_str() == Some("complexity"))),
+        // Only a score-only run omits `vital_signs`.
+        score_only: env.get("vital_signs").is_none_or(Value::is_null),
+        baselined: staleness.is_some(),
+        remaining: staleness
+            .and_then(|staleness| staleness.get("remaining_findings"))
+            .and_then(Value::as_u64)
+            .map(|remaining| usize::try_from(remaining).unwrap_or(usize::MAX)),
+    }
+}
+
+/// The run counted functions above a threshold but did not list them, for
+/// example a `--score` or a `--hotspots` run. The summary gives the count,
+/// not a clean result.
+fn render_health_complexity_not_listed(
+    summary: &Value,
+    above: u64,
+    listing: &fallow_api::ComplexityListing,
+    elapsed: &str,
+) -> String {
+    format!(
+        "## Fallow - Code Complexity\n\n> [!NOTE]\n> **{above} function{} exceed{} thresholds** \u{b7} {elapsed}ms\n\n{} functions analyzed (max cyclomatic: {}, max cognitive: {}, max CRAP: {}). {}",
+        if above == 1 { "" } else { "s" },
+        if above == 1 { "s" } else { "" },
+        num(summary, "functions_analyzed"),
+        num(summary, "max_cyclomatic_threshold"),
+        num(summary, "max_cognitive_threshold"),
+        threshold_or(summary, "max_crap_threshold", "30"),
+        listing.not_listed_note(),
     )
 }
 
@@ -1581,7 +1978,12 @@ fn render_health_summary(env: &Value) -> String {
     } else {
         render_health_with_runtime(env, complex, &elapsed)
     };
-    format!("{}{body}", health_score_header(env))
+    let groups = fallow_api::build_health_groups_markdown(env, "");
+    if groups.is_empty() {
+        format!("{}{body}", health_score_header(env))
+    } else {
+        format!("{}{body}\n\n{groups}", health_score_header(env))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,8 +2002,74 @@ fn introduced_label(item: &Value) -> &'static str {
     match item.get("introduced").and_then(Value::as_bool) {
         Some(true) => "new",
         Some(false) => "inherited",
-        None => "-",
+        None => "unknown",
     }
+}
+
+/// Status of a complexity finding: `worsened` if its attribution says so, else the introduced flag.
+fn complexity_status_label(item: &Value) -> &'static str {
+    if item.get("attribution").and_then(Value::as_str) == Some("worsened") {
+        "worsened"
+    } else {
+        introduced_label(item)
+    }
+}
+
+/// Whether the run counts a worsened complexity finding like an introduced
+/// finding (`--worsened error`).
+fn worsened_gates(env: &Value) -> bool {
+    env["attribution"]["worsened"] == "error"
+}
+
+fn audit_rule_severity(item: &Value) -> &'static str {
+    match item
+        .get("effective_severity")
+        .or_else(|| item.get("severity"))
+        .and_then(Value::as_str)
+    {
+        Some("error") => "error",
+        Some("warn") if item["gate_exemption"] == "test-file" => "warn (test file)",
+        Some("warn") => "warn",
+        _ => "unknown",
+    }
+}
+
+fn audit_priority(env: &Value, severity: &str, status: &str) -> (u8, u8) {
+    let severity = match severity {
+        "error" => 0,
+        "warn" => 1,
+        _ => 2,
+    };
+    let status = if env["attribution"]["gate"] == "new-only" {
+        match status {
+            "new" => 0,
+            "worsened" if worsened_gates(env) => 0,
+            "worsened" => 1,
+            "inherited" => 2,
+            _ => 3,
+        }
+    } else {
+        0
+    };
+    (severity, status)
+}
+
+fn sorted_audit_findings<'a>(env: &Value, section: &'a Value, key: &str) -> Vec<&'a Value> {
+    let mut findings: Vec<&Value> = arr(section, key).collect();
+    findings.sort_by(|a, b| {
+        audit_priority(env, audit_rule_severity(a), complexity_status_label(a))
+            .cmp(&audit_priority(
+                env,
+                audit_rule_severity(b),
+                complexity_status_label(b),
+            ))
+            .then_with(|| s(a, "path").cmp(s(b, "path")))
+            .then_with(|| u(a, "line").cmp(&u(b, "line")))
+            .then_with(|| s(a, "name").cmp(s(b, "name")))
+            .then_with(|| s(a, "code").cmp(s(b, "code")))
+            .then_with(|| s(a, "value").cmp(s(b, "value")))
+    });
+    findings
 }
 
 struct AuditRow {
@@ -1609,6 +2077,7 @@ struct AuditRow {
     location: String,
     item: String,
     status: &'static str,
+    severity: &'static str,
 }
 
 fn audit_row(kind: &'static str, location: String, item: String, finding: &Value) -> AuditRow {
@@ -1617,6 +2086,7 @@ fn audit_row(kind: &'static str, location: String, item: String, finding: &Value
         location,
         item,
         status: introduced_label(finding),
+        severity: audit_rule_severity(finding),
     }
 }
 
@@ -1638,6 +2108,11 @@ const AUDIT_EXPORT_DEP_ROWS: &[AuditRowSpec] = &[
             code_cell(it, "type_name")
         )
     }),
+    (
+        "Deprecated export in use",
+        "deprecated_exports_in_use",
+        |it| code_cell(it, "export_name"),
+    ),
     ("Unused dependency", "unused_dependencies", |it| {
         code_cell(it, "package_name")
     }),
@@ -1669,6 +2144,11 @@ const AUDIT_COMPONENT_ROWS: &[AuditRowSpec] = &[
     ("Unused component prop", "unused_component_props", |it| {
         component_member_item(it, "prop_name")
     }),
+    (
+        "Absent optional component prop",
+        "absent_component_props",
+        |it| component_member_item(it, "prop_name"),
+    ),
     ("Unused component emit", "unused_component_emits", |it| {
         format!(
             "{} emit {}",
@@ -1696,6 +2176,15 @@ const AUDIT_COMPONENT_ROWS: &[AuditRowSpec] = &[
             code_cell(it, "component_name"),
             code_cell(it, "event_name")
         )
+    }),
+    ("Unused Effect layer", "unused_effect_layers", |it| {
+        format!("layer {}", code_cell(it, "name"))
+    }),
+    ("Unused tagged error", "unused_tagged_errors", |it| {
+        format!("{} tag {}", code_cell(it, "name"), code_cell(it, "tag"))
+    }),
+    ("Unproduced catch tag", "unproduced_catch_tags", |it| {
+        format!("catchTag {}", code_cell(it, "tag"))
     }),
     ("Unprovided inject", "unprovided_injects", |it| {
         format!(
@@ -1858,6 +2347,22 @@ fn audit_rows_graph(dead_code: &Value, rows: &mut Vec<AuditRow>) {
             it,
         ));
     }
+    for it in arr(dead_code, "package_cycles") {
+        let location = arr(it, "packages")
+            .filter_map(Value::as_str)
+            .map(markdown_table_code_span)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let detail = if it.get("group_truncated").and_then(Value::as_bool) == Some(true) {
+            format!(
+                "cycle ({})",
+                fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+            )
+        } else {
+            "cycle".to_owned()
+        };
+        rows.push(audit_row("Package cycle", location, detail, it));
+    }
 }
 
 /// jq order positions 16-19: boundary and policy kinds.
@@ -1986,12 +2491,25 @@ fn audit_dead_code_rows(dead_code: &Value) -> Vec<AuditRow> {
     audit_rows_frameworks(dead_code, &mut rows);
     audit_rows_from_table(dead_code, AUDIT_COMPONENT_ROWS, &mut rows);
     audit_rows_from_table(dead_code, AUDIT_HYGIENE_ROWS, &mut rows);
+    for item in arr(dead_code, "prop_drilling_chains")
+        .filter(|item| s(item, "effective_severity") == "error")
+    {
+        let Some(source) = arr(item, "hops").next() else {
+            continue;
+        };
+        rows.push(audit_row(
+            "Prop drilling",
+            markdown_table_code_span(s(source, "file")),
+            code_cell(item, "prop"),
+            item,
+        ));
+    }
     rows
 }
 
 fn audit_complexity_section(env: &Value) -> String {
     let complexity = env.get("complexity").cloned().unwrap_or(Value::Null);
-    let findings: Vec<&Value> = arr(&complexity, "findings").collect();
+    let findings = sorted_audit_findings(env, &complexity, "findings");
     if findings.is_empty() {
         return String::new();
     }
@@ -2000,10 +2518,11 @@ fn audit_complexity_section(env: &Value) -> String {
         .take(15)
         .map(|it| {
             format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 path_line_cell(it),
                 code_cell(it, "name"),
-                introduced_label(it),
+                complexity_status_label(it),
+                audit_rule_severity(it),
                 markdown_table_text(str_or(it, "severity", "moderate")),
                 num(it, "cyclomatic"),
                 num(it, "cognitive"),
@@ -2024,7 +2543,7 @@ fn audit_complexity_section(env: &Value) -> String {
         String::new()
     };
     format!(
-        "### Complexity\n\n| File | Function | Status | Severity | Cyclomatic | Cognitive | Coverage | CRAP |\n|:-----|:---------|:-------|:---------|:-----------|:----------|:---------|:-----|\n{rows}{tail}{}\n\n",
+        "### Complexity\n\n| File | Function | Status | Rule severity | Complexity band | Cyclomatic | Cognitive | Coverage | CRAP |\n|:-----|:---------|:-------|:--------------|:----------------|:-----------|:----------|:---------|:-----|\n{rows}{tail}{}\n\n",
         audit_coverage_model_note(&complexity),
     )
 }
@@ -2078,7 +2597,16 @@ fn audit_coverage_model_note(complexity: &Value) -> String {
 
 fn audit_duplication_section(env: &Value) -> String {
     let duplication = env.get("duplication").cloned().unwrap_or(Value::Null);
-    let groups: Vec<&Value> = arr(&duplication, "clone_groups").collect();
+    let mut groups: Vec<&Value> = arr(&duplication, "clone_groups").collect();
+    groups.sort_by(|a, b| {
+        audit_priority(env, "unknown", introduced_label(a))
+            .cmp(&audit_priority(env, "unknown", introduced_label(b)))
+            .then_with(|| s(&a["instances"][0], "file").cmp(s(&b["instances"][0], "file")))
+            .then_with(|| {
+                u(&a["instances"][0], "start_line").cmp(&u(&b["instances"][0], "start_line"))
+            })
+            .then_with(|| u(a, "token_count").cmp(&u(b, "token_count")))
+    });
     if groups.is_empty() {
         return String::new();
     }
@@ -2137,6 +2665,136 @@ fn audit_duplication_section(env: &Value) -> String {
     )
 }
 
+fn audit_styling_section(env: &Value) -> String {
+    let findings = sorted_audit_findings(env, &env["complexity"], "styling_findings");
+    if findings.is_empty() {
+        return String::new();
+    }
+    let rows = findings
+        .iter()
+        .take(15)
+        .map(|finding| {
+            format!(
+                "| {} | {} | {} | {} | {} |",
+                code_cell(finding, "code"),
+                path_line(finding),
+                code_cell(finding, "value"),
+                introduced_label(finding),
+                audit_rule_severity(finding),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail = if findings.len() > 15 {
+        format!(
+            "\n\n> {} more styling findings in the full audit report",
+            findings.len() - 15,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "### Styling\n\n| Rule | Location | Value | Status | Rule severity |\n|:-----|:---------|:------|:-------|:--------------|\n{rows}{tail}\n\n"
+    )
+}
+
+/// The diff-risk findings of an audit. Every finding is introduced by the
+/// change and can set the verdict, so the summary lists each one.
+fn audit_diff_risk_section(env: &Value) -> String {
+    let diff_risk = env.get("diff_risk").cloned().unwrap_or(Value::Null);
+    let findings = sorted_audit_findings(env, &diff_risk, "findings");
+    if findings.is_empty() {
+        return String::new();
+    }
+    let rows = findings
+        .iter()
+        .take(15)
+        .map(|finding| {
+            let path = rel_path_absolute_only(s(finding, "path"));
+            let line = u(finding, "line");
+            let location = if line > 0 {
+                format!("{path}:{line}")
+            } else {
+                path
+            };
+            format!(
+                "| {} | {} | {} | {} |",
+                markdown_table_code_span(s(finding, "rule")),
+                markdown_table_code_span(&location),
+                markdown_table_code_span(s(finding, "evidence")),
+                str_or(finding, "severity", "warn"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail = if findings.len() > 15 {
+        format!(
+            "\n\n> {} more diff-risk findings in the full audit report",
+            findings.len() - 15
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "### Diff Risk\n\n| Rule | Location | Evidence | Severity |\n|:-----|:---------|:---------|:---------|\n{rows}{tail}\n\n"
+    )
+}
+
+/// One row of the audit category table. A skipped sub-analysis prints
+/// `skipped`, because its 0 counts do not mean a clean result.
+fn audit_category_row(
+    label: &str,
+    summary: &Value,
+    skipped_key: &str,
+    findings: &str,
+    attribution: &Value,
+    attribution_prefix: &str,
+) -> String {
+    if summary
+        .get(skipped_key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return format!("| {label} | skipped | - | - |");
+    }
+    let count = |suffix: &str| {
+        attribution
+            .get(format!("{attribution_prefix}_{suffix}"))
+            .and_then(Value::as_u64)
+            .map_or_else(|| "unknown".to_owned(), |count| count.to_string())
+    };
+    format!(
+        "| {label} | {findings} | {} | {} |",
+        count("introduced"),
+        count("inherited"),
+    )
+}
+
+/// A note under the category table when inherited complexity findings got
+/// worse. The Introduced column does not count them, so the note says how
+/// they take part in the verdict.
+fn audit_worsened_note(env: &Value, attribution: &Value) -> String {
+    let count = attribution
+        .get("complexity_worsened")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if count == 0 {
+        return String::new();
+    }
+    let effect = if worsened_gates(env) {
+        "`--worsened error` counts them like introduced findings"
+    } else {
+        "they make the verdict at least warn and do not fail it"
+    };
+    format!(
+        "> {} got worse than the base (status `worsened`): {effect}.\n\n",
+        plural_n(
+            usize::try_from(count).unwrap_or(usize::MAX),
+            "inherited complexity finding"
+        ),
+    )
+}
+
 /// Port of `summary-audit.jq`.
 #[must_use]
 fn render_audit_summary(env: &Value) -> String {
@@ -2144,31 +2802,72 @@ fn render_audit_summary(env: &Value) -> String {
     let summary = env.get("summary").cloned().unwrap_or(Value::Null);
     let attribution = env.get("attribution").cloned().unwrap_or(Value::Null);
     let dead_code = env.get("dead_code").cloned().unwrap_or(Value::Null);
-    let dead_rows = audit_dead_code_rows(&dead_code);
+    let mut dead_rows = audit_dead_code_rows(&dead_code);
+    dead_rows.sort_by(|a, b| {
+        audit_priority(env, a.severity, a.status)
+            .cmp(&audit_priority(env, b.severity, b.status))
+            .then_with(|| a.location.cmp(&b.location))
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.item.cmp(&b.item))
+    });
+
+    let styling_count = env
+        .get("complexity")
+        .and_then(|complexity| complexity.get("styling_findings"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+        .to_string();
+    let rows = [
+        audit_category_row(
+            "Dead code",
+            &summary,
+            "dead_code_skipped",
+            &num(&summary, "dead_code_issues"),
+            &attribution,
+            "dead_code",
+        ),
+        audit_category_row(
+            "Complexity",
+            &summary,
+            "complexity_skipped",
+            &num(&summary, "complexity_findings"),
+            &attribution,
+            "complexity",
+        ),
+        audit_category_row(
+            "Duplication",
+            &summary,
+            "duplication_skipped",
+            &num(&summary, "duplication_clone_groups"),
+            &attribution,
+            "duplication",
+        ),
+        audit_category_row(
+            "Styling",
+            &summary,
+            "complexity_skipped",
+            &styling_count,
+            &attribution,
+            "styling",
+        ),
+    ]
+    .join("\n");
 
     let mut out = format!(
-        "## Fallow Audit\n\n> {} \u{b7} {} \u{b7} {}ms\n\n| Category | Findings | Introduced | Inherited |\n|:---------|---------:|-----------:|----------:|\n| Dead code | {} | {} | {} |\n| Complexity | {} | {} | {} |\n| Duplication | {} | {} | {} |\n\n",
+        "## Fallow Audit\n\n> {} \u{b7} {} \u{b7} {}ms\n\n| Category | Findings | Introduced | Inherited |\n|:---------|---------:|-----------:|----------:|\n{rows}\n\n",
         audit_verdict_label(verdict),
         plural_n(u(env, "changed_files_count") as usize, "changed file"),
         num(env, "elapsed_ms"),
-        num(&summary, "dead_code_issues"),
-        num(&attribution, "dead_code_introduced"),
-        num(&attribution, "dead_code_inherited"),
-        num(&summary, "complexity_findings"),
-        num(&attribution, "complexity_introduced"),
-        num(&attribution, "complexity_inherited"),
-        num(&summary, "duplication_clone_groups"),
-        num(&attribution, "duplication_introduced"),
-        num(&attribution, "duplication_inherited"),
     );
+    out.push_str(&audit_worsened_note(env, &attribution));
     if !dead_rows.is_empty() {
         let rows = dead_rows
             .iter()
             .take(10)
             .map(|row| {
                 format!(
-                    "| {} | {} | {} | {} |",
-                    row.kind, row.location, row.item, row.status
+                    "| {} | {} | {} | {} | {} |",
+                    row.kind, row.location, row.item, row.status, row.severity,
                 )
             })
             .collect::<Vec<_>>()
@@ -2183,15 +2882,22 @@ fn render_audit_summary(env: &Value) -> String {
         };
         let _ = write!(
             out,
-            "### Dead Code\n\n| Type | Location | Item | Status |\n|:-----|:---------|:-----|:-------|\n{rows}{tail}\n\n"
+            "### Dead Code\n\n| Type | Location | Item | Status | Rule severity |\n|:-----|:---------|:-----|:-------|:--------------|\n{rows}{tail}\n\n"
         );
     }
     out.push_str(&audit_complexity_section(env));
     out.push_str(&audit_duplication_section(env));
-    out.push_str(if s(&attribution, "gate") == "all" {
-        "*Audit gate: all. Every finding in changed files affects the verdict.*"
-    } else {
-        "*Audit gate: new-only. Inherited findings are reported but do not fail the verdict.*"
+    out.push_str(&audit_styling_section(env));
+    out.push_str(&audit_diff_risk_section(env));
+    out.push_str(match s(&attribution, "gate") {
+        "all" => "*Audit gate: all. Every finding in changed files affects the verdict.*",
+        "new-only" if worsened_gates(env) => {
+            "*Audit gate: new-only, worsened: error. Inherited findings that got worse fail the verdict like introduced findings. Other inherited findings do not fail the verdict.*"
+        }
+        "new-only" => {
+            "*Audit gate: new-only. Inherited findings are reported but do not fail the verdict.*"
+        }
+        _ => "*Audit gate: unknown. New-versus-inherited attribution is unavailable.*",
     });
     out
 }
@@ -2280,9 +2986,14 @@ fn render_security_summary(env: &Value) -> String {
 // summary-fix.jq
 // ---------------------------------------------------------------------------
 
+/// The entries of one fix type that actually landed (or, in a dry run, would).
+/// A withheld entry keeps its `type` so a caller can see which finding was
+/// declined, so the skipped flag is what separates the two; listing a withheld
+/// removal under "Dependencies removed" would report a write that never
+/// happened.
 fn fix_entries<'v>(env: &'v Value, entry_type: &str) -> Vec<&'v Value> {
     arr(env, "fixes")
-        .filter(|fix| s(fix, "type") == entry_type)
+        .filter(|fix| s(fix, "type") == entry_type && !b(fix, "skipped"))
         .collect()
 }
 
@@ -2310,9 +3021,17 @@ pub fn render_fix_summary(env: &Value) -> String {
     let content_changed = u(env, "skipped_content_changed") as usize;
     let mixed_eol = u(env, "skipped_mixed_line_endings") as usize;
     let low_confidence = u(env, "skipped_low_confidence_exports") as usize;
+    let low_confidence_deps = u(env, "skipped_low_confidence_dependencies") as usize;
+    let low_confidence_members = u(env, "skipped_low_confidence_members") as usize;
     let dry_run = b(env, "dry_run");
 
-    if fix_attempts == 0 && content_changed == 0 && mixed_eol == 0 && low_confidence == 0 {
+    if fix_attempts == 0
+        && content_changed == 0
+        && mixed_eol == 0
+        && low_confidence == 0
+        && low_confidence_deps == 0
+        && low_confidence_members == 0
+    {
         return "## Fallow - Auto-fix\n\nNo fixable issues found.".to_owned();
     }
 
@@ -2340,6 +3059,18 @@ pub fn render_fix_summary(env: &Value) -> String {
         let _ = write!(
             out,
             ", kept exports in {low_confidence} file(s) where consumers may be hidden from static analysis"
+        );
+    }
+    if low_confidence_deps > 0 {
+        let _ = write!(
+            out,
+            ", kept {low_confidence_deps} declared package(s) whose only import may sit in a file this run did not fully read"
+        );
+    }
+    if low_confidence_members > 0 {
+        let _ = write!(
+            out,
+            ", kept {low_confidence_members} unused enum member(s) whose only reference may sit in a file this run did not fully analyze"
         );
     }
     out.push_str("\n\n| Type | Count |\n|------|-------|\n");
@@ -2473,12 +3204,28 @@ fn combined_counts(env: &Value) -> CombinedCounts {
     let check = env
         .get("check")
         .map_or(0, |check| u(check, "total_issues") as usize);
-    let dupes = env
-        .get("dupes")
-        .map_or(0, |dupes| arr(dupes, "clone_groups").count());
+    // Visible groups plus what a presentation cap withheld, NOT
+    // `stats.clone_groups`. The two differ for two unrelated reasons and only
+    // one of them belongs here: a filtered combined run leaves `stats`
+    // describing the unfiltered corpus while `clone_groups[]` holds the
+    // actionable set, and counting `stats` there reports issues a reader
+    // cannot inspect (issue #1250); a presentation cap such as `--top`
+    // truncates the array while `stats` stays right. `clone_groups_omitted`
+    // counts only the second, and no combined envelope carries it today
+    // because the bare command takes no `--top`.
+    let dupes = env.get("dupes").map_or(0, |dupes| {
+        arr(dupes, "clone_groups")
+            .count()
+            .saturating_add(u(dupes, "clone_groups_omitted") as usize)
+    });
     let health = env.get("health").cloned().unwrap_or(Value::Null);
+    // After the baseline when one is loaded: the functions it accepts are
+    // not health findings of this run.
     let complex = health.get("summary").map_or(0, |summary| {
-        u(summary, "functions_above_threshold") as usize
+        baselined_complexity(summary).map_or_else(
+            || u(summary, "functions_above_threshold"),
+            |(remaining, _)| remaining,
+        ) as usize
     });
     let runtime = health
         .get("runtime_coverage")
@@ -2543,8 +3290,20 @@ fn combined_zero_case(env: &Value, counts: &CombinedCounts) -> String {
         }
     } else {
         out.push_str(
-            "> [!NOTE]\n> **Quality gate passed**\n\n:white_check_mark: No code issues \u{b7} :white_check_mark: No duplication \u{b7} :white_check_mark: No complex functions",
+            "> [!NOTE]\n> **Quality gate passed**\n\n:white_check_mark: No code issues \u{b7} :white_check_mark: No duplication \u{b7} :white_check_mark: ",
         );
+        // A health baseline that accepts functions gets them as context, so
+        // the line does not read as a project with no complex functions.
+        let accepted = env
+            .get("health")
+            .and_then(|health| health.get("summary"))
+            .and_then(baselined_complexity)
+            .map_or(0, |(_, accepted)| accepted);
+        if accepted > 0 {
+            let _ = write!(out, "No new complex functions ({accepted} in the baseline)");
+        } else {
+            out.push_str("No complex functions");
+        }
     }
     if let Some(maintainability) = opt_f(&vitals, "maintainability_avg") {
         let _ = write!(
@@ -2726,14 +3485,28 @@ fn combined_complexity_breakdown(env: &Value, counts: &CombinedCounts) -> String
     } else {
         String::new()
     };
+    let label = match baselined_complexity(&summary).filter(|&(_, accepted)| accepted > 0) {
+        Some((_, accepted)) => format!(
+            "{} new {} above threshold, {accepted} in the baseline",
+            counts.complex,
+            if counts.complex == 1 {
+                "function"
+            } else {
+                "functions"
+            },
+        ),
+        None => format!(
+            "{} {} above threshold",
+            counts.complex,
+            if counts.complex == 1 {
+                "function"
+            } else {
+                "functions"
+            },
+        ),
+    };
     format!(
-        "<details>\n<summary><strong><a href=\"{HEALTH_DOCS}#complexity-metrics\">Complexity</a> ({} {} above threshold)</strong></summary>\n\n| File | Function | Severity | [Cyclomatic]({HEALTH_DOCS}#cyclomatic-complexity) | [Cognitive]({HEALTH_DOCS}#cognitive-complexity){crap_header} | Lines |\n|:-----|:---------|:---------|----------:|---------:{crap_separator}|------:|\n{rows}\n\n**{}** files, **{}** functions analyzed (thresholds: cyclomatic > {cyc_t}, cognitive > {cog_t}{crap_footer})\n\n</details>\n\n",
-        counts.complex,
-        if counts.complex == 1 {
-            "function"
-        } else {
-            "functions"
-        },
+        "<details>\n<summary><strong><a href=\"{HEALTH_DOCS}#complexity-metrics\">Complexity</a> ({label})</strong></summary>\n\n| File | Function | Severity | [Cyclomatic]({HEALTH_DOCS}#cyclomatic-complexity) | [Cognitive]({HEALTH_DOCS}#cognitive-complexity){crap_header} | Lines |\n|:-----|:---------|:---------|----------:|---------:{crap_separator}|------:|\n{rows}\n\n**{}** files, **{}** functions analyzed (thresholds: cyclomatic > {cyc_t}, cognitive > {cog_t}{crap_footer})\n\n</details>\n\n",
         threshold_or(&summary, "files_analyzed", "unknown"),
         threshold_or(&summary, "functions_analyzed", "unknown"),
     )
@@ -2862,6 +3635,24 @@ fn combined_vitals(env: &Value) -> String {
             pct(avg_cyclomatic),
         );
     }
+    if let Some(population) = vitals
+        .get("cyclomatic_population")
+        .filter(|value| value.is_object())
+    {
+        let _ = writeln!(
+            out,
+            "| Cyclomatic units | Functions: {}, module scopes: {}, templates: {} |",
+            num(&population["functions"], "count"),
+            num(&population["modules"], "count"),
+            num(&population["templates"], "count")
+        );
+        if let Some(max) = population["modules"]["max"].as_u64() {
+            let _ = writeln!(
+                out,
+                "| Module-scope max cyclomatic (aggregate only) | {max} |"
+            );
+        }
+    }
     out.push('\n');
     out
 }
@@ -2907,4 +3698,427 @@ fn render_combined_summary(env: &Value, links: &LinkContext) -> String {
         combined_vitals(env),
         combined_tips(env),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use fallow_types::issue_meta::counted_result_issue_metas;
+
+    use super::{
+        DEAD_CODE_CATEGORIES, LinkContext, render_audit_summary, render_combined_summary,
+        render_health_summary,
+    };
+
+    /// One listed complexity finding.
+    fn complexity_finding(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": "src/a.ts", "name": name, "line": 1, "col": 0,
+            "cyclomatic": 25, "cognitive": 30, "line_count": 40,
+            "exceeded": "both", "severity": "high"
+        })
+    }
+
+    /// A health summary with a loaded baseline: `above` functions exceed a
+    /// threshold before the baseline, and `remaining` after it.
+    fn health_with_baseline(above: u64, remaining: u64) -> serde_json::Value {
+        let findings: Vec<serde_json::Value> = (0..remaining)
+            .map(|index| complexity_finding(&format!("f{index}")))
+            .collect();
+        serde_json::json!({
+            "elapsed_ms": 1,
+            "findings": findings,
+            "vital_signs": { "avg_cyclomatic": 2.0 },
+            "summary": {
+                "files_analyzed": 3,
+                "functions_analyzed": 90,
+                "functions_above_threshold": above,
+                "max_cyclomatic_threshold": 20,
+                "max_cognitive_threshold": 15,
+                "max_crap_threshold": 30.0,
+                "baseline_staleness": {
+                    "baseline_entries": above,
+                    "matched_entries": above,
+                    "stale_entries": 0,
+                    "current_findings": above,
+                    "remaining_findings": remaining,
+                    "stale": false
+                }
+            }
+        })
+    }
+
+    fn no_links() -> LinkContext {
+        LinkContext {
+            prefix: String::new(),
+            repo: String::new(),
+            sha: String::new(),
+        }
+    }
+
+    /// A skipped dead-code pass reports 0 issues, which must not read as a
+    /// clean row.
+    #[test]
+    fn audit_summary_marks_skipped_sub_analyses() {
+        let audit = |dead_code: bool, complexity: bool, duplication: bool| {
+            serde_json::json!({
+                "command": "audit",
+                "verdict": "warn",
+                "changed_files_count": 1,
+                "elapsed_ms": 3,
+                "summary": {
+                    "dead_code_issues": 0,
+                    "dead_code_skipped": dead_code,
+                    "complexity_skipped": complexity,
+                    "duplication_skipped": duplication,
+                    "complexity_findings": 1,
+                    "duplication_clone_groups": 0
+                },
+                "attribution": {
+                    "gate": "new-only",
+                    "dead_code_introduced": 0,
+                    "dead_code_inherited": 0,
+                    "complexity_introduced": 1,
+                    "complexity_inherited": 0,
+                    "duplication_introduced": 0,
+                    "duplication_inherited": 0,
+                    "styling_introduced": 0,
+                    "styling_inherited": 0
+                }
+            })
+        };
+        let out = render_audit_summary(&audit(true, false, false));
+        assert!(out.contains("| Dead code | skipped | - | - |"), "{out}");
+        assert!(out.contains("| Complexity | 1 | 1 | 0 |"), "{out}");
+        assert!(out.contains("| Styling | 0 | 0 | 0 |"), "{out}");
+        let out = render_audit_summary(&audit(false, true, true));
+        assert!(out.contains("| Dead code | 0 | 0 | 0 |"), "{out}");
+        assert!(out.contains("| Complexity | skipped | - | - |"), "{out}");
+        assert!(out.contains("| Duplication | skipped | - | - |"), "{out}");
+        assert!(out.contains("| Styling | skipped | - | - |"), "{out}");
+    }
+
+    #[test]
+    fn audit_summary_names_worsened_findings_and_their_mode() {
+        let audit = |mode: &str, verdict: &str| {
+            serde_json::json!({
+                "command": "audit",
+                "verdict": verdict,
+                "changed_files_count": 1,
+                "elapsed_ms": 3,
+                "summary": {"dead_code_issues": 0, "complexity_findings": 1, "duplication_clone_groups": 0},
+                "attribution": {
+                    "gate": "new-only",
+                    "worsened": mode,
+                    "dead_code_introduced": 0,
+                    "dead_code_inherited": 0,
+                    "complexity_introduced": 0,
+                    "complexity_inherited": 1,
+                    "complexity_worsened": 1,
+                    "duplication_introduced": 0,
+                    "duplication_inherited": 0
+                },
+                "complexity": {"findings": [{
+                    "path": "src/a.ts",
+                    "line": 1,
+                    "name": "run",
+                    "introduced": false,
+                    "attribution": "worsened",
+                    "effective_severity": "error",
+                    "cyclomatic": 30,
+                    "cognitive": 20
+                }]}
+            })
+        };
+        let out = render_audit_summary(&audit("error", "fail"));
+        assert!(out.contains("| `run` | worsened |"), "{out}");
+        assert!(
+            out.contains("> 1 inherited complexity finding got worse than the base (status `worsened`): `--worsened error` counts them like introduced findings."),
+            "{out}"
+        );
+        assert!(
+            out.contains("*Audit gate: new-only, worsened: error."),
+            "{out}"
+        );
+        assert!(
+            !out.contains("Inherited findings are reported but"),
+            "{out}"
+        );
+
+        let out = render_audit_summary(&audit("warn", "warn"));
+        assert!(out.contains("| `run` | worsened |"), "{out}");
+        assert!(
+            out.contains("they make the verdict at least warn and do not fail it."),
+            "{out}"
+        );
+        assert!(
+            out.contains("*Audit gate: new-only. Inherited findings are reported but do not fail the verdict.*"),
+            "{out}"
+        );
+    }
+
+    /// With a baseline, the headline counts the functions after the
+    /// baseline and gives the accepted functions as context.
+    #[test]
+    fn health_summary_headline_counts_after_the_baseline() {
+        let out = render_health_summary(&health_with_baseline(76, 0));
+        assert!(
+            out.contains("**No new functions exceed complexity thresholds (76 in the baseline)**"),
+            "{out}"
+        );
+        let out = render_health_summary(&health_with_baseline(76, 2));
+        assert!(
+            out.contains("**2 new functions exceed thresholds (74 in the baseline)**"),
+            "{out}"
+        );
+        assert!(!out.contains("76 functions"), "{out}");
+    }
+
+    /// The bare-run summary counts health findings after the baseline too.
+    #[test]
+    fn combined_summary_counts_health_after_the_baseline() {
+        let combined = |health: serde_json::Value| {
+            serde_json::json!({
+                "check": { "total_issues": 0 },
+                "dupes": { "clone_groups": [], "stats": {} },
+                "health": health
+            })
+        };
+        let out = render_combined_summary(&combined(health_with_baseline(76, 0)), &no_links());
+        assert!(
+            out.contains(":white_check_mark: No new complex functions (76 in the baseline)"),
+            "{out}"
+        );
+        assert!(!out.contains("above threshold"), "{out}");
+
+        let out = render_combined_summary(&combined(health_with_baseline(76, 2)), &no_links());
+        assert!(out.contains(":warning: **2** health findings"), "{out}");
+        assert!(
+            out.contains("(2 new functions above threshold, 74 in the baseline)"),
+            "{out}"
+        );
+    }
+
+    /// Without `remaining_findings` the combined count stays the summary count.
+    #[test]
+    fn combined_summary_without_a_baseline_keeps_the_summary_count() {
+        let mut health = health_with_baseline(3, 3);
+        health["summary"]
+            .as_object_mut()
+            .expect("summary")
+            .remove("baseline_staleness");
+        let env = serde_json::json!({
+            "check": { "total_issues": 0 },
+            "dupes": { "clone_groups": [], "stats": {} },
+            "health": health
+        });
+        let out = render_combined_summary(&env, &no_links());
+        assert!(out.contains(":warning: **3** health findings"), "{out}");
+        assert!(out.contains("(3 functions above threshold)"), "{out}");
+        assert!(!out.contains("baseline"), "{out}");
+    }
+
+    /// A run without a finding list (for example `--score`) still counts the
+    /// functions above a threshold. The summary must give that count.
+    #[test]
+    fn health_summary_counts_unlisted_functions() {
+        let envelope = |above: u64| {
+            serde_json::json!({
+                "elapsed_ms": 1,
+                "summary": {
+                    "functions_analyzed": 5,
+                    "functions_above_threshold": above,
+                    "max_cyclomatic_threshold": 20,
+                    "max_cognitive_threshold": 15,
+                    "max_crap_threshold": 30.0
+                }
+            })
+        };
+        let out = render_health_summary(&envelope(1));
+        assert!(out.contains("**1 function exceeds thresholds**"), "{out}");
+        assert!(out.contains("`fallow health --complexity`"), "{out}");
+        assert!(!out.contains("baseline"), "{out}");
+        assert!(!out.contains("No functions exceed"), "{out}");
+        let out = render_health_summary(&envelope(0));
+        assert!(
+            out.contains("**No functions exceed complexity thresholds**"),
+            "{out}"
+        );
+    }
+
+    /// A baselined envelope. A score-only run omits `vital_signs`; a run that
+    /// lists findings carries it.
+    fn baselined_envelope(lists_findings: bool) -> serde_json::Value {
+        let mut envelope = serde_json::json!({
+            "elapsed_ms": 1,
+            "findings": [],
+            "summary": {
+                "functions_analyzed": 5,
+                "functions_above_threshold": 1,
+                "max_cyclomatic_threshold": 20,
+                "max_cognitive_threshold": 15,
+                "max_crap_threshold": 30.0,
+                "baseline_staleness": {
+                    "baseline_entries": 2,
+                    "matched_entries": 2,
+                    "stale_entries": 0,
+                    "current_findings": 1,
+                    "stale": false
+                }
+            }
+        });
+        if lists_findings {
+            envelope["vital_signs"] = serde_json::json!({ "avg_cyclomatic": 2.0 });
+        }
+        envelope
+    }
+
+    /// A run that lists findings and has a baseline that accepts every
+    /// finding is clean. The summary must not give the count or ask for a
+    /// rerun.
+    #[test]
+    fn health_summary_keeps_a_baselined_listed_run_clean() {
+        let out = render_health_summary(&baselined_envelope(true));
+        assert!(
+            out.contains("**No functions exceed complexity thresholds**"),
+            "{out}"
+        );
+        assert!(!out.contains("--complexity"), "{out}");
+    }
+
+    /// A score-only run does not list findings, so a baseline does not make
+    /// it clean. The count comes before the baseline, and the summary says so.
+    #[test]
+    fn health_summary_counts_unlisted_functions_on_a_baselined_score_run() {
+        let out = render_health_summary(&baselined_envelope(false));
+        assert!(out.contains("**1 function exceeds thresholds**"), "{out}");
+        assert!(
+            out.contains("The count includes the functions that the baseline accepts."),
+            "{out}"
+        );
+        assert!(
+            out.contains("Run `fallow health --complexity` with the same `--baseline`"),
+            "{out}"
+        );
+        assert!(!out.contains("No functions exceed"), "{out}");
+    }
+
+    /// A run with `sections` that does not name `complexity` does not list
+    /// findings, also when it has `vital_signs` and a baseline. The summary
+    /// gives the count and the number of new functions.
+    #[test]
+    fn health_summary_reads_the_sections_member() {
+        let mut env = baselined_envelope(true);
+        env["sections"] = serde_json::json!(["vital-signs", "hotspots"]);
+        env["summary"]["functions_above_threshold"] = serde_json::json!(3);
+        env["summary"]["baseline_staleness"]["remaining_findings"] = serde_json::json!(1);
+        let out = render_health_summary(&env);
+        assert!(out.contains("**3 functions exceed thresholds**"), "{out}");
+        assert!(out.contains("The baseline accepts 2. 1 is new."), "{out}");
+        assert!(
+            out.contains("Run `fallow health --complexity` with the same `--baseline`"),
+            "{out}"
+        );
+        assert!(!out.contains("No functions exceed"), "{out}");
+        assert!(!out.contains("The count includes"), "{out}");
+
+        env["sections"] = serde_json::json!(["complexity", "vital-signs", "hotspots"]);
+        let out = render_health_summary(&env);
+        assert!(
+            out.contains("**No functions exceed complexity thresholds**"),
+            "{out}"
+        );
+    }
+
+    /// When the baseline accepts every function, the note says so and does
+    /// not ask for a rerun.
+    #[test]
+    fn health_summary_with_no_new_function_does_not_ask_for_a_rerun() {
+        let mut env = baselined_envelope(false);
+        env["sections"] = serde_json::json!(["score"]);
+        env["summary"]["baseline_staleness"]["remaining_findings"] = serde_json::json!(0);
+        let out = render_health_summary(&env);
+        assert!(out.contains("**1 function exceeds thresholds**"), "{out}");
+        assert!(out.contains("The baseline accepts 1. 0 are new."), "{out}");
+        assert!(!out.contains("--complexity"), "{out}");
+    }
+
+    /// Every counted dead-code kind needs a summary row with the registry
+    /// label and docs anchor, and every summary row needs a registry kind.
+    #[test]
+    fn dead_code_categories_match_counted_result_metadata() {
+        let native: BTreeSet<(&str, &str, &str)> = DEAD_CODE_CATEGORIES.iter().copied().collect();
+        assert_eq!(
+            native.len(),
+            DEAD_CODE_CATEGORIES.len(),
+            "DEAD_CODE_CATEGORIES has a duplicate row"
+        );
+        let registry: BTreeSet<(&str, &str, &str)> = counted_result_issue_metas()
+            .map(|meta| (meta.summary_label, meta.result_key, meta.docs_anchor))
+            .collect();
+        let missing: Vec<_> = registry.difference(&native).collect();
+        let extra: Vec<_> = native.difference(&registry).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "DEAD_CODE_CATEGORIES must match the counted result metadata \
+             (label, result key, docs anchor).\nMissing rows: {missing:?}\nRows not in the registry: {extra:?}"
+        );
+    }
+
+    /// Rows without a path or line tie on the first two keys. The serialized
+    /// row breaks the tie, so the rendered order does not depend on the input
+    /// order. The rows past the rendered limit are counted, not listed.
+    #[test]
+    fn pathless_rows_render_in_one_order_for_any_input_order() {
+        let envelope = |names: &[String]| {
+            serde_json::json!({
+                "total_issues": names.len(),
+                "elapsed_ms": 1,
+                "unlisted_dependencies": names
+                    .iter()
+                    .map(|name| serde_json::json!({ "package_name": name, "imported_from": [] }))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let names: Vec<String> = (0..40).map(|index| format!("pkg-{index:02}")).collect();
+        let mut reversed = names.clone();
+        reversed.reverse();
+        let ordered = super::render_check_summary(&envelope(&names));
+        assert_eq!(super::render_check_summary(&envelope(&reversed)), ordered);
+        let first = ordered.find("pkg-00").expect("first row");
+        let second = ordered.find("pkg-01").expect("second row");
+        assert!(
+            first < second,
+            "rows follow the serialized order: {ordered}"
+        );
+        assert!(
+            !ordered.contains("pkg-39"),
+            "rows past the limit are counted only"
+        );
+        assert!(
+            ordered.contains("15 more"),
+            "the tail counts the rest: {ordered}"
+        );
+    }
+
+    /// A saved `--group-by` envelope lists rows group by group. The summary
+    /// renders them in one order whatever the input order is.
+    #[test]
+    fn dead_code_rows_render_in_one_order_for_any_input_order() {
+        let envelope = |paths: [&str; 3]| {
+            serde_json::json!({
+                "total_issues": 3,
+                "elapsed_ms": 1,
+                "unused_files": paths.map(|path| serde_json::json!({ "path": path })),
+            })
+        };
+        let flat = super::render_check_summary(&envelope(["src/a.ts", "src/b.ts", "src/c.ts"]));
+        let grouped = super::render_check_summary(&envelope(["src/a.ts", "src/c.ts", "src/b.ts"]));
+        assert_eq!(grouped, flat);
+        let a = flat.find("`src/a.ts`").expect("a");
+        let b = flat.find("`src/b.ts`").expect("b");
+        let c = flat.find("`src/c.ts`").expect("c");
+        assert!(a < b && b < c, "rows follow path order: {flat}");
+    }
 }

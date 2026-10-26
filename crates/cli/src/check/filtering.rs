@@ -20,213 +20,12 @@ pub fn filter_to_workspaces(
     fallow_engine::dead_code::filter_to_workspaces(results, ws_roots);
 }
 
-pub use fallow_engine::changed_files::{
-    filter_results_by_changed_files as filter_changed_files, get_changed_files,
-};
+pub use fallow_engine::changed_files::changed_files as try_get_changed_files;
 
-/// Drop findings whose source line is not inside an added hunk of the
-/// supplied unified diff. Range-shaped findings (clone instances live in
-/// dupes, not here; complexity hotspots live in health, not here) are
-/// handled in their own subsystems. This filter only governs the per-file
-/// findings that live on `AnalysisResults`.
-///
-/// **Project-level findings bypass the filter.** A PR that deletes the
-/// last consumer of `lodash` semantically caused the `unused-dependency`
-/// finding even though the diff never touches `package.json`; the same
-/// reasoning applies to catalog entries, dependency overrides, type-only
-/// deps, and test-only deps. The line filter is a noise-floor reducer for
-/// source-anchored findings; CI must still fail on project-level findings
-/// the PR caused. Mirrors the default `FALLOW_SUMMARY_SCOPE=all` behavior
-/// in typed PR-comment rendering.
-///
-/// `DiffIndex::key_for` normalizes the finding's absolute path to the
-/// forward-slashed key shape `git diff` writes (`+++ b/<path>`), relative to
-/// the diff's own base rather than to `root` — the two differ whenever the
-/// analysis root sits below the repository toplevel. When the path cannot be
-/// expressed relative to that base (different drive, traversal escape), the
-/// finding is RETAINED rather than silently dropped: an unfilterable path is
-/// better surfaced than silently hidden.
-pub fn filter_results_by_diff(
-    results: &mut fallow_types::results::AnalysisResults,
-    diff_index: &crate::report::ci::diff_filter::DiffIndex,
-    root: &Path,
-) {
-    let touches_file = |path: &Path| -> bool {
-        match diff_index.key_for(path, root) {
-            Some(p) => diff_index.touches_file(&p),
-            None => true,
-        }
-    };
-    let line_in_diff = |path: &Path, line: u32| -> bool {
-        match diff_index.key_for(path, root) {
-            Some(p) => diff_index
-                .added_lines_in(&p)
-                .is_some_and(|set| set.contains(&u64::from(line))),
-            None => true,
-        }
-    };
-
-    filter_diff_source_findings(results, &touches_file, &line_in_diff);
-    filter_diff_security_findings(results, &touches_file, &line_in_diff);
-    filter_diff_dependency_findings(results, &line_in_diff);
-    filter_diff_graph_findings(results, &touches_file, &line_in_diff);
-    filter_diff_framework_findings(results, &line_in_diff);
-}
-
-fn filter_diff_source_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.unused_files.retain(|f| touches_file(&f.file.path));
-
-    results
-        .unused_exports
-        .retain(|e| line_in_diff(&e.export.path, e.export.line));
-    results
-        .unused_types
-        .retain(|e| line_in_diff(&e.export.path, e.export.line));
-    results
-        .private_type_leaks
-        .retain(|e| line_in_diff(&e.leak.path, e.leak.line));
-    results
-        .unused_enum_members
-        .retain(|m| line_in_diff(&m.member.path, m.member.line));
-    results
-        .unused_class_members
-        .retain(|m| line_in_diff(&m.member.path, m.member.line));
-    results
-        .unused_store_members
-        .retain(|m| line_in_diff(&m.member.path, m.member.line));
-    results
-        .unprovided_injects
-        .retain(|f| line_in_diff(&f.inject.path, f.inject.line));
-    results
-        .unrendered_components
-        .retain(|c| line_in_diff(&c.component.path, c.component.line));
-    results
-        .unused_component_props
-        .retain(|p| line_in_diff(&p.prop.path, p.prop.line));
-    results
-        .unused_component_emits
-        .retain(|e| line_in_diff(&e.emit.path, e.emit.line));
-    results
-        .unused_component_inputs
-        .retain(|i| line_in_diff(&i.input.path, i.input.line));
-    results
-        .unused_component_outputs
-        .retain(|o| line_in_diff(&o.output.path, o.output.line));
-    results
-        .unused_svelte_events
-        .retain(|e| line_in_diff(&e.event.path, e.event.line));
-    results
-        .unused_server_actions
-        .retain(|a| line_in_diff(&a.action.path, a.action.line));
-    results
-        .unused_load_data_keys
-        .retain(|k| line_in_diff(&k.key.path, k.key.line));
-    results
-        .unresolved_imports
-        .retain(|i| line_in_diff(&i.import.path, i.import.line));
-}
-
-fn filter_diff_security_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.security_findings.retain(|f| {
-        line_in_diff(&f.path, f.line)
-            || f.trace.iter().any(|hop| {
-                line_in_diff(&hop.path, hop.line)
-                    || (matches!(hop.role, fallow_types::results::TraceHopRole::SecretSource)
-                        && touches_file(&hop.path))
-            })
-            || f.reachability.as_ref().is_some_and(|reachability| {
-                // Source-trace matching here is deliberately ROLE-AGNOSTIC (any
-                // hop on a changed line keeps the finding for advisory display).
-                // Do NOT add a role gate: unlike the strict `retain_gate_new`
-                // gate, the advisory display must surface a finding whose
-                // module-level `ModuleSource` source node sits on a changed line.
-                reachability
-                    .untrusted_source_trace
-                    .iter()
-                    .any(|hop| line_in_diff(&hop.path, hop.line))
-            })
-    });
-    results
-        .security_unresolved_callee_diagnostics
-        .retain(|d| line_in_diff(&d.path, d.line));
-}
-
-fn filter_diff_dependency_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    for unlisted in &mut results.unlisted_dependencies {
-        unlisted
-            .dep
-            .imported_from
-            .retain(|s| line_in_diff(&s.path, s.line));
-    }
-    results
-        .unlisted_dependencies
-        .retain(|d| !d.dep.imported_from.is_empty());
-}
-
-fn filter_diff_graph_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.duplicate_exports.retain(|d| {
-        d.export
-            .locations
-            .iter()
-            .any(|loc| line_in_diff(&loc.path, loc.line))
-    });
-
-    results
-        .circular_dependencies
-        .retain(|c| c.cycle.files.iter().any(|f| touches_file(f)));
-
-    results
-        .re_export_cycles
-        .retain(|c| c.cycle.files.iter().any(|f| touches_file(f)));
-
-    results
-        .boundary_violations
-        .retain(|v| line_in_diff(&v.violation.from_path, v.violation.line));
-
-    results
-        .stale_suppressions
-        .retain(|s| line_in_diff(&s.path, s.line));
-}
-
-fn filter_diff_framework_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results
-        .invalid_client_exports
-        .retain(|e| line_in_diff(&e.export.path, e.export.line));
-
-    results
-        .mixed_client_server_barrels
-        .retain(|b| line_in_diff(&b.barrel.path, b.barrel.line));
-
-    results
-        .misplaced_directives
-        .retain(|d| line_in_diff(&d.directive_site.path, d.directive_site.line));
-
-    results
-        .route_collisions
-        .retain(|c| line_in_diff(&c.collision.path, c.collision.line));
-
-    results
-        .dynamic_segment_name_conflicts
-        .retain(|c| line_in_diff(&c.conflict.path, c.conflict.line));
-}
+/// Drop the findings whose source line is not on an added line of the diff.
+/// The one implementation lives in the engine, so the CLI and the programmatic
+/// API filter a diff the same way.
+pub use fallow_engine::diff_scope::filter_dead_code_by_diff as filter_results_by_diff;
 
 /// Strict gate predicate for `fallow security --gate new` (issue #886): retain a
 /// security finding ONLY when the change INTRODUCED it, not merely when it lives
@@ -300,9 +99,13 @@ pub fn resolve_workspace_scope(
     root: &Path,
     workspace: Option<&[String]>,
     changed_workspaces: Option<&str>,
+    workspace_patterns: &[String],
     output: OutputFormat,
 ) -> Result<Option<Vec<PathBuf>>, ExitCode> {
-    let workspaces = fallow_engine::discover::discover_workspace_packages(root);
+    let workspaces = fallow_engine::discover::discover_workspace_packages_with_patterns(
+        root,
+        workspace_patterns,
+    );
     fallow_engine::workspace_scope::resolve_workspace_scope_roots(
         root,
         workspace,
@@ -350,13 +153,13 @@ fn no_workspaces_message(
 ) -> String {
     match mode {
         WorkspaceScopeMode::Workspace => format!(
-            "--workspace {} specified but no workspaces found. Ensure root package.json has a \"workspaces\" field, pnpm-workspace.yaml exists, or tsconfig.json has \"references\".",
+            "--workspace {} specified but no workspaces found. Ensure root package.json has a \"workspaces\" field, pnpm-workspace.yaml exists, tsconfig.json has \"references\", or the project sets \"workspaces.patterns\" in the fallow config.",
             quote_owned_patterns(patterns)
         ),
         WorkspaceScopeMode::ChangedWorkspaces => {
             let git_ref = git_ref.unwrap_or_default();
             format!(
-                "--changed-workspaces '{git_ref}' specified but no workspaces found. Ensure root package.json has a \"workspaces\" field, pnpm-workspace.yaml exists, or tsconfig.json has \"references\"."
+                "--changed-workspaces '{git_ref}' specified but no workspaces found. Ensure root package.json has a \"workspaces\" field, pnpm-workspace.yaml exists, tsconfig.json has \"references\", or the project sets \"workspaces.patterns\" in the fallow config."
             )
         }
     }
@@ -373,6 +176,7 @@ fn quote_owned_patterns(patterns: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fallow_engine::changed_files::filter_results_by_changed_files as filter_changed_files;
     use fallow_types::extract::MemberKind;
     use fallow_types::extract::{SkippedSecurityCalleeExpressionKind, SkippedSecurityCalleeReason};
     use fallow_types::output_dead_code::*;
@@ -456,6 +260,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_dependencies
@@ -465,6 +270,7 @@ mod tests {
                 path: PathBuf::from("/project/packages/ui/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_dev_dependencies
@@ -474,6 +280,7 @@ mod tests {
                 path: PathBuf::from("/project/packages/ui/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let ws_root = PathBuf::from("/project/packages/ui");
@@ -581,6 +388,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -592,6 +401,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -603,6 +414,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let ws_root = PathBuf::from("/project/packages/ui");
@@ -723,6 +536,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_dev_dependencies
@@ -732,6 +546,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 10,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let changed = rustc_hash::FxHashSet::default(); // empty set
@@ -755,6 +570,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -766,6 +583,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let mut changed = rustc_hash::FxHashSet::default();
@@ -920,6 +739,7 @@ mod tests {
                     path: PathBuf::from("/project/packages/ui/package.json"),
                     line: 3,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         results
@@ -931,6 +751,7 @@ mod tests {
                     path: PathBuf::from("/project/package.json"),
                     line: 7,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
 
@@ -1092,6 +913,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -1103,6 +926,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let mut changed = rustc_hash::FxHashSet::default();
@@ -1192,6 +1017,7 @@ mod tests {
                     path: PathBuf::from("/project/package.json"),
                     line: 3,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         results
@@ -1271,6 +1097,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -1282,6 +1110,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_enum_members
@@ -1437,6 +1267,7 @@ mod tests {
                 path: PathBuf::from("/project/packages/ui/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_dependencies
@@ -1446,6 +1277,7 @@ mod tests {
                 path: PathBuf::from("/project/packages/api/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_dependencies
@@ -1455,6 +1287,7 @@ mod tests {
                 path: PathBuf::from("/project/packages/legacy/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let roots = [
@@ -1489,7 +1322,7 @@ mod tests {
     #[test]
     fn resolve_workspace_scope_neither_flag_returns_none() {
         let root = Path::new("/project");
-        let got = resolve_workspace_scope(root, None, None, OutputFormat::Human).unwrap();
+        let got = resolve_workspace_scope(root, None, None, &[], OutputFormat::Human).unwrap();
         assert!(got.is_none());
     }
 
@@ -1497,7 +1330,13 @@ mod tests {
     fn resolve_workspace_scope_both_flags_is_error() {
         let root = Path::new("/project");
         let patterns = ["web".to_owned()];
-        let got = resolve_workspace_scope(root, Some(&patterns), Some("main"), OutputFormat::Human);
+        let got = resolve_workspace_scope(
+            root,
+            Some(&patterns),
+            Some("main"),
+            &[],
+            OutputFormat::Human,
+        );
         assert!(
             got.is_err(),
             "--workspace + --changed-workspaces must error out"
@@ -1530,6 +1369,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -1541,6 +1382,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         filter_results_by_diff(&mut results, &diff, root);
         let names: Vec<&str> = results
@@ -1597,6 +1440,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 42,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_catalog_entries

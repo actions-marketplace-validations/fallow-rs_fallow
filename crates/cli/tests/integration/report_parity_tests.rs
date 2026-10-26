@@ -1,0 +1,1690 @@
+#![allow(
+    clippy::expect_used,
+    reason = "integration tests use expect to keep fixture setup concise"
+)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use crate::common::{fallow_bin, git, strip_volatile_fields};
+
+#[test]
+fn consumer_contract_saved_errors_preserve_original_failure() {
+    assert_saved_error_preserves_failure(&serde_json::json!({}));
+}
+
+#[test]
+fn consumer_contract_saved_error_cannot_render_a_successful_kind() {
+    assert_saved_error_preserves_failure(&serde_json::json!({
+        "kind": "audit", "verdict": "pass", "summary": {}, "attribution": {}
+    }));
+}
+
+#[test]
+fn consumer_contract_saved_error_keeps_its_failure_exit_code() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let store = tempfile::tempdir().expect("saved error directory");
+    let path = store.path().join("saved.json");
+    // Exit codes 0 and 1 mean success, so a saved failure never maps to them.
+    for (saved_exit, expected_exit) in [(3, 3), (1, 2), (0, 2), (300, 2)] {
+        let error = serde_json::json!({
+            "error": true,
+            "message": "coverage file cannot be read",
+            "exit_code": saved_exit,
+            "code": "FALLOW_INVALID_COVERAGE_PATH",
+            "help": "check the coverage path before retrying"
+        });
+        std::fs::write(&path, error.to_string()).expect("save failure");
+        let rendered = run(
+            &root,
+            &[
+                "report".to_owned(),
+                "--from".to_owned(),
+                path.display().to_string(),
+                "--quiet".to_owned(),
+                "--format".to_owned(),
+                "github-summary".to_owned(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&rendered.stderr);
+        assert_eq!(rendered.status.code(), Some(expected_exit), "{stderr}");
+        assert!(stderr.contains("FALLOW_INVALID_COVERAGE_PATH"), "{stderr}");
+        assert!(
+            stderr.contains("hint: check the coverage path before retrying"),
+            "{stderr}"
+        );
+        assert!(
+            rendered.stdout.is_empty(),
+            "failed runs must not render success"
+        );
+    }
+}
+
+#[test]
+fn consumer_contract_saved_legacy_audit_preserves_styling_rule_identity() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let store = tempfile::tempdir().expect("legacy audit directory");
+    let path = store.path().join("styling.json");
+    // The untyped legacy section forces both formats through their annotation fallback.
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "kind": "audit", "dead_code": false, "complexity": { "styling_findings": [{
+                "path": "src/button.tsx", "line": 7, "code": "css-token-drift",
+                "sub_kind": "tailwind-arbitrary-value", "value": "w-[13px]",
+                "effective_severity": "error", "introduced": true, "actions": []
+            }, {
+                "path": "src/button.tsx", "line": 7, "code": "css-token-drift",
+                "sub_kind": "tailwind-arbitrary-value", "value": "h-[17px]",
+                "effective_severity": "error", "introduced": true, "actions": []
+            }, {
+                "path": "src/button.tsx", "line": 7, "code": "css-token-drift",
+                "sub_kind": "css-declaration-value", "value": "w-[13px]",
+                "effective_severity": "error", "introduced": true, "actions": []
+        }] }, "diff_risk": { "findings": [{
+            "path": "package.json", "line": 1, "rule": "added-dependency",
+            "severity": "warn", "introduced": true,
+            "message": "new dependency", "evidence": "left-pad"
+        }] }
+        })
+        .to_string(),
+    )
+    .expect("save legacy audit");
+    for format in ["sarif", "codeclimate"] {
+        let args = [
+            "report".to_owned(),
+            "--from".to_owned(),
+            path.display().to_string(),
+            "--format".to_owned(),
+            format.to_owned(),
+            "--quiet".to_owned(),
+        ];
+        let rendered = run(&root, &args);
+        assert_eq!(
+            rendered.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&rendered.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&rendered.stdout).expect("report JSON");
+        if format == "sarif" {
+            let results = value["runs"][0]["results"]
+                .as_array()
+                .expect("SARIF results");
+            assert_eq!(results.len(), 4);
+            let styling = results
+                .iter()
+                .find(|result| result["ruleId"] == "fallow/css-token-drift")
+                .expect("canonical styling rule");
+            let risk = results
+                .iter()
+                .find(|result| result["ruleId"] == "fallow/added-dependency")
+                .expect("canonical diff-risk rule");
+            assert_eq!(styling["level"], "error");
+            assert_eq!(risk["level"], "warning");
+            assert_eq!(
+                styling["locations"][0]["physicalLocation"]["region"]["startLine"],
+                7
+            );
+        } else {
+            let issues = value.as_array().expect("CodeClimate issues");
+            assert_eq!(issues.len(), 4);
+            let styling = issues
+                .iter()
+                .find(|issue| issue["check_name"] == "fallow/css-token-drift")
+                .expect("canonical styling rule");
+            let risk = issues
+                .iter()
+                .find(|issue| issue["check_name"] == "fallow/added-dependency")
+                .expect("canonical diff-risk rule");
+            assert_eq!(risk["fingerprint"], "cafb30822aca4e49");
+            assert_eq!(styling["categories"], serde_json::json!(["Style"]));
+            assert_eq!(styling["location"]["lines"]["begin"], 7);
+            let fingerprints: std::collections::BTreeSet<&str> = issues
+                .iter()
+                .filter(|issue| issue["check_name"] == "fallow/css-token-drift")
+                .map(|issue| issue["fingerprint"].as_str().expect("styling fingerprint"))
+                .collect();
+            assert_eq!(
+                fingerprints.len(),
+                3,
+                "each value and subkind needs its own identity"
+            );
+            let repeated = run(&root, &args);
+            assert_eq!(repeated.status.code(), Some(0));
+            assert_eq!(
+                rendered.stdout, repeated.stdout,
+                "fingerprints must remain stable"
+            );
+        }
+    }
+}
+
+fn assert_saved_error_preserves_failure(extra: &serde_json::Value) {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let store = tempfile::tempdir().expect("saved error directory");
+    let path = store.path().join("saved.json");
+    let mut error = serde_json::json!({
+        "error": true,
+        "message": "coverage file cannot be read",
+        "exit_code": 2,
+        "code": "FALLOW_INVALID_COVERAGE_PATH",
+        "help": "check the coverage path before retrying"
+    });
+    error
+        .as_object_mut()
+        .expect("error object")
+        .extend(extra.as_object().expect("extra fields").clone());
+    std::fs::write(&path, error.to_string()).expect("save failure");
+    for format in ["github-summary", "github-annotations"] {
+        let rendered = run(
+            &root,
+            &[
+                "report".to_owned(),
+                "--from".to_owned(),
+                path.display().to_string(),
+                "--root".to_owned(),
+                root.display().to_string(),
+                "--quiet".to_owned(),
+                "--format".to_owned(),
+                format.to_owned(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&rendered.stderr);
+        assert_eq!(rendered.status.code(), Some(2), "{format}: {stderr}");
+        assert!(stderr.contains("coverage file cannot be read"), "{stderr}");
+        assert!(stderr.contains("FALLOW_INVALID_COVERAGE_PATH"), "{stderr}");
+        assert!(
+            stderr.contains("check the coverage path before retrying"),
+            "{stderr}"
+        );
+        assert!(
+            rendered.stdout.is_empty(),
+            "failed runs must not render success"
+        );
+    }
+    for invalid in ["{}", "{"] {
+        std::fs::write(&path, invalid).expect("save invalid input");
+        let rendered = run(
+            &root,
+            &[
+                "report".to_owned(),
+                "--from".to_owned(),
+                path.display().to_string(),
+                "--format".to_owned(),
+                "github-summary".to_owned(),
+            ],
+        );
+        assert_eq!(rendered.status.code(), Some(2));
+        assert!(rendered.stdout.is_empty());
+    }
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "kind": "dead-code", "total_issues": 1,
+                "unused_exports": [{ "path": "src/unused.ts", "line": 1, "col": 0,
+                    "export_name": "legacyUnused", "is_re_export": false, "is_type_only": false }]
+        })
+        .to_string(),
+    )
+    .expect("save legacy success");
+    let rendered = run(
+        &root,
+        &[
+            "report".to_owned(),
+            "--from".to_owned(),
+            path.display().to_string(),
+            "--format".to_owned(),
+            "github-summary".to_owned(),
+        ],
+    );
+    assert_eq!(rendered.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&rendered.stdout).contains("legacyUnused"));
+}
+
+fn workspace_fixture(path: &str) -> PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("../..")
+    .join(path)
+    .canonicalize()
+    .expect("fixture path")
+}
+
+fn run(root: &Path, args: &[String]) -> Output {
+    let mut command = Command::new(fallow_bin());
+    command
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "")
+        .args(args);
+    crate::common::scrub_analysis_env(&mut command);
+    command.output().expect("run fallow")
+}
+
+fn run_with_env(root: &Path, args: &[String], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(fallow_bin());
+    command
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "")
+        .args(args);
+    crate::common::scrub_analysis_env(&mut command);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().expect("run fallow with env")
+}
+
+fn run_with_type_aware_sidecar(root: &Path, args: &[String]) -> Output {
+    let mut command = Command::new(fallow_bin());
+    command
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "")
+        .args(args);
+    crate::common::scrub_analysis_env(&mut command);
+    crate::common::configure_type_aware_sidecar(&mut command);
+    command.output().expect("run type-aware fallow")
+}
+
+fn analysis_args(command: Option<&str>, root: &Path, format: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(command) = command {
+        args.push(command.to_string());
+    }
+    args.extend([
+        "--root".to_string(),
+        root.display().to_string(),
+        "--quiet".to_string(),
+        "--format".to_string(),
+        format.to_string(),
+    ]);
+    args.extend(extra.iter().map(|value| (*value).to_string()));
+    args
+}
+
+fn assert_saved_report_parity(root: &Path, command: Option<&str>) {
+    assert_saved_report_parity_with_args(root, command, &[]);
+}
+
+fn assert_saved_report_parity_with_args(root: &Path, command: Option<&str>, extra: &[&str]) {
+    let json = run(root, &analysis_args(command, root, "json", extra));
+    assert!(
+        matches!(json.status.code(), Some(0 | 1)),
+        "analysis failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&json.stdout).expect("analysis JSON");
+
+    let saved_dir = tempfile::tempdir().expect("saved report tempdir");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved report");
+
+    let formats: &[&str] = match command {
+        // The live audit markdown is the human report with markdown sections,
+        // so a saved audit envelope does not render markdown.
+        Some("audit") => &[
+            "codeclimate",
+            "sarif",
+            "pr-comment-github",
+            "pr-comment-gitlab",
+            "review-github",
+            "review-gitlab",
+            "github-summary",
+            "github-annotations",
+        ],
+        Some(_) => &[
+            "codeclimate",
+            "sarif",
+            "pr-comment-github",
+            "pr-comment-gitlab",
+            "review-github",
+            "review-gitlab",
+            "github-summary",
+            "github-annotations",
+            "markdown",
+        ],
+        // Combined comments use their richer multi-gate presentation while
+        // the saved generic renderer preserves the same typed findings.
+        None => &[
+            "codeclimate",
+            "sarif",
+            "github-summary",
+            "github-annotations",
+            "markdown",
+        ],
+    };
+    for format in formats {
+        let direct = run(root, &analysis_args(command, root, format, extra));
+        assert!(
+            matches!(direct.status.code(), Some(0 | 1)),
+            "direct {format} failed: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+
+        let saved = run(
+            root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert!(
+            saved.status.success(),
+            "saved {format} failed: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        let (saved_body, direct_body) = if *format == "github-summary" {
+            (
+                mask_summary_elapsed(&String::from_utf8_lossy(&saved.stdout)),
+                mask_summary_elapsed(&String::from_utf8_lossy(&direct.stdout)),
+            )
+        } else {
+            (
+                String::from_utf8_lossy(&saved.stdout).into_owned(),
+                String::from_utf8_lossy(&direct.stdout).into_owned(),
+            )
+        };
+        assert_eq!(
+            saved_body, direct_body,
+            "saved {format} must be byte-identical to direct rendering"
+        );
+    }
+}
+
+/// Mask the one elapsed-time token in the header line of a job summary.
+///
+/// The summary prints the `elapsed_ms` of the envelope it renders. The direct
+/// run and the run that saved the envelope are two processes, so the two values
+/// differ although both renders read the same member. Only the first token after
+/// `· ` or ` in ` is masked, so a count that drifts still fails the comparison.
+fn mask_summary_elapsed(body: &str) -> String {
+    let token = ["\u{b7} ", " in "]
+        .iter()
+        .filter_map(|marker| {
+            body.match_indices(marker).find_map(|(offset, _)| {
+                let start = offset + marker.len();
+                let len = body[start..].bytes().take_while(u8::is_ascii_digit).count();
+                (len > 0 && body[start + len..].starts_with("ms")).then_some((start, start + len))
+            })
+        })
+        .min();
+    match token {
+        Some((start, end)) => format!("{}<n>{}", &body[..start], &body[end..]),
+        None => body.to_owned(),
+    }
+}
+
+#[test]
+fn saved_reports_preserve_native_health_duplication_and_combined_output() {
+    assert_saved_report_parity(
+        &workspace_fixture("tests/fixtures/basic-project"),
+        Some("check"),
+    );
+    assert_saved_report_parity(
+        &workspace_fixture("tests/fixtures/complexity-project"),
+        Some("health"),
+    );
+    assert_saved_report_parity(
+        &workspace_fixture("tests/fixtures/duplicate-code"),
+        Some("dupes"),
+    );
+    assert_saved_report_parity(
+        &workspace_fixture("tests/fixtures/complexity-project"),
+        None,
+    );
+    assert_saved_report_parity_with_args(
+        &workspace_fixture("tests/fixtures/complexity-project"),
+        Some("health"),
+        &["--group-by", "directory"],
+    );
+    // The job summary of a grouped run carries the per-group table, with
+    // scores, so the live table must equal the table rendered from the save.
+    assert_saved_report_parity_with_args(
+        &workspace_fixture("tests/fixtures/complexity-project"),
+        Some("health"),
+        &["--group-by", "directory", "--score", "--top", "2"],
+    );
+    assert_saved_report_parity_with_args(
+        &workspace_fixture("tests/fixtures/duplicate-code"),
+        Some("dupes"),
+        &["--group-by", "directory"],
+    );
+    assert_saved_report_parity_with_args(
+        &workspace_fixture("tests/fixtures/basic-project"),
+        Some("check"),
+        &["--group-by", "directory"],
+    );
+}
+
+/// The saved-report parity case of each command that `fallow report --from`
+/// renders, as `(command, test)`. A new command row that renders needs a case
+/// here and a test that compares its saved and direct output.
+const PARITY_CASES: &[(&str, &str)] = &[
+    (
+        "dead-code",
+        "saved_reports_preserve_native_health_duplication_and_combined_output",
+    ),
+    (
+        "architecture",
+        "saved_architecture_reports_match_direct_rendering",
+    ),
+    (
+        "dupes",
+        "saved_reports_preserve_native_health_duplication_and_combined_output",
+    ),
+    (
+        "health",
+        "saved_reports_preserve_native_health_duplication_and_combined_output",
+    ),
+    (
+        "security",
+        "saved_security_report_preserves_native_sarif_and_rejects_codeclimate",
+    ),
+    ("audit", "saved_audit_reports_preserve_all_native_sections"),
+];
+
+#[test]
+fn every_report_from_command_has_a_parity_case() {
+    use fallow_types::command_surfaces::{COMMAND_ENVELOPES, ReportFrom};
+
+    let renders: std::collections::BTreeSet<&str> = COMMAND_ENVELOPES
+        .iter()
+        .filter(|row| row.report_from == ReportFrom::Renders)
+        .map(|row| row.command)
+        .collect();
+    let cases: std::collections::BTreeSet<&str> =
+        PARITY_CASES.iter().map(|(command, _)| *command).collect();
+    assert_eq!(
+        renders, cases,
+        "every command that report --from renders needs a saved-report parity case"
+    );
+    let source = include_str!("report_parity_tests.rs");
+    for (command, test) in PARITY_CASES {
+        let body = test_body(source, test)
+            .unwrap_or_else(|| panic!("{command}: parity test `{test}` does not exist"));
+        // `check` is the hidden alias of `dead-code` that the older cases use.
+        let selectors: &[&str] = if *command == "dead-code" {
+            &["dead-code", "check"]
+        } else {
+            &[command]
+        };
+        assert!(
+            selectors
+                .iter()
+                .any(|selector| body.contains(&format!("Some(\"{selector}\")"))),
+            "{command}: parity test `{test}` does not run `fallow {command}`"
+        );
+    }
+}
+
+/// The source of `fn {name}()` up to the closing brace at column zero.
+fn test_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let start = source.find(&format!("fn {name}()"))?;
+    let rest = &source[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |offset| offset + 3);
+    Some(&rest[..end])
+}
+
+/// `fallow architecture` writes its own `kind`, so `fallow report --from` must
+/// accept it and render every target byte-identical to the direct run, flat and
+/// grouped.
+#[test]
+fn saved_architecture_reports_match_direct_rendering() {
+    for fixture in [
+        "tests/fixtures/boundary-violations",
+        "tests/fixtures/re-export-cycle-2-node",
+    ] {
+        let root = workspace_fixture(fixture);
+        let json = run(
+            &root,
+            &analysis_args(Some("architecture"), &root, "json", &[]),
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&json.stdout).expect("architecture JSON");
+        assert_eq!(envelope["kind"], "architecture", "{fixture}");
+        assert!(
+            envelope["total_issues"].as_u64().unwrap_or(0) > 0,
+            "{fixture} must have an architecture finding so the parity is not vacuous"
+        );
+        assert_saved_report_parity(&root, Some("architecture"));
+        assert_saved_report_parity_with_args(
+            &root,
+            Some("architecture"),
+            &["--group-by", "directory"],
+        );
+    }
+}
+
+/// The two GitHub-native targets build their own render input. They do not read
+/// the report the JSON format serializes. A member the live call leaves out is
+/// therefore absent from the body they write, and `report --from` renders it from
+/// the saved envelope.
+///
+/// The byte-parity list above compares the two bodies. This test also asserts
+/// that the live body states the gate, so a gate that both renders drop still
+/// fails.
+fn assert_live_github_native_states_the_gate(root: &Path, extra: &[&str]) {
+    for format in ["github-summary", "github-annotations"] {
+        let direct = run(root, &analysis_args(Some("check"), root, format, extra));
+        assert!(matches!(direct.status.code(), Some(0 | 1)), "{format}");
+        let rendered = String::from_utf8_lossy(&direct.stdout);
+        assert!(
+            rendered.contains("stale-baseline"),
+            "the live {format} render must state the gate it failed: {rendered}"
+        );
+    }
+}
+
+/// The baseline advisory and the gate rows are rendered from typed state on a
+/// direct run and read back off the envelope by `report --from`. This is the
+/// one test that catches a divergence between the two, and the integrations
+/// post whatever the saved path produced.
+#[test]
+fn saved_stale_baseline_surfaces_match_direct_rendering() {
+    let project = tempfile::tempdir().expect("stale baseline project");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"stale-baseline-parity","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+        .expect("write entrypoint");
+    for name in ["a", "b", "c"] {
+        std::fs::write(
+            root.join(format!("src/{name}.ts")),
+            format!("export const {name} = true;\n"),
+        )
+        .expect("write unused source");
+    }
+
+    let baseline = root.join("baseline.json");
+    let saved = run(
+        root,
+        &analysis_args(
+            Some("check"),
+            root,
+            "json",
+            &["--save-baseline", baseline.to_str().expect("utf8")],
+        ),
+    );
+    assert!(
+        matches!(saved.status.code(), Some(0 | 1)),
+        "saving a baseline failed: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    // Remove what the baseline recorded, so every entry goes unmatched and the
+    // gate rule holds on a run with nothing left to report.
+    for name in ["a", "b", "c"] {
+        std::fs::remove_file(root.join(format!("src/{name}.ts"))).expect("clean the project");
+    }
+
+    let baseline_args = [
+        "--baseline",
+        baseline.to_str().expect("utf8"),
+        "--fail-on-stale-baseline",
+    ];
+    assert_saved_report_parity_with_args(root, Some("check"), &baseline_args);
+
+    assert_live_github_native_states_the_gate(root, &baseline_args);
+
+    // The bodies agreeing is only half of the render: the Check Run the action
+    // posts is built from the decision sidecar, whose gate rows the saved path
+    // fills from the envelope. A run with an armed gate is the only shape that
+    // puts a row in it.
+    let json = run(
+        root,
+        &analysis_args(Some("check"), root, "json", &baseline_args),
+    );
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let saved_path = root.join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved results");
+    let direct_decision = root.join("direct-decision.json");
+    let saved_decision = root.join("saved-decision.json");
+
+    let direct = run_with_env(
+        root,
+        &analysis_args(Some("check"), root, "pr-comment-github", &baseline_args),
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            direct_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(matches!(direct.status.code(), Some(0 | 1)));
+    let rendered = run_with_env(
+        root,
+        &[
+            "report".to_owned(),
+            "--from".to_owned(),
+            saved_path.display().to_string(),
+            "--root".to_owned(),
+            root.display().to_string(),
+            "--quiet".to_owned(),
+            "--format".to_owned(),
+            "pr-comment-github".to_owned(),
+        ],
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            saved_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(rendered.status.success());
+
+    let direct_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(direct_decision).expect("read direct decision"))
+            .expect("parse direct decision");
+    let saved_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(saved_decision).expect("read saved decision"))
+            .expect("parse saved decision");
+    assert_eq!(saved_sidecar, direct_sidecar);
+    assert!(
+        saved_sidecar["gates"]
+            .as_array()
+            .expect("the sidecar carries gate rows")
+            .iter()
+            .any(|gate| gate["id"] == "stale-baseline"),
+        "the armed gate must reach the saved Check Run: {saved_sidecar}"
+    );
+}
+
+#[test]
+fn saved_owner_grouped_dead_code_matches_direct_rendering() {
+    let project = tempfile::tempdir().expect("owner-grouped project");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"owner-grouped-parity","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        root.join("CODEOWNERS"),
+        "src/a.ts @z-owner\nsrc/b.ts @a-owner\nsrc/c.ts @z-owner\n",
+    )
+    .expect("write owners");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+        .expect("write entrypoint");
+    for name in ["a", "b", "c"] {
+        std::fs::write(
+            root.join(format!("src/{name}.ts")),
+            format!("export const {name} = true;\n"),
+        )
+        .expect("write unused source");
+    }
+
+    assert_saved_report_parity_with_args(root, Some("check"), &["--group-by", "owner"]);
+}
+
+/// A clean run with `--group-by` saves an envelope with an empty `groups` list.
+/// Every target must render zero findings from it and exit 0.
+#[test]
+fn saved_empty_grouped_dead_code_renders_zero_findings() {
+    let project = tempfile::tempdir().expect("empty grouped project");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"empty-grouped-parity","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+        .expect("write entrypoint");
+
+    let json = run(
+        root,
+        &analysis_args(
+            Some("dead-code"),
+            root,
+            "json",
+            &["--group-by", "directory"],
+        ),
+    );
+    assert_eq!(json.status.code(), Some(0), "the fixture must be clean");
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).expect("grouped JSON");
+    assert_eq!(envelope["kind"], "dead-code-grouped");
+    assert_eq!(envelope["groups"], serde_json::json!([]));
+
+    assert_saved_report_parity_with_args(root, Some("dead-code"), &["--group-by", "directory"]);
+}
+
+#[test]
+fn saved_gitlab_surfaces_match_direct_type_aware_findings() {
+    let root = workspace_fixture("tests/fixtures/type-aware-unused-export-refinement");
+    let extra = ["--type-aware", "--unused-exports", "--unused-types"];
+    let json =
+        run_with_type_aware_sidecar(&root, &analysis_args(Some("check"), &root, "json", &extra));
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let saved_dir = tempfile::tempdir().expect("saved type-aware directory");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write type-aware results");
+
+    for format in ["pr-comment-gitlab", "review-gitlab"] {
+        let direct = run_with_type_aware_sidecar(
+            &root,
+            &analysis_args(Some("check"), &root, format, &extra),
+        );
+        assert!(matches!(direct.status.code(), Some(0 | 1)), "{format}");
+        let saved = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert!(saved.status.success(), "{format}");
+        assert_eq!(saved.stdout, direct.stdout, "{format}");
+        let rendered = String::from_utf8_lossy(&saved.stdout);
+        assert!(!rendered.contains("PublicApi"), "{format}: {rendered}");
+        assert!(rendered.contains("actuallyUnused"), "{format}: {rendered}");
+    }
+}
+
+#[test]
+fn saved_dead_code_comment_preserves_direct_decision_sidecar() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let json = run(&root, &analysis_args(Some("check"), &root, "json", &[]));
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let saved_dir = tempfile::tempdir().expect("saved sidecar directory");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved results");
+    let direct_decision = saved_dir.path().join("direct-decision.json");
+    let saved_decision = saved_dir.path().join("saved-decision.json");
+
+    let direct = run_with_env(
+        &root,
+        &analysis_args(Some("check"), &root, "pr-comment-gitlab", &[]),
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            direct_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(matches!(direct.status.code(), Some(0 | 1)));
+    let rendered = run_with_env(
+        &root,
+        &[
+            "report".to_owned(),
+            "--from".to_owned(),
+            saved_path.display().to_string(),
+            "--root".to_owned(),
+            root.display().to_string(),
+            "--quiet".to_owned(),
+            "--format".to_owned(),
+            "pr-comment-gitlab".to_owned(),
+        ],
+        &[(
+            "FALLOW_PR_DECISION_FILE",
+            saved_decision.to_str().expect("utf8"),
+        )],
+    );
+    assert!(rendered.status.success());
+
+    let direct_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(direct_decision).expect("read direct decision"))
+            .expect("parse direct decision");
+    let saved_sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(saved_decision).expect("read saved decision"))
+            .expect("parse saved decision");
+    assert_eq!(saved_sidecar, direct_sidecar);
+    assert_eq!(saved_sidecar["gates"][0]["id"], "dead-code");
+}
+
+/// A committed copy of the complexity fixture with one uncommitted duplicate,
+/// so `audit` has a git base in a shallow CI checkout too.
+fn audit_project() -> tempfile::TempDir {
+    let fixture = workspace_fixture("tests/fixtures/complexity-project");
+    let project = tempfile::tempdir().expect("audit project");
+    for entry in [
+        "package.json",
+        "src/index.ts",
+        "src/simple.ts",
+        "src/complex.ts",
+    ] {
+        let source = fixture.join(entry);
+        let target = project.path().join(entry);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture directory");
+        }
+        std::fs::copy(source, target).expect("copy fixture file");
+    }
+    git(project.path(), &["init", "-q"]);
+    git(project.path(), &["add", "."]);
+    git(project.path(), &["commit", "-qm", "baseline"]);
+    std::fs::copy(
+        project.path().join("src/complex.ts"),
+        project.path().join("src/complex-copy.ts"),
+    )
+    .expect("create changed duplicate");
+    project
+}
+
+#[test]
+fn saved_audit_reports_preserve_all_native_sections() {
+    let project = audit_project();
+
+    assert_saved_report_parity(project.path(), Some("audit"));
+}
+
+#[test]
+fn saved_audit_verdict_survives_pr_comment_rendering() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let saved_dir = tempfile::tempdir().expect("saved audit verdict directory");
+    for (verdict, summary) in [
+        ("pass", "Quality gate passed"),
+        ("warn", "Review needed"),
+        ("fail", "Quality gate failed"),
+    ] {
+        let path = saved_dir.path().join(format!("audit-{verdict}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "audit",
+                "schema_version": fallow_output::AUDIT_SCHEMA_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
+                "command": "audit",
+                "verdict": verdict,
+                "changed_files_count": 0,
+                "base_ref": "main",
+                "elapsed_ms": 0,
+                "summary": {
+                    "dead_code_issues": 0,
+                    "dead_code_has_errors": false,
+                    "complexity_findings": 0,
+                    "max_cyclomatic": null,
+                    "duplication_clone_groups": 0
+                },
+                "attribution": {
+                    "gate": "new-only",
+                    "dead_code_introduced": 0,
+                    "dead_code_inherited": 0,
+                    "complexity_introduced": 0,
+                    "complexity_inherited": 0,
+                    "duplication_introduced": 0,
+                    "duplication_inherited": 0,
+                    "styling_introduced": 0,
+                    "styling_inherited": 0,
+                    "duplication_demoted": 0
+                }
+            }))
+            .expect("serialize audit envelope"),
+        )
+        .expect("write audit envelope");
+        let rendered = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                "pr-comment-github".to_string(),
+            ],
+        );
+        assert!(rendered.status.success(), "{verdict}");
+        let body = String::from_utf8(rendered.stdout).expect("sticky comment body");
+        assert!(body.contains(summary), "{verdict}: {body}");
+    }
+}
+
+/// The live `check` path is the one the GitHub Action drives, and the one that
+/// produced a sticky comment titled by the command name. It renders its own
+/// verdict from finding severities, so an error-severity finding reads as a
+/// failed gate on the surface a rerun edits.
+#[test]
+fn live_check_pr_comment_titles_by_content_and_carries_the_verdict() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let rendered = run(
+        &root,
+        &[
+            "check".to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+            "--quiet".to_string(),
+            "--format".to_string(),
+            "pr-comment-github".to_string(),
+        ],
+    );
+    let body = String::from_utf8(rendered.stdout).expect("sticky comment body");
+    assert!(body.contains("### Fallow codebase report"), "{body}");
+    assert!(body.contains("**Quality gate failed**"), "{body}");
+    assert!(
+        body.starts_with("<!-- fallow-id: fallow-results -->\n"),
+        "{body}"
+    );
+    // The envelope always states its default exit rule, so the comment closes
+    // with the gate line after the footer, as it does for any armed gate.
+    assert!(
+        body.trim_end()
+            .ends_with("Generated by fallow.\n\n> Gate outcomes: failed error-severity-findings (7 at or above error)."),
+        "{body}"
+    );
+}
+
+#[test]
+fn truncated_current_audit_envelope_fails_closed_for_every_ci_surface() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let saved_dir = tempfile::tempdir().expect("truncated audit directory");
+    let path = saved_dir.path().join("truncated-audit.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "audit",
+            "schema_version": fallow_output::AUDIT_SCHEMA_VERSION,
+            "verdict": "pass"
+        }))
+        .expect("serialize truncated audit envelope"),
+    )
+    .expect("write truncated audit envelope");
+
+    for format in [
+        "github-annotations",
+        "github-summary",
+        "codeclimate",
+        "sarif",
+        "pr-comment-github",
+        "pr-comment-gitlab",
+        "review-github",
+        "review-gitlab",
+    ] {
+        let rendered = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert_eq!(rendered.status.code(), Some(2), "{format}");
+        assert!(
+            String::from_utf8_lossy(&rendered.stderr).contains("missing required field `version`"),
+            "{format}: {}",
+            String::from_utf8_lossy(&rendered.stderr)
+        );
+    }
+}
+
+#[test]
+fn saved_future_schema_fails_with_precise_exit_two_error() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let saved_dir = tempfile::tempdir().expect("future schema directory");
+    let path = saved_dir.path().join("future.json");
+    std::fs::write(
+        &path,
+        r#"{"kind":"dead-code","schema_version":999,"unused_files":[]}"#,
+    )
+    .expect("write future envelope");
+    let rendered = run(
+        &root,
+        &[
+            "report".to_string(),
+            "--from".to_string(),
+            path.display().to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+            "--quiet".to_string(),
+            "--format".to_string(),
+            "review-gitlab".to_string(),
+        ],
+    );
+    assert_eq!(rendered.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rendered.stderr)
+            .contains("unsupported saved dead-code schema version 999"),
+        "{}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+}
+
+#[test]
+fn saved_security_report_preserves_native_sarif_and_rejects_codeclimate() {
+    let root = workspace_fixture("tests/fixtures/security-dangerous-html");
+    let json = run(&root, &analysis_args(Some("security"), &root, "json", &[]));
+    assert!(
+        matches!(json.status.code(), Some(0 | 1)),
+        "security JSON failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let saved_dir = tempfile::tempdir().expect("saved security tempdir");
+    let saved_path = saved_dir.path().join("security.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved security report");
+
+    let direct_sarif = run(&root, &analysis_args(Some("security"), &root, "sarif", &[]));
+    let saved_sarif = run(
+        &root,
+        &[
+            "report".to_string(),
+            "--from".to_string(),
+            saved_path.display().to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+            "--quiet".to_string(),
+            "--format".to_string(),
+            "sarif".to_string(),
+        ],
+    );
+    assert_eq!(saved_sarif.status.code(), direct_sarif.status.code());
+    assert_eq!(saved_sarif.stdout, direct_sarif.stdout);
+
+    let direct_codeclimate = run(
+        &root,
+        &analysis_args(Some("security"), &root, "codeclimate", &[]),
+    );
+    let saved_codeclimate = run(
+        &root,
+        &[
+            "report".to_string(),
+            "--from".to_string(),
+            saved_path.display().to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+            "--quiet".to_string(),
+            "--format".to_string(),
+            "codeclimate".to_string(),
+        ],
+    );
+    assert_eq!(direct_codeclimate.status.code(), Some(2));
+    assert_eq!(saved_codeclimate.status.code(), Some(2));
+    assert_eq!(saved_codeclimate.stdout, direct_codeclimate.stdout);
+
+    for format in [
+        "pr-comment-github",
+        "pr-comment-gitlab",
+        "review-github",
+        "review-gitlab",
+        "markdown",
+    ] {
+        let saved_ci = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert_eq!(saved_ci.status.code(), Some(2), "{format}");
+        assert!(
+            String::from_utf8_lossy(&saved_ci.stderr).contains("do not support"),
+            "{format}: {}",
+            String::from_utf8_lossy(&saved_ci.stderr)
+        );
+    }
+}
+
+#[test]
+fn malformed_current_security_report_fails_closed_for_saved_renderers() {
+    let root = workspace_fixture("tests/fixtures/security-dangerous-html");
+    let json = run(&root, &analysis_args(Some("security"), &root, "json", &[]));
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("security JSON envelope");
+    envelope["security_findings"] = serde_json::json!("not-an-array");
+
+    let saved_dir = tempfile::tempdir().expect("malformed security tempdir");
+    let saved_path = saved_dir.path().join("malformed-security.json");
+    std::fs::write(
+        &saved_path,
+        serde_json::to_vec(&envelope).expect("serialize malformed security envelope"),
+    )
+    .expect("write malformed security envelope");
+
+    for format in ["github-annotations", "github-summary", "sarif"] {
+        let rendered = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert_eq!(rendered.status.code(), Some(2), "{format}");
+        let stderr = String::from_utf8_lossy(&rendered.stderr);
+        assert!(
+            stderr.contains("saved security full payload is incompatible"),
+            "{format}: {stderr}"
+        );
+        assert!(stderr.contains("invalid type"), "{format}: {stderr}");
+    }
+}
+
+/// Build a one-commit-old git project so a `--base HEAD~1` command has a real
+/// comparison point.
+fn changed_project(label: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("rerun fixture tempdir");
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/core")).expect("create core directory");
+    std::fs::create_dir_all(root.join("src/ui")).expect("create ui directory");
+    std::fs::write(
+        root.join("package.json"),
+        format!(r#"{{"name":"rerun-{label}","private":true,"main":"src/index.ts"}}"#),
+    )
+    .expect("write manifest");
+    // Two zones, so the changed commit below can cross one. Without a zoned
+    // project the decision surface has no coupling candidate to rank.
+    std::fs::write(
+        root.join("fallow.toml"),
+        "[[boundaries.zones]]\nname = \"core\"\npatterns = [\"src/core/**\"]\n\n\
+         [[boundaries.zones]]\nname = \"ui\"\npatterns = [\"src/ui/**\"]\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export { helper } from './core/helper';\n",
+    )
+    .expect("write entrypoint");
+    std::fs::write(
+        root.join("src/core/helper.ts"),
+        "export const helper = (): number => 1;\n",
+    )
+    .expect("write helper");
+    std::fs::write(
+        root.join("src/ui/view.ts"),
+        "import { helper } from '../core/helper';\nexport const view = (): number => helper();\n",
+    )
+    .expect("write view");
+    git(root, &["init", "--quiet", "--initial-branch=main"]);
+    git(root, &["add", "."]);
+    git(
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+    );
+
+    // The second commit is deliberately decision-bearing: it widens the public
+    // API, crosses the core -> ui boundary, and declares a new dependency, so
+    // the ranked `decisions[]` list this gate compares is not empty. A rerun
+    // comparison over an empty list proves nothing about ranking stability.
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{"name":"rerun-{label}","private":true,"main":"src/index.ts","dependencies":{{"left-pad":"^1.3.0"}}}}"#
+        ),
+    )
+    .expect("rewrite manifest");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export { helper, second, third, usesView } from './core/helper';\n\
+         export { view } from './ui/view';\n",
+    )
+    .expect("widen entrypoint");
+    std::fs::write(
+        root.join("src/core/helper.ts"),
+        "import { view } from '../ui/view';\nimport leftPad from 'left-pad';\n\
+         export const helper = (): string => leftPad('1', 2);\n\
+         export const second = (): number => 2;\n\
+         export const third = (): number => 3;\n\
+         export const usesView = (): number => view();\n",
+    )
+    .expect("write changed file");
+    std::fs::write(
+        root.join("src/changed.ts"),
+        "export const changed = (value: number): number => value + 1;\nexport const alsoDead = 2;\n",
+    )
+    .expect("write changed file");
+    git(root, &["add", "."]);
+    git(
+        root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "change",
+        ],
+    );
+
+    dir
+}
+
+/// Reduce a JSON report to the form two runs over the same commit must agree
+/// on exactly. Uses the shared volatile-field definition so this gate and the
+/// determinism gates in `check_tests` / `audit_tests` cannot drift apart.
+fn canonical_stdout(output: &Output, label: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{label} JSON: {e}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    strip_volatile_fields(&mut value);
+    serde_json::to_string(&value).expect("re-serialize canonical report")
+}
+
+/// Assert that a second, independent run of the same command over the same
+/// commit produces the same report.
+///
+/// `assert_saved_report_parity` gives the analysis commands this guarantee as
+/// a side effect: it renders each format from a fresh pipeline and compares it
+/// to the saved render. The commands here cannot be replayed through
+/// `fallow report --from`, which reads only the dead-code, dupes, health,
+/// audit, security and combined envelopes, so they get the rerun comparison
+/// directly.
+fn assert_rerun_is_byte_identical(root: &Path, args: &[String], env: &[(&str, &str)], label: &str) {
+    let first = run_with_env(root, args, env);
+    assert!(
+        matches!(first.status.code(), Some(0 | 1)),
+        "{label} failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = run_with_env(root, args, env);
+    assert!(
+        matches!(second.status.code(), Some(0 | 1)),
+        "{label} rerun failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        canonical_stdout(&first, label),
+        canonical_stdout(&second, label),
+        "{label} must produce the same report on a rerun over the same commit"
+    );
+}
+
+#[test]
+fn decision_surface_rerun_is_byte_identical() {
+    let project = changed_project("decision-surface");
+    let root = project.path();
+    let args = analysis_args(
+        Some("decision-surface"),
+        root,
+        "json",
+        &["--base", "HEAD~1"],
+    );
+
+    // Coverage guard. A rerun comparison over an empty `decisions[]` array
+    // compares two empty lists and reports green whatever the ranking does, so
+    // pin that the fixture still produces a ranked list to compare.
+    let surface: serde_json::Value =
+        serde_json::from_slice(&run(root, &args).stdout).expect("decision-surface JSON");
+    let ranked = surface["decisions"]
+        .as_array()
+        .expect("decision-surface carries a decisions array");
+    assert!(
+        ranked.len() >= 2,
+        "the rerun gate needs at least two ranked decisions to compare an order: {surface}"
+    );
+
+    assert_rerun_is_byte_identical(root, &args, &[], "decision-surface");
+
+    // The thread pool is the one input a plain rerun holds fixed, and the
+    // decision ranking walks graph-derived collections, so vary it explicitly.
+    for threads in ["1", "8"] {
+        let mut varied = args.clone();
+        varied.extend(["--threads".to_string(), threads.to_string()]);
+        assert_eq!(
+            canonical_stdout(&run(root, &args), "decision-surface"),
+            canonical_stdout(&run(root, &varied), "decision-surface"),
+            "decision-surface at --threads {threads} differed from the default thread pool"
+        );
+    }
+}
+
+#[test]
+fn impact_rerun_is_byte_identical() {
+    let project = changed_project("impact");
+    let root = project.path();
+
+    // Impact history lives in the user config dir, never in the repo, so the
+    // test needs its own. Recording is refused in CI, which leaves the store
+    // empty there; the rerun comparison is the assertion either way, and
+    // locally it runs against a populated store.
+    let home = tempfile::tempdir().expect("impact home tempdir");
+    let config = home.path().join(".config");
+    let env: &[(&str, &str)] = &[
+        ("HOME", home.path().to_str().expect("utf8 home")),
+        ("USERPROFILE", home.path().to_str().expect("utf8 home")),
+        ("XDG_CONFIG_HOME", config.to_str().expect("utf8 config")),
+    ];
+
+    let enable = run_with_env(
+        root,
+        &[
+            "impact".to_string(),
+            "enable".to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+        ],
+        env,
+    );
+    assert!(
+        enable.status.success(),
+        "impact enable failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+    let recorded = run_with_env(
+        root,
+        &analysis_args(Some("audit"), root, "json", &["--base", "HEAD~1"]),
+        env,
+    );
+    assert!(matches!(recorded.status.code(), Some(0 | 1)));
+
+    let args = analysis_args(Some("impact"), root, "json", &[]);
+    assert_rerun_is_byte_identical(root, &args, env, "impact");
+}
+
+/// The combined comment is the one surface `fallow report --from` does not
+/// reproduce, and the exclusion above is easy to read as an oversight. Naming the
+/// divergence pins it: the combined renderer carries a multi-gate presentation
+/// the generic saved renderer has no input for, so a combined body is produced by
+/// the direct run and reproduced by `report --from` only for the machine formats.
+///
+/// A repository that needs a combined comment rendered from a saved envelope runs
+/// `fallow report --from` and gets the generic body, which is a documented
+/// difference rather than a parity failure (issue #2735).
+#[test]
+fn a_combined_comment_diverges_from_the_saved_render_by_design() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let json = run(&root, &analysis_args(None, &root, "json", &[]));
+    assert!(
+        matches!(json.status.code(), Some(0 | 1)),
+        "combined analysis failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let saved_dir = tempfile::tempdir().expect("saved report tempdir");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved report");
+
+    for format in ["pr-comment-github", "pr-comment-gitlab"] {
+        let direct = run(&root, &analysis_args(None, &root, format, &[]));
+        let saved = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert!(
+            saved.status.success(),
+            "saved {format} failed: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        assert!(
+            matches!(direct.status.code(), Some(0 | 1)),
+            "direct {format} failed: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+        assert_ne!(
+            saved.stdout, direct.stdout,
+            "if a combined {format} ever matches its saved render, add it to the parity list \
+             above instead of leaving this test to assert a difference that no longer exists"
+        );
+    }
+}
+
+/// The review summary body of the bare run states what `fallow report
+/// --from` states for its saved envelope: the status note and the rest of
+/// the summary text.
+#[test]
+fn combined_review_summary_body_matches_the_saved_render() {
+    let root = workspace_fixture("tests/fixtures/basic-project");
+    let json = run(&root, &analysis_args(None, &root, "json", &[]));
+    assert!(matches!(json.status.code(), Some(0 | 1)));
+    let saved_dir = tempfile::tempdir().expect("saved combined directory");
+    let saved_path = saved_dir.path().join("results.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write combined results");
+
+    let body = |output: &Output| -> String {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("review envelope JSON");
+        envelope["body"].as_str().unwrap_or_default().to_owned()
+    };
+    for format in ["review-github", "review-gitlab"] {
+        let direct = run(&root, &analysis_args(None, &root, format, &[]));
+        assert!(matches!(direct.status.code(), Some(0 | 1)), "{format}");
+        let saved = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                format.to_string(),
+            ],
+        );
+        assert!(saved.status.success(), "{format}");
+        let direct_body = body(&direct);
+        assert!(
+            direct_body.contains("> Gate outcomes:"),
+            "{format}: the live body carries the status note:\n{direct_body}"
+        );
+        assert_eq!(direct_body, body(&saved), "{format}");
+    }
+}
+
+/// Copy the complexity fixture into a temporary project with a CODEOWNERS
+/// file, so `--group-by owner` has owners to read.
+fn owned_complexity_project() -> tempfile::TempDir {
+    let fixture = workspace_fixture("tests/fixtures/complexity-project");
+    let project = tempfile::tempdir().expect("owned complexity project");
+    for entry in [
+        "package.json",
+        "src/index.ts",
+        "src/simple.ts",
+        "src/complex.ts",
+    ] {
+        let target = project.path().join(entry);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture directory");
+        }
+        std::fs::copy(fixture.join(entry), target).expect("copy fixture file");
+    }
+    std::fs::write(
+        project.path().join("CODEOWNERS"),
+        "src/complex.ts @team-core\nsrc/simple.ts @team-web\n",
+    )
+    .expect("write owners");
+    project
+}
+
+/// The live markdown of an owner-grouped health run with a score adds the
+/// score heading and the per-owner table. The saved render must print the
+/// same document.
+#[test]
+fn saved_owner_grouped_health_markdown_matches_direct_rendering() {
+    let project = owned_complexity_project();
+    assert_saved_report_parity_with_args(
+        project.path(),
+        Some("health"),
+        &["--group-by", "owner", "--score"],
+    );
+}
+
+/// The optional health sections (file scores, coverage gaps, refactoring
+/// targets) all come back from the saved envelope.
+#[test]
+fn saved_health_markdown_keeps_every_requested_section() {
+    let root = workspace_fixture("tests/fixtures/complexity-project");
+    assert_saved_report_parity_with_args(
+        &root,
+        Some("health"),
+        &["--score", "--file-scores", "--coverage-gaps", "--targets"],
+    );
+}
+
+/// A baselined run carries `sections` and `summary.baseline_staleness.remaining_findings`.
+/// The saved render must read both and print the same document as the live run,
+/// for a score-only run and for a run that does not list complexity findings.
+#[test]
+fn saved_baselined_health_markdown_reads_sections_and_remaining_count() {
+    let project = owned_complexity_project();
+    let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+    let baseline = baseline_dir.path().join("health-baseline.json");
+    let baseline = baseline.display().to_string();
+    let root = project.path().display().to_string();
+    let saved = run(
+        project.path(),
+        &[
+            "health".to_string(),
+            "--root".to_string(),
+            root,
+            "--quiet".to_string(),
+            "--save-baseline".to_string(),
+            baseline.clone(),
+        ],
+    );
+    assert!(
+        matches!(saved.status.code(), Some(0 | 1)),
+        "save baseline failed: {}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    for extra in [["--score", "--baseline"], ["--file-scores", "--baseline"]] {
+        assert_saved_report_parity_with_args(
+            project.path(),
+            Some("health"),
+            &[extra[0], extra[1], &baseline],
+        );
+    }
+}
+
+/// The live audit markdown is the human report with markdown sections. A saved
+/// audit envelope cannot reproduce it, so `report` refuses the format with
+/// exit 2 rather than print a different document.
+#[test]
+fn saved_audit_markdown_is_refused() {
+    let project = audit_project();
+    let root = project.path().to_path_buf();
+    let json = run(&root, &analysis_args(Some("audit"), &root, "json", &[]));
+    assert!(
+        matches!(json.status.code(), Some(0 | 1)),
+        "audit JSON failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let saved_dir = tempfile::tempdir().expect("saved audit tempdir");
+    let saved_path = saved_dir.path().join("audit.json");
+    std::fs::write(&saved_path, &json.stdout).expect("write saved audit report");
+
+    let saved = run(
+        &root,
+        &[
+            "report".to_string(),
+            "--from".to_string(),
+            saved_path.display().to_string(),
+            "--root".to_string(),
+            root.display().to_string(),
+            "--quiet".to_string(),
+            "--format".to_string(),
+            "markdown".to_string(),
+        ],
+    );
+    assert_eq!(saved.status.code(), Some(2));
+    assert!(saved.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&saved.stderr)
+            .contains("saved audit envelopes do not support --format markdown"),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+}
+
+/// A saved dead-code envelope with type-aware evidence renders the same
+/// markdown as the live run. A saved combined envelope keeps the evidence of
+/// the dead-code section only, while the live combined markdown also prints
+/// the evidence of the health section. `report` therefore refuses markdown
+/// for that envelope with exit 2.
+#[test]
+fn saved_type_aware_markdown_matches_or_is_refused() {
+    let root = workspace_fixture("tests/fixtures/type-aware-unused-export-refinement");
+    let saved_dir = tempfile::tempdir().expect("saved type-aware tempdir");
+    for (command, extra) in [
+        (
+            Some("check"),
+            &["--type-aware", "--unused-exports", "--unused-types"][..],
+        ),
+        (Some("health"), &["--type-aware"][..]),
+        (None, &["--type-aware"][..]),
+    ] {
+        let label = command.unwrap_or("combined");
+        let json =
+            run_with_type_aware_sidecar(&root, &analysis_args(command, &root, "json", extra));
+        assert!(matches!(json.status.code(), Some(0 | 1)), "{label}");
+        let saved_path = saved_dir.path().join(format!("{label}.json"));
+        std::fs::write(&saved_path, &json.stdout).expect("write saved type-aware report");
+        let saved = run(
+            &root,
+            &[
+                "report".to_string(),
+                "--from".to_string(),
+                saved_path.display().to_string(),
+                "--root".to_string(),
+                root.display().to_string(),
+                "--quiet".to_string(),
+                "--format".to_string(),
+                "markdown".to_string(),
+            ],
+        );
+        if command.is_none() {
+            assert_eq!(saved.status.code(), Some(2), "{label}");
+            assert!(saved.stdout.is_empty(), "{label}");
+            assert!(
+                String::from_utf8_lossy(&saved.stderr).contains(
+                    "saved combined envelopes with type-aware evidence do not support --format markdown"
+                ),
+                "{label}: {}",
+                String::from_utf8_lossy(&saved.stderr)
+            );
+            continue;
+        }
+        let direct =
+            run_with_type_aware_sidecar(&root, &analysis_args(command, &root, "markdown", extra));
+        assert!(matches!(direct.status.code(), Some(0 | 1)), "{label}");
+        assert!(
+            saved.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        let rendered = String::from_utf8_lossy(&saved.stdout);
+        assert!(
+            rendered.contains("Type-aware evidence"),
+            "{label}: {rendered}"
+        );
+        assert_eq!(saved.stdout, direct.stdout, "{label}");
+    }
+}

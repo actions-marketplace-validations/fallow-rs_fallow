@@ -15,6 +15,7 @@
 //! to stay source-compatible.
 
 #![warn(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 #![cfg_attr(
     test,
     allow(
@@ -25,20 +26,28 @@
 )]
 
 mod config;
+mod config_inputs;
 mod config_writer;
 mod external_plugin;
+/// Extglob groups, such as `!(*.spec)`, rewritten for `globset`.
+pub mod extglob;
 mod fixability;
 /// JSONC parsing helpers pinning the dialect fallow accepts.
 pub mod jsonc;
 pub mod levenshtein;
 mod rule_pack;
+mod source_walk;
 mod workspace;
+/// YAML parsing behind one internal API.
+pub mod yaml;
 
 pub use config::*;
+pub use config_inputs::*;
 pub use config_writer::*;
 pub use external_plugin::*;
 pub use fixability::*;
 pub use rule_pack::*;
+pub use source_walk::{source_walk_builder, source_walked_workspaces};
 pub use workspace::*;
 
 use std::path::{Path, PathBuf};

@@ -18,9 +18,10 @@ pub(super) fn build_framework_health_diagnostics(
         return None;
     }
 
+    let rules = detector_rules(config);
     let mut detectors = Vec::new();
     for framework in &detected_frameworks {
-        add_framework_detectors(&mut detectors, framework, &config.rules, facts);
+        add_framework_detectors(&mut detectors, framework, &rules, facts);
     }
 
     if detectors.is_empty() {
@@ -66,9 +67,30 @@ fn detect_frameworks(config: &ResolvedConfig, workspaces: &[WorkspaceInfo]) -> V
     if deps.contains("@angular/core") {
         frameworks.push("angular".to_string());
     }
+    if deps.contains("effect") {
+        frameworks.push("effect".to_string());
+    }
     frameworks.sort_unstable();
     frameworks.dedup();
     frameworks
+}
+
+/// The rules that decide the detector status.
+///
+/// The prop-drilling detector runs when the base rule is `off` and an
+/// override enables the rule, so the status reports the override severity.
+fn detector_rules(config: &ResolvedConfig) -> RulesConfig {
+    let mut rules = config.rules.clone();
+    if rules.prop_drilling == Severity::Off
+        && let Some(severity) = config
+            .overrides
+            .iter()
+            .filter_map(|override_config| override_config.rules.prop_drilling)
+            .find(|severity| *severity != Severity::Off)
+    {
+        rules.prop_drilling = severity;
+    }
+    rules
 }
 
 fn add_framework_detectors(
@@ -79,6 +101,7 @@ fn add_framework_detectors(
 ) {
     match framework {
         "angular" => add_angular_detectors(detectors, framework, rules),
+        "effect" => add_effect_detectors(detectors, framework, rules),
         "next" => add_next_detectors(detectors, framework, rules),
         "nuxt" => add_nuxt_detectors(detectors, framework, rules),
         "vue" => add_vue_detectors(detectors, framework, rules),
@@ -87,6 +110,31 @@ fn add_framework_detectors(
         "sveltekit" => add_sveltekit_detectors(detectors, framework, rules, facts),
         _ => {}
     }
+}
+
+fn add_effect_detectors(
+    detectors: &mut Vec<fallow_output::FrameworkHealthDetector>,
+    framework: &str,
+    rules: &RulesConfig,
+) {
+    add_detector(
+        detectors,
+        framework,
+        "unused-effect-layer",
+        rules.unused_effect_layers,
+    );
+    add_detector(
+        detectors,
+        framework,
+        "unused-tagged-error",
+        rules.unused_tagged_errors,
+    );
+    add_detector(
+        detectors,
+        framework,
+        "unproduced-catch-tag",
+        rules.unproduced_catch_tags,
+    );
 }
 
 fn add_angular_detectors(

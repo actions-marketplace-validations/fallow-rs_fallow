@@ -13,9 +13,11 @@ struct ProtocolManifest {
     semantic_schema_version: u32,
     analysis_operation: String,
     status_operation: String,
+    mutant_typecheck_operation: String,
     query_operations: Vec<String>,
     session_envelope_types: Vec<String>,
     backend: Backend,
+    experimental_backends: Vec<Backend>,
     sidecar: Sidecar,
 }
 
@@ -23,6 +25,7 @@ struct ProtocolManifest {
 #[serde(deny_unknown_fields)]
 struct Backend {
     family: String,
+    package: String,
     version: String,
 }
 
@@ -109,6 +112,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if manifest.query_operations.is_empty() {
         return Err(invalid_manifest("query operations must not be empty").into());
     }
+    let backends: Vec<&Backend> = std::iter::once(&manifest.backend)
+        .chain(&manifest.experimental_backends)
+        .collect();
+    let mut families: Vec<&str> = backends.iter().map(|b| b.family.as_str()).collect();
+    families.sort_unstable();
+    families.dedup();
+    if families.len() != backends.len() {
+        return Err(invalid_manifest("backend families must be unique").into());
+    }
+    if backends
+        .iter()
+        .any(|b| b.package.is_empty() || b.version.is_empty())
+    {
+        return Err(invalid_manifest("backend package and version must not be empty").into());
+    }
     if manifest.sidecar.version_source != "workspace-package" {
         return Err(invalid_manifest("unsupported sidecar version source").into());
     }
@@ -119,19 +137,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          pub(super) const SEMANTIC_SCHEMA_VERSION: u32 = {};\n\
          pub(super) const ANALYSIS_OPERATION: &str = {};\n\
          pub(super) const STATUS_OPERATION: &str = {};\n\
+         pub(super) const MUTANT_TYPECHECK_OPERATION: &str = {};\n\
          pub(super) const QUERY_OPERATIONS: &[&str] = &[{}];\n\
          pub(super) const SESSION_ENVELOPE_TYPES: &[&str] = &[{}];\n\
          pub(super) const BACKEND_FAMILY: &str = {};\n\
          pub(super) const BACKEND_VERSION: &str = {};\n\
+         pub(super) const BACKENDS: &[(&str, &str)] = &[{}];\n\
          pub(super) const SIDECAR_PACKAGE: &str = {};\n",
         manifest.wire_protocol_version,
         manifest.semantic_schema_version,
         rust_string(&manifest.analysis_operation),
         rust_string(&manifest.status_operation),
+        rust_string(&manifest.mutant_typecheck_operation),
         rust_string_slice(&manifest.query_operations),
         rust_string_slice(&manifest.session_envelope_types),
         rust_string(&manifest.backend.family),
         rust_string(&manifest.backend.version),
+        backends
+            .iter()
+            .map(|b| format!("({}, {})", rust_string(&b.family), rust_string(&b.version)))
+            .collect::<Vec<_>>()
+            .join(", "),
         rust_string(&manifest.sidecar.package),
     );
     let output = PathBuf::from(

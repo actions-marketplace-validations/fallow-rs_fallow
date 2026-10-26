@@ -1,0 +1,137 @@
+//! CLI integration tests, built as one test binary.
+//!
+//! Each module used to be a test binary of its own. Every binary linked the
+//! whole CLI, so the build linked it once per file. One binary links it once.
+//! Three targets stay separate. `runtime_coverage_tests` and
+//! `audit_brief_runtime_focus_tests` need the `test-sidecar-key` feature, and
+//! the `drift` harness has its own ignored cases. CI runs each one by name.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
+#[path = "../common/mod.rs"]
+mod common;
+#[path = "../common/http_stub.rs"]
+mod http_stub;
+#[path = "../common/sign.rs"]
+mod sign;
+
+mod absent_component_prop_tests;
+mod agent_tests;
+mod architecture_tests;
+mod audit_analysis_selection_tests;
+mod audit_complexity_attribution_tests;
+mod audit_diff_risk_tests;
+mod audit_test_file_gate_tests;
+mod audit_test_reach_tests;
+mod audit_tests;
+mod audit_unprovable_base_tests;
+mod audit_worsened_tests;
+mod baseline_growth_tests;
+mod baseline_install_state_tests;
+mod baselines_prune_tests;
+mod cascade_tests;
+mod caveat_surface_tests;
+mod change_coupling_tests;
+mod changed_since_added_files_tests;
+mod changed_workspaces_tests;
+mod check_tests;
+mod ci_command_routing_tests;
+mod claude_code_hint_tests;
+mod codeowners_tests;
+mod combined_coverage_tests;
+mod combined_health_duplication_tests;
+mod complexity_gate_tests;
+mod config_pattern_parity_tests;
+mod config_string_package_names_tests;
+mod coverage_analyze_tests;
+mod coverage_cloud_reads_tests;
+mod deep_nesting_tests;
+mod deprecated_export_tests;
+mod doctor_tests;
+mod dupes_tests;
+mod dupes_workspace_tests;
+mod exit_code_tests;
+mod export_assignment_forward_tests;
+mod finding_id_filter_tests;
+mod finding_id_tests;
+mod fix_tests;
+mod flags_tests;
+mod gate_outcome_tests;
+mod gate_severity_tests;
+mod github_format_tests;
+mod group_by_footer_tests;
+mod group_by_issue_types_tests;
+mod grouping_fallback_tests;
+mod guard_tests;
+mod health_baseline_tests;
+mod health_cyclomatic_policy_tests;
+mod health_diagnostic_tests;
+mod health_group_trend_tests;
+mod health_mutation_report_tests;
+mod health_production_crap_tests;
+mod health_score_baseline_summary_tests;
+mod health_tests;
+mod health_v8_private_method_tests;
+mod impact_store_schema_tests;
+mod init_tests;
+mod inspect_tests;
+mod json_format_tests;
+mod json_style_aux_commands_tests;
+mod legacy_glob_warning_tests;
+mod license_refresh_tests;
+mod line_free_baseline_tests;
+mod list_tests;
+mod logging_tests;
+mod migrate_tests;
+mod monorepo_report_paths_tests;
+mod mutation_tests;
+mod non_gating_ci_level_tests;
+mod nx_run_commands_tests;
+mod output_file_tests;
+mod package_baselines_tests;
+mod package_cycle_tests;
+mod parse_error_gate_tests;
+mod peer_dependency_credit_tests;
+mod plugin_diagnostic_tests;
+mod production_workspace_tests;
+mod quiet_stderr_tests;
+mod reconcile_review_tests;
+mod release_publish_list;
+mod report_from_levels_tests;
+mod report_parity_tests;
+mod request_outcome_tests;
+mod rule_pack_gdp_tests;
+mod rule_pack_tests;
+mod schema_conformance;
+mod schema_tests;
+mod scope_path_tests;
+mod search_visibility_tests;
+mod security_gate_tests;
+mod security_override_tests;
+mod security_workflow_tests;
+mod signal_tests;
+mod snapshot_tests;
+mod stable_ci_fingerprint_tests;
+mod stdout_pipe_tests;
+mod summary_mark_tests;
+mod suppressions_tests;
+mod telemetry_tests;
+mod trace_dependency_tests;
+mod trace_dependency_usage_tests;
+mod trace_error_tests;
+mod trace_federation_tests;
+mod trace_path_tests;
+mod trace_plugin_credit_tests;
+mod trace_tooling_credit_tests;
+mod type_aware_backend_tests;
+mod type_aware_coupling_tests;
+mod type_aware_degradation_tests;
+mod typeorm_datasource_tests;
+mod unresolved_gitignored_target_tests;
+mod workspace_config_patterns_tests;
+
+mod plugin_config_shapes_tests;

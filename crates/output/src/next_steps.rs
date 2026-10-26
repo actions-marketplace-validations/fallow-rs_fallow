@@ -8,10 +8,39 @@ use fallow_types::output::NextStep;
 use fallow_types::results::AnalysisResults;
 use std::path::Path;
 
-use crate::HealthReport;
+use crate::{BaselineScopeReasons, HealthReport, ScopeReason};
 
 const MAX_NEXT_STEPS: usize = 3;
 const MUTATING_VERBS: [&str; 5] = ["fix", "init", "hooks", "migrate", "setup-hooks"];
+
+/// The loaded baseline a narrowed run could not judge, for the
+/// `recheck-baseline` next step.
+///
+/// A run narrowed to part of the project compares a whole-project baseline
+/// against a slice of it, so both the advisory and the gate stand down and the
+/// baseline can rot unnoticed for as long as every run is narrowed. The step
+/// names the one run that CAN judge it. It stays read-only, like every other
+/// entry: it re-reads the baseline and reports, it never re-saves.
+///
+/// Offered only when dropping every channel in `scope_reasons` widens the run,
+/// because the step's command carries `--baseline` and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaselineRecheckInput<'a> {
+    /// The command whose baseline this is, as `fallow <command>` spells it.
+    pub command: &'a str,
+    /// The `--baseline` path as the caller wrote it. The envelope's
+    /// root-prefix post-process renders it root-relative when it lives under
+    /// the analyzed root and leaves it absolute otherwise, so the command stays
+    /// runnable from the root either way.
+    pub path: &'a str,
+    /// Entries the loaded baseline carried. Zero means there is nothing to
+    /// re-check.
+    pub baseline_entries: usize,
+    /// The channels that narrowed this run, named in the reason so the two
+    /// cannot drift from the published `scope_reasons`. A channel the printed
+    /// command cannot drop suppresses the step entirely.
+    pub scope_reasons: BaselineScopeReasons,
+}
 
 /// Local impact digest counters used to render the `impact-report` next step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +71,11 @@ pub struct DeadCodeNextStepsInput<'a> {
     /// The project has external plugins declared; when files are also unused,
     /// route the agent to `fallow plugin-check` to verify what they seed.
     pub has_external_plugins: bool,
+    /// The loaded baseline this run was too narrow to judge, when there is one.
+    pub baseline_recheck: Option<BaselineRecheckInput<'a>>,
+    /// The subcommand that ran (`dead-code` or `architecture`). The
+    /// `scope-workspaces` step names it.
+    pub command: &'a str,
 }
 
 /// Runtime-independent inputs for standalone duplication next steps.
@@ -57,6 +91,8 @@ pub struct DupesNextStepsInput<'a> {
     pub impact_digest: Option<ImpactDigestCounts>,
     /// Offer `fallow audit` because the working tree has changed files.
     pub audit_changed: bool,
+    /// The loaded baseline this run was too narrow to judge, when there is one.
+    pub baseline_recheck: Option<BaselineRecheckInput<'a>>,
 }
 
 /// Deterministic unused-export trace target selected by the caller.
@@ -93,6 +129,10 @@ pub struct CombinedNextStepsInput<'a> {
     pub has_external_plugins: bool,
     /// The run reported unused files (the signal a plugin may be misconfigured).
     pub has_unused_files: bool,
+    /// The loaded baseline this run was too narrow to judge, when there is one.
+    /// A combined run baselines its dead-code sub-pass only, so this is that
+    /// sub-pass's baseline and the step it produces names `fallow dead-code`.
+    pub baseline_recheck: Option<BaselineRecheckInput<'a>>,
 }
 
 /// Runtime-independent inputs for audit next steps.
@@ -108,7 +148,7 @@ pub struct AuditNextStepsInput {
 
 /// Runtime-independent inputs for standalone health next steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HealthNextStepsInput {
+pub struct HealthNextStepsInput<'a> {
     /// False when `FALLOW_SUGGESTIONS=off`; suppresses all steps.
     pub suggestions_enabled: bool,
     /// The health report contains findings.
@@ -119,24 +159,28 @@ pub struct HealthNextStepsInput {
     pub impact_digest: Option<ImpactDigestCounts>,
     /// Offer `fallow audit` because the working tree has changed files.
     pub audit_changed: bool,
+    /// The loaded baseline this run was too narrow to judge, when there is one.
+    pub baseline_recheck: Option<BaselineRecheckInput<'a>>,
 }
 
 /// Build standalone health next-step inputs from a typed health report plus
 /// caller-supplied runtime probes.
 #[must_use]
-pub fn build_health_next_steps_input(
+pub fn build_health_next_steps_input<'a>(
     report: &HealthReport,
     suggestions_enabled: bool,
     offer_setup: bool,
     impact_digest: Option<ImpactDigestCounts>,
     audit_changed: bool,
-) -> HealthNextStepsInput {
+    baseline_recheck: Option<BaselineRecheckInput<'a>>,
+) -> HealthNextStepsInput<'a> {
     HealthNextStepsInput {
         suggestions_enabled,
         has_findings: !report.findings.is_empty(),
         offer_setup,
         impact_digest,
         audit_changed,
+        baseline_recheck,
     }
 }
 
@@ -168,17 +212,20 @@ pub fn impact_digest_summary(digest: ImpactDigestCounts) -> String {
 
 /// Next-steps for standalone `fallow health`.
 #[must_use]
-pub fn build_health_next_steps(input: HealthNextStepsInput) -> Vec<NextStep> {
+pub fn build_health_next_steps(input: HealthNextStepsInput<'_>) -> Vec<NextStep> {
     if !input.suggestions_enabled {
         return Vec::new();
     }
+    let recheck = recheck_baseline(input.baseline_recheck);
     if !input.has_findings {
-        return impact_digest_step(input.impact_digest)
+        return recheck
             .into_iter()
+            .chain(impact_digest_step(input.impact_digest))
             .collect();
     }
 
     let mut steps: Vec<NextStep> = [
+        recheck,
         setup_pointer(input.offer_setup),
         impact_digest_step(input.impact_digest),
         complexity_breakdown(input.has_findings),
@@ -197,18 +244,22 @@ pub fn build_dead_code_next_steps(input: DeadCodeNextStepsInput<'_>) -> Vec<Next
     if !input.suggestions_enabled {
         return Vec::new();
     }
+    let recheck = recheck_baseline(input.baseline_recheck);
     if input.results.total_issues() == 0 {
-        return impact_digest_step(input.impact_digest)
+        return recheck
             .into_iter()
+            .chain(impact_digest_step(input.impact_digest))
             .collect();
     }
 
     let mut steps: Vec<NextStep> = [
+        recheck,
         verify_plugins(input.has_external_plugins && !input.results.unused_files.is_empty()),
         setup_pointer(input.offer_setup),
         impact_digest_step(input.impact_digest),
         trace_unused_export(input.results, input.root),
-        scope_workspaces(input.workspace_ref),
+        trace_deprecated_export(input.results, input.root),
+        scope_workspaces(input.workspace_ref, input.command),
         audit_changed(input.audit_changed),
     ]
     .into_iter()
@@ -224,13 +275,16 @@ pub fn build_dupes_next_steps(input: DupesNextStepsInput<'_>) -> Vec<NextStep> {
     if !input.suggestions_enabled {
         return Vec::new();
     }
+    let recheck = recheck_baseline(input.baseline_recheck);
     if input.clone_fingerprints.is_empty() {
-        return impact_digest_step(input.impact_digest)
+        return recheck
             .into_iter()
+            .chain(impact_digest_step(input.impact_digest))
             .collect();
     }
 
     let mut steps: Vec<NextStep> = [
+        recheck,
         setup_pointer(input.offer_setup),
         impact_digest_step(input.impact_digest),
         trace_clone(input.clone_fingerprints),
@@ -249,21 +303,24 @@ pub fn build_combined_next_steps(input: &CombinedNextStepsInput<'_>) -> Vec<Next
     if !input.suggestions_enabled {
         return Vec::new();
     }
+    let recheck = recheck_baseline(input.baseline_recheck);
     let has_findings = input.has_dead_code_findings
         || !input.clone_fingerprints.is_empty()
         || input.has_complexity_findings;
     if !has_findings {
-        return impact_digest_step(input.impact_digest)
+        return recheck
             .into_iter()
+            .chain(impact_digest_step(input.impact_digest))
             .collect();
     }
 
     let mut steps: Vec<NextStep> = [
+        recheck,
         verify_plugins(input.has_external_plugins && input.has_unused_files),
         setup_pointer(input.offer_setup),
         impact_digest_step(input.impact_digest),
         trace_unused_export_from_input(input.trace_unused_export.as_ref()),
-        scope_workspaces(input.workspace_ref),
+        scope_workspaces(input.workspace_ref, "dead-code"),
         trace_clone(input.clone_fingerprints),
         complexity_breakdown(input.has_complexity_findings),
         audit_changed(input.audit_changed),
@@ -339,6 +396,28 @@ pub fn trace_unused_export_input(
     })
 }
 
+/// Trace the deprecated export with the most consumers: its `consumers`
+/// sample is the one most likely to be capped. Ties go to the smallest path
+/// and name, so the choice is deterministic.
+fn trace_deprecated_export(results: &AnalysisResults, root: &Path) -> Option<NextStep> {
+    let target = results
+        .deprecated_exports_in_use
+        .iter()
+        .map(|finding| {
+            (
+                std::cmp::Reverse(finding.export.consumer_count),
+                relative_command_path(&finding.export.path, root),
+                finding.export.export_name.as_str(),
+            )
+        })
+        .min()?;
+    Some(next_step(
+        "trace-deprecated-export",
+        format!("fallow dead-code --trace {}:{}", target.1, target.2),
+        "list every consumer of a deprecated export before you migrate it",
+    ))
+}
+
 fn trace_unused_export(results: &AnalysisResults, root: &Path) -> Option<NextStep> {
     trace_unused_export_from_input(trace_unused_export_input(results, root).as_ref())
 }
@@ -392,14 +471,55 @@ fn next_step(id: &str, command: String, reason: &str) -> NextStep {
     }
 }
 
+/// The read-only re-read of a baseline this run was too narrow to judge.
+///
+/// Silent on an unscoped run, because there the advisory and the gate already
+/// spoke, and silent on an empty baseline, because there is nothing to
+/// re-check.
+///
+/// Silent as well when any channel that narrowed the run survives the printed
+/// command. The command is rebuilt from scratch and carries nothing but
+/// `--baseline`, so it drops only narrowing that came from a flag. Production
+/// mode and workspace scoping also resolve from the project config and the
+/// environment, where the same command would come back just as narrow and
+/// re-emit this step without end. An entry that cannot judge the baseline is
+/// worse than no entry: `next_steps` is a contract an agent follows.
+fn recheck_baseline(input: Option<BaselineRecheckInput<'_>>) -> Option<NextStep> {
+    let input = input?;
+    if input.scope_reasons.is_empty()
+        || input.baseline_entries == 0
+        || !input.scope_reasons.all_removable_by_rerun()
+    {
+        return None;
+    }
+    // The package map comes from the config, so the repeated command turns it
+    // off explicitly; without the flag it would come back just as narrow.
+    let package_map = if input.scope_reasons.contains(ScopeReason::PackageBaselines) {
+        " --no-package-baselines"
+    } else {
+        ""
+    };
+    Some(next_step(
+        "recheck-baseline",
+        format!(
+            "fallow {} --baseline {}{package_map}",
+            input.command, input.path
+        ),
+        &format!(
+            "this run was narrowed to part of the project ({}), which cannot judge a whole-project baseline",
+            input.scope_reasons.join()
+        ),
+    ))
+}
+
 fn setup_pointer(offer_setup: bool) -> Option<NextStep> {
     if !offer_setup {
         return None;
     }
     Some(next_step(
         "setup",
-        "fallow schema".to_string(),
-        "fallow has no config here; the manifest lists guided-setup commands (agent guide, commit gate) to offer the user",
+        "fallow agent install --dry-run".to_string(),
+        "fallow has no config here; offer the user `fallow init` for a config, and this dry run previews the agent guide, skills, MCP server, and commit gate",
     ))
 }
 
@@ -437,11 +557,11 @@ fn audit_changed(applicable: bool) -> Option<NextStep> {
     ))
 }
 
-fn scope_workspaces(workspace_ref: Option<&str>) -> Option<NextStep> {
+fn scope_workspaces(workspace_ref: Option<&str>, command: &str) -> Option<NextStep> {
     let reference = workspace_ref?;
     Some(next_step(
         "scope-workspaces",
-        format!("fallow dead-code --changed-workspaces {reference}"),
+        format!("fallow {command} --changed-workspaces {reference}"),
         "scope a monorepo run to the packages your branch touched",
     ))
 }
@@ -449,9 +569,11 @@ fn scope_workspaces(workspace_ref: Option<&str>) -> Option<NextStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComplexityViolation, ExceededThreshold, FindingSeverity, HealthFinding};
-    use fallow_types::output_dead_code::UnusedExportFinding;
-    use fallow_types::results::UnusedExport;
+    use crate::{
+        ComplexityViolation, ExceededThreshold, FindingSeverity, HealthFinding, ScopeReason,
+    };
+    use fallow_types::output_dead_code::{DeprecatedExportInUseFinding, UnusedExportFinding};
+    use fallow_types::results::{DeprecatedExportInUse, UnusedExport};
 
     fn digest(containment_count: usize, resolved_total: usize) -> ImpactDigestCounts {
         ImpactDigestCounts {
@@ -460,13 +582,14 @@ mod tests {
         }
     }
 
-    fn dirty_input() -> HealthNextStepsInput {
+    fn dirty_input() -> HealthNextStepsInput<'static> {
         HealthNextStepsInput {
             suggestions_enabled: true,
             has_findings: true,
             offer_setup: false,
             impact_digest: None,
             audit_changed: false,
+            baseline_recheck: None,
         }
     }
 
@@ -478,6 +601,7 @@ mod tests {
                 line: 1,
                 col: 0,
                 cyclomatic: 21,
+                standard_cyclomatic: None,
                 cognitive: 16,
                 line_count: 42,
                 param_count: 0,
@@ -487,7 +611,9 @@ mod tests {
                 react_hook_profile: None,
                 exceeded: ExceededThreshold::Both,
                 severity: FindingSeverity::High,
+                effective_severity: None,
                 crap: None,
+                mutation: None,
                 coverage_pct: None,
                 coverage_tier: None,
                 coverage_source: None,
@@ -510,6 +636,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         })
     }
 
@@ -523,6 +651,8 @@ mod tests {
             workspace_ref: None,
             audit_changed: false,
             has_external_plugins: false,
+            baseline_recheck: None,
+            command: "dead-code",
         }
     }
 
@@ -533,6 +663,7 @@ mod tests {
             offer_setup: false,
             impact_digest: None,
             audit_changed: false,
+            baseline_recheck: None,
         }
     }
 
@@ -549,6 +680,7 @@ mod tests {
             audit_changed: false,
             has_external_plugins: false,
             has_unused_files: false,
+            baseline_recheck: None,
         }
     }
 
@@ -659,6 +791,7 @@ mod tests {
             offer_setup: true,
             impact_digest: Some(digest(2, 1)),
             audit_changed: true,
+            baseline_recheck: None,
         });
 
         assert!(steps.is_empty());
@@ -672,6 +805,7 @@ mod tests {
             true,
             Some(digest(2, 1)),
             true,
+            None,
         );
         assert_eq!(
             clean,
@@ -681,11 +815,45 @@ mod tests {
                 offer_setup: true,
                 impact_digest: Some(digest(2, 1)),
                 audit_changed: true,
+                baseline_recheck: None,
             }
         );
 
-        let dirty = build_health_next_steps_input(&dirty_report(), true, false, None, false);
+        let dirty = build_health_next_steps_input(&dirty_report(), true, false, None, false, None);
         assert!(dirty.has_findings);
+    }
+
+    fn deprecated(path: &str, name: &str, consumer_count: usize) -> DeprecatedExportInUseFinding {
+        DeprecatedExportInUseFinding::with_actions(DeprecatedExportInUse {
+            path: path.into(),
+            export_name: name.to_string(),
+            is_type_only: false,
+            line: 1,
+            col: 0,
+            span_start: 0,
+            deprecated_reason: None,
+            consumer_count,
+            consumers: Vec::new(),
+            public_api: false,
+        })
+    }
+
+    #[test]
+    fn dead_code_steps_trace_the_deprecated_export_with_most_consumers() {
+        let results = AnalysisResults {
+            deprecated_exports_in_use: vec![
+                deprecated("/project/src/a.ts", "few", 2),
+                deprecated("/project/src/b.ts", "many", 40),
+                deprecated("/project/src/c.ts", "tied", 40),
+            ],
+            ..AnalysisResults::default()
+        };
+
+        let steps = build_dead_code_next_steps(dead_code_input(&results));
+
+        assert_eq!(steps[0].id, "trace-deprecated-export");
+        assert_eq!(steps[0].command, "fallow dead-code --trace src/b.ts:many");
+        assert_valid(&steps[0]);
     }
 
     #[test]
@@ -703,6 +871,33 @@ mod tests {
         assert_eq!(steps[0].id, "trace-unused-export");
         assert_eq!(steps[0].command, "fallow dead-code --trace src/a.ts:alpha");
         assert_valid(&steps[0]);
+    }
+
+    #[test]
+    fn scope_workspaces_step_names_the_command_that_ran() {
+        let results = AnalysisResults {
+            unused_exports: vec![unused_export("/project/src/a.ts", "alpha")],
+            ..AnalysisResults::default()
+        };
+        let scope_command = |command| {
+            build_dead_code_next_steps(DeadCodeNextStepsInput {
+                workspace_ref: Some("origin/main"),
+                command,
+                ..dead_code_input(&results)
+            })
+            .into_iter()
+            .find(|step| step.id == "scope-workspaces")
+            .map(|step| step.command)
+        };
+
+        assert_eq!(
+            scope_command("dead-code").as_deref(),
+            Some("fallow dead-code --changed-workspaces origin/main")
+        );
+        assert_eq!(
+            scope_command("architecture").as_deref(),
+            Some("fallow architecture --changed-workspaces origin/main")
+        );
     }
 
     #[test]
@@ -843,6 +1038,7 @@ mod tests {
             audit_changed: true,
             has_external_plugins: false,
             has_unused_files: false,
+            baseline_recheck: None,
         });
 
         assert!(steps.is_empty());
@@ -916,6 +1112,7 @@ mod tests {
             offer_setup: true,
             impact_digest: Some(digest(2, 1)),
             audit_changed: true,
+            baseline_recheck: None,
         });
 
         assert_eq!(steps.len(), 1);
@@ -966,5 +1163,277 @@ mod tests {
             impact_digest_summary(digest(2, 3)),
             "2 commits contained at the gate, 3 findings resolved"
         );
+    }
+
+    fn narrowed_baseline(command: &'static str) -> BaselineRecheckInput<'static> {
+        BaselineRecheckInput {
+            command,
+            path: ".fallow-baseline.json",
+            baseline_entries: 8,
+            scope_reasons: BaselineScopeReasons::empty()
+                .with(ScopeReason::ChangedSince)
+                .with(ScopeReason::Scope),
+        }
+    }
+
+    /// The package map comes from the config, so a repeat without flags would
+    /// come back just as narrow. The step turns the map off explicitly.
+    #[test]
+    fn a_package_map_recheck_turns_the_map_off() {
+        let results = AnalysisResults::default();
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            baseline_recheck: Some(BaselineRecheckInput {
+                scope_reasons: BaselineScopeReasons::empty().with(ScopeReason::PackageBaselines),
+                ..narrowed_baseline("dead-code")
+            }),
+            ..dead_code_input(&results)
+        });
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].command,
+            "fallow dead-code --baseline .fallow-baseline.json --no-package-baselines"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_zero_finding_dead_code_run_still_offers_the_baseline_recheck() {
+        let results = AnalysisResults::default();
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            baseline_recheck: Some(narrowed_baseline("dead-code")),
+            ..dead_code_input(&results)
+        });
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recheck-baseline"],
+            "a cleaned project with a rotted baseline is the run that most needs the pointer"
+        );
+        assert_eq!(
+            steps[0].command,
+            "fallow dead-code --baseline .fallow-baseline.json"
+        );
+        assert!(
+            steps[0].reason.contains("changed-since, scope"),
+            "the reason must name the published scope_reasons: {}",
+            steps[0].reason
+        );
+        assert_valid(&steps[0]);
+    }
+
+    #[test]
+    fn the_baseline_recheck_leads_a_run_that_triggers_everything() {
+        let results = AnalysisResults {
+            unused_exports: vec![unused_export("/project/src/a.ts", "alpha")],
+            ..AnalysisResults::default()
+        };
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            offer_setup: true,
+            impact_digest: Some(digest(2, 1)),
+            audit_changed: true,
+            baseline_recheck: Some(narrowed_baseline("dead-code")),
+            ..dead_code_input(&results)
+        });
+
+        assert_eq!(steps[0].id, "recheck-baseline");
+    }
+
+    #[test]
+    fn a_narrowed_zero_finding_dupes_run_still_offers_the_baseline_recheck() {
+        let steps = build_dupes_next_steps(DupesNextStepsInput {
+            baseline_recheck: Some(narrowed_baseline("dupes")),
+            ..dupes_input(&[])
+        });
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recheck-baseline"]
+        );
+        assert_eq!(
+            steps[0].command,
+            "fallow dupes --baseline .fallow-baseline.json"
+        );
+    }
+
+    #[test]
+    fn a_narrowed_zero_finding_health_run_still_offers_the_baseline_recheck() {
+        let steps = build_health_next_steps(HealthNextStepsInput {
+            has_findings: false,
+            baseline_recheck: Some(narrowed_baseline("health")),
+            ..dirty_input()
+        });
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recheck-baseline"]
+        );
+        assert_eq!(
+            steps[0].command,
+            "fallow health --baseline .fallow-baseline.json"
+        );
+    }
+
+    /// The combined run was the one shape that could load a baseline and offer no
+    /// way to judge it: it baselines its dead-code sub-pass, so the step names
+    /// that command (issue #2735).
+    #[test]
+    fn a_narrowed_combined_run_offers_the_baseline_recheck() {
+        let steps = build_combined_next_steps(&CombinedNextStepsInput {
+            baseline_recheck: Some(narrowed_baseline("dead-code")),
+            ..combined_input(&[])
+        });
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            ["recheck-baseline"],
+            "a combined run with nothing to report is still a run that loaded a baseline"
+        );
+        assert_eq!(
+            steps[0].command,
+            "fallow dead-code --baseline .fallow-baseline.json"
+        );
+        assert_valid(&steps[0]);
+    }
+
+    #[test]
+    fn the_baseline_recheck_leads_a_combined_run_that_triggers_everything() {
+        let fingerprints = ["dup:aaaaaaaa"];
+        let steps = build_combined_next_steps(&CombinedNextStepsInput {
+            has_dead_code_findings: true,
+            has_complexity_findings: true,
+            offer_setup: true,
+            impact_digest: Some(digest(2, 1)),
+            audit_changed: true,
+            baseline_recheck: Some(narrowed_baseline("dead-code")),
+            ..combined_input(&fingerprints)
+        });
+
+        assert_eq!(steps[0].id, "recheck-baseline");
+    }
+
+    #[test]
+    fn an_unscoped_run_offers_no_baseline_recheck() {
+        let results = AnalysisResults::default();
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            baseline_recheck: Some(BaselineRecheckInput {
+                scope_reasons: BaselineScopeReasons::empty(),
+                ..narrowed_baseline("dead-code")
+            }),
+            ..dead_code_input(&results)
+        });
+
+        assert!(
+            steps.is_empty(),
+            "an unscoped run already got the advisory and the gate"
+        );
+    }
+
+    #[test]
+    fn narrowing_the_printed_command_cannot_drop_offers_no_baseline_recheck() {
+        let results = AnalysisResults::default();
+        for reason in [
+            ScopeReason::Production,
+            ScopeReason::Workspace,
+            ScopeReason::ChangedWorkspaces,
+        ] {
+            let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+                baseline_recheck: Some(BaselineRecheckInput {
+                    scope_reasons: BaselineScopeReasons::empty().with(reason),
+                    ..narrowed_baseline("dead-code")
+                }),
+                ..dead_code_input(&results)
+            });
+
+            assert!(
+                steps.is_empty(),
+                "`fallow dead-code --baseline <path>` resolves {} again, so the step would \
+                 re-emit itself: {steps:?}",
+                reason.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn one_unremovable_channel_suppresses_the_recheck_for_the_whole_set() {
+        let results = AnalysisResults::default();
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            baseline_recheck: Some(BaselineRecheckInput {
+                scope_reasons: BaselineScopeReasons::empty()
+                    .with(ScopeReason::ChangedSince)
+                    .with(ScopeReason::Production),
+                ..narrowed_baseline("dead-code")
+            }),
+            ..dead_code_input(&results)
+        });
+
+        assert!(
+            steps.is_empty(),
+            "dropping the base ref still leaves a production run, which judges nothing: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_baseline_offers_no_baseline_recheck() {
+        let results = AnalysisResults::default();
+        let steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
+            baseline_recheck: Some(BaselineRecheckInput {
+                baseline_entries: 0,
+                ..narrowed_baseline("dead-code")
+            }),
+            ..dead_code_input(&results)
+        });
+
+        assert!(steps.is_empty(), "there is nothing to re-check");
+    }
+
+    #[test]
+    fn no_next_step_command_ever_re_saves_a_baseline() {
+        let results = AnalysisResults {
+            unused_exports: vec![unused_export("/project/src/a.ts", "alpha")],
+            ..AnalysisResults::default()
+        };
+        let fingerprints = ["abc123"];
+        let mut every_step = Vec::new();
+        every_step.extend(build_dead_code_next_steps(DeadCodeNextStepsInput {
+            offer_setup: true,
+            impact_digest: Some(digest(2, 1)),
+            audit_changed: true,
+            has_external_plugins: true,
+            workspace_ref: Some("web"),
+            baseline_recheck: Some(narrowed_baseline("dead-code")),
+            ..dead_code_input(&results)
+        }));
+        every_step.extend(build_dupes_next_steps(DupesNextStepsInput {
+            offer_setup: true,
+            impact_digest: Some(digest(2, 1)),
+            audit_changed: true,
+            baseline_recheck: Some(narrowed_baseline("dupes")),
+            ..dupes_input(&fingerprints)
+        }));
+        every_step.extend(build_health_next_steps(HealthNextStepsInput {
+            baseline_recheck: Some(narrowed_baseline("health")),
+            ..dirty_input()
+        }));
+
+        assert!(!every_step.is_empty());
+        for step in &every_step {
+            assert_valid(step);
+            assert!(
+                !step.command.contains("--save-baseline"),
+                "next_steps is a read-only contract: {}",
+                step.command
+            );
+        }
     }
 }

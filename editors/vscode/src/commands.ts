@@ -7,8 +7,10 @@ import {
   getLspPath,
   getProductionOverride,
   getAuditGate,
+  getAuditWorsened,
   getDuplicationCrossLanguageOverride,
   getDuplicationIgnoreImportsOverride,
+  getDuplicationIgnoreSymlinksOverride,
   getDuplicationMinLinesOverride,
   getDuplicationMinOccurrencesOverride,
   getDuplicationMinTokensOverride,
@@ -22,16 +24,20 @@ import {
   getComplexityDecorationCap,
   getIssueTypes,
   getChangedSince,
+  getPackageBaselines,
   getResolvedConfigPath,
   getAutoDownload,
   getTypeAwareSettings,
+  getTypeAwareTimeoutSeconds,
   type TypeAwareSettings,
 } from "./config.js";
 import {
   buildAnalysisArgs,
-  compareVersions,
   countCheckIssues,
+  countFindings,
+  describeAnalysisFailure,
   planDegradation,
+  type CheckFindingKey,
 } from "./analysis-utils.js";
 import {
   AnalysisBackoffBlockedError,
@@ -48,11 +54,14 @@ import {
   getExtensionVersion,
   getInstalledCliPath,
 } from "./download.js";
+import { compareVersions } from "./cli-args-utils.js";
 import { buildFixArgs, createFixPreviewItems, resolveFixLocation } from "./fix-utils.js";
 import { buildHealthArgs, parseUnknownHealthSubcommand } from "./health-utils.js";
 import { registerChild, unregisterChild } from "./process-registry.js";
 import { buildSecurityArgs, parseUnknownSubcommand } from "./security-utils.js";
 import { appendTypeAwareArgs, TYPE_AWARE_MIN_CLI_VERSION } from "./type-aware-utils.js";
+import { noteTypeAwareDegradation, typeAwareDegradationWarnings } from "./typeAwareDegradation.js";
+import { getWorkspaceRoot } from "./workspaceRoot.js";
 import {
   cacheWorkspacesOutput,
   getCachedWorkspacesOutput,
@@ -61,6 +70,7 @@ import {
 } from "./workspacePicker.js";
 import type {
   AuditOutput,
+  FallowAnalysisScope,
   FallowCheckResult,
   FallowCombinedResult,
   FallowDupesResult,
@@ -68,6 +78,7 @@ import type {
   FallowFixResult,
   FixAction,
   HealthOutput,
+  IssueTypeConfig,
   SecurityOutput,
   WorkspacesOutput,
 } from "./types.js";
@@ -104,6 +115,7 @@ export const findCliBinary = async (context: vscode.ExtensionContext): Promise<s
 
 export const resolveCliBinary = async (
   context: vscode.ExtensionContext,
+  outputChannel?: vscode.OutputChannel,
 ): Promise<string | null> => {
   const existing = await findCliBinary(context);
   if (existing) {
@@ -114,7 +126,7 @@ export const resolveCliBinary = async (
     return null;
   }
 
-  return downloadCliBinary(context);
+  return downloadCliBinary(context, outputChannel);
 };
 
 /**
@@ -298,7 +310,7 @@ export const resolveCliForRun = async (
 ): Promise<{ binary: string | null; version: string | null }> => {
   const found = await findCliBinary(context);
   if (!found) {
-    const downloaded = await resolveCliBinary(context);
+    const downloaded = await resolveCliBinary(context, outputChannel);
     return { binary: downloaded, version: downloaded ? await probeCliVersion(downloaded) : null };
   }
 
@@ -308,7 +320,8 @@ export const resolveCliForRun = async (
 
   if (tooOld && getAutoDownload()) {
     const managed =
-      (await getInstalledCliPath(context, outputChannel)) ?? (await downloadCliBinary(context));
+      (await getInstalledCliPath(context, outputChannel)) ??
+      (await downloadCliBinary(context, outputChannel));
     if (managed && managed !== found) {
       const managedVersion = await probeCliVersion(managed);
       outputChannel?.appendLine(
@@ -407,7 +420,8 @@ const execInspectWithManagedFallback = async (
 
     if (getAutoDownload()) {
       const managed =
-        (await getInstalledCliPath(context, outputChannel)) ?? (await downloadCliBinary(context));
+        (await getInstalledCliPath(context, outputChannel)) ??
+        (await downloadCliBinary(context, outputChannel));
       if (managed && managed !== initialBinary) {
         outputChannel?.appendLine(
           "Fallow: resolved CLI does not support inspect; switched to the managed CLI.",
@@ -482,117 +496,119 @@ const showAnalysisPausedMessage = (failures: number, cause: string | null): void
     });
 };
 
+/** Each check result array and the issue-type toggle that keeps it. */
+const ISSUE_TYPE_FILTERS: ReadonlyArray<readonly [CheckFindingKey, keyof IssueTypeConfig]> = [
+  ["unused_files", "unused-files"],
+  ["unused_exports", "unused-exports"],
+  ["unused_types", "unused-types"],
+  ["private_type_leaks", "private-type-leaks"],
+  ["unused_dependencies", "unused-dependencies"],
+  ["unused_dev_dependencies", "unused-dev-dependencies"],
+  ["unused_optional_dependencies", "unused-optional-dependencies"],
+  ["unused_enum_members", "unused-enum-members"],
+  ["unused_class_members", "unused-class-members"],
+  ["unused_store_members", "unused-store-members"],
+  ["unused_server_actions", "unused-server-actions"],
+  ["unused_load_data_keys", "unused-load-data-keys"],
+  ["unused_component_props", "unused-component-props"],
+  ["absent_component_props", "absent-component-props"],
+  ["unused_component_emits", "unused-component-emits"],
+  ["unused_component_inputs", "unused-component-inputs"],
+  ["unused_component_outputs", "unused-component-outputs"],
+  ["unused_svelte_events", "unused-svelte-events"],
+  ["unused_effect_layers", "unused-effect-layers"],
+  ["unused_tagged_errors", "unused-tagged-errors"],
+  ["unproduced_catch_tags", "unproduced-catch-tags"],
+  ["unrendered_components", "unrendered-components"],
+  ["unprovided_injects", "unprovided-injects"],
+  ["invalid_client_exports", "invalid-client-export"],
+  ["mixed_client_server_barrels", "mixed-client-server-barrel"],
+  ["misplaced_directives", "misplaced-directive"],
+  ["route_collisions", "route-collision"],
+  ["dynamic_segment_name_conflicts", "dynamic-segment-name-conflict"],
+  ["unresolved_imports", "unresolved-imports"],
+  ["unlisted_dependencies", "unlisted-dependencies"],
+  ["duplicate_exports", "duplicate-exports"],
+  ["type_only_dependencies", "type-only-dependencies"],
+  ["test_only_dependencies", "test-only-dependencies"],
+  ["dev_dependencies_in_production", "dev-dependencies-in-production"],
+  ["circular_dependencies", "circular-dependencies"],
+  ["re_export_cycles", "re-export-cycle"],
+  ["package_cycles", "package-cycle"],
+  ["boundary_violations", "boundary-violation"],
+  ["boundary_coverage_violations", "boundary-violation"],
+  ["boundary_call_violations", "boundary-violation"],
+  ["policy_violations", "policy-violation"],
+  ["stale_suppressions", "stale-suppressions"],
+  ["unused_catalog_entries", "unused-catalog-entries"],
+  ["empty_catalog_groups", "empty-catalog-groups"],
+  ["unresolved_catalog_references", "unresolved-catalog-references"],
+  ["unused_dependency_overrides", "unused-dependency-overrides"],
+  ["misconfigured_dependency_overrides", "misconfigured-dependency-overrides"],
+  ["prop_drilling_chains", "prop-drilling"],
+  ["thin_wrappers", "thin-wrapper"],
+  ["duplicate_prop_shapes", "duplicate-prop-shape"],
+];
+
+const summarizeCheckResult = (
+  result: FallowCheckResult,
+  totalIssues: number,
+): FallowCheckResult["summary"] => {
+  const count = (...keys: CheckFindingKey[]): number => countFindings(result, keys);
+  return {
+    total_issues: totalIssues,
+    unused_files: count("unused_files"),
+    unused_exports: count("unused_exports"),
+    unused_types: count("unused_types"),
+    private_type_leaks: count("private_type_leaks"),
+    // The extension has no deprecated-export surface in v1, and
+    // countCheckIssues does not count these findings.
+    deprecated_exports_in_use: 0,
+    unused_dependencies: count(
+      "unused_dependencies",
+      "unused_dev_dependencies",
+      "unused_optional_dependencies",
+    ),
+    unused_enum_members: count("unused_enum_members"),
+    unused_class_members: count("unused_class_members"),
+    absent_component_props: count("absent_component_props"),
+    unresolved_imports: count("unresolved_imports"),
+    unlisted_dependencies: count("unlisted_dependencies"),
+    duplicate_exports: count("duplicate_exports"),
+    type_only_dependencies: count("type_only_dependencies"),
+    test_only_dependencies: count("test_only_dependencies"),
+    dev_dependencies_in_production: count("dev_dependencies_in_production"),
+    circular_dependencies: count("circular_dependencies"),
+    re_export_cycles: count("re_export_cycles"),
+    package_cycles: count("package_cycles"),
+    boundary_violations: count("boundary_violations"),
+    boundary_coverage_violations: count("boundary_coverage_violations"),
+    boundary_call_violations: count("boundary_call_violations"),
+    policy_violations: count("policy_violations"),
+    stale_suppressions: count("stale_suppressions"),
+    unused_catalog_entries: count("unused_catalog_entries"),
+    empty_catalog_groups: count("empty_catalog_groups"),
+    unresolved_catalog_references: count("unresolved_catalog_references"),
+    unused_dependency_overrides: count("unused_dependency_overrides"),
+    misconfigured_dependency_overrides: count("misconfigured_dependency_overrides"),
+  };
+};
+
 /** Filter check results based on the user's issueTypes configuration. */
 const filterCheckResult = (result: FallowCheckResult): FallowCheckResult => {
   const types = getIssueTypes();
   const filtered: FallowCheckResult = {
     ...result,
-    unused_files: types["unused-files"] ? result.unused_files : [],
-    unused_exports: types["unused-exports"] ? result.unused_exports : [],
-    unused_types: types["unused-types"] ? result.unused_types : [],
-    private_type_leaks: types["private-type-leaks"] ? result.private_type_leaks : [],
-    unused_dependencies: types["unused-dependencies"] ? result.unused_dependencies : [],
-    unused_dev_dependencies: types["unused-dev-dependencies"] ? result.unused_dev_dependencies : [],
-    unused_optional_dependencies: types["unused-optional-dependencies"]
-      ? result.unused_optional_dependencies
-      : [],
-    unused_enum_members: types["unused-enum-members"] ? result.unused_enum_members : [],
-    unused_class_members: types["unused-class-members"] ? result.unused_class_members : [],
-    unused_store_members: types["unused-store-members"] ? result.unused_store_members : [],
-    unused_server_actions: types["unused-server-actions"] ? result.unused_server_actions : [],
-    unused_load_data_keys: types["unused-load-data-keys"] ? result.unused_load_data_keys : [],
-    unused_component_props: types["unused-component-props"] ? result.unused_component_props : [],
-    unused_component_emits: types["unused-component-emits"] ? result.unused_component_emits : [],
-    unused_component_inputs: types["unused-component-inputs"] ? result.unused_component_inputs : [],
-    unused_component_outputs: types["unused-component-outputs"]
-      ? result.unused_component_outputs
-      : [],
-    unused_svelte_events: types["unused-svelte-events"] ? result.unused_svelte_events : [],
-    unrendered_components: types["unrendered-components"] ? result.unrendered_components : [],
-    unprovided_injects: types["unprovided-injects"] ? result.unprovided_injects : [],
-    invalid_client_exports: types["invalid-client-export"] ? result.invalid_client_exports : [],
-    mixed_client_server_barrels: types["mixed-client-server-barrel"]
-      ? result.mixed_client_server_barrels
-      : [],
-    misplaced_directives: types["misplaced-directive"] ? result.misplaced_directives : [],
-    route_collisions: types["route-collision"] ? result.route_collisions : [],
-    dynamic_segment_name_conflicts: types["dynamic-segment-name-conflict"]
-      ? result.dynamic_segment_name_conflicts
-      : [],
-    unresolved_imports: types["unresolved-imports"] ? result.unresolved_imports : [],
-    unlisted_dependencies: types["unlisted-dependencies"] ? result.unlisted_dependencies : [],
-    duplicate_exports: types["duplicate-exports"] ? result.duplicate_exports : [],
-    type_only_dependencies: types["type-only-dependencies"] ? result.type_only_dependencies : [],
-    test_only_dependencies: types["test-only-dependencies"] ? result.test_only_dependencies : [],
-    dev_dependencies_in_production: types["dev-dependencies-in-production"]
-      ? result.dev_dependencies_in_production
-      : [],
-    circular_dependencies: types["circular-dependencies"] ? result.circular_dependencies : [],
-    re_export_cycles: types["re-export-cycle"] ? result.re_export_cycles : [],
-    boundary_violations: types["boundary-violation"] ? result.boundary_violations : [],
-    boundary_coverage_violations: types["boundary-violation"]
-      ? result.boundary_coverage_violations
-      : [],
-    boundary_call_violations: types["boundary-violation"] ? result.boundary_call_violations : [],
-    policy_violations: types["policy-violation"] ? result.policy_violations : [],
-    stale_suppressions: types["stale-suppressions"] ? result.stale_suppressions : [],
-    unused_catalog_entries: types["unused-catalog-entries"] ? result.unused_catalog_entries : [],
-    empty_catalog_groups: types["empty-catalog-groups"] ? result.empty_catalog_groups : [],
-    unresolved_catalog_references: types["unresolved-catalog-references"]
-      ? result.unresolved_catalog_references
-      : [],
-    unused_dependency_overrides: types["unused-dependency-overrides"]
-      ? result.unused_dependency_overrides
-      : [],
-    misconfigured_dependency_overrides: types["misconfigured-dependency-overrides"]
-      ? result.misconfigured_dependency_overrides
-      : [],
+    ...Object.fromEntries(
+      ISSUE_TYPE_FILTERS.map(([key, type]) => [key, types[type] ? result[key] : []]),
+    ),
   };
   const totalIssues = countCheckIssues(filtered);
-  const summary = {
-    total_issues: totalIssues,
-    unused_files: filtered.unused_files.length,
-    unused_exports: filtered.unused_exports.length,
-    unused_types: filtered.unused_types.length,
-    private_type_leaks: filtered.private_type_leaks?.length ?? 0,
-    unused_dependencies:
-      filtered.unused_dependencies.length +
-      filtered.unused_dev_dependencies.length +
-      (filtered.unused_optional_dependencies?.length ?? 0),
-    unused_enum_members: filtered.unused_enum_members.length,
-    unused_class_members: filtered.unused_class_members.length,
-    unresolved_imports: filtered.unresolved_imports.length,
-    unlisted_dependencies: filtered.unlisted_dependencies.length,
-    duplicate_exports: filtered.duplicate_exports.length,
-    type_only_dependencies: filtered.type_only_dependencies?.length ?? 0,
-    test_only_dependencies: filtered.test_only_dependencies?.length ?? 0,
-    dev_dependencies_in_production: filtered.dev_dependencies_in_production?.length ?? 0,
-    circular_dependencies: filtered.circular_dependencies?.length ?? 0,
-    re_export_cycles: filtered.re_export_cycles?.length ?? 0,
-    boundary_violations: filtered.boundary_violations?.length ?? 0,
-    boundary_coverage_violations: filtered.boundary_coverage_violations?.length ?? 0,
-    boundary_call_violations: filtered.boundary_call_violations?.length ?? 0,
-    policy_violations: filtered.policy_violations?.length ?? 0,
-    stale_suppressions: filtered.stale_suppressions?.length ?? 0,
-    unused_catalog_entries: filtered.unused_catalog_entries?.length ?? 0,
-    empty_catalog_groups: filtered.empty_catalog_groups?.length ?? 0,
-    unresolved_catalog_references: filtered.unresolved_catalog_references?.length ?? 0,
-    unused_dependency_overrides: filtered.unused_dependency_overrides?.length ?? 0,
-    misconfigured_dependency_overrides: filtered.misconfigured_dependency_overrides?.length ?? 0,
-  };
   return {
     ...filtered,
     total_issues: totalIssues,
-    summary,
+    summary: summarizeCheckResult(filtered, totalIssues),
   };
-};
-
-const getWorkspaceRoot = (): string | null => {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders || folders.length === 0) {
-    return null;
-  }
-  return folders[0].uri.fsPath;
 };
 
 interface FixQuickPickItem extends vscode.QuickPickItem {
@@ -680,15 +696,17 @@ export const runAnalysis = async (
 ): Promise<{
   check: FallowCheckResult | null;
   dupes: FallowDupesResult | null;
+  scope: FallowAnalysisScope | null;
 }> => {
   const root = getWorkspaceRoot();
   if (!root) {
     void vscode.window.showWarningMessage("Fallow: no workspace folder open.");
-    return { check: null, dupes: null };
+    return { check: null, dupes: null, scope: null };
   }
 
   let check: FallowCheckResult | null = null;
   let dupes: FallowDupesResult | null = null;
+  let scope: FallowAnalysisScope | null = null;
   let backoffKey: string | null = null;
   const backoff = options.backoff ?? analysisBackoff;
 
@@ -707,6 +725,7 @@ export const runAnalysis = async (
     const { args: analysisArgs, skipped } = buildAnalysisArgs({
       production: getProductionOverride(),
       changedSince: getChangedSince(),
+      packageBaselines: getPackageBaselines(),
       workspace: resolveActiveWorkspaceScope(context),
       configPath: getResolvedConfigPath(),
       dupesMode: getDuplicationModeOverride(),
@@ -718,6 +737,7 @@ export const runAnalysis = async (
       dupesSkipLocal: getDuplicationSkipLocalOverride(),
       dupesCrossLanguage: getDuplicationCrossLanguageOverride(),
       dupesIgnoreImports: getDuplicationIgnoreImportsOverride(),
+      dupesIgnoreSymlinks: getDuplicationIgnoreSymlinksOverride(),
       typeAware: getTypeAwareSettings(),
       cliVersion,
     });
@@ -733,7 +753,7 @@ export const runAnalysis = async (
     noteSkippedCapabilities(skipped, cliBinary, outputChannel);
 
     const output = await execFallowTolerant(analysisArgs, root, cliBinary, outputChannel, {
-      env: buildAnalysisProcessEnv(),
+      env: buildAnalysisProcessEnv(process.env, getTypeAwareTimeoutSeconds()),
     });
 
     if (output.trim().length === 0) {
@@ -741,18 +761,31 @@ export const runAnalysis = async (
       // an empty stdout on a successful exit means there was nothing to
       // report. Leave check/dupes null and return without raising.
       backoff.recordSuccess(backoffKey);
-      return { check, dupes };
+      return { check, dupes, scope };
     }
 
     const result = JSON.parse(output) as FallowCombinedResult;
+    noteTypeAwareDegradation(typeAwareDegradationWarnings(result), outputChannel);
     check = result.check ? filterCheckResult(result.check) : null;
     dupes = result.dupes ?? null;
+    scope = {
+      request_outcomes: result.request_outcomes,
+      package_baselines: result.package_baselines,
+    };
     backoff.recordSuccess(backoffKey);
   } catch (err) {
     if (err instanceof AnalysisBackoffBlockedError) {
       throw err;
     }
-    const message = err instanceof Error ? err.message : String(err);
+    // Under `--format json` the CLI's diagnostic is the stdout envelope, not
+    // stderr, so the FallowExecError message alone would report a bare exit
+    // code and drop the reason (issue #2499).
+    const message =
+      err instanceof FallowExecError
+        ? describeAnalysisFailure(err.stdout, err.message)
+        : err instanceof Error
+          ? err.message
+          : String(err);
     const paused =
       backoffKey !== null && options.force !== true ? backoff.recordFailure(backoffKey) : null;
     if (paused) {
@@ -765,7 +798,7 @@ export const runAnalysis = async (
     throw err;
   }
 
-  return { check, dupes };
+  return { check, dupes, scope };
 };
 
 /**
@@ -886,6 +919,7 @@ export const runAudit = async (
       workspace: resolveActiveWorkspaceScope(context),
       configPath: getResolvedConfigPath(),
       gate: getAuditGate(),
+      worsened: getAuditWorsened(),
       typeAware: getTypeAwareSettings(),
       cliVersion,
     });
@@ -1098,8 +1132,9 @@ export const resetHealthNoWorkspaceWarning = (): void => {
  * Run a standalone `fallow health` analysis for the Health view. This is a
  * separate spawn from {@link runAnalysis}, fired lazily only when the Health
  * view is first revealed, so it never slows the latency-critical combined run
- * (which keeps `--skip health`). Hotspots (a git-churn walk) are requested only
- * when the user opted in via `fallow.health.hotspots`.
+ * (which keeps `--skip health`). The hotspot section follows
+ * `fallow.health.hotspots`; refactoring targets still read git history when
+ * that section is hidden.
  *
  * Reuses the same binary resolution and spawn primitive as the combined run.
  * `execFallow` already tolerates exit 0/1 (health exits 1 when findings exist)

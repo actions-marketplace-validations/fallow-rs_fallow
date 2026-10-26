@@ -36,6 +36,7 @@ fn make_file_tokens(source: &str, count: usize) -> FileTokens {
         tokens: make_source_tokens(count),
         function_spans: Vec::new(),
         atomic_invocation_spans: Vec::new(),
+        literal_argument_spans: Vec::new(),
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }
@@ -60,6 +61,7 @@ fn make_boundary_test_file(path: &str, has_boundary: bool) -> FileData {
             }],
             function_spans: Vec::new(),
             atomic_invocation_spans: Vec::new(),
+            literal_argument_spans: Vec::new(),
             source: "x".to_string(),
             line_count: 1,
         },
@@ -251,6 +253,7 @@ fn stats_computation() {
     let groups = vec![CloneGroup {
         instances: vec![
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("a.ts"),
                 start_line: 1,
                 end_line: 5,
@@ -259,6 +262,7 @@ fn stats_computation() {
                 fragment: "...".to_string(),
             },
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("b.ts"),
                 start_line: 10,
                 end_line: 14,
@@ -1017,6 +1021,7 @@ fn stats_zero_total_lines() {
     let groups = vec![CloneGroup {
         instances: vec![
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("a.ts"),
                 start_line: 1,
                 end_line: 1,
@@ -1025,6 +1030,7 @@ fn stats_zero_total_lines() {
                 fragment: String::new(),
             },
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("b.ts"),
                 start_line: 1,
                 end_line: 1,
@@ -1049,6 +1055,7 @@ fn stats_duplicated_tokens_capped() {
     let groups = vec![CloneGroup {
         instances: vec![
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("a.ts"),
                 start_line: 1,
                 end_line: 10,
@@ -1057,6 +1064,7 @@ fn stats_duplicated_tokens_capped() {
                 fragment: String::new(),
             },
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("b.ts"),
                 start_line: 1,
                 end_line: 10,
@@ -1065,6 +1073,7 @@ fn stats_duplicated_tokens_capped() {
                 fragment: String::new(),
             },
             CloneInstance {
+                is_symlink: false,
                 file: PathBuf::from("c.ts"),
                 start_line: 1,
                 end_line: 10,
@@ -1093,6 +1102,7 @@ fn stats_multiple_groups_same_file() {
         CloneGroup {
             instances: vec![
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("a.ts"),
                     start_line: 1,
                     end_line: 5,
@@ -1101,6 +1111,7 @@ fn stats_multiple_groups_same_file() {
                     fragment: String::new(),
                 },
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("b.ts"),
                     start_line: 1,
                     end_line: 5,
@@ -1116,6 +1127,7 @@ fn stats_multiple_groups_same_file() {
         CloneGroup {
             instances: vec![
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("a.ts"),
                     start_line: 3,
                     end_line: 8,
@@ -1124,6 +1136,7 @@ fn stats_multiple_groups_same_file() {
                     fragment: String::new(),
                 },
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("b.ts"),
                     start_line: 3,
                     end_line: 8,
@@ -1150,6 +1163,7 @@ fn stats_coalesces_nested_adjacent_and_disjoint_ranges_per_file() {
     use crate::duplicates::types::{CloneGroup, CloneInstance};
 
     let instance = |file: &str, start_line, end_line| CloneInstance {
+        is_symlink: false,
         file: PathBuf::from(file),
         start_line,
         end_line,
@@ -1190,6 +1204,7 @@ fn stats_single_instance_no_duplicated_tokens() {
 
     let groups = vec![CloneGroup {
         instances: vec![CloneInstance {
+            is_symlink: false,
             file: PathBuf::from("a.ts"),
             start_line: 1,
             end_line: 5,
@@ -1441,7 +1456,7 @@ mod proptests {
 
             let instances = ranges
                 .iter()
-                .map(|&(start, len)| CloneInstance {
+                .map(|&(start, len)| CloneInstance { is_symlink: false,
                     file: PathBuf::from("a.ts"),
                     start_line: start,
                     end_line: start + len,

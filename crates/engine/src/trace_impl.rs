@@ -1,39 +1,163 @@
 use std::path::{Path, PathBuf};
 
-pub use fallow_types::trace::{
+use fallow_types::discover::FileId;
+use fallow_types::trace::{
     ClassMemberTrace, CloneTrace, DependencyTrace, ExportReference, ExportTrace, FileTrace,
-    ImpactClosureGap, ImpactClosureTrace, NamespacedExportReferences, PipelineTimings,
-    ReExportChain, TracedCloneGroup, TracedExport, TracedReExport,
+    ImpactClosureGap, ImpactClosureTrace, ImportPathHop, ImportPathTrace,
+    ImportPathTraceSchemaVersion, NamespacedExportReferences, PeerClosureSeeds, ReExportChain,
+    SearchGapReason, ToolingCredit, TracedCloneGroup, TracedExport, TracedReExport,
 };
 use fallow_types::trace_chain::StarExportAmbiguity;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::duplicates::{
     CloneFingerprintSet, CloneGroup, CloneInstance, DuplicationReport, dominant_identifier,
     group_refactoring_suggestion,
 };
-use crate::graph::{EffectiveExportResolution, ExportNamespace, ModuleGraph, ReferenceKind};
+use crate::graph::{
+    ExportNamespace, ImportPathHop as GraphImportPathHop, ModuleGraph, ModuleNode, ReferenceKind,
+};
+use crate::search_visibility::{SearchCheck, SearchTarget, SourceCache};
 
-/// Match a user-provided file path against a module's actual path.
+/// Match exact module paths before considering abbreviated suffixes.
 ///
-/// Handles monorepo scenarios where module paths may be canonicalized
-/// (symlinks resolved) while user-provided paths are not.
-fn path_matches(module_path: &Path, root: &Path, user_path: &str) -> bool {
-    let user_path_norm = user_path.replace('\\', "/");
-    let rel = module_path.strip_prefix(root).unwrap_or(module_path);
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    let module_str = module_path.to_string_lossy().replace('\\', "/");
-    if rel_str == user_path_norm || module_str == user_path_norm {
-        return true;
+/// A root-relative `src/a.ts` must not select `packages/x/src/a.ts` merely
+/// because discovery listed that module first. Suffix matches remain useful
+/// for abbreviated requests, but callers must preserve their ambiguity.
+pub fn matching_module_indexes(graph: &ModuleGraph, root: &Path, user_path: &str) -> Vec<usize> {
+    let normalized = user_path.replace('\\', "/");
+    // The root-relative forms are joined once, so each module costs a path
+    // comparison instead of a `strip_prefix` component walk.
+    let exact_targets: Vec<PathBuf> = [
+        Some(root.join(&normalized)),
+        dunce::canonicalize(root)
+            .ok()
+            .map(|canonical_root| canonical_root.join(&normalized)),
+        dunce::canonicalize(root.join(&normalized)).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut exact = Vec::new();
+    let mut suffix = Vec::new();
+    let suffix_pattern = format!("/{normalized}");
+    for (index, module) in graph.modules.iter().enumerate() {
+        let module_path = forward_slash_path(&module.path);
+        let is_exact = module_path == normalized || exact_targets.contains(&module.path);
+        if is_exact {
+            exact.push(index);
+        } else if module_path.ends_with(&suffix_pattern) {
+            suffix.push(index);
+        }
     }
-    if dunce::canonicalize(root).is_ok_and(|canonical_root| {
-        module_path
-            .strip_prefix(&canonical_root)
-            .is_ok_and(|rel| rel.to_string_lossy().replace('\\', "/") == user_path_norm)
-    }) {
-        return true;
+    if exact.is_empty() { suffix } else { exact }
+}
+
+/// Render a path with forward slashes. Borrows when no rewrite is needed, so
+/// the per-module comparison in a lookup does not allocate on Unix.
+fn forward_slash_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    let lossy = path.to_string_lossy();
+    if lossy.contains('\\') {
+        std::borrow::Cow::Owned(lossy.replace('\\', "/"))
+    } else {
+        lossy
     }
-    module_str.ends_with(&format!("/{user_path_norm}"))
+}
+
+/// Module paths indexed once for callers that resolve many user paths
+/// against one graph.
+///
+/// [`ModulePathLookup::matching`] returns the same indexes, in graph order, as
+/// [`matching_module_indexes`]. A single lookup does not need this index; a
+/// loop over many references would otherwise scan every module per reference.
+struct ModulePathLookup<'g> {
+    graph: &'g ModuleGraph,
+    root: &'g Path,
+    canonical_root: Option<PathBuf>,
+    /// Component-normalized, forward-slash module path to module indexes.
+    by_path: FxHashMap<String, Vec<usize>>,
+    /// Last path segment to module indexes, for suffix matches.
+    by_file_name: FxHashMap<String, Vec<usize>>,
+}
+
+impl<'g> ModulePathLookup<'g> {
+    fn new(graph: &'g ModuleGraph, root: &'g Path) -> Self {
+        let mut by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut by_file_name: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (index, module) in graph.modules.iter().enumerate() {
+            by_path
+                .entry(path_key(&module.path))
+                .or_default()
+                .push(index);
+            let module_path = forward_slash_path(&module.path);
+            let file_name = module_path.rsplit('/').next().unwrap_or_default();
+            by_file_name
+                .entry(file_name.to_owned())
+                .or_default()
+                .push(index);
+        }
+        Self {
+            graph,
+            root,
+            canonical_root: dunce::canonicalize(root).ok(),
+            by_path,
+            by_file_name,
+        }
+    }
+
+    fn matching(&self, user_path: &str) -> Vec<usize> {
+        let normalized = user_path.replace('\\', "/");
+        let joined = self.root.join(&normalized);
+        let mut targets = vec![path_key(Path::new(&normalized)), path_key(&joined)];
+        if let Some(canonical_root) = &self.canonical_root {
+            targets.push(path_key(&canonical_root.join(&normalized)));
+        }
+        if let Ok(canonical_target) = dunce::canonicalize(&joined) {
+            targets.push(path_key(&canonical_target));
+        }
+        let mut exact: Vec<usize> = targets
+            .iter()
+            .filter_map(|target| self.by_path.get(target))
+            .flatten()
+            .copied()
+            .collect();
+        if !exact.is_empty() {
+            exact.sort_unstable();
+            exact.dedup();
+            return exact;
+        }
+        let suffix_pattern = format!("/{normalized}");
+        let file_name = normalized.rsplit('/').next().unwrap_or_default();
+        self.by_file_name
+            .get(file_name)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&index| {
+                forward_slash_path(&self.graph.modules[index].path).ends_with(&suffix_pattern)
+            })
+            .collect()
+    }
+}
+
+/// A path rendered from its components with forward slashes, so paths that
+/// `Path` equality treats as equal get the same key.
+fn path_key(path: &Path) -> String {
+    forward_slash_path(&path.components().collect::<PathBuf>()).into_owned()
+}
+
+/// Find the module for a user path.
+///
+/// An exact match wins. Otherwise the first suffix match in graph order wins,
+/// so an abbreviated path keeps its earlier behaviour.
+pub fn find_module<'a>(
+    graph: &'a ModuleGraph,
+    root: &Path,
+    user_path: &str,
+) -> Option<&'a ModuleNode> {
+    matching_module_indexes(graph, root, user_path)
+        .first()
+        .map(|&index| &graph.modules[index])
 }
 
 /// Reconcile checker-backed reference evidence with the retained graph's
@@ -48,13 +172,15 @@ pub fn reconcile_semantic_trace_reachability(
     if trace.assertion != "references-found" || trace.references.is_empty() {
         return;
     }
-    let has_reachable_reference = target_reachable
-        && trace.references.iter().any(|reference| {
-            let reference_path = reference.path.to_string_lossy();
-            graph.modules.iter().any(|module| {
-                path_matches(&module.path, root, &reference_path) && module.is_reachable()
-            })
-        });
+    let has_reachable_reference = target_reachable && {
+        let lookup = ModulePathLookup::new(graph, root);
+        trace.references.iter().any(|reference| {
+            lookup
+                .matching(&reference.path.to_string_lossy())
+                .iter()
+                .any(|&index| graph.modules[index].is_reachable())
+        })
+    };
     if has_reachable_reference {
         return;
     }
@@ -79,10 +205,7 @@ fn reference_to_export_reference(
         || PathBuf::from(format!("<unknown:{}>", r.from_file.0)),
         |m| m.path.strip_prefix(root).unwrap_or(&m.path).to_path_buf(),
     );
-    ExportReference {
-        from_file: from_path,
-        kind: format_reference_kind(r.kind),
-    }
+    ExportReference::new(from_path, format_reference_kind(r.kind))
 }
 
 /// Project graph-owned effective routes into the public trace contract.
@@ -99,11 +222,7 @@ fn collect_re_export_chains(
         .filter_map(|route| {
             let module = graph.modules.get(route.barrel_file().0 as usize)?;
             Some(ReExportChain {
-                barrel_file: module
-                    .path
-                    .strip_prefix(root)
-                    .unwrap_or(&module.path)
-                    .to_path_buf(),
+                barrel_file: relative_module_path(&module.path, root),
                 exported_as: route.exported_name().to_string(),
                 reference_count: graph
                     .effective_export_surface_references(
@@ -164,10 +283,7 @@ pub fn trace_export(
     file_path: &str,
     export_name: &str,
 ) -> Option<ExportTrace> {
-    let module = graph
-        .modules
-        .iter()
-        .find(|m| path_matches(&m.path, root, file_path))?;
+    let module = find_module(graph, root, file_path)?;
 
     let star_export_ambiguity =
         trace_star_export_ambiguity(graph, root, module.file_id, export_name);
@@ -175,11 +291,7 @@ pub fn trace_export(
         let ambiguity = star_export_ambiguity?;
         let namespace = ambiguity.namespaces.first().copied().unwrap_or_default();
         return Some(ExportTrace {
-            file: module
-                .path
-                .strip_prefix(root)
-                .unwrap_or(&module.path)
-                .to_path_buf(),
+            file: relative_module_path(&module.path, root),
             export_name: export_name.to_string(),
             namespace,
             file_reachable: module.is_reachable(),
@@ -189,6 +301,7 @@ pub fn trace_export(
             direct_references_by_namespace: Vec::new(),
             star_export_ambiguity: Some(ambiguity),
             re_export_chains: Vec::new(),
+            plugin_credits: Vec::new(),
             reason: "Star re-export collision makes this name ambiguous".to_string(),
             semantic: None,
         });
@@ -208,11 +321,7 @@ pub fn trace_export(
     };
 
     Some(ExportTrace {
-        file: module
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&module.path)
-            .to_path_buf(),
+        file: relative_module_path(&module.path, root),
         export_name: export_name.to_string(),
         namespace: match namespace {
             ExportNamespace::Type => fallow_types::semantic::SemanticNamespace::Type,
@@ -225,21 +334,31 @@ pub fn trace_export(
         direct_references_by_namespace,
         star_export_ambiguity,
         re_export_chains,
+        plugin_credits: Vec::new(),
         reason,
         semantic: None,
     })
 }
 
+/// The root-relative path of a module, or the path as it is outside `root`.
+fn relative_module_path(path: &Path, root: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+}
+
 /// Distinct referencing files of one module export surface in one namespace.
+///
+/// Each reference carries the literal-search check: the consumer source is
+/// read on demand and compared with a whole-word search for the export name.
 fn direct_export_references(
     graph: &ModuleGraph,
     root: &Path,
+    sources: &mut SourceCache<'_>,
     file_id: crate::discover::FileId,
     export_name: &str,
     namespace: ExportNamespace,
 ) -> Vec<ExportReference> {
     let mut referenced_files = FxHashSet::default();
-    graph
+    let references: Vec<_> = graph
         .effective_export_surface_references(file_id, export_name, namespace)
         .into_iter()
         .filter(|reference| {
@@ -249,8 +368,28 @@ fn direct_export_references(
                 .is_some_and(crate::graph::ModuleNode::is_reachable)
         })
         .filter(|reference| referenced_files.insert(reference.from_file))
-        .map(|r| reference_to_export_reference(graph, root, r))
+        .collect();
+    if references.is_empty() {
+        return Vec::new();
+    }
+    let target = SearchTarget::new(graph, sources, file_id, export_name, namespace);
+    references
+        .into_iter()
+        .map(|reference| {
+            let mut export_reference = reference_to_export_reference(graph, root, reference);
+            if let Some(check) = target.check(graph, sources, reference) {
+                apply_search_check(&mut export_reference, check);
+            }
+            export_reference
+        })
         .collect()
+}
+
+fn apply_search_check(reference: &mut ExportReference, check: SearchCheck) {
+    reference.line = check.line;
+    reference.search_visibility = Some(check.visibility);
+    reference.reason = check.reason;
+    reference.search_as = check.search_as;
 }
 
 /// References that credit the traced declaration, with the namespace that
@@ -276,7 +415,9 @@ fn crediting_export_references(
     Vec<NamespacedExportReferences>,
 ) {
     let namespace = surface.namespace();
-    let references = direct_export_references(graph, root, file_id, export_name, namespace);
+    let mut sources = SourceCache::new(graph);
+    let references =
+        direct_export_references(graph, root, &mut sources, file_id, export_name, namespace);
     let other = match namespace {
         ExportNamespace::Type => ExportNamespace::Value,
         ExportNamespace::Value => ExportNamespace::Type,
@@ -289,7 +430,8 @@ fn crediting_export_references(
     if !same_binding {
         return (namespace, references, Vec::new());
     }
-    let other_references = direct_export_references(graph, root, file_id, export_name, other);
+    let other_references =
+        direct_export_references(graph, root, &mut sources, file_id, export_name, other);
     let by_namespace = if references.is_empty() || other_references.is_empty() {
         Vec::new()
     } else {
@@ -340,13 +482,7 @@ fn trace_star_export_ambiguity(
         .iter()
         .flat_map(|collision| collision.contributors.iter())
         .filter_map(|contributor| graph.modules.get(contributor.0 as usize))
-        .map(|module| {
-            module
-                .path
-                .strip_prefix(root)
-                .unwrap_or(&module.path)
-                .to_path_buf()
-        })
+        .map(|module| relative_module_path(&module.path, root))
         .collect();
     sources.sort();
     sources.dedup();
@@ -379,10 +515,7 @@ pub fn semantic_symbol_for_export(
 ) -> Option<fallow_types::semantic::SemanticSymbol> {
     use fallow_types::semantic::{SemanticNamespace, SemanticSymbol};
 
-    let module = graph
-        .modules
-        .iter()
-        .find(|module| path_matches(&module.path, root, file_path))?;
+    let module = find_module(graph, root, file_path)?;
     let surface = select_export(graph, module, export_name)?;
     let namespace = surface.namespace();
     let (identity_module, span, identity_exported_name, local_name) = if let Some(re_export) =
@@ -437,10 +570,7 @@ pub fn semantic_symbol_for_class_member(
     use fallow_types::extract::MemberKind;
     use fallow_types::semantic::{SemanticNamespace, SemanticSymbol};
 
-    let module = graph
-        .modules
-        .iter()
-        .find(|module| path_matches(&module.path, root, file_path))?;
+    let module = find_module(graph, root, file_path)?;
     let (owner, member) = module
         .exports
         .iter()
@@ -461,11 +591,7 @@ pub fn semantic_symbol_for_class_member(
     let offsets = fallow_types::extract::compute_line_offsets(&source);
     let (line, col) = fallow_types::extract::byte_offset_to_line_col(&offsets, member.span.start);
     Some(SemanticSymbol {
-        path: module
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&module.path)
-            .to_path_buf(),
+        path: relative_module_path(&module.path, root),
         namespace: SemanticNamespace::Value,
         declaration_kind: declaration_kind.to_string(),
         exported_name: member_name.to_string(),
@@ -512,37 +638,28 @@ pub fn semantic_symbol_for_exact_class_method(
     use fallow_types::extract::MemberKind;
     use fallow_types::semantic::{SemanticNamespace, SemanticSymbol};
 
-    let module = graph
-        .modules
-        .iter()
-        .find(|module| path_matches(&module.path, root, file_path))
+    let module = find_module(graph, root, file_path)
         .ok_or(SemanticClassMethodResolutionError::FileNotFound)?;
-    let owners = module
+    let mut owners = module
         .exports
         .iter()
-        .filter(|export| export.name.matches_str(owner_name))
-        .collect::<Vec<_>>();
-    if owners.len() != 1 {
-        return Err(if owners.is_empty() {
-            SemanticClassMethodResolutionError::SymbolNotFound
-        } else {
-            SemanticClassMethodResolutionError::AmbiguousSymbol
-        });
+        .filter(|export| export.name.matches_str(owner_name));
+    let owner = owners
+        .next()
+        .ok_or(SemanticClassMethodResolutionError::SymbolNotFound)?;
+    if owners.next().is_some() {
+        return Err(SemanticClassMethodResolutionError::AmbiguousSymbol);
     }
-    let owner = owners[0];
-    let members = owner
+    let mut members = owner
         .members
         .iter()
-        .filter(|member| member.name == member_name)
-        .collect::<Vec<_>>();
-    if members.len() != 1 {
-        return Err(if members.is_empty() {
-            SemanticClassMethodResolutionError::SymbolNotFound
-        } else {
-            SemanticClassMethodResolutionError::AmbiguousSymbol
-        });
+        .filter(|member| member.name == member_name);
+    let member = members
+        .next()
+        .ok_or(SemanticClassMethodResolutionError::SymbolNotFound)?;
+    if members.next().is_some() {
+        return Err(SemanticClassMethodResolutionError::AmbiguousSymbol);
     }
-    let member = members[0];
     if member.kind != MemberKind::ClassMethod {
         return Err(SemanticClassMethodResolutionError::UnsupportedSyntax);
     }
@@ -551,11 +668,7 @@ pub fn semantic_symbol_for_exact_class_method(
     let offsets = fallow_types::extract::compute_line_offsets(&source);
     let (line, col) = fallow_types::extract::byte_offset_to_line_col(&offsets, member.span.start);
     Ok(SemanticSymbol {
-        path: module
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&module.path)
-            .to_path_buf(),
+        path: relative_module_path(&module.path, root),
         namespace: SemanticNamespace::Value,
         declaration_kind: "class_method".to_string(),
         exported_name: member_name.to_string(),
@@ -580,10 +693,7 @@ pub fn trace_class_member(
 ) -> Option<ClassMemberTrace> {
     use fallow_types::extract::MemberKind;
 
-    let module = graph
-        .modules
-        .iter()
-        .find(|m| path_matches(&m.path, root, file_path))?;
+    let module = find_module(graph, root, file_path)?;
 
     // Find the export that declares this member. When several declare a member
     // of the same name (rare), prefer a used, non-type-only owner so the trace
@@ -712,6 +822,7 @@ fn traced_exports(
                 is_type_only: e.is_type_only,
                 reference_count: referenced_by.len(),
                 referenced_by,
+                plugin_credits: Vec::new(),
             }
         })
         .collect()
@@ -783,24 +894,28 @@ fn traced_re_exports(
 /// Trace all edges for a file.
 #[must_use]
 pub fn trace_file(graph: &ModuleGraph, root: &Path, file_path: &str) -> Option<FileTrace> {
-    let module = graph
-        .modules
-        .iter()
-        .find(|m| path_matches(&m.path, root, file_path))?;
+    let module = find_module(graph, root, file_path)?;
 
     Some(FileTrace {
-        file: module
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&module.path)
-            .to_path_buf(),
+        file: relative_module_path(&module.path, root),
         is_reachable: module.is_reachable(),
         is_entry_point: module.is_entry_point(),
         exports: traced_exports(graph, root, module),
         imports_from: traced_imports_from(graph, root, module),
         imported_by: traced_imported_by(graph, root, module),
         re_exports: traced_re_exports(graph, root, module),
+        sources: Vec::new(),
     })
+}
+
+/// The packages that the dependency trace credits although no file imports
+/// them.
+pub struct DependencyCredit<'a> {
+    /// The packages that scripts, CI configs and git hooks run.
+    pub script_used_packages: &'a FxHashSet<String>,
+    /// The packages that start the peer-dependency closures in addition to
+    /// the imported packages.
+    pub peer_seeds: &'a PeerClosureSeeds,
 }
 
 /// Trace where a dependency is used.
@@ -810,54 +925,99 @@ pub fn trace_file(graph: &ModuleGraph, root: &Path, file_path: &str) -> Option<F
 /// (`.github/workflows/*.yml`, `.gitlab-ci.yml`). The same set the unused-deps
 /// detector consults; passing it in lets the trace output match the detector's
 /// view of "used" instead of reporting `is_used=false` for tools invoked only
-/// through scripts.
+/// through scripts. `ignore_patterns` hide workspace manifests from the peer
+/// closure, as in the unused-dependency check.
 #[must_use]
 pub fn trace_dependency(
     graph: &ModuleGraph,
     root: &Path,
+    workspace_roots: &[&Path],
+    ignore_patterns: &fallow_config::IgnorePatternSet,
     package_name: &str,
-    script_used_packages: &FxHashSet<String>,
+    credit: &DependencyCredit<'_>,
 ) -> DependencyTrace {
-    let imported_by: Vec<PathBuf> = graph
-        .package_usage
-        .get(package_name)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|fid| {
-                    graph
-                        .modules
-                        .get(fid.0 as usize)
-                        .map(|m| m.path.strip_prefix(root).unwrap_or(&m.path).to_path_buf())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let type_only_imported_by: Vec<PathBuf> = graph
-        .type_only_package_usage
-        .get(package_name)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|fid| {
-                    graph
-                        .modules
-                        .get(fid.0 as usize)
-                        .map(|m| m.path.strip_prefix(root).unwrap_or(&m.path).to_path_buf())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let (imported_by, type_only_imported_by) = package_importers(graph, root, package_name);
 
     let import_count = imported_by.len();
-    let used_in_scripts = script_used_packages.contains(package_name);
-    DependencyTrace {
+    let used_in_scripts = credit.script_used_packages.contains(package_name);
+    let peer_of = crate::core_backend::peer_dependency_hosts(
+        graph,
+        root,
+        workspace_roots,
+        ignore_patterns,
+        package_name,
+        credit.peer_seeds,
+    );
+    let mut trace = DependencyTrace {
         package_name: package_name.to_string(),
         imported_by,
         type_only_imported_by,
         used_in_scripts,
-        is_used: import_count > 0 || used_in_scripts,
+        is_used: import_count > 0 || used_in_scripts || !peer_of.is_empty(),
         import_count,
+        peer_of,
+        sources: Vec::new(),
+        tooling_credit: None,
+        unused_in: Vec::new(),
+        usage: None,
+    };
+    trace.apply_tooling_credit(imported_types_target_credit(graph, package_name));
+    trace
+}
+
+/// The files that import `package_name`, each listed once, and the subset
+/// whose every import of the package is type-only.
+///
+/// The graph records one usage entry per import, so a file with two imports
+/// of the package appears twice. A file with a type-only import and a value
+/// import is not a type-only importer.
+fn package_importers(
+    graph: &ModuleGraph,
+    root: &Path,
+    package_name: &str,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let counts = |usage: &FxHashMap<String, Vec<FileId>>| {
+        let mut counts: FxHashMap<FileId, usize> = FxHashMap::default();
+        for &fid in usage.get(package_name).into_iter().flatten() {
+            *counts.entry(fid).or_default() += 1;
+        }
+        counts
+    };
+    let mut all = counts(&graph.package_usage);
+    let type_only = counts(&graph.type_only_package_usage);
+    let mut imported_by = Vec::new();
+    let mut type_only_imported_by = Vec::new();
+    for &fid in graph.package_usage.get(package_name).into_iter().flatten() {
+        // The first entry of a file takes its count, so a repeat finds none.
+        let Some(total) = all.remove(&fid) else {
+            continue;
+        };
+        let Some(module) = graph.modules.get(fid.0 as usize) else {
+            continue;
+        };
+        let path = relative_module_path(&module.path, root);
+        if type_only.get(&fid) == Some(&total) {
+            type_only_imported_by.push(path.clone());
+        }
+        imported_by.push(path);
     }
+    (imported_by, type_only_imported_by)
+}
+
+/// The credit of a `@types/X` package whose target `X` the code imports, as
+/// the unused devDependency check gives it.
+fn imported_types_target_credit(graph: &ModuleGraph, package_name: &str) -> Option<ToolingCredit> {
+    let target = crate::core_backend::types_package_target(package_name)?;
+    graph
+        .package_usage
+        .get(target.as_str())
+        .is_some_and(|ids| !ids.is_empty())
+        .then(|| ToolingCredit {
+            reason: "types-target".to_string(),
+            plugin: None,
+            config: None,
+            reference: Some(target),
+        })
 }
 
 fn format_reference_kind(kind: ReferenceKind) -> String {
@@ -877,16 +1037,37 @@ fn format_reference_kind(kind: ReferenceKind) -> String {
 /// chains to the transitive affected set, and reports the coordination gap (the
 /// seed's exported contracts consumed by modules outside the seed). Returns
 /// `None` when the file is not in the module graph.
+///
+/// Each coordination gap carries the literal-search check, so this reads the
+/// source of each consumer of the seed exports.
 #[must_use]
 pub fn trace_impact_closure(
     graph: &ModuleGraph,
     root: &Path,
     file_path: &str,
 ) -> Option<ImpactClosureTrace> {
-    let module = graph
-        .modules
-        .iter()
-        .find(|m| path_matches(&m.path, root, file_path))?;
+    impact_closure_trace(graph, root, file_path, true)
+}
+
+/// Compute the impact closure like [`trace_impact_closure`], without the
+/// literal-search check. The coordination gaps have no search fields, and no
+/// consumer source is read. Use it when only the affected set is needed.
+#[must_use]
+pub fn trace_impact_closure_without_search(
+    graph: &ModuleGraph,
+    root: &Path,
+    file_path: &str,
+) -> Option<ImpactClosureTrace> {
+    impact_closure_trace(graph, root, file_path, false)
+}
+
+fn impact_closure_trace(
+    graph: &ModuleGraph,
+    root: &Path,
+    file_path: &str,
+    check_search: bool,
+) -> Option<ImpactClosureTrace> {
+    let module = find_module(graph, root, file_path)?;
 
     let closure = graph.impact_closure(&[module.file_id]);
     let paths = graph.closure_with_paths(&closure, root);
@@ -897,13 +1078,38 @@ pub fn trace_impact_closure(
         .cloned()
         .unwrap_or_else(|| file_path.replace('\\', "/"));
 
+    let mut checks: FxHashMap<String, (String, SearchCheck)> =
+        if !check_search || paths.coordination_gap.is_empty() {
+            FxHashMap::default()
+        } else {
+            consumer_search_checks(graph, module.file_id)
+                .into_iter()
+                .filter_map(|(file_id, check)| {
+                    let consumer = graph.modules.get(file_id.0 as usize)?;
+                    let path = consumer
+                        .path
+                        .strip_prefix(root)
+                        .unwrap_or(&consumer.path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    Some((path, check))
+                })
+                .collect()
+        };
     let coordination_gap = paths
         .coordination_gap
         .into_iter()
-        .map(|gap| ImpactClosureGap {
-            consumer_file: gap.consumer_file,
-            consumed_symbols: gap.consumed_symbols,
-            note: "syntactic attention pointer, not a correctness proof".to_string(),
+        .map(|gap| {
+            let (search_symbol, check) = checks.remove(&gap.consumer_file).unzip();
+            ImpactClosureGap {
+                consumer_file: gap.consumer_file,
+                consumed_symbols: gap.consumed_symbols,
+                note: "syntactic attention pointer, not a correctness proof".to_string(),
+                search_visibility: check.as_ref().map(|check| check.visibility),
+                reason: check.as_ref().and_then(|check| check.reason),
+                search_as: check.and_then(|check| check.search_as),
+                search_symbol,
+            }
         })
         .collect();
 
@@ -912,6 +1118,229 @@ pub fn trace_impact_closure(
         affected_not_shown: paths.affected_not_shown,
         coordination_gap,
     })
+}
+
+/// The worst literal-search check per consumer of the value exports of
+/// `seed`, over every export the consumer references, with the name of the
+/// export that the check belongs to. The order of the levels is `missed`, then
+/// `renamed`, then `found`.
+fn consumer_search_checks(
+    graph: &ModuleGraph,
+    seed: FileId,
+) -> FxHashMap<FileId, (String, SearchCheck)> {
+    let mut checks: FxHashMap<FileId, (String, SearchCheck)> = FxHashMap::default();
+    let Some(module) = graph.modules.get(seed.0 as usize) else {
+        return checks;
+    };
+    let mut sources = SourceCache::new(graph);
+    for export in module.exports.iter().filter(|export| !export.is_type_only) {
+        let name = export.name.to_string();
+        let target = SearchTarget::new(graph, &mut sources, seed, &name, ExportNamespace::Value);
+        let mut seen = FxHashSet::default();
+        for reference in &export.references {
+            if reference.from_file == seed || !seen.insert(reference.from_file) {
+                continue;
+            }
+            let Some(check) = target.check(graph, &mut sources, reference) else {
+                continue;
+            };
+            // A local use of one export outranks a pass-through of another.
+            let worse = checks.get(&reference.from_file).is_none_or(|(_, known)| {
+                check.visibility > known.visibility
+                    || (check.visibility == known.visibility
+                        && known.reason == Some(SearchGapReason::PassThrough)
+                        && check.reason != Some(SearchGapReason::PassThrough))
+            });
+            if worse {
+                checks.insert(reference.from_file, (name.clone(), check));
+            }
+        }
+    }
+    checks
+}
+
+/// Which endpoint of a `--path` request did not resolve to exactly one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPathEndpoint {
+    /// The module the walk would start from.
+    From,
+    /// The module the walk is looking for.
+    To,
+    /// Several modules match the starting path abbreviation.
+    AmbiguousFrom,
+    /// Several modules match the destination path abbreviation.
+    AmbiguousTo,
+}
+
+impl ImportPathEndpoint {
+    /// The flag position this endpoint occupies, for diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::From | Self::AmbiguousFrom => "from",
+            Self::To | Self::AmbiguousTo => "to",
+        }
+    }
+
+    /// Whether the endpoint matched several modules instead of no module.
+    #[must_use]
+    pub const fn is_ambiguous(self) -> bool {
+        matches!(self, Self::AmbiguousFrom | Self::AmbiguousTo)
+    }
+}
+
+fn import_path_endpoint_index(
+    graph: &ModuleGraph,
+    root: &Path,
+    path: &str,
+    missing: ImportPathEndpoint,
+    ambiguous: ImportPathEndpoint,
+) -> Result<usize, ImportPathEndpoint> {
+    match matching_module_indexes(graph, root, path).as_slice() {
+        [index] => Ok(*index),
+        [] => Err(missing),
+        _ => Err(ambiguous),
+    }
+}
+
+/// Trace the shortest import path from one module to another.
+///
+/// Exact paths take priority over abbreviated suffixes. Returns the unresolved
+/// endpoint when either side names no module or an ambiguous suffix, so the
+/// caller can name which half of the request was wrong.
+///
+/// # Errors
+///
+/// Returns the endpoint that did not resolve to exactly one module in the graph.
+pub fn trace_import_path(
+    graph: &ModuleGraph,
+    root: &Path,
+    from_path: &str,
+    to_path: &str,
+    eager_only: bool,
+) -> Result<ImportPathTrace, ImportPathEndpoint> {
+    let from_index = import_path_endpoint_index(
+        graph,
+        root,
+        from_path,
+        ImportPathEndpoint::From,
+        ImportPathEndpoint::AmbiguousFrom,
+    )?;
+    let to_index = import_path_endpoint_index(
+        graph,
+        root,
+        to_path,
+        ImportPathEndpoint::To,
+        ImportPathEndpoint::AmbiguousTo,
+    )?;
+    let from = &graph.modules[from_index];
+    let to = &graph.modules[to_index];
+
+    let from_rel = relativize(&from.path, root);
+    let to_rel = relativize(&to.path, root);
+
+    let route = if eager_only {
+        graph.shortest_eager_import_path(from.file_id, to.file_id)
+    } else {
+        graph.shortest_import_path(from.file_id, to.file_id)
+    };
+    let Some(hops) = route else {
+        let kind = if eager_only {
+            "eager import path"
+        } else {
+            "import path"
+        };
+        return Ok(ImportPathTrace {
+            schema_version: ImportPathTraceSchemaVersion::V1,
+            reason: format!("no {kind} from {from_rel} to {to_rel}"),
+            from: from_rel,
+            to: to_rel,
+            reachable: false,
+            hops: 0,
+            path: Vec::new(),
+        });
+    };
+
+    if hops.is_empty() {
+        return Ok(ImportPathTrace {
+            schema_version: ImportPathTraceSchemaVersion::V1,
+            reason: format!("{from_rel} is the same module as {to_rel}"),
+            from: from_rel,
+            to: to_rel,
+            reachable: true,
+            hops: 0,
+            path: Vec::new(),
+        });
+    }
+
+    let path = resolve_import_path_hops(graph, root, &hops);
+    let hop_count = path.len();
+    let plural = if hop_count == 1 { "hop" } else { "hops" };
+    // A route whose every hop is type-only is erased at build time. Saying so is
+    // the difference between "these modules ship coupled" and "the coupling only
+    // exists for the type checker".
+    let reason = if path.iter().all(|hop| hop.type_only) {
+        format!(
+            "{from_rel} reaches {to_rel} in {hop_count} type-only {plural}, erased at build time"
+        )
+    } else {
+        format!("{from_rel} reaches {to_rel} in {hop_count} {plural}")
+    };
+
+    Ok(ImportPathTrace {
+        schema_version: ImportPathTraceSchemaVersion::V1,
+        from: from_rel,
+        to: to_rel,
+        reachable: true,
+        hops: hop_count,
+        path,
+        reason,
+    })
+}
+
+/// Resolve graph-level hops to the wire shape, turning each import span into a
+/// 1-based line. Each source file is read at most once per trace; a file that
+/// cannot be read yields `import_line: None` rather than a guessed line.
+fn resolve_import_path_hops(
+    graph: &ModuleGraph,
+    root: &Path,
+    hops: &[GraphImportPathHop],
+) -> Vec<ImportPathHop> {
+    let mut line_offsets: FxHashMap<FileId, Option<Vec<u32>>> = FxHashMap::default();
+    hops.iter()
+        .filter_map(|hop| {
+            let from = graph.modules.get(hop.from.0 as usize)?;
+            let to = graph.modules.get(hop.to.0 as usize)?;
+            let import_line = hop.import_span_start.and_then(|span_start| {
+                line_offsets
+                    .entry(hop.from)
+                    .or_insert_with(|| {
+                        std::fs::read_to_string(&from.path)
+                            .ok()
+                            .map(|source| fallow_types::extract::compute_line_offsets(&source))
+                    })
+                    .as_ref()
+                    .map(|offsets| {
+                        fallow_types::extract::byte_offset_to_line_col(offsets, span_start).0
+                    })
+            });
+            Some(ImportPathHop {
+                from: relativize(&from.path, root),
+                to: relativize(&to.path, root),
+                type_only: hop.all_type_only,
+                dynamic: hop.dynamic,
+                import_line,
+            })
+        })
+        .collect()
+}
+
+/// Relativize a module path against the project root, forward-slashed.
+pub fn relativize(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Build a [`TracedCloneGroup`] from a raw clone group, computing the
@@ -1032,13 +1461,17 @@ fn relativize_instance(inst: &CloneInstance, root: &Path) -> CloneInstance {
 }
 
 #[cfg(test)]
+#[path = "trace_impl_dependency_tests.rs"]
+mod dependency_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
-    use crate::extract::{ExportInfo, ExportName, ImportInfo, ImportedName, VisibilityTag};
-    use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
+    use fallow_graph::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
     use fallow_types::extract::ReExportInfo;
+    use fallow_types::extract::{ExportInfo, ExportName, ImportInfo, ImportedName, VisibilityTag};
 
     fn resolved_re_export(
         source: FileId,
@@ -1060,33 +1493,39 @@ mod tests {
     }
 
     fn build_test_graph() -> ModuleGraph {
+        build_test_graph_at(Path::new("/project"))
+    }
+
+    /// The `entry -> utils` graph with module paths under `root`.
+    fn build_test_graph_at(root: &Path) -> ModuleGraph {
+        let src = |name: &str| root.join("src").join(name);
         let files = vec![
             DiscoveredFile {
                 id: FileId(0),
-                path: PathBuf::from("/project/src/entry.ts"),
+                path: src("entry.ts"),
                 size_bytes: 100,
             },
             DiscoveredFile {
                 id: FileId(1),
-                path: PathBuf::from("/project/src/utils.ts"),
+                path: src("utils.ts"),
                 size_bytes: 50,
             },
             DiscoveredFile {
                 id: FileId(2),
-                path: PathBuf::from("/project/src/unused.ts"),
+                path: src("unused.ts"),
                 size_bytes: 30,
             },
         ];
 
         let entry_points = vec![EntryPoint {
-            path: PathBuf::from("/project/src/entry.ts"),
+            path: src("entry.ts"),
             source: EntryPointSource::PackageJsonMain,
         }];
 
         let resolved_modules = vec![
             ResolvedModule {
                 file_id: FileId(0),
-                path: PathBuf::from("/project/src/entry.ts"),
+                path: src("entry.ts"),
                 resolved_imports: vec![ResolvedImport {
                     info: ImportInfo {
                         source: "./utils".to_string(),
@@ -1104,7 +1543,7 @@ mod tests {
             },
             ResolvedModule {
                 file_id: FileId(1),
-                path: PathBuf::from("/project/src/utils.ts"),
+                path: src("utils.ts"),
                 exports: vec![
                     ExportInfo {
                         name: ExportName::Named("foo".to_string()),
@@ -1116,6 +1555,8 @@ mod tests {
                         members: vec![],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                     ExportInfo {
                         name: ExportName::Named("bar".to_string()),
@@ -1127,6 +1568,8 @@ mod tests {
                         members: vec![],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 ]
                 .into(),
@@ -1134,7 +1577,7 @@ mod tests {
             },
             ResolvedModule {
                 file_id: FileId(2),
-                path: PathBuf::from("/project/src/unused.ts"),
+                path: src("unused.ts"),
                 exports: vec![ExportInfo {
                     name: ExportName::Named("baz".to_string()),
                     local_name: Some("baz".to_string()),
@@ -1145,6 +1588,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }]
                 .into(),
                 ..Default::default()
@@ -1206,6 +1651,70 @@ mod tests {
         assert!(trace.is_none());
     }
 
+    fn assert_no_search_fields(reference: &ExportReference) {
+        assert_eq!(reference.line, None);
+        assert_eq!(reference.search_visibility, None);
+        assert_eq!(reference.reason, None);
+        assert_eq!(reference.search_as, None);
+    }
+
+    fn assert_gap_has_no_search_fields(gap: &ImpactClosureGap) {
+        assert_eq!(gap.search_visibility, None);
+        assert_eq!(gap.reason, None);
+        assert_eq!(gap.search_as, None);
+        assert_eq!(gap.search_symbol, None);
+    }
+
+    #[test]
+    fn unreadable_consumer_leaves_the_search_fields_absent() {
+        // The paths under `/project` do not exist, so no consumer source can be read.
+        let graph = build_test_graph();
+        let root = Path::new("/project");
+
+        let trace = trace_export(&graph, root, "src/utils.ts", "foo").unwrap();
+        assert_eq!(trace.direct_references.len(), 1);
+        assert_no_search_fields(&trace.direct_references[0]);
+
+        let impact = trace_impact_closure(&graph, root, "src/utils.ts").unwrap();
+        assert_eq!(impact.coordination_gap.len(), 1);
+        assert_gap_has_no_search_fields(&impact.coordination_gap[0]);
+    }
+
+    #[test]
+    fn impact_closure_without_search_reads_no_consumer_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("entry.ts"),
+            "import { foo } from './utils';\nfoo();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("utils.ts"),
+            "export const foo = 1;\nexport const bar = 2;\n",
+        )
+        .unwrap();
+        let graph = build_test_graph_at(dir.path());
+
+        let checked = trace_impact_closure(&graph, dir.path(), "src/utils.ts").unwrap();
+        assert_eq!(checked.coordination_gap.len(), 1);
+        assert_eq!(
+            checked.coordination_gap[0].search_visibility,
+            Some(fallow_types::trace::SearchVisibility::Found)
+        );
+        assert_eq!(
+            checked.coordination_gap[0].search_symbol.as_deref(),
+            Some("foo")
+        );
+
+        let unchecked =
+            trace_impact_closure_without_search(&graph, dir.path(), "src/utils.ts").unwrap();
+        assert_eq!(unchecked.coordination_gap.len(), 1);
+        assert_gap_has_no_search_fields(&unchecked.coordination_gap[0]);
+        assert_eq!(unchecked.affected_not_shown, checked.affected_not_shown);
+    }
+
     #[test]
     fn trace_reports_only_the_effective_re_export_origin() {
         let files: Vec<_> = ["entry", "barrel", "star-source", "explicit-source"]
@@ -1243,6 +1752,8 @@ mod tests {
             members: Vec::new(),
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         };
         let resolved = vec![
             ResolvedModule {
@@ -1336,6 +1847,8 @@ mod tests {
                     members: Vec::new(),
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }]
                 .into(),
                 ..Default::default()
@@ -1493,6 +2006,8 @@ mod tests {
             members: Vec::new(),
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }]
         .into();
         resolved[1].re_exports = vec![re_export(FileId(0), "foo", "bar")];
@@ -1549,6 +2064,8 @@ mod tests {
             members: Vec::new(),
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         };
         let resolved = vec![
             ResolvedModule {
@@ -1733,6 +2250,8 @@ mod tests {
             members: Vec::new(),
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -1914,6 +2433,7 @@ mod tests {
             decorator_names: vec![],
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         }];
         let graph = source_consumer_graph(vec![owner], true, false, Vec::new());
 
@@ -1939,6 +2459,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture names every ExportInfo field so a new field is a compile error here"
+    )]
     fn trace_preserves_dual_namespace_named_re_exports() {
         let files: Vec<_> = ["entry", "barrel", "types", "values"]
             .into_iter()
@@ -1959,6 +2483,8 @@ mod tests {
             members: Vec::new(),
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         };
         let re_export = |source: FileId, is_type_only| ResolvedReExport {
             info: ReExportInfo {
@@ -2070,6 +2596,7 @@ mod tests {
             decorator_names: vec![],
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         };
         let resolved_modules = vec![
             ResolvedModule {
@@ -2103,6 +2630,8 @@ mod tests {
                     members: vec![method("used"), method("dead")],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }]
                 .into(),
                 ..Default::default()
@@ -2141,8 +2670,7 @@ mod tests {
         assert!(trace_class_member(&graph, root, "src/controller.ts", "nope").is_none());
     }
 
-    #[test]
-    fn exact_class_method_resolution_rejects_overloads_without_guessing() {
+    fn exact_class_method_fixture() -> (tempfile::TempDir, ModuleGraph) {
         use fallow_types::extract::{MemberInfo, MemberKind};
 
         let temp = tempfile::tempdir().unwrap();
@@ -2162,6 +2690,7 @@ mod tests {
             decorator_names: vec![],
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         };
         let files = vec![DiscoveredFile {
             id: FileId(0),
@@ -2185,12 +2714,20 @@ mod tests {
                 ],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
         }];
         let graph = ModuleGraph::build(&resolved_modules, &[], &files);
+        (temp, graph)
+    }
 
+    #[test]
+    fn exact_class_method_resolution_rejects_overloads_without_guessing() {
+        let (temp, graph) = exact_class_method_fixture();
+        let root = temp.path();
         assert_eq!(
             semantic_symbol_for_exact_class_method(
                 &graph,
@@ -2223,6 +2760,73 @@ mod tests {
         assert_eq!(resolved.local_name, "run");
     }
 
+    #[test]
+    fn exact_class_method_resolution_preserves_error_precedence() {
+        use fallow_types::extract::MemberKind;
+
+        let (temp, mut graph) = exact_class_method_fixture();
+        let root = temp.path();
+        for (file, owner, member, expected) in [
+            (
+                "missing.ts",
+                "Repository",
+                "run",
+                SemanticClassMethodResolutionError::FileNotFound,
+            ),
+            (
+                "repository.ts",
+                "Repository",
+                "missing",
+                SemanticClassMethodResolutionError::SymbolNotFound,
+            ),
+        ] {
+            assert_eq!(
+                semantic_symbol_for_exact_class_method(&graph, root, file, owner, member),
+                Err(expected),
+            );
+        }
+        graph.modules[0].exports[0].members[2].kind = MemberKind::ClassProperty;
+        assert_eq!(
+            semantic_symbol_for_exact_class_method(
+                &graph,
+                root,
+                "repository.ts",
+                "Repository",
+                "run"
+            ),
+            Err(SemanticClassMethodResolutionError::UnsupportedSyntax),
+        );
+        graph.modules[0].exports[0].members[2].kind = MemberKind::ClassMethod;
+        std::fs::remove_file(&graph.modules[0].path).expect("remove fixture source");
+        assert_eq!(
+            semantic_symbol_for_exact_class_method(
+                &graph,
+                root,
+                "repository.ts",
+                "Repository",
+                "run"
+            ),
+            Err(SemanticClassMethodResolutionError::SymbolNotFound),
+        );
+        let (_other_temp, mut other_graph) = exact_class_method_fixture();
+        let duplicate = other_graph.modules[0]
+            .exports
+            .pop()
+            .expect("fixture declares an owner");
+        graph.modules[0].exports.push(duplicate);
+        assert_eq!(
+            semantic_symbol_for_exact_class_method(
+                &graph,
+                root,
+                "repository.ts",
+                "Repository",
+                "run"
+            ),
+            Err(SemanticClassMethodResolutionError::AmbiguousSymbol),
+            "owner ambiguity must be reported before reading source",
+        );
+    }
+
     /// Build a graph where the controller declaring `Ctrl` is NOT imported by
     /// the entry, so its file is unreachable and every member is dead.
     fn build_unreachable_class_member_graph() -> ModuleGraph {
@@ -2252,6 +2856,7 @@ mod tests {
             decorator_names: vec![],
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         };
         let resolved_modules = vec![
             ResolvedModule {
@@ -2273,6 +2878,8 @@ mod tests {
                     members: vec![method("dead")],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }]
                 .into(),
                 ..Default::default()
@@ -2331,6 +2938,7 @@ mod tests {
             decorator_names: vec![],
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         };
         let resolved_modules = vec![
             ResolvedModule {
@@ -2367,6 +2975,8 @@ mod tests {
                         members: vec![method("shared")],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                     ExportInfo {
                         name: ExportName::Named("UsedCtrl".to_string()),
@@ -2378,6 +2988,8 @@ mod tests {
                         members: vec![method("shared")],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 ]
                 .into(),
@@ -2417,6 +3029,170 @@ mod tests {
         assert!(trace.imported_by.is_empty());
     }
 
+    fn build_nested_duplicate_path_graph() -> ModuleGraph {
+        let export = |name: &str| ExportInfo {
+            name: ExportName::Named(name.to_string()),
+            local_name: Some(name.to_string()),
+            is_type_only: false,
+            visibility: VisibilityTag::None,
+            expected_unused_reason: None,
+            span: oxc_span::Span::new(0, 20),
+            members: vec![],
+            is_side_effect_used: false,
+            super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
+        };
+        let nested = PathBuf::from("/project/packages/x/src/a.ts");
+        let root_file = PathBuf::from("/project/src/a.ts");
+        let files = vec![
+            DiscoveredFile {
+                id: FileId(0),
+                path: nested.clone(),
+                size_bytes: 20,
+            },
+            DiscoveredFile {
+                id: FileId(1),
+                path: root_file.clone(),
+                size_bytes: 20,
+            },
+        ];
+        let entry_points = vec![EntryPoint {
+            path: root_file.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }];
+        let resolved_modules = vec![
+            ResolvedModule {
+                file_id: FileId(0),
+                path: nested,
+                exports: vec![export("nestedOnly")].into(),
+                ..Default::default()
+            },
+            ResolvedModule {
+                file_id: FileId(1),
+                path: root_file,
+                exports: vec![export("rootOnly")].into(),
+                ..Default::default()
+            },
+        ];
+        ModuleGraph::build(&resolved_modules, &entry_points, &files)
+    }
+
+    fn graph_with_module_paths(paths: &[PathBuf]) -> ModuleGraph {
+        let files: Vec<DiscoveredFile> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| DiscoveredFile {
+                id: FileId(u32::try_from(index).expect("small fixture")),
+                path: path.clone(),
+                size_bytes: 1,
+            })
+            .collect();
+        let resolved_modules: Vec<ResolvedModule> = files
+            .iter()
+            .map(|file| ResolvedModule {
+                file_id: file.id,
+                path: file.path.clone(),
+                ..Default::default()
+            })
+            .collect();
+        ModuleGraph::build(&resolved_modules, &[], &files)
+    }
+
+    fn assert_lookup_matches_single_scan(graph: &ModuleGraph, root: &Path, queries: &[&str]) {
+        let lookup = ModulePathLookup::new(graph, root);
+        for query in queries {
+            assert_eq!(
+                lookup.matching(query),
+                matching_module_indexes(graph, root, query),
+                "query {query:?}"
+            );
+        }
+    }
+
+    const LOOKUP_QUERIES: &[&str] = &[
+        "src/a.ts",
+        "./src/a.ts",
+        "src//a.ts",
+        r"src\a.ts",
+        "a.ts",
+        "x/src/a.ts",
+        "packages/x/src/a.ts",
+        "sub/c.ts",
+        "c.ts",
+        "src/",
+        "",
+        "missing.ts",
+        "/elsewhere/src/a.ts",
+    ];
+
+    /// The indexed lookup must return the same modules, in the same order, as
+    /// the single-scan lookup for exact, suffix, ambiguous and missing paths.
+    #[test]
+    fn module_path_lookup_matches_single_scan_lookup() {
+        let root = Path::new("/project");
+        let paths: Vec<PathBuf> = [
+            "src/a.ts",
+            "packages/x/src/a.ts",
+            "packages/y/a.ts",
+            "src/sub/c.ts",
+            "lib/b.ts",
+        ]
+        .iter()
+        .map(|relative| root.join(relative))
+        .collect();
+        let graph = graph_with_module_paths(&paths);
+        let mut queries = LOOKUP_QUERIES.to_vec();
+        let absolute = root.join("src/a.ts").to_string_lossy().into_owned();
+        queries.push(&absolute);
+        assert_lookup_matches_single_scan(&graph, root, &queries);
+    }
+
+    /// With real files, the canonical-root and canonical-target forms take
+    /// part too. On macOS the temp dir sits behind a symlink.
+    #[test]
+    fn module_path_lookup_matches_single_scan_lookup_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for relative in ["src/a.ts", "packages/x/src/a.ts", "src/sub/c.ts"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, "").expect("write");
+        }
+        let canonical_root = dunce::canonicalize(root).expect("canonical root");
+        let paths: Vec<PathBuf> = ["src/a.ts", "packages/x/src/a.ts", "src/sub/c.ts"]
+            .iter()
+            .map(|relative| canonical_root.join(relative))
+            .collect();
+        let graph = graph_with_module_paths(&paths);
+        assert_lookup_matches_single_scan(&graph, root, LOOKUP_QUERIES);
+    }
+
+    #[test]
+    fn root_relative_path_prefers_exact_module_over_nested_suffix() {
+        let graph = build_nested_duplicate_path_graph();
+        let root = Path::new("/project");
+
+        let file = trace_file(&graph, root, "src/a.ts").expect("root file resolves");
+        assert_eq!(file.file, PathBuf::from("src/a.ts"));
+        assert!(file.is_entry_point);
+
+        let export = trace_export(&graph, root, "src/a.ts", "rootOnly");
+        assert!(
+            export.is_some(),
+            "an export of the root-level file must resolve"
+        );
+    }
+
+    #[test]
+    fn abbreviated_path_keeps_first_suffix_match() {
+        let graph = build_nested_duplicate_path_graph();
+        let root = Path::new("/project");
+
+        let file = trace_file(&graph, root, "a.ts").expect("suffix match resolves");
+        assert_eq!(file.file, PathBuf::from("packages/x/src/a.ts"));
+    }
+
     #[test]
     fn trace_file_imported_by() {
         let graph = build_test_graph();
@@ -2442,111 +3218,13 @@ mod tests {
     }
 
     #[test]
-    fn trace_dependency_used() {
-        let files = vec![DiscoveredFile {
-            id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            size_bytes: 100,
-        }];
-        let entry_points = vec![EntryPoint {
-            path: PathBuf::from("/project/src/app.ts"),
-            source: EntryPointSource::PackageJsonMain,
-        }];
-        let resolved_modules = vec![ResolvedModule {
-            file_id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            resolved_imports: vec![ResolvedImport {
-                info: ImportInfo {
-                    source: "lodash".to_string(),
-                    imported_name: ImportedName::Named("get".to_string()),
-                    local_name: "get".to_string(),
-                    is_type_only: false,
-                    is_type_only_star: false,
-                    from_style: false,
-                    span: oxc_span::Span::new(0, 10),
-                    source_span: oxc_span::Span::default(),
-                },
-                target: ResolveResult::NpmPackage("lodash".to_string()),
-            }],
-            ..Default::default()
-        }];
-
-        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
-        let root = Path::new("/project");
-
-        let trace = trace_dependency(&graph, root, "lodash", &FxHashSet::default());
-        assert!(trace.is_used);
-        assert!(!trace.used_in_scripts);
-        assert_eq!(trace.import_count, 1);
-        assert_eq!(trace.imported_by[0], PathBuf::from("src/app.ts"));
-    }
-
-    #[test]
-    fn trace_dependency_unused() {
-        let files = vec![DiscoveredFile {
-            id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            size_bytes: 100,
-        }];
-        let entry_points = vec![EntryPoint {
-            path: PathBuf::from("/project/src/app.ts"),
-            source: EntryPointSource::PackageJsonMain,
-        }];
-        let resolved_modules = vec![ResolvedModule {
-            file_id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            ..Default::default()
-        }];
-
-        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
-        let root = Path::new("/project");
-
-        let trace = trace_dependency(&graph, root, "nonexistent-pkg", &FxHashSet::default());
-        assert!(!trace.is_used);
-        assert!(!trace.used_in_scripts);
-        assert_eq!(trace.import_count, 0);
-        assert!(trace.imported_by.is_empty());
-    }
-
-    #[test]
-    fn trace_dependency_used_only_in_scripts() {
-        let files = vec![DiscoveredFile {
-            id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            size_bytes: 100,
-        }];
-        let entry_points = vec![EntryPoint {
-            path: PathBuf::from("/project/src/app.ts"),
-            source: EntryPointSource::PackageJsonMain,
-        }];
-        let resolved_modules = vec![ResolvedModule {
-            file_id: FileId(0),
-            path: PathBuf::from("/project/src/app.ts"),
-            ..Default::default()
-        }];
-
-        let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
-        let root = Path::new("/project");
-        let mut script_used = FxHashSet::default();
-        script_used.insert("microbundle".to_string());
-
-        let trace = trace_dependency(&graph, root, "microbundle", &script_used);
-        assert!(
-            trace.is_used,
-            "is_used must be true when the package is referenced from package.json scripts"
-        );
-        assert!(trace.used_in_scripts);
-        assert_eq!(trace.import_count, 0);
-        assert!(trace.imported_by.is_empty());
-    }
-
-    #[test]
     fn trace_clone_finds_matching_group() {
         use crate::duplicates::{CloneGroup, CloneInstance, DuplicationReport, DuplicationStats};
         let report = DuplicationReport {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/a.ts"),
                         start_line: 10,
                         end_line: 20,
@@ -2555,6 +3233,7 @@ mod tests {
                         fragment: "fn foo() {}".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/b.ts"),
                         start_line: 5,
                         end_line: 15,
@@ -2577,6 +3256,7 @@ mod tests {
                 total_tokens: 200,
                 duplicated_tokens: 120,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 2,
                 duplication_percentage: 22.0,
                 clone_groups_below_min_occurrences: 0,
@@ -2601,6 +3281,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/a.ts"),
                         start_line: 10,
                         end_line: 20,
@@ -2609,6 +3290,7 @@ mod tests {
                         fragment: "fn buildInvoice() {}".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/b.ts"),
                         start_line: 5,
                         end_line: 15,
@@ -2644,6 +3326,7 @@ mod tests {
         let report = DuplicationReport {
             clone_groups: vec![CloneGroup {
                 instances: vec![CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("/project/src/a.ts"),
                     start_line: 10,
                     end_line: 20,
@@ -2665,6 +3348,7 @@ mod tests {
                 total_tokens: 100,
                 duplicated_tokens: 60,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 1,
                 duplication_percentage: 22.0,
                 clone_groups_below_min_occurrences: 0,
@@ -2684,6 +3368,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/a.ts"),
                         start_line: 10,
                         end_line: 20,
@@ -2692,6 +3377,7 @@ mod tests {
                         fragment: "code".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/b.ts"),
                         start_line: 1,
                         end_line: 11,
@@ -2714,6 +3400,7 @@ mod tests {
                 total_tokens: 200,
                 duplicated_tokens: 100,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 2,
                 duplication_percentage: 22.0,
                 clone_groups_below_min_occurrences: 0,
@@ -2746,6 +3433,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/a.ts"),
                         start_line: 1,
                         end_line: 10,
@@ -2754,6 +3442,7 @@ mod tests {
                         fragment: "code".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: PathBuf::from("/project/src/b.ts"),
                         start_line: 1,
                         end_line: 10,
@@ -2776,6 +3465,7 @@ mod tests {
                 total_tokens: 100,
                 duplicated_tokens: 100,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 2,
                 duplication_percentage: 40.0,
                 clone_groups_below_min_occurrences: 0,
@@ -2811,27 +3501,42 @@ mod tests {
     /// failures: the MCP layer passes forward-slashed user input
     /// (`src/utils.ts`) but `module_path` on Windows uses backslash
     /// separators (`D:\a\fallow\...\src\utils.ts`). The byte-level
-    /// equality check missed every match. The helper now normalises
+    /// equality check missed every match. The lookup now normalises
     /// both sides to forward slashes before comparing.
-    #[test]
-    fn path_matches_normalises_windows_module_path_against_posix_user_path() {
-        let root = Path::new(r"D:\a\fallow\fallow\tests\fixtures\basic-project");
-        let module_path =
-            PathBuf::from(r"D:\a\fallow\fallow\tests\fixtures\basic-project\src\utils.ts");
-        assert!(path_matches(&module_path, root, "src/utils.ts"));
-        assert!(path_matches(&module_path, root, r"src\utils.ts"));
+    fn single_module_graph(path: &str) -> ModuleGraph {
+        let path = PathBuf::from(path);
+        let files = vec![DiscoveredFile {
+            id: FileId(0),
+            path: path.clone(),
+            size_bytes: 10,
+        }];
+        let resolved_modules = vec![ResolvedModule {
+            file_id: FileId(0),
+            path,
+            ..Default::default()
+        }];
+        ModuleGraph::build(&resolved_modules, &[], &files)
     }
 
     #[test]
-    fn path_matches_ends_with_fallback_handles_mixed_separators() {
+    fn find_module_normalises_windows_module_path_against_posix_user_path() {
+        let root = Path::new(r"D:\a\fallow\fallow\tests\fixtures\basic-project");
+        let graph =
+            single_module_graph(r"D:\a\fallow\fallow\tests\fixtures\basic-project\src\utils.ts");
+        assert!(find_module(&graph, root, "src/utils.ts").is_some());
+        assert!(find_module(&graph, root, r"src\utils.ts").is_some());
+    }
+
+    #[test]
+    fn find_module_suffix_fallback_handles_mixed_separators() {
         let root = Path::new("/some/other/root");
-        let module_path =
-            PathBuf::from(r"D:\a\fallow\fallow\tests\fixtures\basic-project\src\utils.ts");
-        assert!(path_matches(&module_path, root, "src/utils.ts"));
+        let graph =
+            single_module_graph(r"D:\a\fallow\fallow\tests\fixtures\basic-project\src\utils.ts");
+        assert!(find_module(&graph, root, "src/utils.ts").is_some());
     }
 
     /// Regression for the MCP e2e trace_export / trace_file failures: even
-    /// after `path_matches` correctly identified the file on Windows, the
+    /// after `find_module` correctly identified the file on Windows, the
     /// trace output struct's `file: PathBuf` field serialized the stored
     /// backslash-shaped path verbatim. JSON consumers (MCP agents, CI
     /// pipelines, the cross-platform trace_file assertion in
@@ -2847,10 +3552,10 @@ mod tests {
             file_reachable: true,
             is_entry_point: false,
             is_used: true,
-            direct_references: vec![ExportReference {
-                from_file: PathBuf::from(r"src\entry.ts"),
-                kind: "named import".to_string(),
-            }],
+            direct_references: vec![ExportReference::new(
+                PathBuf::from(r"src\entry.ts"),
+                "named import".to_string(),
+            )],
             direct_references_by_namespace: Vec::new(),
             star_export_ambiguity: None,
             re_export_chains: vec![ReExportChain {
@@ -2858,6 +3563,7 @@ mod tests {
                 exported_as: "foo".to_string(),
                 reference_count: 1,
             }],
+            plugin_credits: Vec::new(),
             reason: "ok".to_string(),
             semantic: None,
         };
@@ -2894,6 +3600,7 @@ mod tests {
                 imported_name: "foo".to_string(),
                 exported_name: "foo".to_string(),
             }],
+            sources: Vec::new(),
         };
         let json = serde_json::to_string(&trace).expect("serializes");
         assert!(json.contains("\"file\":\"src/utils.ts\""), "got {json}");

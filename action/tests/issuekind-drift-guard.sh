@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # Shared drift guard: every canonical dead-code IssueKind must surface in the
-# jq summary / annotation / filter tables that are supposed to carry the full
-# dead-code set. A new fallow IssueKind that is not wired into one of those
-# surfaces would otherwise vanish silently from PR/MR output (the class of gap
-# this guard exists to catch). It gates ALL such surfaces, not just
-# summary-check.jq:
+# tables that are supposed to carry the full dead-code set. A new fallow
+# IssueKind that is not wired into one of those surfaces would otherwise vanish
+# silently from PR/MR output (the class of gap this guard exists to catch). The
+# gated surfaces:
 #
-#   action/jq/summary-check.jq      (all)   GitHub dead-code summary table
-#   action/jq/summary-combined.jq   (all)   GitHub combined Code-issues breakdown
-#   action/jq/summary-audit.jq      (all)   GitHub audit dead_code_rows
-#   action/jq/annotations-check.jq  (all)   GitHub ::warning annotations
 #   action/jq/filter-changed.jq     (all)   per-changed-file filter + recount
-#   ci/jq/summary-check.jq          (all)   GitLab dead-code summary table
-#   ci/jq/summary-combined.jq       (all)   GitLab combined Code-issues breakdown
-#   ci/jq/summary-audit.jq          (all)   GitLab audit dead_code_rows
+#   editors/vscode DIAGNOSTIC_CATEGORIES    LSP diagnostic-code catalog
 #
-# Sourced by both action/tests/run.sh and ci/tests/run.sh. Relies on the
+# The other action/jq files are frozen legacy renderers for fallow before
+# 3.4.2. Those binaries do not emit newer kinds, so this guard does not gate
+# them. The native renderers in crates/cli/src/report/github_{summary,
+# annotations}.rs carry the kind coverage for 3.4.2 and later, and their Rust
+# tests check it.
+#
+# Sourced by both action/tests/run.sh and ci/tests/run.sh. The GitLab suite
+# checks only the helpers, because the GitLab scripts use the typed Rust
+# formats and have no jq surface. Relies on the
 # `pass` / `fail` helpers defined by the sourcing runner, plus `$GUARD_DIR`
 # (the directory containing this script) being set by the caller.
 #
@@ -159,6 +160,8 @@ issuekind_json_key_fallback() {
     unused-export) echo "unused_exports" ;;
     unused-type) echo "unused_types" ;;
     private-type-leak) echo "private_type_leaks" ;;
+    deprecated-export-in-use) echo "deprecated_exports_in_use" ;;
+    package-cycle) echo "package_cycles" ;;
     unused-dependency) echo "unused_dependencies" ;;
     unused-dev-dependency) echo "unused_dev_dependencies" ;;
     unused-optional-dependency) echo "unused_optional_dependencies" ;;
@@ -189,10 +192,14 @@ issuekind_json_key_fallback() {
     unprovided-inject) echo "unprovided_injects" ;;
     unrendered-component) echo "unrendered_components" ;;
     unused-component-prop) echo "unused_component_props" ;;
+    absent-component-prop) echo "absent_component_props" ;;
     unused-component-emit) echo "unused_component_emits" ;;
     unused-component-input) echo "unused_component_inputs" ;;
     unused-component-output) echo "unused_component_outputs" ;;
     unused-svelte-event) echo "unused_svelte_events" ;;
+    unused-effect-layer) echo "unused_effect_layers" ;;
+    unused-tagged-error) echo "unused_tagged_errors" ;;
+    unproduced-catch-tag) echo "unproduced_catch_tags" ;;
     unused-server-action) echo "unused_server_actions" ;;
     unused-load-data-key) echo "unused_load_data_keys" ;;
     route-collision) echo "route_collisions" ;;
@@ -299,13 +306,6 @@ issuekind_key_present() {
   grep -qE "\"${key}\"|\.${key}([^A-Za-z0-9_]|$)" <<< "$stripped"
 }
 
-issuekind_summary_table_row_present() {
-  local jq_src="$1" key="$2" label="$3" anchor="$4" stripped expected
-  stripped="$(printf '%s' "$jq_src" | issuekind_strip_jq_comments)"
-  expected="table_row(\"$label\"; \"$key\"; \"$anchor\")"
-  grep -qF "$expected" <<< "$stripped"
-}
-
 # Is <kebab-id> in the space-separated allowed-omission list <allow>? Used to
 # tolerate the documented per-surface subset exceptions.
 issuekind_in_allowlist() {
@@ -354,13 +354,8 @@ assert_issuekind_summary_coverage() {
       # Non-dead-code kinds (security, dupes, health, flags) live on other
       # surfaces; only the suppress.rs fallback yields them. Skip, don't fail.
       #
-      # prop-drilling / thin-wrapper / duplicate-prop-shape are command-tagged
-      # dead-code, but they are opt-in (default-off) React/Preact advisory
-      # health signals surfaced ONLY in the CLI human report + raw JSON. They
-      # are deliberately NOT emitted by the LSP (no DIAGNOSTIC_ISSUE_TYPES
-      # entry) and not carried by the PR-summary jq surfaces, so they are
-      # classified here like complexity / coverage-gaps rather than gated for
-      # surface presence.
+      # Native Rust reports and LSP diagnostics cover these opt-in families;
+      # frozen jq adapters do not acquire newer renderer contracts.
       case "$id" in
         security-*|code-duplication|complexity|coverage-gaps|feature-flag|prop-drilling|thin-wrapper|duplicate-prop-shape)
           skipped+=("$id") ;;
@@ -403,65 +398,6 @@ assert_issuekind_summary_coverage() {
   fi
 
   pass "$label: every gated dead-code IssueKind appears in the surface"
-}
-
-# Run the summary-table contract guard against standalone dead-code summary
-# renderers. Unlike the broad surface coverage guard above, this checks the
-# human-visible table label and docs anchor for each counted result row.
-assert_issuekind_summary_table_contract() {
-  local label="$1" jq_file="$2"
-  local jq_src rows ids id key counts summary_label summary_anchor missing=() skipped=()
-
-  if [ ! -f "$jq_file" ]; then
-    fail "$label: surface file present" "missing file: $jq_file"
-    return
-  fi
-  jq_src="$(cat "$jq_file")"
-  rows="$(fallow_dead_code_schema_rows 2>/dev/null || true)"
-  if ! grep -q $'\t.*\t.*\t' <<< "$rows"; then
-    echo "    (skipped summary label contract: schema metadata unavailable)"
-    return
-  fi
-  ids="$(fallow_dead_code_ids 2>/dev/null)"
-
-  if [ -z "$ids" ]; then
-    fail "$label: canonical IssueKind set resolved" "no dead-code ids derived"
-    return
-  fi
-
-  while IFS= read -r id; do
-    [ -z "$id" ] && continue
-    if ! key="$(issuekind_schema_field "$id" result_key)"; then
-      skipped+=("$id")
-      continue
-    fi
-    counts="$(issuekind_schema_field "$id" counts_in_total || true)"
-    if [ "$counts" != "true" ] || [ -z "$key" ]; then
-      skipped+=("$id")
-      continue
-    fi
-    summary_label="$(issuekind_schema_field "$id" summary_label || true)"
-    summary_anchor="$(issuekind_schema_field "$id" summary_docs_anchor || true)"
-    if [ -z "$summary_label" ] || [ -z "$summary_anchor" ]; then
-      missing+=("$id -> missing summary metadata")
-      continue
-    fi
-    if ! issuekind_summary_table_row_present "$jq_src" "$key" "$summary_label" "$summary_anchor"; then
-      missing+=("$id -> table_row(\"$summary_label\"; \"$key\"; \"$summary_anchor\")")
-    fi
-  done <<< "$ids"
-
-  if [ "${#skipped[@]}" -gt 0 ]; then
-    echo "    (skipped rows not counted by standalone summaries: ${skipped[*]})"
-  fi
-
-  if [ "${#missing[@]}" -gt 0 ]; then
-    fail "$label: summary labels and docs anchors match registry" \
-      "missing or mismatched row(s): ${missing[*]}"
-    return
-  fi
-
-  pass "$label: summary labels and docs anchors match registry"
 }
 
 # Assert the VS Code extension's DIAGNOSTIC_CATEGORIES, the LSP diagnostic-code
@@ -512,7 +448,14 @@ assert_issuekind_vscode_category_coverage() {
       esac
       continue
     fi
-    if ! printf '%s' "$wiring_src" | grep -qE "field: \"${key}\""; then
+    # deprecated-export-in-use has no editor surface in v1: TypeScript already
+    # strikes deprecated names through in the editor, so the LSP does not emit
+    # it and DIAGNOSTIC_CATEGORIES does not carry it.
+    if [ "$id" = "deprecated-export-in-use" ]; then
+      skipped+=("$id")
+      continue
+    fi
+    if ! grep -qE "field: \"${key}\"" <<< "$wiring_src"; then
       missing_wiring+=("$id -> $key")
     fi
     if [ "$id" = "missing-suppression-reason" ]; then
@@ -523,7 +466,7 @@ assert_issuekind_vscode_category_coverage() {
     # family collapses to boundary-violation); the quotes bound the match so
     # "unused-file" never matches "unused-files".
     code="$(issuekind_diagnostic_code "$id")"
-    if printf '%s' "$ts_src" | grep -qE "\"${code}\""; then
+    if grep -qE "\"${code}\"" <<< "$ts_src"; then
       continue
     fi
     missing+=("$id -> code \"$code\"")

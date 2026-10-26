@@ -1,8 +1,6 @@
 //! Shared list command JSON output assembly.
 
-use fallow_output::{
-    ListEntryPointOutput, ListOutput, ListPluginOutput, RootEnvelopeMode, WorkspacesOutput,
-};
+use fallow_output::{ListEntryPointOutput, ListOutput, ListPluginOutput, WorkspacesOutput};
 use serde::Serialize;
 
 /// Root envelope mode for a `fallow list --format json` payload.
@@ -27,9 +25,17 @@ pub struct ListJsonOutputInput<Boundaries, Diagnostic> {
     pub entry_points: Option<Vec<ListEntryPointOutput>>,
     /// Boundaries listing payload; `None` omits the section.
     pub boundaries: Option<Boundaries>,
+    /// Startup import weight per runtime entry; `None` omits the section.
+    pub entry_weight: Option<fallow_output::EntryWeightListing>,
     /// Workspace listing whose count, members, and diagnostics are flattened
     /// into the output body; `None` omits all three fields.
     pub workspaces: Option<WorkspacesOutput<Diagnostic>>,
+    /// Diagnostics the plugin stage recorded (`plugin-config-unreadable`,
+    /// `plugin-effect-not-modeled`), appended to `workspace_diagnostics`.
+    /// When the workspace listing is absent, a non-empty set still emits
+    /// `workspace_diagnostics`, so a listing of plugins or entry points states
+    /// the plugin problem that shaped it.
+    pub plugin_diagnostics: Vec<Diagnostic>,
 }
 
 /// Build the typed list output body before optional root wrapping.
@@ -45,7 +51,7 @@ pub fn build_list_json_output<Boundaries, Diagnostic>(
     });
     let file_count = input.files.as_ref().map(Vec::len);
     let entry_point_count = input.entry_points.as_ref().map(Vec::len);
-    let (workspace_count, workspaces, workspace_diagnostics) =
+    let (workspace_count, workspaces, mut workspace_diagnostics) =
         input.workspaces.map_or((None, None, None), |workspaces| {
             (
                 Some(workspaces.workspace_count),
@@ -53,6 +59,11 @@ pub fn build_list_json_output<Boundaries, Diagnostic>(
                 Some(workspaces.workspace_diagnostics),
             )
         });
+    if !input.plugin_diagnostics.is_empty() {
+        workspace_diagnostics
+            .get_or_insert_with(Vec::new)
+            .extend(input.plugin_diagnostics);
+    }
 
     ListOutput {
         plugins,
@@ -61,6 +72,7 @@ pub fn build_list_json_output<Boundaries, Diagnostic>(
         entry_point_count,
         entry_points: input.entry_points,
         boundaries: input.boundaries,
+        entry_weight: input.entry_weight,
         workspace_count,
         workspaces,
         workspace_diagnostics,
@@ -75,7 +87,6 @@ pub fn build_list_json_output<Boundaries, Diagnostic>(
 /// JSON.
 pub fn serialize_list_json_output<Boundaries, Diagnostic>(
     input: ListJsonOutputInput<Boundaries, Diagnostic>,
-    mode: RootEnvelopeMode,
     envelope: ListJsonEnvelope,
 ) -> Result<serde_json::Value, serde_json::Error>
 where
@@ -86,10 +97,10 @@ where
     match envelope {
         ListJsonEnvelope::Plain => serde_json::to_value(output),
         ListJsonEnvelope::Boundaries => {
-            fallow_output::serialize_list_boundaries_json_output(output, mode)
+            fallow_output::serialize_list_boundaries_json_output(output)
         }
         ListJsonEnvelope::Workspaces => {
-            fallow_output::serialize_list_workspaces_json_output(output, mode)
+            fallow_output::serialize_list_workspaces_json_output(output)
         }
     }
 }
@@ -112,9 +123,10 @@ mod tests {
                     source: "package.json main".to_string(),
                 }]),
                 boundaries: None,
+                entry_weight: None,
                 workspaces: None,
+                plugin_diagnostics: Vec::new(),
             },
-            RootEnvelopeMode::Tagged,
             ListJsonEnvelope::Plain,
         )
         .expect("list output should serialize");
@@ -134,9 +146,10 @@ mod tests {
                 files: None,
                 entry_points: None,
                 boundaries: Some(json!({"configured": false})),
+                entry_weight: None,
                 workspaces: None,
+                plugin_diagnostics: Vec::new(),
             },
-            RootEnvelopeMode::Tagged,
             ListJsonEnvelope::Boundaries,
         )
         .expect("list output should serialize");

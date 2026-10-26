@@ -124,6 +124,8 @@ pub enum IssueKind {
     /// declared prop that is referenced NOWHERE inside its own component.
     /// Single-component dead-input direction.
     UnusedComponentProp,
+    /// Used optional input absent from inspected reachable callers.
+    AbsentComponentProp,
     /// A Vue `<script setup>` `defineEmits` declared event that is EMITTED
     /// nowhere inside its own single-file component (no `emit('<name>')` call).
     /// Single-file dead-input direction.
@@ -199,6 +201,40 @@ pub enum IssueKind {
     /// would omit it and break at runtime. The promote-side mirror of
     /// `test-only-dependency` / `type-only-dependency`.
     DevDependencyInProduction,
+    /// An export whose leading JSDoc carries `@deprecated` and that still has
+    /// at least one reachable reference. Reported at the export site with the
+    /// consumer count and a capped consumer sample.
+    DeprecatedExportInUse,
+    /// A dependency cycle between workspace packages, built from resolved
+    /// cross-package imports. Reported even when no file-level cycle exists.
+    PackageCycle,
+    /// An Effect layer whose every reference sits inside other layers that
+    /// nothing uses. A layer with zero references stays an `unused-export` or
+    /// an `unused-class-member`.
+    UnusedEffectLayer,
+    /// An Effect tagged error class that type positions or `catchTag` handlers
+    /// reference, but that no code constructs, fails with, or reads as a value.
+    UnusedTaggedError,
+    /// A `catchTag("X")` / `catchTags({ X })` handler whose project tag `X` no
+    /// code produces, when no `unused-tagged-error` finding already covers it.
+    UnproducedCatchTag,
+    /// An audit diff that weakens tests: a new skip or focus marker, removed
+    /// test cases, fewer assertions, or a lowered coverage threshold.
+    /// Audit-only, computed from the base and head text of changed files.
+    WeakenedTests,
+    /// An audit diff that adds a lint, type-check, coverage or Fallow
+    /// suppression comment. Audit-only.
+    AddedSuppression,
+    /// An audit diff that adds a test-environment branch, such as
+    /// `process.env.NODE_ENV === 'test'`, to a non-test source file.
+    /// Audit-only.
+    TestOnlyBranch,
+    /// An audit diff that edits one instance of a base clone group so that it
+    /// no longer matches its siblings, while no sibling changed. Audit-only.
+    DivergedCloneSibling,
+    /// An audit diff that adds a dependency to a `package.json`. Audit-only
+    /// and off by default.
+    AddedDependency,
 }
 
 impl IssueKind {
@@ -242,6 +278,7 @@ impl IssueKind {
         Self::DynamicSegmentNameConflict,
         Self::UnrenderedComponent,
         Self::UnusedComponentProp,
+        Self::AbsentComponentProp,
         Self::UnusedComponentEmit,
         Self::UnusedComponentInput,
         Self::UnusedComponentOutput,
@@ -257,6 +294,16 @@ impl IssueKind {
         Self::CssDeadSurface,
         Self::CssBrokenReference,
         Self::DevDependencyInProduction,
+        Self::DeprecatedExportInUse,
+        Self::PackageCycle,
+        Self::UnusedEffectLayer,
+        Self::UnusedTaggedError,
+        Self::UnproducedCatchTag,
+        Self::WeakenedTests,
+        Self::AddedSuppression,
+        Self::TestOnlyBranch,
+        Self::DivergedCloneSibling,
+        Self::AddedDependency,
     ];
 
     /// Parse an issue kind from the string tokens used in CLI output and suppression comments.
@@ -322,6 +369,17 @@ impl IssueKind {
             Self::CssDeadSurface => 51,
             Self::CssBrokenReference => 52,
             Self::DevDependencyInProduction => 53,
+            Self::DeprecatedExportInUse => 54,
+            Self::PackageCycle => 55,
+            Self::AbsentComponentProp => 56,
+            Self::UnusedEffectLayer => 57,
+            Self::UnusedTaggedError => 58,
+            Self::UnproducedCatchTag => 59,
+            Self::WeakenedTests => 60,
+            Self::AddedSuppression => 61,
+            Self::TestOnlyBranch => 62,
+            Self::DivergedCloneSibling => 63,
+            Self::AddedDependency => 64,
         }
     }
 
@@ -382,6 +440,17 @@ impl IssueKind {
             51 => Some(Self::CssDeadSurface),
             52 => Some(Self::CssBrokenReference),
             53 => Some(Self::DevDependencyInProduction),
+            54 => Some(Self::DeprecatedExportInUse),
+            55 => Some(Self::PackageCycle),
+            56 => Some(Self::AbsentComponentProp),
+            57 => Some(Self::UnusedEffectLayer),
+            58 => Some(Self::UnusedTaggedError),
+            59 => Some(Self::UnproducedCatchTag),
+            60 => Some(Self::WeakenedTests),
+            61 => Some(Self::AddedSuppression),
+            62 => Some(Self::TestOnlyBranch),
+            63 => Some(Self::DivergedCloneSibling),
+            64 => Some(Self::AddedDependency),
             _ => None,
         }
     }
@@ -664,60 +733,12 @@ pub struct UnknownSuppressionKind {
     pub reason: Option<String>,
 }
 
-/// Levenshtein edit distance between two ASCII-leaning strings.
-///
-/// Local duplicate of the config-crate helper (see
-/// `crates/config/src/config/rules.rs::levenshtein`) so `fallow-types` can
-/// compute "did you mean?" suggestions for unknown suppression tokens without
-/// taking a dependency on `fallow-config`. Issue-kind names are short
-/// (max ~33 chars) so allocation cost is negligible.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let (a_len, b_len) = (a_bytes.len(), b_bytes.len());
-
-    if a_len == 0 {
-        return b_len;
-    }
-    if b_len == 0 {
-        return a_len;
-    }
-
-    let mut prev: Vec<usize> = (0..=b_len).collect();
-    let mut curr: Vec<usize> = vec![0; b_len + 1];
-
-    for i in 1..=a_len {
-        curr[0] = i;
-        for j in 1..=b_len {
-            let cost = usize::from(a_bytes[i - 1] != b_bytes[j - 1]);
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[b_len]
-}
-
 /// Find the closest known issue-kind name to `input` when it is plausibly a typo.
 ///
-/// Returns the best match when the Levenshtein distance is at most 2 AND
-/// the input is long enough that the match is not coincidental
-/// (`input.len() / 2 > distance`). Returns `None` for completely novel
-/// strings where a suggestion would be misleading.
+/// Applies the policy of [`crate::levenshtein::closest_match`].
 #[must_use]
 pub fn closest_known_kind_name(input: &str) -> Option<&'static str> {
-    let input_lower = input.to_ascii_lowercase();
-    let mut best: Option<(&'static str, usize)> = None;
-
-    for &candidate in KNOWN_ISSUE_KIND_NAMES.iter() {
-        let d = levenshtein(&input_lower, candidate);
-        if best.is_none_or(|(_, b_dist)| d < b_dist) {
-            best = Some((candidate, d));
-        }
-    }
-
-    best.filter(|&(_, d)| d > 0 && d <= 2 && input_lower.len() / 2 > d)
-        .map(|(name, _)| name)
+    crate::levenshtein::closest_match(input, KNOWN_ISSUE_KIND_NAMES.iter().copied())
 }
 
 const _: () = assert!(std::mem::size_of::<IssueKind>() == 1);
@@ -766,6 +787,21 @@ mod tests {
     }
 
     #[test]
+    fn issue_kind_parse_accepts_diff_risk_tokens() {
+        let cases = [
+            ("weakened-tests", IssueKind::WeakenedTests),
+            ("added-suppression", IssueKind::AddedSuppression),
+            ("test-only-branch", IssueKind::TestOnlyBranch),
+            ("diverged-clone-sibling", IssueKind::DivergedCloneSibling),
+            ("added-dependency", IssueKind::AddedDependency),
+        ];
+        for (token, kind) in cases {
+            assert_eq!(IssueKind::parse(token), Some(kind), "{token}");
+            assert_eq!(issue_kind_to_kebab(kind), token);
+        }
+    }
+
+    #[test]
     fn issue_kind_from_str_unknown() {
         assert_eq!(IssueKind::parse("foo"), None);
         assert_eq!(IssueKind::parse(""), None);
@@ -783,8 +819,37 @@ mod tests {
     fn discriminant_out_of_range() {
         // Pin exact discriminants so an inserted or reordered variant that
         // shifts wire values is caught. `ALL` is not discriminant-ordered, so
-        // the mapping is spelled out explicitly.
+        // the mapping is spelled out explicitly, and the row count is checked
+        // against `ALL` below so a new variant cannot be added without a row.
         let cases: &[(u8, IssueKind)] = &[
+            (1, IssueKind::UnusedFile),
+            (2, IssueKind::UnusedExport),
+            (3, IssueKind::UnusedType),
+            (4, IssueKind::PrivateTypeLeak),
+            (5, IssueKind::UnusedDependency),
+            (6, IssueKind::UnusedDevDependency),
+            (7, IssueKind::UnusedEnumMember),
+            (8, IssueKind::UnusedClassMember),
+            (9, IssueKind::UnresolvedImport),
+            (10, IssueKind::UnlistedDependency),
+            (11, IssueKind::DuplicateExport),
+            (12, IssueKind::CodeDuplication),
+            (13, IssueKind::CircularDependency),
+            (14, IssueKind::TypeOnlyDependency),
+            (15, IssueKind::TestOnlyDependency),
+            (16, IssueKind::BoundaryViolation),
+            (17, IssueKind::CoverageGaps),
+            (18, IssueKind::FeatureFlag),
+            (19, IssueKind::Complexity),
+            (20, IssueKind::StaleSuppression),
+            (21, IssueKind::PnpmCatalogEntry),
+            (22, IssueKind::UnresolvedCatalogReference),
+            (23, IssueKind::UnusedDependencyOverride),
+            (24, IssueKind::MisconfiguredDependencyOverride),
+            (25, IssueKind::EmptyCatalogGroup),
+            (26, IssueKind::ReExportCycle),
+            (27, IssueKind::SecurityClientServerLeak),
+            (28, IssueKind::SecuritySink),
             (29, IssueKind::PolicyViolation),
             (30, IssueKind::InvalidClientExport),
             (31, IssueKind::MixedClientServerBarrel),
@@ -810,6 +875,17 @@ mod tests {
             (51, IssueKind::CssDeadSurface),
             (52, IssueKind::CssBrokenReference),
             (53, IssueKind::DevDependencyInProduction),
+            (54, IssueKind::DeprecatedExportInUse),
+            (55, IssueKind::PackageCycle),
+            (56, IssueKind::AbsentComponentProp),
+            (57, IssueKind::UnusedEffectLayer),
+            (58, IssueKind::UnusedTaggedError),
+            (59, IssueKind::UnproducedCatchTag),
+            (60, IssueKind::WeakenedTests),
+            (61, IssueKind::AddedSuppression),
+            (62, IssueKind::TestOnlyBranch),
+            (63, IssueKind::DivergedCloneSibling),
+            (64, IssueKind::AddedDependency),
         ];
         for &(discriminant, kind) in cases {
             assert_eq!(kind.to_discriminant(), discriminant, "{kind:?} drifted");
@@ -952,6 +1028,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow under Miri: edit distance over every issue kind in safe code"
+    )]
     fn closest_known_kind_name_finds_near_misses() {
         assert_eq!(
             closest_known_kind_name("unused-exports"),
@@ -962,6 +1042,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow under Miri: edit distance over every issue kind in safe code"
+    )]
     fn closest_known_kind_name_rejects_novel_strings() {
         assert_eq!(closest_known_kind_name("xyzzy"), None);
         assert_eq!(closest_known_kind_name("foo"), None);
@@ -969,6 +1053,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow under Miri: edit distance over every issue kind in safe code"
+    )]
     fn closest_known_kind_name_skips_exact_match() {
         assert_eq!(closest_known_kind_name("unused-export"), None);
     }

@@ -28,6 +28,9 @@ Use this file for a fast architectural map before editing or reviewing.
   modes.
 - `crates/license/`: offline license verification and feature entitlements.
 - `crates/security/`: data-driven security source and sink catalogue.
+- `crates/mutation/`: pure mutant site discovery, mutant ids, and
+  mutation-switching instrumentation by text splice. It depends only on Oxc
+  crates, not on other workspace crates.
 - `crates/v8-coverage/`: V8 coverage parsing and normalization.
 - `tools/similar-code-sidecar/`: pinned local Candle inference and model setup
   for opt-in semantic similar-code discovery.
@@ -89,6 +92,13 @@ Find the first incorrect stage before editing:
   provider transport, vector cache, orchestration, inspect evidence, and verdict
   joining.
 - `crates/engine/src/health/`: scoring, hotspots, targets, and coverage gaps.
+- `crates/engine/src/test_paths.rs`: the shared test-path predicates.
+  `is_test_code_path` matches test code only. Audit test adjacency, the audit
+  diff-risk test rules, and similar-code related tests use it.
+  `is_test_path` also matches test support (mocks, fixtures, and snapshots).
+  Hotspots, the human check split, orientation, and the audit branching split
+  use it. Do not add a private copy. A caller that must also skip other paths
+  adds them on top.
 - `crates/api/src/runtime/`: typed programmatic run entry points.
 - `crates/output/src/issue_contract.rs`: output-facing issue metadata.
 - `crates/output/src/root_envelopes.rs`: root envelope policy.
@@ -101,10 +111,14 @@ Find the first incorrect stage before editing:
 - `crates/napi/src/lib.rs`: Node.js API bindings.
 - `editors/vscode/src/`: editor client and commands.
 - `crates/engine/src/viz.rs`: command-neutral visualization graph data.
-- `crates/cli/src/viz.rs`: visualization command and asset serving.
+- `crates/cli/src/viz/mod.rs`: visualization command and asset serving.
 - `viz-frontend/src/`: browser rendering and interaction.
-- `action.yml`, `action/scripts/`, `action/jq/`: GitHub Action.
-- `ci/gitlab-ci.yml`, `ci/scripts/`, `ci/jq/`: GitLab CI.
+- `action.yml`, `action/scripts/`, `action/jq/`: GitHub Action. The job
+  summary and annotations come from the native `fallow report` formats.
+  `action/jq/filter-changed.jq` and `summary-fix.jq` serve every fallow
+  version. The other `action/jq/` files are frozen legacy renderers for
+  fallow before 3.4.2 and do not get new issue kinds.
+- `ci/gitlab-ci.yml`, `ci/scripts/`: GitLab CI.
 
 ## System invariants
 

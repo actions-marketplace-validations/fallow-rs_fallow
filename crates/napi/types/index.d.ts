@@ -17,19 +17,30 @@ export interface TypeAwareAnalysisOptions extends AnalysisOptions {
 }
 
 export interface TypeAwareOptions {
+  /**
+   * `true` runs type-aware analysis. `false` keeps the call syntactic, also
+   * when `typeAware.enabled` or `FALLOW_TYPE_AWARE` turns it on. When unset
+   * and one of these turns it on, the call rejects with
+   * `FALLOW_TYPE_AWARE_CONFIG_UNSUPPORTED`.
+   */
   enabled?: boolean;
   projects?: string[];
   require?: 'best-effort' | 'complete';
 }
 
 export interface DeadCodeOptions extends TypeAwareAnalysisOptions {
+  /** Ignore the per-package refs of `workspaces.changedSince` for this call. */
+  noPackageBaselines?: boolean;
   unusedFiles?: boolean;
   unusedExports?: boolean;
   unusedDeps?: boolean;
   unusedTypes?: boolean;
   privateTypeLeaks?: boolean;
+  deprecatedExportsInUse?: boolean;
   unusedEnumMembers?: boolean;
   unusedClassMembers?: boolean;
+  /** Review locally read optional props absent from inspected callers. Defaults to off. */
+  absentComponentProps?: boolean;
   unresolvedImports?: boolean;
   unlistedDeps?: boolean;
   duplicateExports?: boolean;
@@ -38,17 +49,43 @@ export interface DeadCodeOptions extends TypeAwareAnalysisOptions {
   staleSuppressions?: boolean;
   files?: string[];
   includeEntryExports?: boolean;
+  showCascade?: boolean;
+  findingIds?: string[];
+}
+
+/**
+ * Options for `detectArchitecture`. No selector reports every kind; each
+ * selector keeps one kind, as `fallow architecture --cycles`, `--boundaries`
+ * and `--policy` do.
+ */
+export interface ArchitectureOptions extends AnalysisOptions {
+  /** Ignore the per-package refs of `workspaces.changedSince` for this call. */
+  noPackageBaselines?: boolean;
+  /** Report only import cycles: circular dependencies, re-export cycles and package cycles. */
+  cycles?: boolean;
+  /** Report only boundary violations, boundary coverage and forbidden calls. */
+  boundaries?: boolean;
+  /** Report only rule-pack policy violations. */
+  policy?: boolean;
+  files?: string[];
 }
 
 export type DuplicationMode = 'strict' | 'mild' | 'weak' | 'semantic';
 
 export interface DuplicationOptions extends AnalysisOptions {
+  /** Ignore the per-package refs of `workspaces.changedSince` for this call. */
+  noPackageBaselines?: boolean;
   mode?: DuplicationMode;
   near?: boolean;
   minTokens?: number;
   minLines?: number;
   threshold?: number;
   skipLocal?: boolean;
+  /**
+   * Omit clone instances whose path is a symlink or lies under a symlinked
+   * directory. Omit it to use the project config.
+   */
+  ignoreSymlinks?: boolean;
   crossLanguage?: boolean;
   ignoreImports?: boolean;
   top?: number;
@@ -124,11 +161,13 @@ export interface AnalysisAction {
 }
 
 export interface DeadCodeSummary {
+  absent_component_props: number;
   total_issues: number;
   unused_files: number;
   unused_exports: number;
   unused_types: number;
   private_type_leaks: number;
+  deprecated_exports_in_use: number;
   unused_dependencies: number;
   unused_enum_members: number;
   unused_class_members: number;
@@ -159,6 +198,8 @@ export interface UnusedExportFinding {
   export_name: string;
   line: number;
   col: number;
+  deprecated?: boolean;
+  deprecated_reason?: string;
   actions?: AnalysisAction[];
   [key: string]: unknown;
 }
@@ -174,12 +215,34 @@ export interface PrivateTypeLeakFinding {
   [key: string]: unknown;
 }
 
+export interface DeprecatedExportConsumer {
+  path: string;
+  line: number;
+  col: number;
+  kind: string;
+  [key: string]: unknown;
+}
+
+export interface DeprecatedExportInUseFinding {
+  path: string;
+  export_name: string;
+  line: number;
+  col: number;
+  deprecated_reason?: string;
+  consumer_count: number;
+  consumers: DeprecatedExportConsumer[];
+  public_api: boolean;
+  actions?: AnalysisAction[];
+  [key: string]: unknown;
+}
+
 export interface UnusedDependencyFinding {
   path: string;
   package_name: string;
   line: number;
   col: number;
   used_in_workspaces?: string[];
+  declared_and_imported_in?: string[];
   actions?: AnalysisAction[];
   [key: string]: unknown;
 }
@@ -270,17 +333,35 @@ export interface StaleSuppressionFinding {
   [key: string]: unknown;
 }
 
+/** An optional prop review candidate. Static caller evidence does not prove runtime unreachability. */
+export interface AbsentComponentPropFinding {
+  path: string;
+  component_name: string;
+  prop_name: string;
+  framework: string;
+  line: number;
+  col: number;
+  has_default: boolean;
+  inspected_call_sites: Array<{ path: string; line: number; col: number }>;
+  explanation: string;
+  finding_id?: string;
+  actions: AnalysisAction[];
+  effective_severity?: 'warn' | 'error';
+}
+
 export interface DeadCodeReport {
   schema_version: number;
   version: string;
   elapsed_ms: number;
   total_issues: number;
   summary: DeadCodeSummary;
+  absent_component_props?: AbsentComponentPropFinding[];
   entry_points?: EntryPointSummary;
   unused_files: UnusedFileFinding[];
   unused_exports: UnusedExportFinding[];
   unused_types: UnusedExportFinding[];
   private_type_leaks: PrivateTypeLeakFinding[];
+  deprecated_exports_in_use?: DeprecatedExportInUseFinding[];
   unused_dependencies: UnusedDependencyFinding[];
   unused_dev_dependencies: UnusedDependencyFinding[];
   unused_optional_dependencies: UnusedDependencyFinding[];
@@ -296,6 +377,14 @@ export interface DeadCodeReport {
   boundary_violations: BoundaryViolationFinding[];
   stale_suppressions: StaleSuppressionFinding[];
   _meta?: Record<string, unknown>;
+}
+
+/**
+ * The `detectArchitecture` report: the dead-code body with
+ * `kind: 'architecture'` and its own `schema_version`.
+ */
+export interface ArchitectureReport extends DeadCodeReport {
+  kind: 'architecture';
 }
 
 export interface CloneInstance {
@@ -559,6 +648,11 @@ export interface FileHealthScore {
   crap_max: number;
   crap_above_threshold: number;
   crap_exempted?: number;
+  /** Scored functions accepted by a complexity suppression, independent of configured exemptions. */
+  crap_suppressed?: number;
+  /** Remaining maximum and ceiling are supplied together; an incomplete pair uses the legacy metrics. */
+  crap_unsuppressed_max?: number;
+  crap_unsuppressed_effective_threshold?: number;
   crap_effective_threshold?: number;
   [key: string]: unknown;
 }
@@ -588,6 +682,44 @@ export interface RefactoringTarget {
   [key: string]: unknown;
 }
 
+export interface HotspotEntry {
+  path: string;
+  score: number;
+  commits: number;
+  /** Median analyzed files per commit that changed this file. Absent without commit ids. */
+  median_files_per_commit?: number;
+  /** Median changed lines per commit that changed this file. Absent without commit ids. */
+  median_lines_per_commit?: number;
+  [key: string]: unknown;
+}
+
+export interface HiddenCouplingPair {
+  path_a: string;
+  path_b: string;
+  revisions_a: number;
+  revisions_b: number;
+  shared_revisions: number;
+  /** Coupling degree from 0 to 1. */
+  degree: number;
+  /** Present and true when `degree` reaches `thresholds.strong_degree`. */
+  strong?: boolean;
+}
+
+export interface ChangeCouplingReport {
+  since: string;
+  commits_analyzed: number;
+  commits_skipped: number;
+  total_pairs: number;
+  thresholds: {
+    max_files_per_commit: number;
+    min_revisions: number;
+    min_shared_revisions: number;
+    min_degree: number;
+    strong_degree: number;
+  };
+  pairs: HiddenCouplingPair[];
+}
+
 export interface HealthReport {
   schema_version: number;
   version: string;
@@ -598,8 +730,10 @@ export interface HealthReport {
   health_score?: Record<string, unknown>;
   file_scores?: FileHealthScore[];
   coverage_gaps?: CoverageGaps;
-  hotspots?: Array<Record<string, unknown>>;
+  hotspots?: HotspotEntry[];
   hotspot_summary?: Record<string, unknown>;
+  /** Hidden change coupling. Present when the hotspots section ran and the run read the commit history. */
+  change_coupling?: ChangeCouplingReport;
   runtime_coverage?: Record<string, unknown>;
   large_functions?: Array<Record<string, unknown>>;
   targets?: RefactoringTarget[];
@@ -621,6 +755,7 @@ export type FallowNodeError = Error & FallowNodeErrorShape;
 export function detectDeadCode(options?: DeadCodeOptions): Promise<DeadCodeReport>;
 export function detectCircularDependencies(options?: DeadCodeOptions): Promise<DeadCodeReport>;
 export function detectBoundaryViolations(options?: DeadCodeOptions): Promise<DeadCodeReport>;
+export function detectArchitecture(options?: ArchitectureOptions): Promise<ArchitectureReport>;
 export function detectDuplication(options?: DuplicationOptions): Promise<DuplicationReport>;
 export function detectSimilarCode(options?: SimilarCodeOptions): Promise<SimilarCodeReport>;
 export function detectFeatureFlags(options?: FeatureFlagsOptions): Promise<FeatureFlagsReport>;

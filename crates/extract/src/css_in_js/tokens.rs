@@ -48,7 +48,6 @@
 //!
 use std::path::Path;
 
-use oxc_allocator::Allocator;
 use oxc_ast::{
     AstKind,
     ast::{
@@ -62,12 +61,12 @@ use oxc_ast::{
     },
 };
 use oxc_ast_visit::{Visit, walk};
-use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, ScopeFlags, Scoping, SemanticBuilder, SymbolId};
 use oxc_span::{GetSpan, SourceType, Span};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::object::{Lib, module_library};
+use crate::js_text::JsText;
 
 const PANDA_CONFIG_BINDING: &str = "pandaConfig";
 
@@ -117,21 +116,20 @@ pub enum CssInJsTokenOrigin {
 #[must_use]
 pub fn css_in_js_token_defs(source: &str, path: &Path) -> Vec<CssInJsTokenDef> {
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, source, source_type).parse();
-
-    let mut collector = TokenDefCollector::new(source);
-    collector.build_import_map(&ret.program);
-    if collector.imports.is_empty() {
-        return Vec::new();
-    }
-    let semantic_return = SemanticBuilder::new().build(&ret.program);
-    collector.build_const_object_map(&ret.program, semantic_return.semantic.scoping());
-    collector.collecting_mutations = true;
-    collector.visit_program(&ret.program);
-    collector.collecting_mutations = false;
-    collector.visit_program(&ret.program);
-    collector.defs
+    crate::parse_bounded_or_default(source, source_type, |ret| {
+        let mut collector = TokenDefCollector::new(source);
+        collector.build_import_map(&ret.program);
+        if collector.imports.is_empty() {
+            return Vec::new();
+        }
+        let semantic_return = SemanticBuilder::new().build(&ret.program);
+        collector.build_const_object_map(&ret.program, semantic_return.semantic.scoping());
+        collector.collecting_mutations = true;
+        collector.visit_program(&ret.program);
+        collector.collecting_mutations = false;
+        collector.visit_program(&ret.program);
+        collector.defs
+    })
 }
 
 /// One located consumer of a CSS-in-JS token: the defined LEAF token path it
@@ -146,84 +144,6 @@ pub struct TokenConsumerHit {
     pub line: u32,
 }
 
-/// Walk a consuming JS/TS source for cross-module reads of a token binding,
-/// returning the located reads that resolve to a DEFINED leaf token path. The
-/// caller supplies the local `alias` the consuming file imported the token binding
-/// under (so aliased imports work) and the set of defined leaf paths. A member
-/// access `<alias>.a.b` is a hit when `a.b` is exactly a defined leaf path;
-/// intermediate groups (`<alias>.a` where only `a.b` is defined) and accesses on
-/// other bindings are not hits, so there is no double-count and no false match.
-#[must_use]
-#[expect(
-    clippy::implicit_hasher,
-    reason = "callers build an FxHashSet; std HashSet is a disallowed type here"
-)]
-pub fn css_in_js_token_consumers(
-    source: &str,
-    path: &Path,
-    alias: &str,
-    leaf_paths: &FxHashSet<String>,
-) -> Vec<TokenConsumerHit> {
-    css_in_js_consumer_scan(
-        source,
-        path,
-        &[ConsumerQuery::MemberBinding { alias, leaf_paths }],
-    )
-    .into_iter()
-    .map(|(_, hit)| hit)
-    .collect()
-}
-
-/// Walk a consuming JS/TS source for PandaCSS `token('path.to.token')` calls.
-/// The caller supplies the local alias imported from Panda's generated
-/// `styled-system` token module and the set of defined leaf paths.
-#[must_use]
-#[expect(
-    clippy::implicit_hasher,
-    reason = "callers build an FxHashSet; std HashSet is a disallowed type here"
-)]
-pub fn panda_token_call_consumers(
-    source: &str,
-    path: &Path,
-    alias: &str,
-    leaf_paths: &FxHashSet<String>,
-) -> Vec<TokenConsumerHit> {
-    css_in_js_consumer_scan(
-        source,
-        path,
-        &[ConsumerQuery::PandaTokenCall { alias, leaf_paths }],
-    )
-    .into_iter()
-    .map(|(_, hit)| hit)
-    .collect()
-}
-
-/// Walk a consuming JS/TS source for common PandaCSS style calls whose object
-/// literal values statically name token paths.
-#[must_use]
-#[expect(
-    clippy::implicit_hasher,
-    reason = "callers build FxHashSet values; std HashSet is a disallowed type here"
-)]
-pub fn panda_style_value_consumers(
-    source: &str,
-    path: &Path,
-    aliases: &FxHashSet<String>,
-    leaf_paths: &FxHashSet<String>,
-) -> Vec<TokenConsumerHit> {
-    css_in_js_consumer_scan(
-        source,
-        path,
-        &[ConsumerQuery::PandaStyleValues {
-            aliases,
-            leaf_paths,
-        }],
-    )
-    .into_iter()
-    .map(|(_, hit)| hit)
-    .collect()
-}
-
 /// Walk a JS/TS source for statically-authored theme object definitions used by
 /// styled-components and Emotion. A `theme` or `*Theme` variable with an object
 /// literal initializer becomes a token surface, with nested scalar leaves exposed
@@ -231,41 +151,21 @@ pub fn panda_style_value_consumers(
 #[must_use]
 pub fn css_in_js_theme_token_defs(source: &str, path: &Path) -> Vec<CssInJsTokenDef> {
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, source, source_type).parse();
-
-    let mut collector = ThemeDefCollector {
-        lines: LineCounter::new(source),
-        defs: Vec::new(),
-    };
-    collector.visit_program(&ret.program);
-    collector.defs
+    crate::parse_bounded_or_default(source, source_type, |ret| {
+        let mut collector = ThemeDefCollector {
+            lines: LineCounter::new(source),
+            defs: Vec::new(),
+        };
+        collector.visit_program(&ret.program);
+        collector.defs
+    })
 }
 
-/// Walk a consuming JS/TS source for styled-components / Emotion theme reads such
-/// as `theme.colors.brand` and `props.theme.colors.brand`.
-#[must_use]
-#[expect(
-    clippy::implicit_hasher,
-    reason = "callers build an FxHashSet; std HashSet is a disallowed type here"
-)]
-pub fn css_in_js_theme_consumers(
-    source: &str,
-    path: &Path,
-    leaf_paths: &FxHashSet<String>,
-) -> Vec<TokenConsumerHit> {
-    css_in_js_consumer_scan(source, path, &[ConsumerQuery::ThemeReads { leaf_paths }])
-        .into_iter()
-        .map(|(_, hit)| hit)
-        .collect()
-}
-
-/// One attribution query to run against a single parsed consumer source. Each
-/// variant mirrors one of the single-query consumer functions above; a scan runs
-/// any mix of them against ONE parse of the source.
+/// One attribution query to run against a single parsed consumer source. A scan
+/// runs any mix of queries against ONE parse of the source.
 pub enum ConsumerQuery<'a> {
-    /// Member-access reads `<alias>.a.b` of an imported token binding. Mirrors
-    /// [`css_in_js_token_consumers`].
+    /// Member-access reads `<alias>.a.b` of an imported token binding. A read is
+    /// a hit only when `a.b` is a defined leaf path, not an intermediate group.
     MemberBinding {
         /// The local identifier the token binding was imported under.
         alias: &'a str,
@@ -280,36 +180,42 @@ pub enum ConsumerQuery<'a> {
         /// Every defined leaf in that contract group.
         leaf_paths: &'a FxHashSet<String>,
     },
-    /// PandaCSS `token('a.b')` calls through the given alias. Mirrors
-    /// [`panda_token_call_consumers`].
+    /// PandaCSS `token('a.b')` calls through the given alias.
     PandaTokenCall {
         /// The local alias imported from Panda's generated token module.
         alias: &'a str,
         /// The defined leaf token paths (`colors.brand`).
         leaf_paths: &'a FxHashSet<String>,
     },
-    /// PandaCSS style-call object values naming token paths. Mirrors
-    /// [`panda_style_value_consumers`].
+    /// PandaCSS style-call object values naming token paths.
     PandaStyleValues {
         /// The local aliases for Panda style calls (`css`, `cva`).
         aliases: &'a FxHashSet<String>,
         /// The defined leaf token paths (`colors.brand`).
         leaf_paths: &'a FxHashSet<String>,
     },
-    /// styled-components / Emotion theme reads (`theme.colors.x`). Mirrors
-    /// [`css_in_js_theme_consumers`].
+    /// styled-components / Emotion theme reads (`theme.colors.x`), including
+    /// `props.theme.colors.x`.
     ThemeReads {
         /// The defined leaf token paths (`colors.brand`).
         leaf_paths: &'a FxHashSet<String>,
     },
 }
 
+impl ConsumerQuery<'_> {
+    /// `true` for the queries that `BatchedBindingCollector` runs in one walk.
+    const fn is_batched(&self) -> bool {
+        matches!(
+            self,
+            Self::MemberBinding { .. } | Self::StyleXThemeGroup { .. }
+        )
+    }
+}
+
 /// Parse `source` once and run every query against the same AST, returning
 /// `(query_index, hit)` pairs so the caller can attribute each hit back to the
-/// definer that produced its query. Behavior per query is identical to the
-/// corresponding single-query function, including the empty-alias / empty-leaf
-/// short-circuits (a query that would have early-returned simply contributes no
-/// hits, without suppressing the other queries).
+/// definer that produced its query. A query with an empty alias or an empty
+/// leaf set contributes no hits and does not suppress the other queries.
 #[must_use]
 pub fn css_in_js_consumer_scan(
     source: &str,
@@ -320,55 +226,40 @@ pub fn css_in_js_consumer_scan(
         return Vec::new();
     }
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, source, source_type).parse();
-    let mut out = Vec::new();
-    let batch_query_count = queries
-        .iter()
-        .filter(|query| {
-            matches!(
-                query,
-                ConsumerQuery::MemberBinding { .. } | ConsumerQuery::StyleXThemeGroup { .. }
-            )
-        })
-        .count();
-    if batch_query_count > 0 {
-        let mut collector = BatchedBindingCollector {
-            lines: LineCounter::new(source),
-            queries,
-            namespaces: FxHashSet::default(),
-            theme_functions: FxHashSet::default(),
-            stylex_imports: FxHashMap::default(),
-            member_queries: FxHashMap::default(),
-            theme_queries: FxHashMap::default(),
-            root_reference_spans: FxHashSet::default(),
-            static_values: FxHashMap::default(),
-            static_alias_neighbors: FxHashMap::default(),
-            collecting_mutations: false,
-            hits: Vec::new(),
-        };
-        collector.build_import_map(&ret.program);
-        collector.build_query_indexes();
-        collector.build_static_value_map(&ret.program);
-        collector.build_root_reference_spans(&ret.program);
-        collector.collecting_mutations = true;
-        collector.visit_program(&ret.program);
-        collector.collecting_mutations = false;
-        collector.visit_program(&ret.program);
-        out.extend(collector.hits);
-    }
-    for (idx, query) in queries.iter().enumerate() {
-        if batch_query_count > 0
-            && matches!(
-                query,
-                ConsumerQuery::MemberBinding { .. } | ConsumerQuery::StyleXThemeGroup { .. }
-            )
-        {
-            continue;
+    crate::parse_bounded_or_default(source, source_type, |ret| {
+        let mut out = Vec::new();
+        if queries.iter().any(ConsumerQuery::is_batched) {
+            let mut collector = BatchedBindingCollector {
+                lines: LineCounter::new(source),
+                queries,
+                namespaces: FxHashSet::default(),
+                theme_functions: FxHashSet::default(),
+                stylex_imports: FxHashMap::default(),
+                member_queries: FxHashMap::default(),
+                theme_queries: FxHashMap::default(),
+                root_reference_spans: FxHashSet::default(),
+                static_values: FxHashMap::default(),
+                static_alias_neighbors: FxHashMap::default(),
+                collecting_mutations: false,
+                hits: Vec::new(),
+            };
+            collector.build_import_map(&ret.program);
+            collector.build_query_indexes();
+            collector.build_static_value_map(&ret.program);
+            collector.build_root_reference_spans(&ret.program);
+            collector.collecting_mutations = true;
+            collector.visit_program(&ret.program);
+            collector.collecting_mutations = false;
+            collector.visit_program(&ret.program);
+            out.extend(collector.hits);
         }
-        run_consumer_query(query, source, &ret.program, idx, &mut out);
-    }
-    out
+        for (idx, query) in queries.iter().enumerate() {
+            if !query.is_batched() {
+                run_consumer_query(query, source, &ret.program, idx, &mut out);
+            }
+        }
+        out
+    })
 }
 
 struct BatchedBindingCollector<'a, 'q, 'v> {
@@ -393,7 +284,7 @@ impl<'a> BatchedBindingCollector<'a, '_, '_> {
                 continue;
             };
             if decl.import_kind.is_type()
-                || module_library(decl.source.value.as_str()) != Some(Lib::StyleX)
+                || module_library(&decl.source.value.text()) != Some(Lib::StyleX)
             {
                 continue;
             }
@@ -459,7 +350,7 @@ impl<'a> BatchedBindingCollector<'a, '_, '_> {
         names.extend(self.stylex_imports.keys().copied());
         names.extend(self.static_values.keys().copied());
 
-        let semantic_return = SemanticBuilder::new().build(program);
+        let semantic_return = SemanticBuilder::new().with_build_nodes(true).build(program);
         let semantic = semantic_return.semantic;
         let scoping = semantic.scoping();
         let root_scope = scoping.root_scope_id();
@@ -502,8 +393,8 @@ impl<'a> BatchedBindingCollector<'a, '_, '_> {
         for stmt in &program.body {
             let declaration = match stmt {
                 Statement::VariableDeclaration(declaration) => Some(&**declaration),
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::VariableDeclaration(declaration)) => Some(&**declaration),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::VariableDeclaration(declaration) => Some(&**declaration),
                     _ => None,
                 },
                 _ => None,
@@ -867,9 +758,9 @@ impl<'a> Visit<'a> for BatchedBindingCollector<'a, '_, '_> {
     }
 }
 
-/// Run one [`ConsumerQuery`] against an already-parsed `program`, tagging each
-/// resulting hit with `idx`. The per-variant guards mirror each single-query
-/// function's empty-input short-circuit exactly.
+/// Run one non-batched [`ConsumerQuery`] against an already-parsed `program`,
+/// and tag each resulting hit with `idx`. A query with an empty alias or an
+/// empty leaf set gives no hits.
 fn run_consumer_query<'a>(
     query: &ConsumerQuery<'_>,
     source: &'a str,
@@ -878,19 +769,8 @@ fn run_consumer_query<'a>(
     out: &mut Vec<(usize, TokenConsumerHit)>,
 ) {
     match query {
-        ConsumerQuery::MemberBinding { alias, leaf_paths } => {
-            if alias.is_empty() || leaf_paths.is_empty() {
-                return;
-            }
-            let mut collector = ConsumerCollector {
-                lines: LineCounter::new(source),
-                alias,
-                leaf_paths,
-                hits: Vec::new(),
-            };
-            collector.visit_program(program);
-            out.extend(collector.hits.into_iter().map(|hit| (idx, hit)));
-        }
+        // `css_in_js_consumer_scan` runs these queries in `BatchedBindingCollector`.
+        ConsumerQuery::MemberBinding { .. } | ConsumerQuery::StyleXThemeGroup { .. } => {}
         ConsumerQuery::PandaTokenCall { alias, leaf_paths } => {
             if alias.is_empty() || leaf_paths.is_empty() {
                 return;
@@ -901,25 +781,6 @@ fn run_consumer_query<'a>(
                 leaf_paths,
                 hits: Vec::new(),
             };
-            collector.visit_program(program);
-            out.extend(collector.hits.into_iter().map(|hit| (idx, hit)));
-        }
-        ConsumerQuery::StyleXThemeGroup {
-            contract_alias,
-            leaf_paths,
-        } => {
-            if contract_alias.is_empty() || leaf_paths.is_empty() {
-                return;
-            }
-            let mut collector = StyleXThemeGroupCollector {
-                lines: LineCounter::new(source),
-                contract_alias,
-                leaf_paths,
-                namespaces: FxHashSet::default(),
-                theme_functions: FxHashSet::default(),
-                hits: Vec::new(),
-            };
-            collector.build_import_map(program);
             collector.visit_program(program);
             out.extend(collector.hits.into_iter().map(|hit| (idx, hit)));
         }
@@ -954,144 +815,6 @@ fn run_consumer_query<'a>(
     }
 }
 
-struct StyleXThemeGroupCollector<'a, 'b> {
-    lines: LineCounter<'a>,
-    contract_alias: &'b str,
-    leaf_paths: &'b FxHashSet<String>,
-    namespaces: FxHashSet<&'a str>,
-    theme_functions: FxHashSet<&'a str>,
-    hits: Vec<TokenConsumerHit>,
-}
-
-impl<'a> StyleXThemeGroupCollector<'a, '_> {
-    fn build_import_map(&mut self, program: &'a Program<'a>) {
-        for stmt in &program.body {
-            let Statement::ImportDeclaration(decl) = stmt else {
-                continue;
-            };
-            if decl.import_kind.is_type()
-                || module_library(decl.source.value.as_str()) != Some(Lib::StyleX)
-            {
-                continue;
-            }
-            let Some(specifiers) = &decl.specifiers else {
-                continue;
-            };
-            for specifier in specifiers {
-                match specifier {
-                    ImportDeclarationSpecifier::ImportSpecifier(specifier)
-                        if !specifier.import_kind.is_type()
-                            && matches!(
-                                specifier.imported.name().as_str(),
-                                "createTheme" | "unstable_createThemeNested"
-                            ) =>
-                    {
-                        self.theme_functions.insert(specifier.local.name.as_str());
-                    }
-                    ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
-                        self.namespaces.insert(specifier.local.name.as_str());
-                    }
-                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(specifier) => {
-                        self.namespaces.insert(specifier.local.name.as_str());
-                    }
-                    ImportDeclarationSpecifier::ImportSpecifier(_) => {}
-                }
-            }
-        }
-    }
-
-    fn is_theme_callee(&self, callee: &Expression<'a>) -> bool {
-        match callee {
-            Expression::Identifier(id) => self.theme_functions.contains(id.name.as_str()),
-            Expression::StaticMemberExpression(member) => {
-                let Expression::Identifier(object) = &member.object else {
-                    return false;
-                };
-                self.namespaces.contains(object.name.as_str())
-                    && matches!(
-                        member.property.name.as_str(),
-                        "createTheme" | "unstable_createThemeNested"
-                    )
-            }
-            _ => false,
-        }
-    }
-}
-
-impl<'a> Visit<'a> for StyleXThemeGroupCollector<'a, '_> {
-    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-        if self.is_theme_callee(&call.callee)
-            && let Some(contract) = call.arguments.first().and_then(Argument::as_expression)
-            && matches!(contract, Expression::Identifier(id) if id.name.as_str() == self.contract_alias)
-        {
-            let line = self.lines.line_at(call.span().start);
-            self.hits.extend(
-                self.leaf_paths
-                    .iter()
-                    .cloned()
-                    .map(|token_path| TokenConsumerHit { token_path, line }),
-            );
-        }
-        walk::walk_call_expression(self, call);
-    }
-}
-
-/// Walks a consuming program for member accesses on a token binding alias.
-struct ConsumerCollector<'a, 'b> {
-    lines: LineCounter<'a>,
-    alias: &'b str,
-    leaf_paths: &'b FxHashSet<String>,
-    hits: Vec<TokenConsumerHit>,
-}
-
-impl<'a> ConsumerCollector<'a, '_> {
-    /// Record a hit if `(base, segments)` is exactly `<alias>.<leaf>` for a defined
-    /// leaf path. A node whose chain is `<alias>.<group>` (an intermediate group)
-    /// reconstructs a non-leaf path and is skipped, so each access site yields at
-    /// most one hit (no double count from the nested member expressions).
-    fn record(&mut self, chain: Option<(&'a str, Vec<String>)>, span_start: u32) {
-        if let Some((base, segments)) = chain
-            && base == self.alias
-            && !segments.is_empty()
-        {
-            let token_path = segments.join(".");
-            if self.leaf_paths.contains(&token_path) {
-                let line = self.lines.line_at(span_start);
-                self.hits.push(TokenConsumerHit { token_path, line });
-            }
-        }
-    }
-}
-
-impl<'a> Visit<'a> for ConsumerCollector<'a, '_> {
-    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        let mut chain = access_object_chain(&member.object);
-        if let Some((_, segments)) = chain.as_mut() {
-            segments.push(member.property.name.to_string());
-        }
-        self.record(chain, member.span().start);
-        walk::walk_static_member_expression(self, member);
-    }
-
-    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        // Bracket access with a STATIC string-literal key (`vars.color['gray-100']`):
-        // the only way to consume a token whose key is not a valid JS identifier
-        // (hyphenated `gray-100`, digit-leading `0x`), which design-token systems use
-        // heavily. Non-literal computed keys (`vars.color[k]`) cannot be resolved
-        // statically and are skipped (a documented lower-bound miss).
-        let mut chain = access_object_chain(&member.object);
-        if let (Some((_, segments)), Some(key)) =
-            (chain.as_mut(), static_computed_key(&member.expression))
-        {
-            segments.push(key);
-        } else {
-            chain = None;
-        }
-        self.record(chain, member.span().start);
-        walk::walk_computed_member_expression(self, member);
-    }
-}
-
 struct PandaTokenCallCollector<'a, 'b> {
     lines: LineCounter<'a>,
     alias: &'b str,
@@ -1108,7 +831,7 @@ impl<'a> Visit<'a> for PandaTokenCallCollector<'a, '_> {
         if callee.name.as_str() == self.alias
             && let Some(Argument::StringLiteral(lit)) = call.arguments.first()
         {
-            let token_path = lit.value.as_str();
+            let token_path = &*lit.value.text();
             if self.leaf_paths.contains(token_path) {
                 let line = self.lines.line_at(call.span().start);
                 self.hits.push(TokenConsumerHit {
@@ -1141,7 +864,7 @@ impl<'a> PandaStyleValueCollector<'a, '_> {
     fn record_expression(&mut self, expr: &Expression<'a>) {
         match expr {
             Expression::StringLiteral(lit) => {
-                let token_path = lit.value.as_str();
+                let token_path = &*lit.value.text();
                 if self.leaf_paths.contains(token_path) {
                     let line = self.lines.line_at(lit.span().start);
                     self.hits.push(TokenConsumerHit {
@@ -1768,7 +1491,7 @@ fn resolve_static_stylex_object_property<'a>(
                         visiting,
                     )?
                 } else {
-                    property.key.static_name()?.to_string()
+                    property.key.static_name()?.text().into_owned()
                 };
                 if key == wanted {
                     return Some(ResolvedStyleXStaticMember {
@@ -2754,13 +2477,7 @@ struct StyleXArrowStaticContext<'maps, 'ast> {
 fn stylex_arrow_expression_body<'a>(
     arrow: &'a ArrowFunctionExpression<'a>,
 ) -> Option<&'a Expression<'a>> {
-    if !arrow.expression {
-        return None;
-    }
-    match arrow.body.statements.first() {
-        Some(Statement::ExpressionStatement(statement)) => Some(&statement.expression),
-        _ => None,
-    }
+    arrow.body.as_expression()
 }
 
 fn resolve_stylex_arrow_parameter_member<'a>(
@@ -2961,7 +2678,7 @@ fn is_stylex_type_helper(name: &str) -> bool {
 /// dynamic key that cannot be resolved without executing code.
 fn static_computed_key(expr: &Expression<'_>) -> Option<String> {
     match unwrap_transparent_expression(expr) {
-        Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+        Expression::StringLiteral(lit) => Some(lit.value.text().into_owned()),
         Expression::NumericLiteral(lit) => Some(format_numeric_token(lit)),
         Expression::TemplateLiteral(template) if template.expressions.is_empty() => template
             .quasis
@@ -3165,7 +2882,7 @@ struct TokenDefCollector<'a> {
     /// Every resolved reference to a top-level immutable object literal.
     const_object_references: FxHashMap<ReferenceId, SymbolId>,
     /// Top-level constant condition names used by computed StyleX condition keys.
-    const_strings: FxHashMap<ReferenceId, (u32, &'a str)>,
+    const_strings: FxHashMap<ReferenceId, (u32, oxc_str::JSStr<'a>)>,
     nested_depth: u32,
     collecting_mutations: bool,
     defs: Vec<CssInJsTokenDef>,
@@ -3197,7 +2914,7 @@ impl<'a> TokenDefCollector<'a> {
             if decl.import_kind.is_type() {
                 continue;
             }
-            let Some(lib) = module_library(decl.source.value.as_str()) else {
+            let Some(lib) = module_library(&decl.source.value.text()) else {
                 continue;
             };
             let Some(specifiers) = &decl.specifiers else {
@@ -3225,8 +2942,8 @@ impl<'a> TokenDefCollector<'a> {
         for stmt in &program.body {
             let declaration = match stmt {
                 Statement::VariableDeclaration(declaration) => Some(&**declaration),
-                Statement::ExportNamedDeclaration(export) => match &export.declaration {
-                    Some(Declaration::VariableDeclaration(declaration)) => Some(&**declaration),
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::VariableDeclaration(declaration) => Some(&**declaration),
                     _ => None,
                 },
                 _ => None,
@@ -3264,7 +2981,7 @@ impl<'a> TokenDefCollector<'a> {
                                 .iter()
                                 .copied()
                                 .map(|reference_id| {
-                                    (reference_id, (declaration_start, value.value.as_str()))
+                                    (reference_id, (declaration_start, value.value))
                                 }),
                         );
                     }
@@ -3455,7 +3172,7 @@ impl<'a> TokenDefCollector<'a> {
 
 struct StyleXTokenContext<'maps, 'ast> {
     imports: &'maps FxHashMap<&'ast str, (Lib, &'ast str)>,
-    const_strings: &'maps FxHashMap<ReferenceId, (u32, &'ast str)>,
+    const_strings: &'maps FxHashMap<ReferenceId, (u32, oxc_str::JSStr<'ast>)>,
     before: u32,
 }
 
@@ -3475,9 +3192,9 @@ fn collect_stylex_token_object(
             return false;
         };
         let path = if prefix.is_empty() {
-            key.to_string()
+            key.text().into_owned()
         } else {
-            format!("{prefix}.{key}")
+            format!("{prefix}.{}", key.text())
         };
         let line = lines.line_at(prop.key.span().start);
         match shape {
@@ -3511,7 +3228,7 @@ fn collect_stylex_token_object(
 
 fn is_stylex_conditional_object(
     obj: &ObjectExpression<'_>,
-    const_strings: &FxHashMap<ReferenceId, (u32, &str)>,
+    const_strings: &FxHashMap<ReferenceId, (u32, oxc_str::JSStr<'_>)>,
     before: u32,
 ) -> bool {
     let mut has_default = false;
@@ -3532,7 +3249,7 @@ fn is_stylex_conditional_object(
                     if *declaration_start >= before {
                         return false;
                     }
-                    (*condition).to_string()
+                    condition.text().into_owned()
                 }
                 Some(expression) => {
                     let Some(condition) = static_computed_key(expression) else {
@@ -3546,7 +3263,7 @@ fn is_stylex_conditional_object(
             let Some(key) = prop.key.static_name() else {
                 return false;
             };
-            key.to_string()
+            key.text().into_owned()
         };
         if key == "default" {
             has_default = true;
@@ -3566,7 +3283,7 @@ fn stylex_static_token_value(
             let ObjectPropertyKind::ObjectProperty(prop) = prop else {
                 return None;
             };
-            (prop.key.static_name().as_deref() == Some("default"))
+            (prop.key.static_name().is_some_and(|name| name == "default"))
                 .then(|| stylex_static_token_value(&prop.value, imports))
                 .flatten()
         }),
@@ -3636,9 +3353,9 @@ fn collect_token_leaves(
             continue;
         };
         let path = if prefix.is_empty() {
-            key.to_string()
+            key.text().into_owned()
         } else {
-            format!("{prefix}.{key}")
+            format!("{prefix}.{}", key.text())
         };
         match &prop.value {
             Expression::ObjectExpression(nested)
@@ -3672,7 +3389,7 @@ fn object_static_property_value(obj: &ObjectExpression<'_>, wanted: &str) -> Opt
         let ObjectPropertyKind::ObjectProperty(prop) = prop else {
             return None;
         };
-        (prop.key.static_name().as_deref() == Some(wanted))
+        (prop.key.static_name().is_some_and(|name| name == wanted))
             .then(|| static_token_value(&prop.value))
             .flatten()
     })
@@ -3681,8 +3398,7 @@ fn object_static_property_value(obj: &ObjectExpression<'_>, wanted: &str) -> Opt
 fn static_token_value(value: &Expression<'_>) -> Option<String> {
     match value {
         Expression::StringLiteral(lit) => {
-            let text = lit.value.as_str().trim();
-            (!text.is_empty()).then(|| text.to_string())
+            Some(lit.value.text().trim().to_owned()).filter(|text| !text.is_empty())
         }
         Expression::NumericLiteral(num) => Some(format_numeric_token(num)),
         Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::UnaryNegation => {
@@ -3726,7 +3442,7 @@ fn object_static_property_object<'a>(
         let ObjectPropertyKind::ObjectProperty(prop) = prop else {
             return None;
         };
-        if prop.key.static_name().as_deref() == Some(wanted)
+        if prop.key.static_name().is_some_and(|name| name == wanted)
             && let Expression::ObjectExpression(value) = &prop.value
         {
             Some(&**value)
@@ -4319,7 +4035,7 @@ export const appTheme = {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let hits = css_in_js_theme_consumers(
+        let hits = scan_one(
             r"
 import styled from 'styled-components';
 export const Card = styled.div`
@@ -4328,7 +4044,9 @@ export const Card = styled.div`
 `;
 ",
             Path::new("card.tsx"),
-            &leaves,
+            ConsumerQuery::ThemeReads {
+                leaf_paths: &leaves,
+            },
         );
         let mut token_paths: Vec<String> = hits.into_iter().map(|hit| hit.token_path).collect();
         token_paths.sort();
@@ -4542,12 +4260,36 @@ export const vars = createGlobalTheme(':root', {
         paths.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// Run one query and drop the query index from each hit.
+    fn scan_one(source: &str, path: &Path, query: ConsumerQuery<'_>) -> Vec<TokenConsumerHit> {
+        css_in_js_consumer_scan(source, path, &[query])
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .collect()
+    }
+
     fn consumers(source: &str, alias: &str, paths: &[&str]) -> Vec<TokenConsumerHit> {
-        css_in_js_token_consumers(source, Path::new("card.ts"), alias, &leaves(paths))
+        let leaf_paths = leaves(paths);
+        scan_one(
+            source,
+            Path::new("card.ts"),
+            ConsumerQuery::MemberBinding {
+                alias,
+                leaf_paths: &leaf_paths,
+            },
+        )
     }
 
     fn panda_consumers(source: &str, alias: &str, paths: &[&str]) -> Vec<TokenConsumerHit> {
-        panda_token_call_consumers(source, Path::new("card.ts"), alias, &leaves(paths))
+        let leaf_paths = leaves(paths);
+        scan_one(
+            source,
+            Path::new("card.ts"),
+            ConsumerQuery::PandaTokenCall {
+                alias,
+                leaf_paths: &leaf_paths,
+            },
+        )
     }
 
     fn panda_style_consumers(
@@ -4556,7 +4298,15 @@ export const vars = createGlobalTheme(':root', {
         paths: &[&str],
     ) -> Vec<TokenConsumerHit> {
         let aliases = aliases.iter().map(|s| (*s).to_string()).collect();
-        panda_style_value_consumers(source, Path::new("card.ts"), &aliases, &leaves(paths))
+        let leaf_paths = leaves(paths);
+        scan_one(
+            source,
+            Path::new("card.ts"),
+            ConsumerQuery::PandaStyleValues {
+                aliases: &aliases,
+                leaf_paths: &leaf_paths,
+            },
+        )
     }
 
     #[test]
@@ -5059,31 +4809,52 @@ const good = createTheme(tokens, {});
         ];
         let scanned = css_in_js_consumer_scan(source, path, &queries);
 
-        let individual: Vec<(usize, TokenConsumerHit)> =
-            css_in_js_token_consumers(source, path, "vars", &member_leaves)
-                .into_iter()
-                .map(|hit| (0, hit))
-                .chain(
-                    panda_token_call_consumers(source, path, "token", &panda_call_leaves)
-                        .into_iter()
-                        .map(|hit| (1, hit)),
-                )
-                .chain(
-                    panda_style_value_consumers(
-                        source,
-                        path,
-                        &panda_style_aliases,
-                        &panda_style_leaves,
-                    )
-                    .into_iter()
-                    .map(|hit| (2, hit)),
-                )
-                .chain(
-                    css_in_js_theme_consumers(source, path, &theme_leaves)
-                        .into_iter()
-                        .map(|hit| (3, hit)),
-                )
-                .collect();
+        let individual: Vec<(usize, TokenConsumerHit)> = scan_one(
+            source,
+            path,
+            ConsumerQuery::MemberBinding {
+                alias: "vars",
+                leaf_paths: &member_leaves,
+            },
+        )
+        .into_iter()
+        .map(|hit| (0, hit))
+        .chain(
+            scan_one(
+                source,
+                path,
+                ConsumerQuery::PandaTokenCall {
+                    alias: "token",
+                    leaf_paths: &panda_call_leaves,
+                },
+            )
+            .into_iter()
+            .map(|hit| (1, hit)),
+        )
+        .chain(
+            scan_one(
+                source,
+                path,
+                ConsumerQuery::PandaStyleValues {
+                    aliases: &panda_style_aliases,
+                    leaf_paths: &panda_style_leaves,
+                },
+            )
+            .into_iter()
+            .map(|hit| (2, hit)),
+        )
+        .chain(
+            scan_one(
+                source,
+                path,
+                ConsumerQuery::ThemeReads {
+                    leaf_paths: &theme_leaves,
+                },
+            )
+            .into_iter()
+            .map(|hit| (3, hit)),
+        )
+        .collect();
 
         assert_eq!(scanned, individual);
         assert_eq!(scanned.len(), 4);

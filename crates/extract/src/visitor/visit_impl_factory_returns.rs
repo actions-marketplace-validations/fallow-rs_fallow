@@ -5,15 +5,19 @@
     reason = "many factory-return AST types used"
 )]
 use oxc_ast::ast::*;
+use oxc_span::Span;
 
-use super::super::{FactoryAssignedValue, ObjectPropValueRef, helpers::is_builtin_constructor};
-use super::unwrap_static_expr;
+use super::super::{FactoryAssignedValue, ObjectPropValueRef};
+use super::visit_source_paths::join_member_path;
+use super::{new_expression_class_name, unwrap_static_expr};
+use crate::function_body::BodyRef;
+use crate::js_text::JsText;
 
 #[derive(Clone, Copy)]
 pub(super) struct FactoryReturnFunctionInput<'site, 'ast> {
+    pub(super) binding_span: Span,
     pub(super) params: &'site FormalParameters<'ast>,
-    pub(super) body: Option<&'site FunctionBody<'ast>>,
-    pub(super) is_expression_body: bool,
+    pub(super) body: Option<BodyRef<'site, 'ast>>,
     pub(super) is_async: bool,
     pub(super) is_generator: bool,
     /// The function's declared return-type annotation, used as a fallback
@@ -81,21 +85,6 @@ pub(in super::super) fn count_returns_in_statements(statements: &[Statement<'_>]
     let mut count = 0;
     for_each_return_statement(statements, &mut |_| count += 1);
     count
-}
-
-/// The class name in a `new Class()` expression, or `None` for a non-`new`
-/// expression, a non-identifier callee, or a builtin constructor.
-fn new_expression_class_name(expr: &Expression<'_>) -> Option<String> {
-    let Expression::NewExpression(new_expr) = expr else {
-        return None;
-    };
-    let Expression::Identifier(callee) = &new_expr.callee else {
-        return None;
-    };
-    if is_builtin_constructor(callee.name.as_str()) {
-        return None;
-    }
-    Some(callee.name.to_string())
 }
 
 /// Classify the right-hand side of a module-local assignment for the alias
@@ -245,22 +234,32 @@ fn collect_self_scope_assignment_expr(
 /// an expression-bodied arrow, or the last top-level `return new Class()` of a
 /// block body. Conservative, only a direct `new Class()` is traced (a value
 /// first bound to one, or a non-`new` return, is out of scope). See issue #1441.
-pub(super) fn function_body_returns_new_class(
-    body: &FunctionBody<'_>,
-    is_expression_body: bool,
-) -> Option<String> {
-    if is_expression_body {
-        let [Statement::ExpressionStatement(stmt)] = body.statements.as_slice() else {
+pub(super) fn function_body_returns_new_class(body: BodyRef<'_, '_>) -> Option<String> {
+    function_body_returns_new_class_target(body).map(|(name, _)| name)
+}
+
+pub(super) fn function_body_returns_new_class_target(
+    body: BodyRef<'_, '_>,
+) -> Option<(String, Span)> {
+    let select = |expression: &Expression<'_>| {
+        let name = new_expression_class_name(expression)?;
+        let Expression::NewExpression(expression) = unwrap_static_expr(expression) else {
             return None;
         };
-        return new_expression_class_name(&stmt.expression);
+        let Expression::Identifier(reference) = &expression.callee else {
+            return None;
+        };
+        Some((name, reference.span))
+    };
+    match body {
+        BodyRef::Concise(expression) => select(expression),
+        BodyRef::Block(body) => body.statements.iter().rev().find_map(|statement| {
+            let Statement::ReturnStatement(ret) = statement else {
+                return None;
+            };
+            select(ret.argument.as_ref()?)
+        }),
     }
-    body.statements.iter().rev().find_map(|stmt| {
-        let Statement::ReturnStatement(ret) = stmt else {
-            return None;
-        };
-        new_expression_class_name(ret.argument.as_ref()?)
-    })
 }
 
 /// The class a function body returns when EVERY static return path resolves to
@@ -272,28 +271,23 @@ pub(super) fn function_body_returns_new_class(
 /// required before a factory is exported as cross-module metadata: a wrong
 /// cross-module credit is a silent false-negative with a wide blast radius.
 /// See issue #1441 (Part A).
-pub(super) fn function_body_returns_new_class_unanimous(
-    body: &FunctionBody<'_>,
-    is_expression_body: bool,
-) -> Option<String> {
-    if is_expression_body {
-        let [Statement::ExpressionStatement(stmt)] = body.statements.as_slice() else {
-            return None;
-        };
-        return new_expression_class_name(&stmt.expression);
-    }
+pub(super) fn function_body_returns_new_class_unanimous(body: BodyRef<'_, '_>) -> Option<String> {
+    let block = match body {
+        BodyRef::Concise(expr) => return new_expression_class_name(expr),
+        BodyRef::Block(block) => block,
+    };
     // A body that can fall through to an implicit `undefined` (e.g.
     // `if (flag) return new C()` with no trailing return) does NOT provably
     // return the class on every path, so it must abstain. See #1441 (Part A).
-    if !function_body_is_terminal(body, is_expression_body) {
+    if !function_body_is_terminal(body) {
         return None;
     }
-    let total_returns = count_returns_in_statements(&body.statements);
+    let total_returns = count_returns_in_statements(&block.statements);
     if total_returns == 0 {
         return None;
     }
     let mut args = Vec::new();
-    collect_return_args_in_statements(&body.statements, &mut args);
+    collect_return_args_in_statements(&block.statements, &mut args);
     // A bare `return;` (counted but argless) means a non-instance path exists.
     if args.len() != total_returns {
         return None;
@@ -317,10 +311,10 @@ pub(super) fn function_body_returns_new_class_unanimous(
 /// (if/else where both arms return, with no trailing statement) is treated as
 /// non-terminal, a safe coverage gap, never an over-credit. Required before a
 /// factory may be exported cross-module. See issue #1441 (Part A).
-pub(super) fn function_body_is_terminal(body: &FunctionBody<'_>, is_expression_body: bool) -> bool {
-    if is_expression_body {
+pub(super) fn function_body_is_terminal(body: BodyRef<'_, '_>) -> bool {
+    let BodyRef::Block(body) = body else {
         return true;
-    }
+    };
     matches!(
         body.statements.last(),
         Some(Statement::ReturnStatement(_) | Statement::ThrowStatement(_))
@@ -331,7 +325,7 @@ pub(super) fn function_body_is_terminal(body: &FunctionBody<'_>, is_expression_b
 /// control flow, not into nested functions). A bare `return;` contributes
 /// nothing, so a shorter result than the return count signals a non-value return
 /// path. See issue #1441.
-fn collect_return_args_in_statements<'b, 'a>(
+pub(super) fn collect_return_args_in_statements<'b, 'a>(
     statements: &'b [Statement<'a>],
     out: &mut Vec<&'b Expression<'a>>,
 ) {
@@ -352,30 +346,29 @@ fn collect_return_args_in_statements<'b, 'a>(
 /// not actually return. Used only when the body does not directly return
 /// `new Class()`. See issue #1441 (var-return case).
 pub(super) fn function_body_returns_identifier(
-    body: &FunctionBody<'_>,
+    body: BodyRef<'_, '_>,
     params: &FormalParameters<'_>,
-    is_expression_body: bool,
 ) -> Option<String> {
-    let returned = if is_expression_body {
-        let [Statement::ExpressionStatement(stmt)] = body.statements.as_slice() else {
-            return None;
-        };
-        let Expression::Identifier(id) = &stmt.expression else {
-            return None;
-        };
-        id.name.to_string()
-    } else {
-        if count_returns_in_statements(&body.statements) != 1 {
-            return None;
+    let returned = match body {
+        BodyRef::Concise(expr) => {
+            let Expression::Identifier(id) = expr else {
+                return None;
+            };
+            id.name.to_string()
         }
-        let Some(Expression::Identifier(id)) = first_return_arg_in_statements(&body.statements)
-        else {
-            return None;
-        };
-        id.name.to_string()
+        BodyRef::Block(body) => {
+            if count_returns_in_statements(&body.statements) != 1 {
+                return None;
+            }
+            let Some(Expression::Identifier(id)) = first_return_arg_in_statements(&body.statements)
+            else {
+                return None;
+            };
+            id.name.to_string()
+        }
     };
     if formal_params_bind_identifier(params, &returned)
-        || statements_declare_identifier(&body.statements, &returned)
+        || statements_declare_identifier(body.statements(), &returned)
     {
         return None;
     }
@@ -392,10 +385,9 @@ pub(super) fn function_body_returns_identifier(
 /// directly; an identifier or a static-member expression records a `Path` the
 /// finalize resolver hops through `binding_target_names`. See issue #1858.
 pub(super) fn function_body_returns_object_shape(
-    body: &FunctionBody<'_>,
-    is_expression_body: bool,
+    body: BodyRef<'_, '_>,
 ) -> Option<Vec<(String, ObjectPropValueRef)>> {
-    let object = object_literal_from_return(body, is_expression_body)?;
+    let object = object_literal_from_return(body)?;
     let mut out = Vec::new();
     flatten_object_shape(object, "", &mut out);
     (!out.is_empty()).then_some(out)
@@ -404,16 +396,13 @@ pub(super) fn function_body_returns_object_shape(
 /// The object literal a function returns: the sole expression of an
 /// expression-bodied arrow, the argument of a block body's single `return`, or
 /// the same-scope `const <id> = { ... }` initializer of a returned identifier.
-fn object_literal_from_return<'a>(
-    body: &'a FunctionBody<'a>,
-    is_expression_body: bool,
+pub(super) fn object_literal_from_return<'a>(
+    body: BodyRef<'a, 'a>,
 ) -> Option<&'a ObjectExpression<'a>> {
-    if is_expression_body {
-        let [Statement::ExpressionStatement(stmt)] = body.statements.as_slice() else {
-            return None;
-        };
-        return object_expression_of(&stmt.expression);
-    }
+    let body = match body {
+        BodyRef::Concise(expr) => return object_expression_of(expr),
+        BodyRef::Block(body) => body,
+    };
     // A single return keeps the shape unambiguous; a branchy / multi-return
     // factory abstains (conservative, matching `function_body_returns_identifier`).
     if count_returns_in_statements(&body.statements) != 1 {
@@ -488,15 +477,22 @@ fn flatten_object_shape(
             continue; // computed key: skip
         };
         let path = if prefix.is_empty() {
-            key.to_string()
+            key.text().into_owned()
         } else {
-            format!("{prefix}.{key}")
+            format!("{prefix}.{}", key.text())
         };
         let value = unwrap_static_expr(&property.value);
         match value {
             Expression::NewExpression(_) => {
                 if let Some(class) = new_expression_class_name(value) {
-                    out.push((path, ObjectPropValueRef::Class(class)));
+                    let origin = match value {
+                        Expression::NewExpression(expression) => match &expression.callee {
+                            Expression::Identifier(reference) => Some(reference.span),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    out.push((path, ObjectPropValueRef::Class(class, origin)));
                 }
             }
             Expression::Identifier(id) => {
@@ -516,21 +512,26 @@ fn flatten_object_shape(
 /// Flatten an identifier / static-member chain (`factory.ordersPage`) to a dotted
 /// path string, or `None` for any non-static-member shape.
 fn flatten_member_path(expr: &Expression<'_>) -> Option<String> {
-    match unwrap_static_expr(expr) {
-        Expression::Identifier(id) => Some(id.name.to_string()),
-        Expression::StaticMemberExpression(member) => Some(format!(
-            "{}.{}",
-            flatten_member_path(&member.object)?,
-            member.property.name
-        )),
-        _ => None,
-    }
+    let mut properties = Vec::new();
+    let mut expr = expr;
+    let root = loop {
+        crate::cost::walk_step();
+        match unwrap_static_expr(expr) {
+            Expression::Identifier(id) => break id.name.as_str(),
+            Expression::StaticMemberExpression(member) => {
+                properties.push(member.property.name.as_str());
+                expr = &member.object;
+            }
+            _ => return None,
+        }
+    };
+    Some(join_member_path(root, &properties))
 }
 
 /// The argument of the single `return` reachable in `statements` (through
 /// control flow, not into nested functions). The caller guarantees exactly one
 /// return exists; a leading bare `return;` (no argument) is skipped. See #1441.
-fn first_return_arg_in_statements<'b, 'a>(
+pub(super) fn first_return_arg_in_statements<'b, 'a>(
     statements: &'b [Statement<'a>],
 ) -> Option<&'b Expression<'a>> {
     let mut first = None;

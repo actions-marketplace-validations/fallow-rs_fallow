@@ -18,6 +18,8 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { FRAGMENT_DIR, fragmentNames } from "./changelog-fragments.mjs";
+
 const EM_DASH = "—";
 
 /**
@@ -108,6 +110,35 @@ export const changelogSections = (changelog) => {
   }));
 };
 
+const SUBHEADING = /^### (?<name>.+?)\s*$/u;
+
+/**
+ * The `###` headings that occur more than once in a section, each with the
+ * 1-based changelog line numbers of every occurrence. A clean merge of two
+ * branches that both add a `### Fixed` leaves two of them, and the release
+ * notes then inherit the split. Fenced blocks are skipped, as in
+ * `changelogSections`.
+ */
+export const repeatedSubheadings = (section) => {
+  const occurrences = new Map();
+  let fenced = false;
+
+  section.body.split(/\r?\n/u).forEach((line, index) => {
+    if (CODE_FENCE.test(line)) {
+      fenced = !fenced;
+      return;
+    }
+    const name = fenced ? undefined : line.match(SUBHEADING)?.groups.name;
+    if (name !== undefined) {
+      occurrences.set(name, [...(occurrences.get(name) ?? []), section.line + 1 + index]);
+    }
+  });
+
+  return Array.from(occurrences, ([name, lines]) => ({ name, lines })).filter(
+    (heading) => heading.lines.length > 1,
+  );
+};
+
 const hasContent = (body) => body.split(/\r?\n/u).some((line) => line.trim() !== "");
 
 /**
@@ -172,6 +203,17 @@ export const assertChangelogRelease = (changelog, tag) => {
     `CHANGELOG.md: the ${version} section contains an em-dash, which the release notes inherit`,
   );
 
+  const repeated = repeatedSubheadings(section);
+  if (repeated.length > 0) {
+    const where = repeated.map(
+      ({ name, lines }) =>
+        `"### ${name}" on lines ${lines.slice(0, -1).join(", ")} and ${lines.at(-1)}`,
+    );
+    assert.fail(
+      `CHANGELOG.md: the ${version} section repeats ${where.join("; ")}, so merge each into one heading`,
+    );
+  }
+
   const previous = previousReleasedVersion(sections, version);
   const expected = `${COMPARE_URL_PREFIX}v${previous}...v${version}`;
   const link = changelogLinks(changelog).get(version);
@@ -199,6 +241,19 @@ export const assertNothingUnreleased = (changelog) => {
   assert.ok(
     !hasContent(unreleased[0].body),
     "CHANGELOG.md: the Unreleased section still holds entries, so they would ship uncredited",
+  );
+};
+
+/**
+ * A fragment left in `changelog.d/` at dispatch was never collected into the
+ * release section, so its entries would ship uncredited.
+ */
+export const assertNoFragments = (root) => {
+  const names = fragmentNames(resolve(root, FRAGMENT_DIR));
+  assert.deepEqual(
+    names,
+    [],
+    `${FRAGMENT_DIR}/ still holds fragments, so they would ship uncredited: run "node scripts/changelog-fragments.mjs collect"`,
   );
 };
 
@@ -270,6 +325,8 @@ export const verifyReleaseMetadata = ({
   if (releaseJson === undefined) {
     assertNothingUnreleased(changelog);
     surfaces.push("an empty CHANGELOG.md [Unreleased] section");
+    assertNoFragments(root);
+    surfaces.push(`no fragments in ${FRAGMENT_DIR}/`);
   } else {
     assertPublishedRelease(JSON.parse(readFileSync(releaseJson, "utf8")), tag, compareUrl);
     surfaces.push("published GitHub Release title and body");

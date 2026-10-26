@@ -6,15 +6,14 @@ use serde::Serialize;
 
 use fallow_types::workspace::WorkspaceDiagnostic;
 
-use crate::{
-    GroupByMode, RootEnvelopeMode, apply_root_kind, attach_telemetry_meta, strip_root_prefix,
-};
+use crate::root_envelopes::apply_root_kind;
+use crate::{GroupByMode, attach_telemetry_meta, strip_root_prefix};
 
 /// Current schema version for the standalone health JSON envelope.
 ///
-/// Version 11 expands the required semantic omission reason-code enum embedded
-/// by type-aware metadata.
-pub const HEALTH_SCHEMA_VERSION: u32 = 11;
+/// Version 12 adds `resolve_hidden_coupling` to the required
+/// `targets[].category` enum.
+pub const HEALTH_SCHEMA_VERSION: u32 = 12;
 
 /// Exact schema version for [`HealthOutput`].
 #[cfg(feature = "schema")]
@@ -54,6 +53,29 @@ pub struct HealthOutput<Report, Group> {
     /// Per-bucket recomputed metrics; present only in grouped output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<Group>>,
+    /// The `--group` selector patterns, as given, when the run kept only some
+    /// groups. A group that is not in `groups` was filtered out by this
+    /// selector. The project-level sections are not filtered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_filter: Option<Vec<String>>,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// `_meta` block with metric definitions, when `--explain` was passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
@@ -85,6 +107,13 @@ pub struct HealthOutputInput<Report, Group> {
     pub grouped_by: Option<GroupByMode>,
     /// Per-bucket recomputed metrics, for grouped output.
     pub groups: Option<Vec<Group>>,
+    /// The `--group` selector patterns, for grouped output.
+    pub group_filter: Option<Vec<String>>,
+    /// Every gate this run evaluated, absent when it evaluated none.
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run received, absent when it
+    /// was asked for nothing.
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// `_meta` block to attach when `--explain` was passed.
     pub meta: Option<Meta>,
     /// Workspace-discovery, source-discovery, and analysis-stage diagnostics.
@@ -102,7 +131,6 @@ pub struct HealthJsonOutputInput<'a, Report, Group> {
     /// Absolute root prefix to strip from every emitted path, when set.
     pub root_prefix: Option<&'a str>,
     /// Root discriminator policy.
-    pub envelope_mode: RootEnvelopeMode,
     /// Telemetry run id to attach under `_meta.telemetry`, when available.
     pub analysis_run_id: Option<&'a str>,
 }
@@ -119,6 +147,9 @@ pub fn build_health_output<Report, Group>(
         report: input.report,
         grouped_by: input.grouped_by,
         groups: input.groups,
+        group_filter: input.group_filter,
+        gate_outcomes: input.gate_outcomes,
+        request_outcomes: input.request_outcomes,
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -144,7 +175,7 @@ where
 {
     let envelope = build_health_output(input.output);
     let mut output = serde_json::to_value(envelope)?;
-    apply_root_kind(&mut output, "health", input.envelope_mode);
+    apply_root_kind(&mut output, "health");
     if let Some(root_prefix) = input.root_prefix {
         strip_root_prefix(&mut output, root_prefix);
     }
@@ -160,18 +191,20 @@ mod tests {
     fn serialize_health_json_output_tags_and_strips_root_paths() {
         let output = serialize_health_json_output(HealthJsonOutputInput {
             output: HealthOutputInput {
+                gate_outcomes: None,
+                request_outcomes: None,
                 schema_version: 7,
                 version: "test".to_string(),
                 elapsed: Duration::ZERO,
                 report: serde_json::json!({ "findings": [{ "path": "/repo/src/a.ts" }] }),
                 grouped_by: None,
                 groups: None::<Vec<serde_json::Value>>,
+                group_filter: None,
                 meta: None,
                 workspace_diagnostics: Vec::new(),
                 next_steps: Vec::new(),
             },
             root_prefix: Some("/repo/"),
-            envelope_mode: RootEnvelopeMode::Tagged,
             analysis_run_id: Some("run-health"),
         })
         .expect("health output should serialize");

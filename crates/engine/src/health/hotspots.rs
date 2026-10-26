@@ -3,28 +3,20 @@
     reason = "human stderr notes (no-git, bot patterns, CODEOWNERS) preserved verbatim from the CLI health path"
 )]
 
-use fallow_output::{FileHealthScore, HotspotEntry, HotspotSummary};
+use fallow_output::{ClockProvenance, ClockSource, FileHealthScore, HotspotEntry, HotspotSummary};
 
 use super::HealthOptions;
 use super::ownership::{OwnershipContext, compile_bot_globs, compute_ownership};
-
-/// Detect test/mock path conventions. Kept as a simple substring scan
-/// against forward-slash normalized paths so it works uniformly on the
-/// relative paths we use for display.
-fn is_test_path(relative: &std::path::Path) -> bool {
-    let s = relative.to_string_lossy().replace('\\', "/");
-    s.contains("/__tests__/")
-        || s.contains("/__mocks__/")
-        || s.contains("/test/")
-        || s.contains("/tests/")
-        || s.contains(".test.")
-        || s.contains(".spec.")
-}
+use crate::test_paths::is_test_path;
 
 /// Result of fetching churn data, including cache hit/miss info and timing.
 pub struct ChurnFetchResult {
     pub result: crate::churn::ChurnResult,
     pub since: crate::churn::SinceDuration,
+    /// Window of [`crate::churn::ChurnResult::commits`], which change
+    /// coupling and change dispersion read. Without `--since` it is wider
+    /// than `since`.
+    pub history: crate::churn::SinceDuration,
     pub cache_hit: bool,
     pub git_log_ms: f64,
 }
@@ -183,12 +175,23 @@ pub(super) fn fetch_churn_data(
                 // than emit a SECOND error document, which would break the
                 // single-document `--format json` contract (#294).
                 tracing::warn!("churn file became unreadable after validation: {e}");
+                // The diagnostic is the channel a `--quiet --format json`
+                // consumer has, and a silent skip there reports the hotspot
+                // sections as zero rather than as unmeasured (issue #2734).
+                super::diagnostics::record_health_diagnostic(
+                    opts.root,
+                    Some(&resolved),
+                    fallow_types::workspace::WorkspaceDiagnosticKind::HotspotsSkipped {
+                        cause: "churn-file-unreadable".to_owned(),
+                    },
+                );
                 return None;
             }
         };
         return Some(ChurnFetchResult {
             result,
             since: imported_since(),
+            history: imported_since(),
             cache_hit: false,
             git_log_ms: t.elapsed().as_secs_f64() * 1000.0,
         });
@@ -198,45 +201,124 @@ pub(super) fn fetch_churn_data(
         if !opts.quiet {
             eprintln!("note: hotspot analysis skipped: no git repository found at project root");
         }
+        // Outside the quiet guard: the note is for a human, the diagnostic is
+        // for the consumer that runs fallow with `--quiet` (issue #2689).
+        super::diagnostics::record_health_diagnostic(
+            opts.root,
+            None,
+            fallow_types::workspace::WorkspaceDiagnosticKind::HotspotsSkipped {
+                cause: "not-a-repository".to_owned(),
+            },
+        );
         return None;
     }
 
-    let since_input = opts.since.unwrap_or("6m");
+    let since_input = opts.since.unwrap_or(DEFAULT_HOTSPOT_WINDOW);
     if let Err(e) = crate::validate::validate_no_control_chars(since_input, "--since") {
         // A malformed `--since` degrades to "no churn, continue" like the
-        // missing-git-repo branch above: route the diagnostic to `tracing` and
+        // missing-git-repo branch above: route the error text to `tracing` and
         // emit NO second JSON document, preserving the single-document
-        // `--format json` contract (#294).
+        // `--format json` contract (#294). The diagnostic carries the cause, so
+        // a consumer that never sees stderr still reads the hotspot sections as
+        // unmeasured rather than as zero (issue #2734).
         tracing::warn!("hotspot analysis skipped: {e}");
+        record_invalid_since(opts.root);
         return None;
     }
     let since = match crate::churn::parse_since(since_input) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("hotspot analysis skipped: invalid --since: {e}");
+            record_invalid_since(opts.root);
             return None;
         }
     };
 
+    // Change coupling and change dispersion need more commits than hotspots,
+    // so without `--since` they read a wider window. The same `git log` pass
+    // feeds both windows.
+    let history = if opts.since.is_some() {
+        since.clone()
+    } else {
+        crate::churn::SinceDuration::relative(
+            DEFAULT_HISTORY_MONTHS,
+            crate::churn::ChurnWindowUnit::Months,
+            format!("{DEFAULT_HISTORY_MONTHS} months"),
+        )
+    };
+
     let t = std::time::Instant::now();
-    let (churn_result, cache_hit) =
-        crate::churn::analyze_churn_cached(opts.root, &since, cache_dir, opts.no_cache)?;
+    let Some((churn_result, cache_hit)) = crate::churn::analyze_churn_cached_with_history(
+        opts.root,
+        &since,
+        &history,
+        cache_dir,
+        opts.no_cache,
+    ) else {
+        record_unborn_head(opts);
+        return None;
+    };
     let git_log_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     Some(ChurnFetchResult {
         result: churn_result,
         since,
+        history,
         cache_hit,
         git_log_ms,
     })
 }
 
+/// Hotspot window when `--since` is absent.
+const DEFAULT_HOTSPOT_WINDOW: &str = "6m";
+
+/// Change coupling and change dispersion window, in months, when `--since` is
+/// absent.
+const DEFAULT_HISTORY_MONTHS: u64 = 12;
+
+/// Record a branch without a commit, where churn has no history to read.
+///
+/// A fresh `git init` or an orphan branch passes the repository check, so without this entry the
+/// hotspot sections read as empty rather than unmeasured (issue #2803). Other
+/// churn failures with a resolvable HEAD keep their `tracing` line only.
+fn record_unborn_head(opts: &HealthOptions<'_>) {
+    if !matches!(crate::repo_refs::head_sha(opts.root), Ok(None)) {
+        return;
+    }
+    if !opts.quiet {
+        eprintln!("note: hotspot analysis skipped: the current branch has no commits yet");
+    }
+    super::diagnostics::record_health_diagnostic(
+        opts.root,
+        None,
+        fallow_types::workspace::WorkspaceDiagnosticKind::HotspotsSkipped {
+            cause: "no-commits".to_owned(),
+        },
+    );
+}
+
+/// Record the two `--since` failures as one diagnostic.
+///
+/// Rejected-as-input and failed-to-parse are one fact to the reader of a report:
+/// the window they asked for was not read, so the hotspot sections measured
+/// nothing. The error text that distinguishes them stays on the `tracing` line
+/// where it was already written.
+fn record_invalid_since(root: &std::path::Path) {
+    super::diagnostics::record_health_diagnostic(
+        root,
+        None,
+        fallow_types::workspace::WorkspaceDiagnosticKind::HotspotsSkipped {
+            cause: "invalid-since".to_owned(),
+        },
+    );
+}
+
 /// Header label for imported churn (`--churn-file`). The imported window is
 /// whatever the wrapper exported, so reusing the `--since` duration ("since 6
-/// months") would misdescribe it. `git_after` is unused on the import path.
+/// months") would misdescribe it, and no cutoff is applied on the import path.
 fn imported_since() -> crate::churn::SinceDuration {
     crate::churn::SinceDuration {
-        git_after: String::new(),
+        window: crate::churn::ChurnWindow::Imported,
         display: "imported churn".to_string(),
     }
 }
@@ -264,7 +346,7 @@ fn compute_normalization_maxima(
 
 /// Check whether a file should be excluded from hotspot results
 /// based on workspace filter and ignore patterns.
-fn is_excluded_from_hotspots(
+pub(super) fn is_excluded_from_hotspots(
     path: &std::path::Path,
     root: &std::path::Path,
     ignore_set: &globset::GlobSet,
@@ -314,9 +396,16 @@ pub(super) struct HotspotComputationInput<'a> {
     pub(super) ignore_set: &'a globset::GlobSet,
     pub(super) ws_roots: Option<&'a [std::path::PathBuf]>,
     pub(super) churn_fetch: ChurnFetchResult,
+    /// Change dispersion per file, when change coupling ran.
+    pub(super) dispersion: Option<
+        &'a rustc_hash::FxHashMap<std::path::PathBuf, crate::change_coupling::FileDispersion>,
+    >,
 }
 
 /// Compute hotspot entries by combining pre-fetched churn data with file health scores.
+///
+/// The list is ranked and complete. The caller applies `--top`, so a grouped
+/// run can keep the complete list for its groups.
 pub(super) fn compute_hotspots(
     input: HotspotComputationInput<'_>,
 ) -> (Vec<HotspotEntry>, Option<HotspotSummary>) {
@@ -327,12 +416,14 @@ pub(super) fn compute_hotspots(
         ignore_set,
         ws_roots,
         churn_fetch,
+        dispersion,
     } = input;
     let churn_result = churn_fetch.result;
     let since = churn_fetch.since;
 
     let shallow_clone = churn_result.shallow_clone;
     warn_shallow_clone(opts, shallow_clone);
+    warn_unpinned_clock(opts, churn_result.clock);
 
     let min_commits = opts.min_commits.unwrap_or(3);
     let (max_weighted, max_density) =
@@ -341,10 +432,10 @@ pub(super) fn compute_hotspots(
     let ownership_cfg = &config.health.ownership;
     let bot_globs_owned = load_ownership_bot_globs(opts, ownership_cfg);
     let codeowners_owned = load_ownership_codeowners(opts, &config.root);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Staleness is measured against the run clock, not the system clock, so
+    // `stale_days` and the thresholds it feeds (owner-active, drift minimum
+    // file age) do not flip between two runs over the same commit.
+    let now_secs = churn_result.clock.epoch_secs();
     let ownership_ctx = bot_globs_owned.as_ref().map(|bot_globs| OwnershipContext {
         author_pool: &churn_result.author_pool,
         bot_globs,
@@ -363,6 +454,7 @@ pub(super) fn compute_hotspots(
         max_weighted,
         max_density,
         ownership_ctx: ownership_ctx.as_ref(),
+        dispersion,
     });
 
     hotspot_entries.sort_by(|a, b| {
@@ -378,18 +470,61 @@ pub(super) fn compute_hotspots(
         files_analyzed,
         files_excluded,
         shallow_clone,
+        clock: Some(clock_provenance(churn_result.clock)),
     };
-
-    if let Some(top) = opts.top {
-        hotspot_entries.truncate(top);
-    }
 
     (hotspot_entries, Some(summary))
 }
 
+/// Describe the run clock on the wire, so a JSON consumer can tell a
+/// reproducible churn number from a drifting one.
+///
+/// [`warn_unpinned_clock`] says the same thing on stderr, where `--quiet`
+/// removes it and a machine consumer never sees it at all.
+fn clock_provenance(clock: crate::clock::AnalysisClock) -> ClockProvenance {
+    ClockProvenance {
+        source: match clock.source() {
+            crate::clock::AnalysisClockSource::Environment => ClockSource::Environment,
+            crate::clock::AnalysisClockSource::HeadCommit => ClockSource::HeadCommit,
+            crate::clock::AnalysisClockSource::WallClock => ClockSource::WallClock,
+        },
+        epoch_secs: clock.epoch_secs(),
+        reproducible: clock.is_reproducible(),
+    }
+}
+
+/// Warn when churn numbers were measured against the wall clock.
+///
+/// The run clock normally comes from HEAD's committer timestamp, which makes
+/// recency weighting and `stale_days` reproducible for one commit. `git log`
+/// churn cannot reach this warning: if HEAD has no readable timestamp there is
+/// no git history to analyze either. Imported churn (`--churn-file`) can, and
+/// is the point of the warning, since it exists for projects whose history
+/// lives in a non-git VCS.
+fn warn_unpinned_clock(opts: &HealthOptions<'_>, clock: crate::clock::AnalysisClock) {
+    if clock.is_reproducible() {
+        return;
+    }
+    if !opts.quiet {
+        eprintln!(
+            "Warning: no commit timestamp available, so churn recency and \
+             ownership staleness were measured against the wall clock and will \
+             drift between runs. Set FALLOW_CLOCK_EPOCH to pin them."
+        );
+    }
+    super::diagnostics::record_health_diagnostic(
+        opts.root,
+        None,
+        fallow_types::workspace::WorkspaceDiagnosticKind::UnpinnedClock,
+    );
+}
+
 /// Emit shallow-clone warnings (and the ownership-skew note) when relevant.
 fn warn_shallow_clone(opts: &HealthOptions<'_>, shallow_clone: bool) {
-    if shallow_clone && !opts.quiet {
+    if !shallow_clone {
+        return;
+    }
+    if !opts.quiet {
         eprintln!(
             "Warning: shallow clone detected. Hotspot analysis may be incomplete. \
              Use `git fetch --unshallow` for full history."
@@ -401,6 +536,13 @@ fn warn_shallow_clone(opts: &HealthOptions<'_>, shallow_clone: bool) {
             );
         }
     }
+    super::diagnostics::record_health_diagnostic(
+        opts.root,
+        None,
+        fallow_types::workspace::WorkspaceDiagnosticKind::ShallowClone {
+            ownership_requested: opts.ownership,
+        },
+    );
 }
 
 /// Compile the bot-author glob set for ownership analysis, warning on a bad pattern.
@@ -413,6 +555,14 @@ fn load_ownership_bot_globs(
             if !opts.quiet {
                 eprintln!("Warning: invalid bot pattern in health.ownership.botPatterns: {e}");
             }
+            super::diagnostics::record_health_diagnostic(
+                opts.root,
+                None,
+                fallow_types::workspace::WorkspaceDiagnosticKind::OwnershipUnavailable {
+                    cause: "invalid-bot-pattern".to_owned(),
+                    error: e.to_string(),
+                },
+            );
             globset::GlobSet::empty()
         })
     })
@@ -427,8 +577,21 @@ fn load_ownership_codeowners(
         .then(|| match crate::codeowners::CodeOwners::load(root, None) {
             Ok(co) => Some(co),
             Err(e) => {
-                if !opts.quiet && !e.contains("no CODEOWNERS file found") {
-                    eprintln!("Warning: failed to parse CODEOWNERS: {e}");
+                // A project with no CODEOWNERS at all never asked for declared
+                // owners, so it is not a degraded input and gets neither the
+                // note nor the diagnostic.
+                if !e.contains("no CODEOWNERS file found") {
+                    if !opts.quiet {
+                        eprintln!("Warning: failed to parse CODEOWNERS: {e}");
+                    }
+                    super::diagnostics::record_health_diagnostic(
+                        root,
+                        None,
+                        fallow_types::workspace::WorkspaceDiagnosticKind::OwnershipUnavailable {
+                            cause: "codeowners-parse-failed".to_owned(),
+                            error: e,
+                        },
+                    );
                 }
                 None
             }
@@ -447,6 +610,9 @@ struct HotspotEntryCtx<'a> {
     max_weighted: f64,
     max_density: f64,
     ownership_ctx: Option<&'a OwnershipContext<'a>>,
+    dispersion: Option<
+        &'a rustc_hash::FxHashMap<std::path::PathBuf, crate::change_coupling::FileDispersion>,
+    >,
 }
 
 /// Build hotspot entries for eligible files; returns the entries plus the count
@@ -472,6 +638,7 @@ fn collect_hotspot_entries(ctx: &HotspotEntryCtx<'_>) -> (Vec<HotspotEntry>, usi
         let ownership = ctx
             .ownership_ctx
             .and_then(|own| compute_ownership(churn, relative, own));
+        let dispersion = ctx.dispersion.and_then(|map| map.get(&score.path));
 
         hotspot_entries.push(HotspotEntry {
             path: score.path.clone(),
@@ -488,12 +655,20 @@ fn collect_hotspot_entries(ctx: &HotspotEntryCtx<'_>) -> (Vec<HotspotEntry>, usi
             complexity_density: score.complexity_density,
             fan_in: score.fan_in,
             trend: churn.trend,
+            median_files_per_commit: dispersion
+                .map(|d| round_one_decimal(d.median_files_per_commit)),
+            median_lines_per_commit: dispersion
+                .map(|d| round_one_decimal(d.median_lines_per_commit)),
             ownership,
-            is_test_path: is_test_path(relative),
+            is_test_path: is_test_path(ctx.root, relative),
         });
     }
 
     (hotspot_entries, files_excluded)
+}
+
+fn round_one_decimal(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
@@ -530,6 +705,9 @@ mod tests {
             files,
             shallow_clone: false,
             author_pool: Vec::new(),
+            clock: crate::clock::AnalysisClock::pinned(1_788_782_400),
+            git_log_bytes: 0,
+            commits: Vec::new(),
         }
     }
 
@@ -716,6 +894,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let mut churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =
@@ -757,6 +938,9 @@ mod tests {
             crap_max: 110.0,
             crap_above_threshold: 2,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         };
         let exempt = FileHealthScore {
@@ -801,6 +985,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let mut churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =
@@ -839,6 +1026,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let mut churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =
@@ -908,6 +1098,9 @@ mod tests {
                 crap_max: 0.0,
                 crap_above_threshold: 0,
                 crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
                 crap_effective_threshold: None,
             },
             FileHealthScore {
@@ -924,6 +1117,9 @@ mod tests {
                 crap_max: 0.0,
                 crap_above_threshold: 0,
                 crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
                 crap_effective_threshold: None,
             },
             FileHealthScore {
@@ -940,6 +1136,9 @@ mod tests {
                 crap_max: 0.0,
                 crap_above_threshold: 0,
                 crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
                 crap_effective_threshold: None,
             },
         ];
@@ -1004,6 +1203,9 @@ mod tests {
                 crap_max: 0.0,
                 crap_above_threshold: 0,
                 crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
                 crap_effective_threshold: None,
             },
             FileHealthScore {
@@ -1020,6 +1222,9 @@ mod tests {
                 crap_max: 0.0,
                 crap_above_threshold: 0,
                 crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
                 crap_effective_threshold: None,
             },
         ];
@@ -1071,6 +1276,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =
@@ -1097,6 +1305,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let mut churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =
@@ -1135,6 +1346,9 @@ mod tests {
             crap_max: 0.0,
             crap_above_threshold: 0,
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
         }];
         let mut churn_files: rustc_hash::FxHashMap<std::path::PathBuf, crate::churn::FileChurn> =

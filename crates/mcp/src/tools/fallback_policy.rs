@@ -1,49 +1,46 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CliFallbackReason {
-    Baseline,
-    Regression,
-    GroupedOutput,
-    DuplicationExplainSkipped,
-    HealthMinScoreGate,
-    HealthMinSeverity,
-    HealthChurnFile,
-    HealthSnapshot,
-    HealthTrend,
-    HealthSummary,
-    HealthRuntimeCoverage,
+use crate::params::TypeAwareRequireParam;
+
+pub(super) fn baseline_requested(baseline: Option<&str>, save_baseline: Option<&str>) -> bool {
+    filled(baseline) || filled(save_baseline)
 }
 
-pub(super) fn baseline_fallback_reason(
-    baseline: Option<&str>,
-    save_baseline: Option<&str>,
-) -> Option<CliFallbackReason> {
-    (filled(baseline) || filled(save_baseline)).then_some(CliFallbackReason::Baseline)
-}
-
-pub(super) fn regression_fallback_reason(
+pub(super) fn regression_requested(
     fail_on_regression: Option<bool>,
     tolerance: Option<&str>,
     regression_baseline: Option<&str>,
     save_regression_baseline: Option<&str>,
-) -> Option<CliFallbackReason> {
-    (fail_on_regression == Some(true)
+) -> bool {
+    fail_on_regression == Some(true)
         || filled(tolerance)
         || filled(regression_baseline)
-        || filled(save_regression_baseline))
-    .then_some(CliFallbackReason::Regression)
+        || filled(save_regression_baseline)
 }
 
-pub(super) fn grouped_fallback_reason(group_by: Option<&str>) -> Option<CliFallbackReason> {
-    filled(group_by).then_some(CliFallbackReason::GroupedOutput)
+pub(super) fn grouped_requested(group_by: Option<&str>) -> bool {
+    filled(group_by)
 }
 
-pub(super) fn duplication_fallback_reason(
+/// The programmatic duplication route has no threshold gate. A typed call with
+/// a `threshold` compares nothing, publishes no `gate_outcomes`, and returns a
+/// result that reads as a pass. The CLI owns that comparison, so a call that
+/// sets a threshold takes the CLI.
+pub(super) fn duplication_needs_cli(
     group_by: Option<&str>,
     explain_skipped: Option<bool>,
-) -> Option<CliFallbackReason> {
-    grouped_fallback_reason(group_by).or_else(|| {
-        (explain_skipped == Some(true)).then_some(CliFallbackReason::DuplicationExplainSkipped)
-    })
+    threshold: Option<f64>,
+) -> bool {
+    threshold.is_some() || grouped_requested(group_by) || explain_skipped == Some(true)
+}
+
+/// Whether the call asks for type-aware analysis, which only the CLI runs.
+pub(super) fn type_aware_requested(
+    type_aware: Option<bool>,
+    projects: Option<&[String]>,
+    require: Option<&TypeAwareRequireParam>,
+) -> bool {
+    type_aware == Some(true)
+        || projects.is_some_and(|projects| !projects.is_empty())
+        || require.is_some()
 }
 
 pub(super) fn filled(value: Option<&str>) -> bool {
@@ -52,39 +49,18 @@ pub(super) fn filled(value: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn baseline_reason_tracks_either_baseline_surface() {
-        assert_eq!(
-            baseline_fallback_reason(Some("base.json"), None),
-            Some(CliFallbackReason::Baseline)
-        );
-        assert_eq!(
-            baseline_fallback_reason(None, Some("next.json")),
-            Some(CliFallbackReason::Baseline)
-        );
-        assert_eq!(baseline_fallback_reason(None, None), None);
-    }
-
-    #[test]
-    fn duplication_reason_preserves_grouping_precedence() {
-        assert_eq!(
-            duplication_fallback_reason(Some("owner"), Some(true)),
-            Some(CliFallbackReason::GroupedOutput)
-        );
-        assert_eq!(
-            duplication_fallback_reason(None, Some(true)),
-            Some(CliFallbackReason::DuplicationExplainSkipped)
-        );
-    }
+    use std::path::Path;
 
     #[test]
     fn cli_fallback_surfaces_are_explicitly_owned() {
-        let tools_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tools");
+        let tools_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("src/tools");
         let unconditional_cli_backed = [
             "check_runtime_coverage.rs",
+            "cloud_reads.rs",
+            "cloud_runtime_context.rs",
             "code_mode.rs",
             "code_mode_subprocess.rs",
             "fix.rs",
@@ -92,6 +68,9 @@ mod tests {
             "impact.rs",
             "inspect_target.rs",
             "mod.rs",
+            // `mutation_plan` is API-backed; `mutation_inspect` always runs
+            // `fallow mutation inspect`.
+            "mutation.rs",
             "recommend.rs",
             "security.rs",
             "semantic.rs",
@@ -100,11 +79,15 @@ mod tests {
         ];
         let conditional_cli_backed = [
             "analyze.rs",
+            "architecture.rs",
             "audit.rs",
             "check_changed.rs",
             "dupes.rs",
             "health.rs",
         ];
+        // The typed route runs first and falls back only when `fallow_api`
+        // refuses with a code that `api_runtime::typed_error_needs_cli` names.
+        let refusal_cli_backed = ["trace.rs"];
 
         for entry in std::fs::read_dir(&tools_dir).expect("read tools dir") {
             let entry = entry.expect("read tools entry");
@@ -121,12 +104,21 @@ mod tests {
             let invokes_cli = invokes_cli_dispatch(&source);
             let is_unconditional = unconditional_cli_backed.contains(&file_name);
             let is_conditional = conditional_cli_backed.contains(&file_name);
+            let is_refusal = refusal_cli_backed.contains(&file_name);
 
             if invokes_cli {
                 assert!(
-                    is_unconditional || is_conditional,
+                    is_unconditional || is_conditional || is_refusal,
                     "{file_name} must be API-backed or added to the explicit CLI fallback policy"
                 );
+            }
+
+            if is_refusal {
+                assert!(
+                    source.contains("typed_tool_result"),
+                    "{file_name} must fall back only on a typed refusal"
+                );
+                continue;
             }
 
             if is_conditional {
@@ -161,11 +153,20 @@ mod tests {
             .expect("utf-8 filename")
     }
 
+    /// Whether a tool module dispatches to the CLI. Matched on the call name
+    /// alone, not on `(binary` adjacency: rustfmt wraps a long call across
+    /// lines and a formatting change must not read as a routing change.
     fn invokes_cli_dispatch(source: &str) -> bool {
-        source.contains("run_tool(binary")
-            || source.contains("run_tool_with_timeout(binary")
-            || source.contains("run_fallow(binary")
-            || source.contains("run_fallow_sync(")
-            || source.contains("Command::new(binary)")
+        [
+            "run_tool(",
+            "run_tool_with_limit(",
+            "run_tool_with_timeout(",
+            "run_tool_with_stdin_timeout(",
+            "run_tool_with_top_level_warnings(",
+            "run_fallow_sync(",
+            "Command::new(binary)",
+        ]
+        .iter()
+        .any(|call| source.contains(call))
     }
 }

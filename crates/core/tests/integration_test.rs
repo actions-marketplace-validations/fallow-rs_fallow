@@ -11,10 +11,16 @@
 #[path = "integration_test/common.rs"]
 mod common;
 
+#[path = "integration_test/ag_ui_agent_hooks.rs"]
+mod ag_ui_agent_hooks;
+#[path = "integration_test/alchemy_plugin.rs"]
+mod alchemy_plugin;
 #[path = "integration_test/angular_ng_package.rs"]
 mod angular_ng_package;
 #[path = "integration_test/angular_unrendered_component.rs"]
 mod angular_unrendered_component;
+#[path = "integration_test/astro_starlight_config.rs"]
+mod astro_starlight_config;
 #[path = "integration_test/astro_unrendered_component.rs"]
 mod astro_unrendered_component;
 #[path = "integration_test/astro_unused_component_prop.rs"]
@@ -23,22 +29,62 @@ mod astro_unused_component_prop;
 mod barrel_exports;
 #[path = "integration_test/basic_analysis.rs"]
 mod basic_analysis;
+#[path = "integration_test/bundler_entry_object_map.rs"]
+mod bundler_entry_object_map;
+#[path = "integration_test/bundler_nested_config_entry.rs"]
+mod bundler_nested_config_entry;
 #[path = "integration_test/caching.rs"]
 mod caching;
+#[path = "integration_test/callback_wrapper_provenance.rs"]
+mod callback_wrapper_provenance;
+#[path = "integration_test/class_factory_property_provenance.rs"]
+mod class_factory_property_provenance;
+#[path = "integration_test/class_value_projections.rs"]
+mod class_value_projections;
+#[path = "integration_test/class_value_source_shapes.rs"]
+mod class_value_source_shapes;
+#[path = "integration_test/config_glob_star_segment.rs"]
+mod config_glob_star_segment;
 #[path = "integration_test/css_in_js_styled.rs"]
 mod css_in_js_styled;
 #[path = "integration_test/css_modules.rs"]
 mod css_modules;
+#[path = "integration_test/cycles_ignore_lazy_imports.rs"]
+mod cycles_ignore_lazy_imports;
 #[path = "integration_test/deno_workspace.rs"]
 mod deno_workspace;
 #[path = "integration_test/dependencies.rs"]
 mod dependencies;
+#[path = "integration_test/deprecated_exports.rs"]
+mod deprecated_exports;
+#[path = "integration_test/directory_resolution.rs"]
+mod directory_resolution;
+#[path = "integration_test/dotenv_plugin.rs"]
+mod dotenv_plugin;
 #[path = "integration_test/duplicate_prop_shape.rs"]
 mod duplicate_prop_shape;
+#[path = "integration_test/dynamic_import_glob_excludes.rs"]
+mod dynamic_import_glob_excludes;
+#[path = "integration_test/dynamic_import_parent_patterns.rs"]
+mod dynamic_import_parent_patterns;
 #[path = "integration_test/dynamic_import_then.rs"]
 mod dynamic_import_then;
 #[path = "integration_test/dynamic_imports.rs"]
 mod dynamic_imports;
+#[path = "integration_test/effect_dead_code.rs"]
+mod effect_dead_code;
+#[path = "integration_test/egg_framework_plugin.rs"]
+mod egg_framework_plugin;
+#[path = "integration_test/entry_load_closure.rs"]
+mod entry_load_closure;
+#[path = "integration_test/entry_output_mapping.rs"]
+mod entry_output_mapping;
+#[path = "integration_test/entry_point_spans.rs"]
+mod entry_point_spans;
+#[path = "integration_test/eve_agent_plugin.rs"]
+mod eve_agent_plugin;
+#[path = "integration_test/expo_config_plugins.rs"]
+mod expo_config_plugins;
 #[path = "integration_test/external_plugins.rs"]
 mod external_plugins;
 #[path = "integration_test/extraction.rs"]
@@ -63,6 +109,8 @@ mod framework_convention_coverage_router;
 mod framework_convention_coverage_vitepress;
 #[path = "integration_test/frameworks.rs"]
 mod frameworks;
+#[path = "integration_test/github_action_manifest_entries.rs"]
+mod github_action_manifest_entries;
 #[path = "integration_test/graph_cache_transparency.rs"]
 mod graph_cache_transparency;
 #[path = "integration_test/graphql_imports.rs"]
@@ -71,6 +119,10 @@ mod graphql_imports;
 mod hono_html_tagged_template;
 #[path = "integration_test/html_entry.rs"]
 mod html_entry;
+#[path = "integration_test/import_load_kinds.rs"]
+mod import_load_kinds;
+#[path = "integration_test/import_meta_resolve_package.rs"]
+mod import_meta_resolve_package;
 #[path = "integration_test/issue_1032_tsconfig_sibling_src_paths.rs"]
 mod issue_1032_tsconfig_sibling_src_paths;
 #[path = "integration_test/issue_1304_effect_schema_same_name.rs"]
@@ -101,18 +153,40 @@ mod issue_948_vscode_provider_members;
 mod issue_952_package_path_resolution;
 #[path = "integration_test/issue_954_pino_transport_target.rs"]
 mod issue_954_pino_transport_target;
+#[path = "integration_test/jsdoc_import_tag.rs"]
+mod jsdoc_import_tag;
 #[path = "integration_test/jsx_assets_and_jsdoc.rs"]
 mod jsx_assets_and_jsdoc;
+#[path = "integration_test/jsx_import_source_pragma.rs"]
+mod jsx_import_source_pragma;
+#[path = "integration_test/kibana_framework_plugin.rs"]
+mod kibana_framework_plugin;
+#[path = "integration_test/link_dependency_workspaces.rs"]
+mod link_dependency_workspaces;
 #[path = "integration_test/lit_unrendered_element.rs"]
 mod lit_unrendered_element;
 #[path = "integration_test/lit_unused_state.rs"]
 mod lit_unused_state;
 #[path = "integration_test/member_detection.rs"]
 mod member_detection;
+#[path = "integration_test/nesting_too_deep_diagnostic.rs"]
+mod nesting_too_deep_diagnostic;
 #[path = "integration_test/nx_project_json.rs"]
 mod nx_project_json;
+#[path = "integration_test/opentelemetry_plugin.rs"]
+mod opentelemetry_plugin;
+#[path = "integration_test/orm_entity_reflection.rs"]
+mod orm_entity_reflection;
+#[path = "integration_test/package_dist_to_src_entries.rs"]
+mod package_dist_to_src_entries;
+#[path = "integration_test/parse_degraded_diagnostic.rs"]
+mod parse_degraded_diagnostic;
 #[path = "integration_test/redwoodsdk.rs"]
 mod redwoodsdk;
+#[path = "integration_test/relative_tsconfig_output_import.rs"]
+mod relative_tsconfig_output_import;
+#[path = "integration_test/release_it_plugin.rs"]
+mod release_it_plugin;
 #[path = "integration_test/rspress_theme.rs"]
 mod rspress_theme;
 #[path = "integration_test/rules_config.rs"]
@@ -121,19 +195,43 @@ mod rules_config;
 mod safe_analysis;
 #[path = "integration_test/sfc_parsing.rs"]
 mod sfc_parsing;
+#[path = "integration_test/signature_backing_unused_backer.rs"]
+mod signature_backing_unused_backer;
 #[path = "integration_test/size_limit_plugin.rs"]
 mod size_limit_plugin;
+#[path = "integration_test/skipped_file_reachability_caveat.rs"]
+mod skipped_file_reachability_caveat;
+#[path = "integration_test/ssr_load_module.rs"]
+mod ssr_load_module;
 #[path = "integration_test/svelte_dead_event.rs"]
 mod svelte_dead_event;
 #[path = "integration_test/symlink_root_containment.rs"]
 mod symlink_root_containment;
+#[path = "integration_test/tsconfig_paths_into_node_modules.rs"]
+mod tsconfig_paths_into_node_modules;
+#[path = "integration_test/tsdown_root_workspace_globs.rs"]
+mod tsdown_root_workspace_globs;
+#[path = "integration_test/type_test_entries.rs"]
+mod type_test_entries;
 #[path = "integration_test/typed_receiver_scoping.rs"]
 mod typed_receiver_scoping;
+#[path = "integration_test/unmeasured_zero_diagnostics.rs"]
+mod unmeasured_zero_diagnostics;
 #[path = "integration_test/unreachable_exports.rs"]
 mod unreachable_exports;
+#[path = "integration_test/vercel_api_directory_functions.rs"]
+mod vercel_api_directory_functions;
+#[path = "integration_test/vitest_jsx_import_source.rs"]
+mod vitest_jsx_import_source;
+#[path = "integration_test/vitest_jsx_project_scopes.rs"]
+mod vitest_jsx_project_scopes;
+#[path = "integration_test/waku.rs"]
+mod waku;
 #[path = "integration_test/workspaces.rs"]
 mod workspaces;
 
+#[path = "integration_test/absent_component_props.rs"]
+mod absent_component_props;
 #[path = "integration_test/boundary_violations.rs"]
 mod boundary_violations;
 #[path = "integration_test/capability_e_route_exports.rs"]
@@ -154,6 +252,16 @@ mod misplaced_directive;
 mod mixed_client_server_barrel;
 #[path = "integration_test/nextjs_route_tree.rs"]
 mod nextjs_route_tree;
+#[path = "integration_test/node_test_bare_default_patterns.rs"]
+mod node_test_bare_default_patterns;
+#[path = "integration_test/non_loading_edges.rs"]
+mod non_loading_edges;
+#[path = "integration_test/pnpm_package_json_overrides_version.rs"]
+mod pnpm_package_json_overrides_version;
+#[path = "integration_test/pnpm_workspace_layout_diagnostics.rs"]
+mod pnpm_workspace_layout_diagnostics;
+#[path = "integration_test/pnpm_workspace_overrides_precedence.rs"]
+mod pnpm_workspace_overrides_precedence;
 #[path = "integration_test/policy_violations.rs"]
 mod policy_violations;
 #[path = "integration_test/private_type_leaks.rs"]
@@ -168,6 +276,10 @@ mod re_export_chains;
 mod react_component_intel;
 #[path = "integration_test/render_fan_in.rs"]
 mod render_fan_in;
+#[path = "integration_test/require_resolve_relative.rs"]
+mod require_resolve_relative;
+#[path = "integration_test/resolve_call_unlisted.rs"]
+mod resolve_call_unlisted;
 #[path = "integration_test/security_catalogue_categories.rs"]
 mod security_catalogue_categories;
 #[path = "integration_test/security_client_server_leak.rs"]
@@ -237,6 +349,10 @@ mod workspace_cross_imports;
 #[path = "integration_test/workspace_internal_deps.rs"]
 mod workspace_internal_deps;
 
+#[path = "integration_test/ci_bun_file_runner.rs"]
+mod ci_bun_file_runner;
+#[path = "integration_test/ci_working_directory.rs"]
+mod ci_working_directory;
 #[path = "integration_test/inheritance_members.rs"]
 mod inheritance_members;
 #[path = "integration_test/issue_1441_factory_return_member.rs"]
@@ -287,8 +403,44 @@ mod issue_2393_mdx_statements;
 mod issue_2395_css_module_credit;
 #[path = "integration_test/issue_2397_default_export_credit.rs"]
 mod issue_2397_default_export_credit;
+#[path = "integration_test/issue_2505_rnstorybook_support.rs"]
+mod issue_2505_rnstorybook_support;
+#[path = "integration_test/issue_2622_nested_build_ignored.rs"]
+mod issue_2622_nested_build_ignored;
+#[path = "integration_test/issue_2638_default_ignore_exclusions.rs"]
+mod issue_2638_default_ignore_exclusions;
+#[path = "integration_test/issue_2698_module_federation.rs"]
+mod issue_2698_module_federation;
+#[path = "integration_test/issue_2753_bundler_entries.rs"]
+mod issue_2753_bundler_entries;
+#[path = "integration_test/issue_2757_federation_option_shapes.rs"]
+mod issue_2757_federation_option_shapes;
+#[path = "integration_test/issue_2940_ignore_pattern_negation.rs"]
+mod issue_2940_ignore_pattern_negation;
+#[path = "integration_test/issue_2952_package_imports_workspace_dep.rs"]
+mod issue_2952_package_imports_workspace_dep;
+#[path = "integration_test/issue_2954_lint_targets_not_entries.rs"]
+mod issue_2954_lint_targets_not_entries;
+#[path = "integration_test/orphan_module_declaration_files.rs"]
+mod orphan_module_declaration_files;
+#[path = "integration_test/workspace_hoisted_package_imports.rs"]
+mod workspace_hoisted_package_imports;
+
+#[path = "integration_test/issue_2794_federation_shared.rs"]
+mod issue_2794_federation_shared;
+
+#[path = "integration_test/issue_2795_federation_runtime_remotes.rs"]
+mod issue_2795_federation_runtime_remotes;
+#[path = "integration_test/issue_2831_storybook_stories_base.rs"]
+mod issue_2831_storybook_stories_base;
+#[path = "integration_test/issue_2842_storybook_cross_workspace.rs"]
+mod issue_2842_storybook_cross_workspace;
+#[path = "integration_test/issue_2876_federation_follow_ups.rs"]
+mod issue_2876_federation_follow_ups;
 #[path = "integration_test/issue_346_static_factory_method.rs"]
 mod issue_346_static_factory_method;
+#[path = "integration_test/issue_3489_import_meta_glob_extglob.rs"]
+mod issue_3489_import_meta_glob_extglob;
 #[path = "integration_test/issue_604_vite_rollup_path_helpers.rs"]
 mod issue_604_vite_rollup_path_helpers;
 #[path = "integration_test/issue_605_new_class_member.rs"]
@@ -320,6 +472,8 @@ mod scoped_used_class_members;
 mod scss_partials;
 #[path = "integration_test/super_method_calls.rs"]
 mod super_method_calls;
+#[path = "integration_test/vite_sass_crediting.rs"]
+mod vite_sass_crediting;
 
 #[path = "integration_test/angular_template_members.rs"]
 mod angular_template_members;
@@ -343,6 +497,10 @@ mod issue_2069_npm_overrides;
 mod issue_2358_bun_lockb_diagnostic;
 #[path = "integration_test/issue_2367_bun_resolutions.rs"]
 mod issue_2367_bun_resolutions;
+#[path = "integration_test/issue_2955_package_cycles.rs"]
+mod issue_2955_package_cycles;
+#[path = "integration_test/issue_3078_catalog_overrides.rs"]
+mod issue_3078_catalog_overrides;
 #[path = "integration_test/issue_317_namespace_barrel_ignore_exports.rs"]
 mod issue_317_namespace_barrel_ignore_exports;
 #[path = "integration_test/issue_329_pnpm_catalog.rs"]
@@ -351,6 +509,8 @@ mod issue_329_pnpm_catalog;
 mod issue_334_unresolved_catalog_ref;
 #[path = "integration_test/issue_336_unused_overrides.rs"]
 mod issue_336_unused_overrides;
+#[path = "integration_test/issue_3525_oxlint_config_names.rs"]
+mod issue_3525_oxlint_config_names;
 #[path = "integration_test/issue_358_custom_eslint_config.rs"]
 mod issue_358_custom_eslint_config;
 #[path = "integration_test/issue_359_empty_catalog_group.rs"]
@@ -407,8 +567,14 @@ mod issue_873_firebase_messaging_sw;
 mod issue_956_playwright_pnpm_exec;
 #[path = "integration_test/lexical_nodes.rs"]
 mod lexical_nodes;
+#[path = "integration_test/playwright_bare_package.rs"]
+mod playwright_bare_package;
+#[path = "integration_test/playwright_test_dir.rs"]
+mod playwright_test_dir;
 #[path = "integration_test/script_multiplexers.rs"]
 mod script_multiplexers;
+#[path = "integration_test/shell_command_substitution.rs"]
+mod shell_command_substitution;
 #[path = "integration_test/visibility_tags.rs"]
 mod visibility_tags;
 #[path = "integration_test/vue_options_api_prop_emit.rs"]
@@ -459,6 +625,37 @@ mod astro_template_map_class_member;
 #[path = "integration_test/issue_843_nestjs_lifecycle.rs"]
 mod issue_843_nestjs_lifecycle;
 
+#[path = "integration_test/nestjs_trpc_interfaces.rs"]
+mod nestjs_trpc_interfaces;
+
+#[path = "integration_test/external_override_class_members.rs"]
+mod external_override_class_members;
+#[path = "integration_test/flue_plugin.rs"]
+mod flue_plugin;
+#[path = "integration_test/gitignored_workspace_members.rs"]
+mod gitignored_workspace_members;
+#[path = "integration_test/issue_2752_nuxt_components_scope.rs"]
+mod issue_2752_nuxt_components_scope;
+#[path = "integration_test/issue_2752_nuxt_local_layers.rs"]
+mod issue_2752_nuxt_local_layers;
+#[path = "integration_test/issue_2847_nuxt_content_components.rs"]
+mod issue_2847_nuxt_content_components;
+#[path = "integration_test/issue_2849_nuxt_og_image_templates.rs"]
+mod issue_2849_nuxt_og_image_templates;
+#[path = "integration_test/issue_2851_nuxt_package_layer_modules.rs"]
+mod issue_2851_nuxt_package_layer_modules;
+#[path = "integration_test/issue_2870_workspace_missing_build_entry.rs"]
+mod issue_2870_workspace_missing_build_entry;
+#[path = "integration_test/issue_3208_lib_output_source.rs"]
+mod issue_3208_lib_output_source;
+#[path = "integration_test/issue_3311_css_module_global_classes.rs"]
+mod issue_3311_css_module_global_classes;
+#[path = "integration_test/issue_3324_nested_package.rs"]
+mod issue_3324_nested_package;
+#[path = "integration_test/issue_3490_entry_glob_star_segment.rs"]
+mod issue_3490_entry_glob_star_segment;
+#[path = "integration_test/issue_3817_workspace_dist_src_exports.rs"]
+mod issue_3817_workspace_dist_src_exports;
 #[path = "integration_test/issue_609_velite.rs"]
 mod issue_609_velite;
 #[path = "integration_test/issue_704_auto_import_components.rs"]
@@ -469,5 +666,43 @@ mod issue_739_script_auto_imports;
 mod issue_740_pinia_store_auto_imports;
 #[path = "integration_test/issue_744_tsdown_config.rs"]
 mod issue_744_tsdown_config;
+#[path = "integration_test/jasmine_plugin.rs"]
+mod jasmine_plugin;
+#[path = "integration_test/mise_plugin.rs"]
+mod mise_plugin;
+#[path = "integration_test/namespace_class_static_member.rs"]
+mod namespace_class_static_member;
+#[path = "integration_test/namespace_spy_call_member.rs"]
+mod namespace_spy_call_member;
+#[path = "integration_test/node_modules_bin_path.rs"]
+mod node_modules_bin_path;
+#[path = "integration_test/npm_alias_dependency_binaries.rs"]
+mod npm_alias_dependency_binaries;
+#[path = "integration_test/osls_plugin.rs"]
+mod osls_plugin;
 #[path = "integration_test/pkg_utils_plugin.rs"]
 mod pkg_utils_plugin;
+#[path = "integration_test/railway_plugin.rs"]
+mod railway_plugin;
+#[path = "integration_test/rstest_plugin.rs"]
+mod rstest_plugin;
+#[path = "integration_test/sanity_plugin.rs"]
+mod sanity_plugin;
+#[path = "integration_test/serverless_framework_plugin.rs"]
+mod serverless_framework_plugin;
+#[path = "integration_test/textlint_plugin.rs"]
+mod textlint_plugin;
+#[path = "integration_test/type_only_namespace.rs"]
+mod type_only_namespace;
+#[path = "integration_test/typescript_content_mapper_plugin.rs"]
+mod typescript_content_mapper_plugin;
+#[path = "integration_test/vite_plus_plugin.rs"]
+mod vite_plus_plugin;
+#[path = "integration_test/vite_root_entries.rs"]
+mod vite_root_entries;
+#[path = "integration_test/vitest_include_scope.rs"]
+mod vitest_include_scope;
+#[path = "integration_test/vitest_script_config_arg.rs"]
+mod vitest_script_config_arg;
+#[path = "integration_test/webpack_inline_loaders.rs"]
+mod webpack_inline_loaders;

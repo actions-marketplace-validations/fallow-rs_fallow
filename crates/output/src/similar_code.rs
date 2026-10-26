@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::root_envelopes::{RootEnvelopeMode, serialize_named_json_output};
+use crate::root_envelopes::serialize_named_json_output;
 use fallow_types::envelope::{ElapsedMs, ToolVersion};
 use serde::{Deserialize, Serialize};
 
@@ -628,6 +628,19 @@ pub struct SimilarCodeCandidateSnapshot {
     pub diagnostics: Vec<SimilarCodeDiagnostic>,
 }
 
+#[cfg(feature = "schema")]
+impl SimilarCodeCandidateSnapshot {
+    /// JSON Schema of the inspect handoff object, published as the
+    /// `fallow://schema/similar-code-snapshot` MCP resource so the
+    /// `inspect_similar_code` input schema can accept a plain object instead
+    /// of inlining this shape on every `tools/list`.
+    #[must_use]
+    pub fn json_schema() -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(SimilarCodeCandidateSnapshot))
+            .unwrap_or_default()
+    }
+}
+
 /// One named graph reference used in an inspect packet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -952,9 +965,8 @@ impl<'de> Deserialize<'de> for SimilarCodeReviewOutput {
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_similar_code_json_output(
     output: SimilarCodeOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "similar-code", mode)
+    serialize_named_json_output(output, "similar-code")
 }
 
 /// Serialize a similar-code inspect packet with its root discriminator.
@@ -964,9 +976,8 @@ pub fn serialize_similar_code_json_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_similar_code_inspect_json_output(
     output: SimilarCodeInspectOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "similar-code-inspect", mode)
+    serialize_named_json_output(output, "similar-code-inspect")
 }
 
 /// Serialize reviewed similar-code output with its root discriminator.
@@ -976,9 +987,8 @@ pub fn serialize_similar_code_inspect_json_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_similar_code_review_json_output(
     output: SimilarCodeReviewOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "similar-code-review", mode)
+    serialize_named_json_output(output, "similar-code-review")
 }
 
 /// Serialize local-provider status with its root discriminator.
@@ -988,9 +998,8 @@ pub fn serialize_similar_code_review_json_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_similar_code_status_json_output(
     output: SimilarCodeStatusOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "similar-code-status", mode)
+    serialize_named_json_output(output, "similar-code-status")
 }
 
 /// Serialize a vector-cache clear result with its root discriminator.
@@ -1000,9 +1009,8 @@ pub fn serialize_similar_code_status_json_output(
 /// Returns a serde error when the envelope cannot be converted to JSON.
 pub fn serialize_similar_code_cache_clear_json_output(
     output: SimilarCodeCacheClearOutput,
-    mode: RootEnvelopeMode,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_named_json_output(output, "similar-code-cache-clear", mode)
+    serialize_named_json_output(output, "similar-code-cache-clear")
 }
 
 #[cfg(test)]
@@ -1031,7 +1039,7 @@ mod tests {
     fn raw_serializer_adds_only_the_similar_code_kind() {
         let output = raw_output();
 
-        let value = serialize_similar_code_json_output(output, RootEnvelopeMode::Tagged)
+        let value = serialize_similar_code_json_output(output)
             .expect("similar-code output should serialize");
 
         assert_eq!(value["kind"], "similar-code");

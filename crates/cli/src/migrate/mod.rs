@@ -2,6 +2,7 @@ mod jscpd;
 mod jsonc;
 mod knip;
 mod knip_fields;
+mod knip_regex;
 mod knip_tables;
 mod stylelint;
 #[cfg(test)]
@@ -168,7 +169,17 @@ fn reject_existing_fallow_config(root: &Path) -> Option<ExitCode> {
 /// a matching source file owns. Printed for every knip migration, not only
 /// when `ignore` was present, so the narrower semantics are stated before a
 /// user reaches for the key.
-const KNIP_IGNORE_SCOPE_NOTE: &str = "Note: knip's ignore also suppresses dependency and manifest issues by file path; fallow's ignoreFindings never hides manifest-owned findings such as unused dependencies. See https://docs.fallow.tools/migration/from-knip";
+const KNIP_IGNORE_SCOPE_NOTE: &str = "\
+Note: knip's ignore also suppresses dependency and manifest issues by file
+path; fallow's ignoreFindings never hides manifest-owned findings such as
+unused dependencies.
+https://fallow.tools/docs/migration/from-knip/";
+
+/// Caveat that knip and fallow match globs with different engines.
+const KNIP_GLOB_ENGINE_NOTE: &str = "\
+Note: knip and fallow use different glob engines; verify migrated entry /
+ignoreFindings with `fallow dead-code` before relying on CI.
+https://fallow.tools/docs/migration/from-knip/";
 
 /// Print the migrated-sources list, migration warnings, the knip
 /// glob-engine caveat, and the knip ignore-scope note after a successful
@@ -190,9 +201,7 @@ fn report_migration_outcome(result: &MigrationResult) {
 
     if should_emit_glob_caveat(result) {
         eprintln!();
-        eprintln!(
-            "Note: knip and fallow use different glob engines; verify migrated entry / ignoreFindings with `fallow dead-code` before relying on CI. See https://docs.fallow.tools/migration/from-knip"
-        );
+        eprintln!("{KNIP_GLOB_ENGINE_NOTE}");
     }
 
     if knip_contributed(result) {
@@ -490,7 +499,10 @@ fn load_json_or_jsonc(path: &Path) -> Result<serde_json::Value, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
-    jsonc_parser::parse_to_serde_value(&content, &jsonc_parse_options())
+    // knip, jscpd and stylelint configs are foreign files, but fallow reads
+    // them with the same JSONC dialect it accepts for its own config, so the
+    // catalogue lives once in `fallow_config::jsonc`.
+    fallow_config::jsonc::parse_to_value::<serde_json::Value>(&content)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
@@ -541,84 +553,12 @@ fn load_stylelint_js_config(path: &Path) -> Result<serde_json::Value, String> {
             allow_single_quoted_strings: true,
             allow_hexadecimal_numbers: false,
             allow_unary_plus_numbers: false,
+            allow_bare_decimal_point_numbers: false,
+            allow_extended_string_escapes: false,
+            allow_non_finite_numbers: false,
         },
     )
     .map_err(|e| format!("failed to parse {}: {e}", path.display()))
-}
-
-fn jsonc_parse_options() -> jsonc_parser::ParseOptions {
-    jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_loose_object_property_names: false,
-        allow_trailing_commas: true,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
-    }
-}
-
-/// Strip JSONC-style trailing commas (`,` immediately before `}` or `]`)
-/// without touching commas inside string literals.
-#[cfg(test)]
-fn strip_trailing_commas(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut last_emit = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        if b == b',' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len()
-                && (bytes[j] == b'}' || bytes[j] == b']')
-                && comma_follows_json_value(bytes, i)
-            {
-                out.push_str(&input[last_emit..i]);
-                last_emit = i + 1;
-            }
-        }
-        i += 1;
-    }
-
-    out.push_str(&input[last_emit..]);
-    out
-}
-
-#[cfg(test)]
-fn comma_follows_json_value(bytes: &[u8], comma_index: usize) -> bool {
-    let Some(prev) = bytes[..comma_index]
-        .iter()
-        .rev()
-        .copied()
-        .find(|b| !b.is_ascii_whitespace())
-    else {
-        return false;
-    };
-
-    matches!(prev, b'"' | b'}' | b']' | b'0'..=b'9' | b'e' | b'l')
 }
 
 /// Strip any trailing ` (...)` suffix from a `MigrationResult.sources` entry,

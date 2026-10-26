@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 
-use fallow_types::envelope::{Meta, MetaRule};
+use fallow_types::envelope::{Meta, MetaMetric, MetaRule};
 pub use fallow_types::issue_meta::{CODECLIMATE_RESULT_CODES, TsAliasMeta};
 use fallow_types::issue_meta::{
     IssueResultMeta, issue_meta_by_code, issue_result_meta_by_code, result_issue_metas,
 };
 
-const DOCS_BASE: &str = "https://docs.fallow.tools";
+const DOCS_BASE: &str = "https://fallow.tools/docs";
 
 /// Docs URL for the dead-code/check command.
-pub const CHECK_DOCS: &str = "https://docs.fallow.tools/cli/dead-code";
+pub const CHECK_DOCS: &str = "https://fallow.tools/docs/cli/dead-code/";
+
+/// Docs URL for the architecture command.
+pub const ARCHITECTURE_DOCS: &str = "https://fallow.tools/docs/cli/architecture/";
 
 /// `_meta` description for the per-finding `actions[]` array shared across
 /// JSON output.
@@ -106,20 +109,62 @@ pub fn check_meta() -> Meta {
             ),
         ]),
         rules,
+        metrics: BTreeMap::from([(
+            "summary.prop_drilling_chains".to_string(),
+            MetaMetric {
+                name: Some("Enforced prop-drilling chains".to_string()),
+                description: Some("Number of prop-drilling chains with saved effective_severity set to error. Warning chains are excluded; the counter is omitted when zero.".to_string()),
+                range: Some("Non-negative integer".to_string()),
+                interpretation: Some("Each counted chain contributes to total_issues and CI error gates. The finding array can also contain advisory chains excluded from this counter.".to_string()),
+            },
+        )]),
         ..Meta::default()
     }
 }
 
-/// Public docs URL for a dead-code explanation `anchor` on the dead-code page.
+/// The `AnalysisResults` arrays that `fallow architecture` reports: import
+/// cycles, boundary violations and rule-pack policy violations.
+///
+/// One list for the `_meta.rules` filter, the human report and the
+/// programmatic selection, so the three cannot disagree.
+pub const ARCHITECTURE_RESULT_KEYS: &[&str] = &[
+    "circular_dependencies",
+    "re_export_cycles",
+    "package_cycles",
+    "boundary_violations",
+    "boundary_coverage_violations",
+    "boundary_call_violations",
+    "policy_violations",
+];
+
+/// Build the `_meta` object for `fallow architecture --format json --explain`.
+///
+/// It has the dead-code field definitions, the architecture docs URL, and
+/// only the rules of the [`ARCHITECTURE_RESULT_KEYS`] arrays.
 #[must_use]
-pub fn dead_code_docs_url(anchor: &str) -> String {
-    format!("{DOCS_BASE}/explanations/dead-code#{anchor}")
+pub fn architecture_meta() -> Meta {
+    let mut meta = check_meta();
+    let architecture_codes: Vec<&'static str> = issue_output_contracts()
+        .filter(|contract| ARCHITECTURE_RESULT_KEYS.contains(&contract.result_key))
+        .map(|contract| contract.code)
+        .collect();
+    meta.rules
+        .retain(|code, _| architecture_codes.contains(&code.as_str()));
+    meta.metrics.remove("summary.prop_drilling_chains");
+    meta.docs = Some(ARCHITECTURE_DOCS.to_string());
+    meta
 }
 
 /// Public docs URL for a rule's `docs_path` relative to the docs site root.
+///
+/// A page URL ends with a slash, before any `#anchor`, because that is the
+/// final address of the page: `cli/flags#x` becomes `.../cli/flags/#x`.
 #[must_use]
 pub fn rule_docs_url(docs_path: &str) -> String {
-    format!("{DOCS_BASE}/{docs_path}")
+    match docs_path.split_once('#') {
+        Some((page, anchor)) => format!("{DOCS_BASE}/{page}/#{anchor}"),
+        None => format!("{DOCS_BASE}/{docs_path}/"),
+    }
 }
 
 /// Output-facing dead-code result contracts in stable registry order.
@@ -138,6 +183,35 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn architecture_meta_lists_only_architecture_rules() {
+        let meta = architecture_meta();
+        let expected: BTreeSet<&str> = issue_output_contracts()
+            .filter(|contract| ARCHITECTURE_RESULT_KEYS.contains(&contract.result_key))
+            .map(|contract| contract.code)
+            .collect();
+        let actual: BTreeSet<&str> = meta.rules.keys().map(String::as_str).collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(meta.docs.as_deref(), Some(ARCHITECTURE_DOCS));
+        assert_eq!(meta.field_definitions, check_meta().field_definitions);
+        assert!(!meta.metrics.contains_key("summary.prop_drilling_chains"));
+    }
+
+    #[test]
+    fn every_architecture_result_key_names_a_result_row() {
+        let keys: BTreeSet<&str> = issue_output_contracts()
+            .map(|contract| contract.result_key)
+            .collect();
+        for key in ARCHITECTURE_RESULT_KEYS {
+            assert!(keys.contains(key), "`{key}` is not a result array key");
+        }
+        let architecture_rows = issue_output_contracts()
+            .filter(|contract| ARCHITECTURE_RESULT_KEYS.contains(&contract.result_key))
+            .count();
+        assert_eq!(architecture_rows, ARCHITECTURE_RESULT_KEYS.len());
+    }
 
     #[test]
     fn every_result_row_has_output_contract() {
@@ -171,7 +245,7 @@ mod tests {
         assert!(meta.rules.contains_key("missing-suppression-reason"));
         assert_eq!(
             meta.rules["unused-dev-dependency"].docs.as_deref(),
-            Some("https://docs.fallow.tools/explanations/dead-code#unused-devdependencies")
+            Some("https://fallow.tools/docs/explanations/dead-code/#unused-devdependencies")
         );
     }
 
@@ -204,7 +278,7 @@ mod tests {
 
     #[test]
     fn codeclimate_result_exclusions_are_explicit() {
-        let expected = BTreeSet::from(["duplicate-prop-shape", "prop-drilling", "thin-wrapper"]);
+        let expected = BTreeSet::from(["duplicate-prop-shape", "thin-wrapper"]);
         let from_contracts: BTreeSet<&str> = issue_output_contracts()
             .filter(|contract| contract.codeclimate_check_names.is_empty())
             .map(|contract| contract.code)
@@ -229,6 +303,7 @@ mod tests {
             BTreeSet::from([
                 ("BoundaryViolation", "BoundaryViolationFinding"),
                 ("CircularDependency", "CircularDependencyFinding"),
+                ("DeprecatedExportInUse", "DeprecatedExportInUseFinding"),
                 (
                     "DevDependencyInProduction",
                     "DevDependencyInProductionFinding",
@@ -239,6 +314,7 @@ mod tests {
                     "MisconfiguredDependencyOverride",
                     "MisconfiguredDependencyOverrideFinding",
                 ),
+                ("PackageCycle", "PackageCycleFinding"),
                 ("PrivateTypeLeak", "PrivateTypeLeakFinding"),
                 ("ReExportCycle", "ReExportCycleFinding"),
                 ("TestOnlyDependency", "TestOnlyDependencyFinding"),

@@ -2,10 +2,13 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use fallow_config::{OutputFormat, ResolvedConfig};
+use fallow_engine::change_scope::{
+    ChangeScope, ChangeScopeOwner, ChangeScopeRequest, PackageBaselineCache,
+};
 use fallow_types::duplicates::{DefaultIgnoreSkips, DuplicationReport};
 
-use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups, recompute_stats};
-use crate::check::{get_changed_files, resolve_workspace_scope};
+use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups};
+use crate::check::resolve_workspace_scope;
 use crate::report;
 use crate::{error::emit_error, load_config_for_analysis};
 
@@ -28,6 +31,77 @@ impl From<fallow_config::DetectionMode> for DupesMode {
     }
 }
 
+/// Per-run overrides of the `duplicates` config, from one CLI parse.
+///
+/// `fallow dupes` fills it from its subcommand flags and the combined run
+/// fills it from the global `--dupes-*` flags. Every field defaults to "not
+/// set", so [`DupesOverrides::is_empty`] tells if the run uses the config as
+/// it is.
+#[derive(Clone, Copy, Default)]
+pub struct DupesOverrides {
+    /// Detection mode. `None` falls back to the config value.
+    pub mode: Option<DupesMode>,
+    /// Enable function-scoped near-miss clone detection.
+    pub near: bool,
+    /// Failure threshold percentage. `None` falls back to config (where `0.0`
+    /// disables the gate).
+    pub threshold: Option<f64>,
+    /// Minimum token count. `None` falls back to config.
+    pub min_tokens: Option<usize>,
+    /// Minimum line count. `None` falls back to config.
+    pub min_lines: Option<usize>,
+    /// Minimum occurrence count (clone groups with fewer instances are
+    /// hidden). `None` falls back to config (default 2). CLI parsing rejects
+    /// `< 2`, so callers never need to clamp here.
+    pub min_occurrences: Option<usize>,
+    pub skip_local: bool,
+    /// Omit symlinked clone instances. `None` defers to the config value
+    /// (default `false`); `Some(false)` is the explicit opt-out.
+    pub ignore_symlinks: Option<bool>,
+    pub cross_language: bool,
+    /// Exclude import declarations from clone detection. `None` defers to the
+    /// config value (which defaults to `true`); `Some(false)` is the explicit
+    /// opt-out.
+    pub ignore_imports: Option<bool>,
+}
+
+impl DupesOverrides {
+    /// The first set override, named by its global `--dupes-*` flag. Commands
+    /// that do not run duplicate detection reject this flag.
+    pub fn first_global_flag(&self) -> Option<&'static str> {
+        [
+            (self.mode.is_some(), "--dupes-mode"),
+            (self.near, "--dupes-near"),
+            (self.threshold.is_some(), "--dupes-threshold"),
+            (self.min_tokens.is_some(), "--dupes-min-tokens"),
+            (self.min_lines.is_some(), "--dupes-min-lines"),
+            (self.min_occurrences.is_some(), "--dupes-min-occurrences"),
+            (self.skip_local, "--dupes-skip-local"),
+            (
+                self.ignore_symlinks == Some(true),
+                "--dupes-ignore-symlinks",
+            ),
+            (
+                self.ignore_symlinks == Some(false),
+                "--dupes-no-ignore-symlinks",
+            ),
+            (self.cross_language, "--dupes-cross-language"),
+            (self.ignore_imports == Some(true), "--dupes-ignore-imports"),
+            (
+                self.ignore_imports == Some(false),
+                "--dupes-no-ignore-imports",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(set, flag)| set.then_some(flag))
+    }
+
+    /// Whether no override is set, so the run uses the config as it is.
+    pub fn is_empty(&self) -> bool {
+        self.first_global_flag().is_none()
+    }
+}
+
 pub struct DupesOptions<'a> {
     pub root: &'a std::path::Path,
     pub config_path: &'a Option<std::path::PathBuf>,
@@ -37,31 +111,27 @@ pub struct DupesOptions<'a> {
     pub threads: usize,
     pub quiet: bool,
     pub allow_remote_extends: bool,
-    /// CLI override for detection mode. `None` falls back to the value from
-    /// the config file (or its default if unspecified there).
-    pub mode: Option<DupesMode>,
-    /// Enable function-scoped near-miss clone detection.
-    pub near: bool,
-    /// CLI override for minimum token count. `None` falls back to config.
-    pub min_tokens: Option<usize>,
-    /// CLI override for minimum line count. `None` falls back to config.
-    pub min_lines: Option<usize>,
-    /// CLI override for minimum occurrence count (clone groups with fewer
-    /// instances are hidden). `None` falls back to config (default 2).
-    /// CLI parsing rejects `< 2` so callers never need to clamp here.
-    pub min_occurrences: Option<usize>,
-    /// CLI override for failure threshold percentage. `None` falls back to
-    /// config (where `0.0` disables the gate).
-    pub threshold: Option<f64>,
-    pub skip_local: bool,
-    pub cross_language: bool,
-    /// CLI/caller override for excluding import declarations from clone
-    /// detection. `None` defers to the config value (which defaults to `true`);
-    /// `Some(false)` is the explicit opt-out (`--no-ignore-imports`).
-    pub ignore_imports: Option<bool>,
+    /// CLI overrides of the `duplicates` config.
+    pub overrides: DupesOverrides,
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Appended to the workspace-roots channel, so it composes with
+    /// `--workspace` the way multiple workspace roots compose (union), and
+    /// intersects with `--changed-since` / `--diff-file` like every other
+    /// scope flag. `None` means whole-project scope.
+    pub scope: Option<std::path::PathBuf>,
     pub top: Option<usize>,
     pub baseline_path: Option<&'a std::path::Path>,
+    /// Which argument carried `baseline_path`, so the note about a baseline
+    /// another command saved names an argument this run accepts. `fallow audit`
+    /// passes `--dupes-baseline`; every other caller passes `--baseline`.
+    pub baseline_flag: &'a str,
     pub save_baseline_path: Option<&'a std::path::Path>,
+    /// Fail the run when a loaded `baseline_path` has entries that match
+    /// nothing.
+    pub fail_on_stale_baseline: bool,
+    /// `--fail-on-issues` or `--ci`: fail the run when a clone group remains
+    /// after the baseline and suppression filters.
+    pub fail_on_issues: bool,
     pub production: bool,
     pub production_override: Option<bool>,
     pub trace: Option<&'a str>,
@@ -69,6 +139,11 @@ pub struct DupesOptions<'a> {
     pub diff_index: Option<&'a crate::report::ci::diff_filter::DiffIndex>,
     pub use_shared_diff_index: bool,
     pub changed_files: Option<&'a rustc_hash::FxHashSet<std::path::PathBuf>>,
+    /// Who owns the change scope. `audit` owns it, so its runs never read
+    /// `workspaces.changedSince`.
+    pub change_scope_owner: ChangeScopeOwner,
+    /// `--no-package-baselines`: ignore `workspaces.changedSince` for this run.
+    pub no_package_baselines: bool,
     pub workspace: Option<&'a [String]>,
     pub changed_workspaces: Option<&'a str>,
     pub explain: bool,
@@ -84,6 +159,14 @@ pub struct DupesOptions<'a> {
     /// Standalone `fallow dupes` reads this; combined-mode invocations rely
     /// on the bare `fallow` pipeline panel and ignore this field.
     pub performance: bool,
+    /// Emit the verbatim source text on each clone instance in `--format json`
+    /// output. `false` is `--no-fragments`: the five location fields still
+    /// address the same code. Human and CI renderers ignore this.
+    pub include_fragments: bool,
+    /// Keep a copy of the detection report before the baseline and scope
+    /// filters in `DupesResult::unfiltered_report`. Combined mode sets this
+    /// when health can use the report in place of a second detection.
+    pub retain_unfiltered_report: bool,
 }
 
 /// Parse a `--trace` spec string into (file_path, line_number).
@@ -143,14 +226,15 @@ fn run_clone_trace(
 /// `toml_dupes`. This is what lets users set e.g. `duplicates.minLines = 8`
 /// in `.fallowrc.jsonc` and have `fallow dupes` honor it. The opt-in toggles
 /// (`skip_local`, `cross_language`) use OR-merge, so any `true` (CLI or config)
-/// wins. `ignore_imports` defaults to `true` and supports opt-out, so it uses
-/// precedence instead: an explicit CLI `Some(true|false)` wins over config,
-/// `None` defers to the config value.
+/// wins. `ignore_imports` and `ignore_symlinks` have a CLI opt-out, so they
+/// use precedence instead: an explicit CLI `Some(true|false)` wins over
+/// config, `None` defers to the config value.
 fn build_dupes_config(
     opts: &DupesOptions<'_>,
     toml_dupes: &fallow_config::DuplicatesConfig,
 ) -> fallow_config::DuplicatesConfig {
-    let mode = opts.mode.map_or(toml_dupes.mode, |m| match m {
+    let overrides = &opts.overrides;
+    let mode = overrides.mode.map_or(toml_dupes.mode, |m| match m {
         DupesMode::Strict => fallow_config::DetectionMode::Strict,
         DupesMode::Mild => fallow_config::DetectionMode::Mild,
         DupesMode::Weak => fallow_config::DetectionMode::Weak,
@@ -159,17 +243,24 @@ fn build_dupes_config(
     fallow_config::DuplicatesConfig {
         enabled: true,
         mode,
-        near: opts.near || toml_dupes.near,
-        min_tokens: opts.min_tokens.unwrap_or(toml_dupes.min_tokens),
-        min_lines: opts.min_lines.unwrap_or(toml_dupes.min_lines),
-        min_occurrences: opts.min_occurrences.unwrap_or(toml_dupes.min_occurrences),
-        threshold: opts.threshold.unwrap_or(toml_dupes.threshold),
+        near: overrides.near || toml_dupes.near,
+        min_tokens: overrides.min_tokens.unwrap_or(toml_dupes.min_tokens),
+        min_lines: overrides.min_lines.unwrap_or(toml_dupes.min_lines),
+        min_occurrences: overrides
+            .min_occurrences
+            .unwrap_or(toml_dupes.min_occurrences),
+        threshold: overrides.threshold.unwrap_or(toml_dupes.threshold),
         ignore: toml_dupes.ignore.clone(),
         ignored_clones: toml_dupes.ignored_clones.clone(),
         ignore_defaults: toml_dupes.ignore_defaults,
-        skip_local: opts.skip_local || toml_dupes.skip_local,
-        cross_language: opts.cross_language || toml_dupes.cross_language,
-        ignore_imports: opts.ignore_imports.unwrap_or(toml_dupes.ignore_imports),
+        skip_local: overrides.skip_local || toml_dupes.skip_local,
+        ignore_symlinks: overrides
+            .ignore_symlinks
+            .unwrap_or(toml_dupes.ignore_symlinks),
+        cross_language: overrides.cross_language || toml_dupes.cross_language,
+        ignore_imports: overrides
+            .ignore_imports
+            .unwrap_or(toml_dupes.ignore_imports),
         normalization: toml_dupes.normalization.clone(),
         min_corpus_size_for_shingle_filter: toml_dupes.min_corpus_size_for_shingle_filter,
         min_corpus_size_for_token_cache: toml_dupes.min_corpus_size_for_token_cache,
@@ -179,68 +270,16 @@ fn build_dupes_config(
 /// Check whether duplication percentage exceeds the configured threshold.
 ///
 /// Returns `true` if the threshold is positive and the duplication percentage exceeds it.
-fn exceeds_threshold(threshold: f64, duplication_percentage: f64) -> bool {
+/// The duplication threshold rule, shared by the standalone exit path, the
+/// combined exit path and the `gate_outcomes` entry, so one comparison decides
+/// all three. A threshold of zero is the CLI's spelling of "no limit".
+pub fn exceeds_threshold(threshold: f64, duplication_percentage: f64) -> bool {
     threshold > 0.0 && duplication_percentage > threshold
-}
-
-use fallow_engine::changed_files::filter_duplication_by_changed_files as filter_by_changed_files;
-
-/// Filter a duplication report to only retain clone groups where at least one
-/// instance belongs to a file under one of the given workspace roots. Mirrors
-/// the `AnalysisResults` workspace-scoping behaviour in
-/// `crate::check::filtering::filter_to_workspaces`: the full cross-workspace
-/// graph is still built, only reported groups are narrowed.
-///
-/// Families and stats are rebuilt from the surviving groups so that the
-/// reported duplication percentage reflects the scoped slice, not the whole
-/// repo.
-fn filter_by_workspaces(
-    report: &mut fallow_types::duplicates::DuplicationReport,
-    ws_roots: &[std::path::PathBuf],
-    root: &std::path::Path,
-) {
-    report.clone_groups.retain(|g| {
-        g.instances
-            .iter()
-            .any(|i| ws_roots.iter().any(|r| i.file.starts_with(r)))
-    });
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.stats = recompute_stats(report);
-}
-
-/// Filter a duplication report to only retain clone groups whose at least
-/// one instance has its `[start_line..=end_line]` range overlap an added
-/// line for that instance's file in the supplied diff. Group-level
-/// retention (panel guidance for issue #424): a group is kept if ANY of
-/// its instances overlaps, even when the other instances do not, so the
-/// reviewer sees the full clone family in PR context. Single-instance
-/// drop is fine because a clone-of-one is no longer a clone.
-///
-/// Families and stats are rebuilt from the surviving groups so that the
-/// reported duplication percentage reflects the scoped slice.
-fn filter_by_diff(
-    report: &mut fallow_types::duplicates::DuplicationReport,
-    diff_index: &crate::report::ci::diff_filter::DiffIndex,
-    root: &std::path::Path,
-) {
-    let instance_overlaps = |instance: &fallow_types::duplicates::CloneInstance| -> bool {
-        let Some(rel) = diff_index.key_for(&instance.file, root) else {
-            return true;
-        };
-        let start = u64::try_from(instance.start_line).unwrap_or(u64::MAX);
-        let end = u64::try_from(instance.end_line).unwrap_or(u64::MAX);
-        diff_index.range_overlaps_added(&rel, start, end)
-    };
-
-    report
-        .clone_groups
-        .retain(|g| g.instances.iter().any(instance_overlaps));
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.stats = recompute_stats(report);
 }
 
 /// Result of executing duplication analysis without printing.
 pub struct DupesResult {
+    pub package_baselines: Vec<fallow_api::PackageBaselineStatus>,
     pub report: DuplicationReport,
     pub default_ignore_skips: DefaultIgnoreSkips,
     pub config: ResolvedConfig,
@@ -265,6 +304,19 @@ pub struct DupesResult {
     /// the same way on every run (issue #2366). Empty when the run reused
     /// another analysis's discovery: that analysis carries the same list.
     pub workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    /// Whether `--format json` carries the verbatim source text per clone
+    /// instance. Mirrors `DupesOptions::include_fragments`.
+    pub include_fragments: bool,
+    /// When a baseline was loaded: this run's view of it, for the opt-in
+    /// stale-baseline gate.
+    pub baseline_staleness: Option<crate::baseline_gate::LoadedBaselineStaleness>,
+    /// Whether `--fail-on-stale-baseline` was requested.
+    pub fail_on_stale_baseline: bool,
+    /// Whether `--fail-on-issues` (or `--ci`) was requested.
+    pub fail_on_issues: bool,
+    /// The detection report before the baseline and scope filters, when
+    /// `DupesOptions::retain_unfiltered_report` was set.
+    pub unfiltered_report: Option<DuplicationReport>,
 }
 
 /// Run duplication analysis, filtering, and baseline handling. Returns results without printing.
@@ -292,9 +344,11 @@ fn load_dupes_config_for_analysis(opts: &DupesOptions<'_>) -> Result<ResolvedCon
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -308,35 +362,117 @@ fn filter_dupes_report(
     report: &mut DuplicationReport,
     opts: &DupesOptions<'_>,
     config: &ResolvedConfig,
-    effective_changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+    change_scope: &ChangeScope,
 ) -> Result<(), ExitCode> {
-    if let Some(changed) = effective_changed_files {
-        filter_by_changed_files(report, changed, &config.root);
-    }
-
-    if let Some(diff_index) = match opts.diff_index {
+    let diff_index = match opts.diff_index {
         Some(index) => Some(index),
         None if opts.use_shared_diff_index => crate::report::ci::diff_filter::shared_diff_index(),
         None => None,
-    } {
-        filter_by_diff(report, diff_index, &config.root);
-    }
-
-    if let Some(ws_roots) = resolve_workspace_scope(
+    };
+    let mut ws_roots = resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
+        &config.workspace_patterns,
         opts.output,
-    )? {
-        filter_by_workspaces(report, &ws_roots, &config.root);
+    )?;
+    if let Some(scope) = opts.scope.as_ref() {
+        ws_roots.get_or_insert_with(Vec::new).push(scope.clone());
     }
+    fallow_engine::duplicates::apply_scope(
+        report,
+        &fallow_engine::duplicates::DuplicationScope {
+            changes: Some(change_scope),
+            diff: diff_index,
+            workspace_roots: ws_roots.as_deref(),
+        },
+        &config.root,
+    );
 
-    if let Some(n) = opts.top
-        && opts.group_by.is_none()
-    {
+    if let Some(n) = opts.top {
         apply_top(report, n, &config.root);
     }
     Ok(())
+}
+
+/// Message for the one flag pair `dupes` cannot serve at once.
+///
+/// The refusal and the reason for it are separate strings so the terminal shows
+/// the actionable half on one line. As a single sentence this soft-wrapped to
+/// four lines and buried "run one or the other" at the end of the fourth.
+const TOP_WITH_GROUP_BY_MESSAGE: &str = "--top and --group-by cannot be combined on dupes";
+
+/// The `hint:` half of [`TOP_WITH_GROUP_BY_MESSAGE`].
+const TOP_WITH_GROUP_BY_HINT: &str = "run one flag or the other; per-bucket stats cover every \
+     clone group in the bucket, so a global top-N would leave them describing groups the listing \
+     no longer holds";
+
+/// Refuse `--top` together with `--group-by` instead of dropping one of them.
+///
+/// The two were previously accepted together and `--top` was silently ignored,
+/// which is the failure mode the shown/omitted disclosure exists to prevent: the
+/// run exited 0 reporting every clone group after being asked for N. Refusing
+/// costs the caller one flag; honouring it per bucket would either recompute
+/// bucket stats over a truncated set (a second contradictory scope inside one
+/// object) or need a per-bucket shown/omitted split the grouped envelope does
+/// not carry.
+fn validate_dupes_flag_combination(opts: &DupesOptions<'_>) -> Result<(), ExitCode> {
+    if opts.top.is_some() && opts.group_by.is_some() {
+        return Err(crate::error::emit_error_with_hint(
+            TOP_WITH_GROUP_BY_MESSAGE,
+            TOP_WITH_GROUP_BY_HINT,
+            2,
+            opts.output,
+        ));
+    }
+    Ok(())
+}
+
+/// The change-scope request of one `dupes` run.
+fn change_scope_request<'a>(
+    opts: &DupesOptions<'_>,
+    files: Option<&'a rustc_hash::FxHashSet<std::path::PathBuf>>,
+) -> ChangeScopeRequest<'a> {
+    ChangeScopeRequest {
+        owner: opts.change_scope_owner,
+        global_ref: opts.changed_since.is_some(),
+        files,
+        cache: Some(crate::requests::package_baseline_cache()),
+        no_package_baselines: opts.no_package_baselines,
+    }
+}
+
+fn resolve_change_scope(
+    opts: &DupesOptions<'_>,
+    config: &ResolvedConfig,
+    request: ChangeScopeRequest<'_>,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> Result<ChangeScope, ExitCode> {
+    let scope = ChangeScope::resolve(request, config, workspaces)
+        .map_err(|err| emit_error(&format!("Workspace baseline error: {err}"), 2, opts.output))?;
+    crate::requests::warn_if_package_baselines_stood_down(&scope);
+    Ok(scope)
+}
+
+/// Resolve the change scope when the caller discovered the files. Workspaces
+/// are discovered only when the package map needs them and no earlier
+/// analysis of the run resolved it.
+fn resolve_change_scope_for_pre_discovered_files(
+    opts: &DupesOptions<'_>,
+    config: &ResolvedConfig,
+    request: ChangeScopeRequest<'_>,
+) -> Result<ChangeScope, ExitCode> {
+    let resolved_earlier = request.cache.is_some_and(PackageBaselineCache::is_resolved);
+    if !request.reads_package_baselines(config) || resolved_earlier {
+        return resolve_change_scope(opts, config, request, &[]);
+    }
+    let (workspaces, _) = fallow_engine::discover::discover_workspace_packages_for_config(
+        &config.root,
+        &config.ignore_patterns,
+        &config.workspace_patterns,
+    )
+    .map_err(|err| emit_error(&format!("Workspace discovery error: {err}"), 2, opts.output))?;
+    resolve_change_scope(opts, config, request, &workspaces)
 }
 
 fn execute_dupes_inner(
@@ -345,6 +481,8 @@ fn execute_dupes_inner(
 ) -> Result<DupesResult, ExitCode> {
     let start = Instant::now();
 
+    validate_dupes_flag_combination(opts)?;
+
     let config = load_dupes_config_for_analysis(opts)?;
 
     let dupes_config = build_dupes_config(opts, &config.duplicates);
@@ -352,16 +490,23 @@ fn execute_dupes_inner(
     let changed_files_from_since = resolve_changed_since(opts);
     let effective_changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>> =
         opts.changed_files.or(changed_files_from_since.as_ref());
+    let change_scope_request = change_scope_request(opts, effective_changed_files);
 
     let mut workspace_diagnostics = Vec::new();
-    let (mut report, default_ignore_skips) = match pre_discovered {
-        Some(files) => run_duplication_analysis(
-            opts,
-            &config,
-            &files,
-            &dupes_config,
-            effective_changed_files,
-        ),
+    let (mut report, default_ignore_skips, change_scope) = match pre_discovered {
+        Some(files) => {
+            let change_scope =
+                resolve_change_scope_for_pre_discovered_files(opts, &config, change_scope_request)?;
+            crate::requests::measure_changed_since_scope(&files);
+            let (report, skips) = run_duplication_analysis(
+                opts,
+                &config,
+                &files,
+                &dupes_config,
+                effective_changed_files,
+            );
+            (report, skips, change_scope)
+        }
         None => {
             let session =
                 match fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
@@ -375,18 +520,30 @@ fn execute_dupes_inner(
                         ));
                     }
                 };
-            let analysis = run_duplication_analysis_with_session(
+            crate::requests::measure_changed_since_scope(session.files());
+            let change_scope =
+                resolve_change_scope(opts, &config, change_scope_request, session.workspaces())?;
+            let (report, skips) = run_duplication_analysis_with_session(
                 opts,
                 &session,
                 &dupes_config,
                 effective_changed_files,
             );
             workspace_diagnostics = session.workspace_diagnostics().to_vec();
-            analysis
+            (report, skips, change_scope)
         }
     };
 
     if let Some(trace_spec) = opts.trace {
+        fallow_engine::duplicates::apply_scope(
+            &mut report,
+            &fallow_engine::duplicates::DuplicationScope {
+                changes: Some(&change_scope),
+                diff: None,
+                workspace_roots: None,
+            },
+            &config.root,
+        );
         // The trace view ran the full duplication analysis; record its find-state
         // for telemetry before the focused early-return so the Dupes workflow's
         // findings_present stays populated regardless of the output view (issue
@@ -404,9 +561,14 @@ fn execute_dupes_inner(
         return Err(code);
     }
 
+    let unfiltered_report = opts.retain_unfiltered_report.then(|| report.clone());
+    // A global ref narrows detection itself, so the baseline sees the scoped
+    // report and records the scope. The package map scopes only the report
+    // below: the baseline compares the full report and nothing is hidden.
     save_duplication_baseline(&report, &config, opts)?;
-    apply_duplication_baseline(&mut report, &config, opts)?;
-    filter_dupes_report(&mut report, opts, &config, effective_changed_files)?;
+    let baseline_staleness =
+        apply_duplication_baseline(&mut report, &config, opts, effective_changed_files)?;
+    filter_dupes_report(&mut report, opts, &config, &change_scope)?;
 
     let elapsed = start.elapsed();
 
@@ -417,6 +579,7 @@ fn execute_dupes_inner(
     crate::telemetry::note_analysis_scale(Some(report.stats.total_files), None);
 
     Ok(DupesResult {
+        package_baselines: change_scope.package_baselines(),
         report,
         default_ignore_skips,
         config,
@@ -426,6 +589,11 @@ fn execute_dupes_inner(
         ignore_imports: dupes_config.ignore_imports,
         explain_skipped: opts.explain_skipped,
         workspace_diagnostics,
+        include_fragments: opts.include_fragments,
+        baseline_staleness,
+        fail_on_stale_baseline: opts.fail_on_stale_baseline,
+        fail_on_issues: opts.fail_on_issues,
+        unfiltered_report,
     })
 }
 
@@ -438,14 +606,33 @@ fn save_duplication_baseline(
         return Ok(());
     };
 
+    if let Some(refusal) = fallow_engine::baseline::refuse_baseline_kind_overwrite(
+        path,
+        fallow_engine::baseline::BaselineKind::Dupes,
+    ) {
+        return Err(emit_error(&refusal, 2, opts.output));
+    }
     let json = serialize_duplication_baseline(report, config, opts.output)?;
-    ensure_duplication_baseline_parent(path, opts.output)?;
-    if let Err(e) = std::fs::write(path, json) {
-        return Err(emit_error(
-            &format!("failed to write duplication baseline: {e}"),
-            2,
-            opts.output,
-        ));
+    match fallow_engine::write_guard::write_file(
+        path,
+        json.as_bytes(),
+        fallow_engine::write_guard::WriteTarget::Path,
+    ) {
+        Ok(()) => {}
+        Err(e) if e.is_directory() => {
+            return Err(emit_error(
+                &format!("failed to create duplication baseline directory: {e}"),
+                2,
+                opts.output,
+            ));
+        }
+        Err(e) => {
+            return Err(emit_error(
+                &format!("failed to write duplication baseline: {e}"),
+                2,
+                opts.output,
+            ));
+        }
     }
     if !opts.quiet {
         eprintln!("Saved duplication baseline to {}", path.display());
@@ -469,51 +656,108 @@ fn serialize_duplication_baseline(
     })
 }
 
-fn ensure_duplication_baseline_parent(
-    path: &std::path::Path,
-    output: OutputFormat,
-) -> Result<(), ExitCode> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(parent).map_err(|e| {
-        emit_error(
-            &format!("failed to create duplication baseline directory: {e}"),
-            2,
-            output,
-        )
-    })
-}
-
 fn apply_duplication_baseline(
     report: &mut DuplicationReport,
     config: &ResolvedConfig,
     opts: &DupesOptions<'_>,
-) -> Result<(), ExitCode> {
+    effective_changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+) -> Result<Option<crate::baseline_gate::LoadedBaselineStaleness>, ExitCode> {
     let Some(path) = opts.baseline_path else {
-        return Ok(());
+        return Ok(None);
     };
 
-    let baseline_data = read_duplication_baseline(path, opts.output)?;
+    let (baseline_data, saved_by, unrecognised_format) =
+        read_duplication_baseline(path, opts.output)?;
     let baseline_entries = baseline_data.entry_count();
+    let legacy_keys = baseline_data.has_unparsed_collision_keys();
     let before = report.clone_groups.len();
     *report = filter_new_clone_groups(std::mem::take(report), &baseline_data, &config.root);
     let matched = before.saturating_sub(report.clone_groups.len());
+    let scope_reasons = duplication_comparison_scope_reasons(config, effective_changed_files);
+    let staleness = fallow_engine::baseline::BaselineStaleness {
+        entries: baseline_entries,
+        matched,
+        current_findings: before,
+        change_scoped: !scope_reasons.is_empty(),
+    };
     if !opts.quiet {
         eprintln!("Comparing against duplication baseline: {}", path.display());
+        if legacy_keys && matches!(opts.output, OutputFormat::Human) {
+            eprintln!(
+                "Note: {} has clone keys that older versions shared between unrelated groups. Run --save-baseline to rewrite them.",
+                path.display()
+            );
+        }
+        warn_on_duplication_baseline_staleness(staleness, path);
     }
-    warn_unmatched_duplication_baseline(path, baseline_entries, matched, opts.quiet);
+    crate::baseline_gate::note_unrecognised_baseline(
+        Some(path),
+        unrecognised_format,
+        saved_by,
+        fallow_engine::baseline::BaselineKind::Dupes,
+        opts.baseline_flag,
+    );
 
-    Ok(())
+    crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
+        command: "dupes",
+        path: path.display().to_string(),
+        baseline_entries,
+        scope_reasons,
+    });
+    Ok(Some(crate::baseline_gate::LoadedBaselineStaleness {
+        staleness,
+        path: path.to_path_buf(),
+        scope_reasons,
+        unrecognised_format,
+        saved_by,
+        legacy_keys,
+        install_state: None,
+    }))
 }
 
+/// Which channels narrowed the duplication comparison below the whole project.
+///
+/// Deliberately narrower than the dead-code equivalent. `dupes` saves and
+/// compares the baseline BEFORE `filter_dupes_report` runs, so `--workspace`,
+/// `--changed-workspaces`, `--diff-file` and the positional `[PATH]` scope
+/// narrow only the rendered report: the comparison, and a re-save, still cover
+/// the whole project and their staleness reading is honest. Only the two
+/// channels that narrow the analysis itself count here: a resolved changed-file
+/// set, which selects the focused analysis, and production mode, which drops
+/// test, story and dev files at discovery.
+///
+/// The changed-file set is reported as `changed-files`, because the flag is gone
+/// by this point. `change_scoped` derives from the returned set.
+fn duplication_comparison_scope_reasons(
+    config: &ResolvedConfig,
+    effective_changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+) -> fallow_output::BaselineScopeReasons {
+    use fallow_output::ScopeReason;
+
+    fallow_output::BaselineScopeReasons::empty()
+        .insert_if(effective_changed_files.is_some(), ScopeReason::ChangedFiles)
+        .insert_if(config.production, ScopeReason::Production)
+}
+
+/// The loaded baseline, the command that saved it when the file names one other
+/// than `dupes`, and whether another command saved the file.
+///
+/// Every field of this format has a serde default, so a foreign JSON object
+/// loads as zero clone groups and is otherwise indistinguishable from a
+/// baseline saved on a project with no duplication. The file's own `kind`
+/// answers when it carries one, and the keys answer for a baseline saved before
+/// that member existed.
 fn read_duplication_baseline(
     path: &std::path::Path,
     output: OutputFormat,
-) -> Result<DuplicationBaselineData, ExitCode> {
+) -> Result<
+    (
+        DuplicationBaselineData,
+        Option<fallow_engine::baseline::BaselineKind>,
+        bool,
+    ),
+    ExitCode,
+> {
     let json = std::fs::read_to_string(path).map_err(|e| {
         emit_error(
             &format!("failed to read duplication baseline: {e}"),
@@ -521,29 +765,47 @@ fn read_duplication_baseline(
             output,
         )
     })?;
-    serde_json::from_str::<DuplicationBaselineData>(&json).map_err(|e| {
+    let data = serde_json::from_str::<DuplicationBaselineData>(&json).map_err(|e| {
         emit_error(
             &format!("failed to parse duplication baseline: {e}"),
             2,
             output,
         )
-    })
+    })?;
+    let classified = fallow_engine::baseline::classify_baseline_file(
+        &json,
+        fallow_engine::baseline::BaselineKind::Dupes,
+    );
+    let saved_by = classified.saved_by();
+    let unrecognised_format = !matches!(classified, fallow_engine::baseline::BaselineFileKind::Own);
+    Ok((data, saved_by, unrecognised_format))
 }
 
-fn warn_unmatched_duplication_baseline(
+/// Warn when a loaded duplication baseline no longer describes the current
+/// project, using the same decision as `dead-code` and `health`.
+fn warn_on_duplication_baseline_staleness(
+    staleness: fallow_engine::baseline::BaselineStaleness,
     path: &std::path::Path,
-    baseline_entries: usize,
-    matched: usize,
-    quiet: bool,
 ) {
-    if baseline_entries > 0 && matched == 0 && !quiet {
-        eprintln!(
+    let baseline_entries = staleness.entries;
+    let stale_entries = staleness.stale_entries();
+    match staleness.warning() {
+        fallow_engine::baseline::BaselineStalenessWarning::None => {}
+        fallow_engine::baseline::BaselineStalenessWarning::ZeroOverlap => eprintln!(
             "Warning: duplication baseline has {baseline_entries} entries but \
              matched 0 current clone groups. Your paths may have changed, or \
              the baseline was saved on a different machine. Re-save with: \
              --save-baseline {}",
             path.display(),
-        );
+        ),
+        fallow_engine::baseline::BaselineStalenessWarning::Partial => eprintln!(
+            "Warning: duplication baseline is partially stale: {stale_entries} \
+             of {baseline_entries} entries matched no current clone group, so \
+             the gate protects less than what was saved. Remove only the stale \
+             entries with: {}, or re-save with: --save-baseline {}",
+            fallow_engine::baseline::BaselineKind::Dupes.prune_command(path),
+            path.display(),
+        ),
     }
 }
 
@@ -561,18 +823,10 @@ fn resolve_changed_since(
         return None;
     }
     let git_ref = opts.changed_since?;
-    get_changed_files(opts.root, git_ref)
+    crate::requests::resolve_changed_since(opts.root, git_ref)
 }
 
-/// Keep only the `n` highest-ranked clone groups.
-fn apply_top(report: &mut DuplicationReport, n: usize, root: &std::path::Path) {
-    report.sort();
-    report.clone_groups.truncate(n);
-    fallow_engine::duplicates::refresh_clone_families(report, root);
-    report.stats.clone_groups = report.clone_groups.len();
-    report.stats.clone_instances = report.clone_groups.iter().map(|g| g.instances.len()).sum();
-    report.sort();
-}
+use fallow_engine::duplicates::apply_top;
 
 fn run_duplication_analysis(
     opts: &DupesOptions<'_>,
@@ -622,7 +876,26 @@ fn run_duplication_analysis_with_session(
     (analysis.report, analysis.default_ignore_skips)
 }
 
-/// Print duplication results and return appropriate exit code.
+/// The presentation choices a mode hands the duplication renderer.
+///
+/// Bundled so an entry point names them rather than passing a row of
+/// positional booleans; `print_dupes_result` keeps the flat signature combined
+/// mode calls.
+pub struct DupesRenderOptions<'a> {
+    pub result: &'a DupesResult,
+    pub quiet: bool,
+    pub explain: bool,
+    pub summary: bool,
+    pub summary_heading: bool,
+    pub show_explain_tip: bool,
+    pub json_style: crate::json_style::JsonStyle,
+}
+
+/// Print duplication results for bare `fallow` and return its exit code.
+///
+/// Combined mode honors the `--dupes-` prefixed globals, so notes printed
+/// from here route to those. `fallow audit` parses the same globals and then
+/// drops them, so it renders through [`print_audit_dupes_result`] instead.
 #[expect(
     clippy::too_many_arguments,
     reason = "duplication rendering carries independent report, grouping, and presentation options"
@@ -636,19 +909,54 @@ pub fn print_dupes_result(
     show_explain_tip: bool,
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
+    print_scoped_dupes_result(
+        &DupesRenderOptions {
+            result,
+            quiet,
+            explain,
+            summary,
+            summary_heading,
+            show_explain_tip,
+            json_style,
+        },
+        DupesOptOutScope::Combined,
+    )
+}
+
+/// Print duplication results for `fallow audit` and return its exit code.
+///
+/// Audit builds its `DupesOptions` from `DuplicatesConfig` alone, so the
+/// `--dupes-` globals parse there and then change nothing; its notes route to
+/// the config keys, which are what actually move the outcome.
+pub fn print_audit_dupes_result(options: &DupesRenderOptions<'_>) -> ExitCode {
+    print_scoped_dupes_result(options, DupesOptOutScope::Audit)
+}
+
+fn print_scoped_dupes_result(
+    options: &DupesRenderOptions<'_>,
+    opt_out_scope: DupesOptOutScope,
+) -> ExitCode {
     print_dupes_result_with_grouping(DupesResultGroupingInput {
-        result,
-        quiet,
-        explain,
+        result: options.result,
+        quiet: options.quiet,
+        opt_out_scope,
+        explain: options.explain,
         group_by: None,
-        summary,
-        summary_heading,
-        show_explain_tip,
-        json_style,
+        summary: options.summary,
+        summary_heading: options.summary_heading,
+        show_explain_tip: options.show_explain_tip,
+        json_style: options.json_style,
     })
 }
 
 pub fn run_dupes(opts: &DupesOptions<'_>) -> ExitCode {
+    if let Some(code) = crate::baseline_gate::refuse_save_before_analysis(
+        opts.save_baseline_path,
+        fallow_engine::baseline::BaselineKind::Dupes,
+        opts.output,
+    ) {
+        return code;
+    }
     let result = match execute_dupes(opts) {
         Ok(r) => r,
         Err(code) => return code,
@@ -660,6 +968,7 @@ pub fn run_dupes(opts: &DupesOptions<'_>) -> ExitCode {
         opts.group_by,
         opts.root,
         result.config.codeowners.as_deref(),
+        &result.config.workspace_patterns,
         opts.output,
     ) {
         Ok(r) => r,
@@ -668,6 +977,7 @@ pub fn run_dupes(opts: &DupesOptions<'_>) -> ExitCode {
     print_dupes_result_with_grouping(DupesResultGroupingInput {
         result: &result,
         quiet: opts.quiet,
+        opt_out_scope: DupesOptOutScope::Subcommand,
         explain: opts.explain,
         group_by: resolver,
         summary: opts.summary,
@@ -736,6 +1046,9 @@ fn print_dupes_performance(result: &DupesResult, output: OutputFormat) {
 struct DupesResultGroupingInput<'a> {
     result: &'a DupesResult,
     quiet: bool,
+    /// Which command surface is printing, so the scoped notes name a control
+    /// that mode actually honors.
+    opt_out_scope: DupesOptOutScope,
     explain: bool,
     group_by: Option<report::OwnershipResolver>,
     summary: bool,
@@ -746,7 +1059,20 @@ struct DupesResultGroupingInput<'a> {
 
 fn print_dupes_result_with_grouping(input: DupesResultGroupingInput<'_>) -> ExitCode {
     let result = input.result;
+    let baseline_staleness = result
+        .baseline_staleness
+        .as_ref()
+        .map(|loaded| loaded.to_envelope(0));
+    let gate_outcomes = crate::gates::dupes_gate_outcomes(
+        result.threshold,
+        result.report.stats.duplication_percentage,
+        result.report.stats.clone_groups,
+        result.fail_on_issues,
+        baseline_staleness.as_ref(),
+        result.fail_on_stale_baseline,
+    );
     let ctx = report::ReportContext {
+        package_baselines: &result.package_baselines,
         root: &result.config.root,
         rules: &result.config.rules,
         workspace_diagnostics: &result.workspace_diagnostics,
@@ -761,16 +1087,22 @@ fn print_dupes_result_with_grouping(input: DupesResultGroupingInput<'_>) -> Exit
         summary_heading: input.summary_heading,
         show_explain_tip: input.show_explain_tip,
         baseline_matched: None,
+        baseline_staleness,
+        finding_id_query: None,
+        gate_outcomes,
         config_fixable: false,
+        failed_parse_files: 0,
         skip_score_and_trend: false,
         css_requested: false,
         json_style: input.json_style,
+        include_fragments: result.include_fragments,
+        architecture_layout: report::ArchitectureLayout::Embedded,
     };
     print_default_ignore_note(result, input.quiet);
-    print_min_occurrences_note(result, input.quiet);
+    print_min_occurrences_note(result, input.quiet, input.opt_out_scope);
     print_reviewed_clones_note(result, input.quiet);
     print_near_candidates_skipped_note(result, input.quiet);
-    print_ignore_imports_note(result, input.quiet);
+    print_ignore_imports_note(result, input.quiet, input.opt_out_scope);
     let report_code = report::print_duplication_report(&result.report, &ctx, result.config.output);
     if report_code != ExitCode::SUCCESS {
         return report_code;
@@ -780,15 +1112,99 @@ fn print_dupes_result_with_grouping(input: DupesResultGroupingInput<'_>) -> Exit
     // entry point inherits it. Standalone `dupes` and combined mode previously
     // rendered through two near-identical functions and only the combined one
     // gated, so `fallow dupes --threshold 1` exited 0 at 100% duplication (#2009).
-    if exceeds_threshold(result.threshold, result.report.stats.duplication_percentage) {
+    let threshold_exceeded =
+        exceeds_threshold(result.threshold, result.report.stats.duplication_percentage);
+    if threshold_exceeded {
         eprintln!(
             "Duplication ({:.1}%) exceeds threshold ({:.1}%)",
             result.report.stats.duplication_percentage, result.threshold
         );
-        return ExitCode::from(1);
     }
 
-    ExitCode::SUCCESS
+    // Evaluated even when the threshold gate already failed. The duplication
+    // percentage is printed in the report, a stale baseline is not, so
+    // returning on the threshold first would exit 1 without a word about the
+    // baseline the user explicitly gated on.
+    let stale_baseline_failed = crate::baseline_gate::gate_failed(
+        result.baseline_staleness.as_ref(),
+        result.fail_on_stale_baseline,
+        fallow_engine::baseline::BaselineKind::Dupes,
+    );
+
+    // `--fail-on-issues` and `--ci` fail on any clone group the report shows.
+    // The same builder gives the `gate_outcomes` entry, so the two agree. The
+    // report already lists each group, so no extra line is printed.
+    let clone_groups_failed = crate::gates::duplication_findings_outcome(
+        result.report.stats.clone_groups,
+        result.fail_on_issues,
+    )
+    .is_some_and(|outcome| outcome.fails_run());
+
+    let code = [
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::DuplicationThreshold,
+            threshold_exceeded,
+        ),
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::DuplicationFindings,
+            clone_groups_failed,
+        ),
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::StaleBaseline,
+            stale_baseline_failed,
+        ),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    // Only the standalone command owns its exit code. `audit` owns its own,
+    // and the bare run prints one line for all its sections.
+    if matches!(input.opt_out_scope, DupesOptOutScope::Subcommand) {
+        crate::gates::print_exit_reason(&crate::gates::ExitReason {
+            gates: ctx.gate_outcomes.as_ref(),
+            code,
+            fail_on_issues: result.fail_on_issues,
+            quiet: input.quiet,
+            output: result.config.output,
+            // The threshold line above prints in every mode.
+            own_lines: &[fallow_output::GateName::DuplicationThreshold],
+        });
+    }
+    crate::exit_codes::run_exit_code([code])
+}
+
+/// The default-ignore note lines: how many files the built-in duplicates
+/// ignores skipped, then either the per-pattern breakdown or the route to it.
+///
+/// Split out from the printer so the wording and the width are testable the
+/// way the sibling notes are: every line has to hold under 80 columns. The
+/// route sits on its own line rather than closing the clause, which rendered at
+/// 89 columns inline for a single skipped file and widens a column per digit of
+/// an unbounded skip count.
+fn default_ignore_note_lines(skips: &DefaultIgnoreSkips, explain: bool) -> Vec<String> {
+    if skips.total == 0 {
+        return Vec::new();
+    }
+
+    let total = skips.total;
+    let noun = if total == 1 { "file" } else { "files" };
+    if !explain {
+        return vec![
+            format!("note: skipped {total} {noun} matching default duplicates ignores"),
+            "  (--explain-skipped for the list)".to_string(),
+        ];
+    }
+
+    let mut lines = vec![format!(
+        "note: skipped {total} {noun} matching default duplicates ignores:"
+    )];
+    lines.extend(
+        skips
+            .by_pattern
+            .iter()
+            .map(|entry| format!("  {:>5}  {}", entry.count, entry.pattern)),
+    );
+    lines
 }
 
 pub fn print_default_ignore_note(result: &DupesResult, quiet: bool) {
@@ -806,33 +1222,44 @@ pub fn print_default_ignore_note(result: &DupesResult, quiet: bool) {
         return;
     }
 
-    let skips = &result.default_ignore_skips;
-    if skips.total == 0 {
-        return;
+    for line in default_ignore_note_lines(&result.default_ignore_skips, result.explain_skipped) {
+        eprintln!("{line}");
     }
+}
 
-    let noun = if skips.total == 1 { "file" } else { "files" };
-    if result.explain_skipped {
-        eprintln!(
-            "note: skipped {} {noun} matching default duplicates ignores:",
-            skips.total
-        );
-        for entry in &skips.by_pattern {
-            eprintln!("  {:>5}  {}", entry.count, entry.pattern);
-        }
-    } else {
-        eprintln!(
-            "note: skipped {} {noun} matching default duplicates ignores (use --explain-skipped for the list)",
-            skips.total
-        );
+/// The `minOccurrences` note lines: how many clone groups the gate hid, then
+/// the control the printing mode honors for seeing them.
+///
+/// Both numbers are unbounded `usize`, so the threshold sits on the route line
+/// rather than closing the opening clause: inline the note rendered at 84
+/// columns for one hidden group at `minOccurrences=2` and widened further with
+/// either count. Split out from the printer so the wording and the width are
+/// testable the way `default_ignore_note_lines` is.
+fn min_occurrences_note_lines(hidden: usize, min: usize, scope: DupesOptOutScope) -> Vec<String> {
+    if hidden == 0 {
+        return Vec::new();
     }
+    let noun = if hidden == 1 { "group" } else { "groups" };
+    vec![
+        format!("note: hid {hidden} clone {noun} below minOccurrences"),
+        format!(
+            "  (lower {} from {min} to see them)",
+            scope.min_occurrences_control()
+        ),
+    ]
+}
+
+/// Emit the `minOccurrences` note for `fallow audit`, whose clean-duplication
+/// path returns before the shared renderer that would otherwise print it.
+pub fn print_audit_min_occurrences_note(result: &DupesResult, quiet: bool) {
+    print_min_occurrences_note(result, quiet, DupesOptOutScope::Audit);
 }
 
 /// Emit a stderr note when `minOccurrences` hid clone groups. Human-format
 /// only, so machine readers (JSON, SARIF, CodeClimate) never see decorative
 /// stderr noise; consumers read `stats.cloneGroupsBelowMinOccurrences`
 /// directly from the JSON envelope instead.
-pub fn print_min_occurrences_note(result: &DupesResult, quiet: bool) {
+fn print_min_occurrences_note(result: &DupesResult, quiet: bool, scope: DupesOptOutScope) {
     if quiet
         || !matches!(
             result.config.output,
@@ -847,65 +1274,131 @@ pub fn print_min_occurrences_note(result: &DupesResult, quiet: bool) {
         return;
     }
 
-    let hidden = result.report.stats.clone_groups_below_min_occurrences;
-    if hidden == 0 {
-        return;
+    for line in min_occurrences_note_lines(
+        result.report.stats.clone_groups_below_min_occurrences,
+        result.min_occurrences,
+        scope,
+    ) {
+        eprintln!("{line}");
     }
-
-    let min = result.min_occurrences;
-    let noun = if hidden == 1 { "group" } else { "groups" };
-    eprintln!(
-        "note: hid {hidden} clone {noun} below minOccurrences={min} (lower --min-occurrences to see them)"
-    );
 }
 
-fn reviewed_clones_note(hidden: usize) -> Option<String> {
+/// The reviewed-clones note lines: how many groups `duplicates.ignoredClones`
+/// hid, then the config key and how to resurface one.
+///
+/// The key and its instruction moved onto their own line because the inline
+/// clause rendered at 96 columns for a single hidden group and grew with an
+/// unbounded hidden count.
+fn reviewed_clones_note_lines(hidden: usize) -> Vec<String> {
     if hidden == 0 {
-        return None;
+        return Vec::new();
     }
     let noun = if hidden == 1 { "group" } else { "groups" };
-    Some(format!(
-        "note: hid {hidden} reviewed clone {noun} from duplicates.ignoredClones (remove a key to review it again)"
-    ))
+    vec![
+        format!("note: hid {hidden} reviewed clone {noun}"),
+        "  (duplicates.ignoredClones: remove a key to review it again)".to_string(),
+    ]
 }
 
 fn print_reviewed_clones_note(result: &DupesResult, quiet: bool) {
     if quiet || !matches!(result.config.output, OutputFormat::Human) {
         return;
     }
-    if let Some(note) = reviewed_clones_note(result.report.stats.clone_groups_ignored) {
-        eprintln!("{note}");
+    for line in reviewed_clones_note_lines(result.report.stats.clone_groups_ignored) {
+        eprintln!("{line}");
     }
 }
 
-fn near_candidates_skipped_note(skipped: usize) -> Option<String> {
+/// The incomplete-near-miss warning lines: the caveat, what was dropped, then
+/// the narrowing route.
+///
+/// Three lines rather than one because the inline sentence rendered at 148
+/// columns for a single skipped comparison, the widest human line this module
+/// emitted, and the skipped count is unbounded.
+fn near_candidates_skipped_note_lines(skipped: usize) -> Vec<String> {
     if skipped == 0 {
-        return None;
+        return Vec::new();
     }
     let noun = if skipped == 1 {
         "comparison"
     } else {
         "comparisons"
     };
-    Some(format!(
-        "warning: near-miss results may be incomplete: skipped {skipped} candidate {noun} to stay within work limits (narrow with --workspace or --changed-since)"
-    ))
+    vec![
+        "warning: near-miss results may be incomplete".to_string(),
+        format!("  skipped {skipped} candidate {noun} to stay within work limits"),
+        "  (narrow with --workspace or --changed-since)".to_string(),
+    ]
 }
 
 fn print_near_candidates_skipped_note(result: &DupesResult, quiet: bool) {
     if quiet || !matches!(result.config.output, OutputFormat::Human) {
         return;
     }
-    if let Some(note) = near_candidates_skipped_note(result.report.stats.near_candidates_skipped) {
-        eprintln!("{note}");
+    for line in near_candidates_skipped_note_lines(result.report.stats.near_candidates_skipped) {
+        eprintln!("{line}");
     }
+}
+
+/// Which spelling of the duplication opt-outs the printing mode honors.
+///
+/// The three modes take three different answers, and one shared renderer prints
+/// the notes, so the mode has to carry its labels in. `--no-ignore-imports` and
+/// `--min-occurrences` are declared on the `dupes` subcommand without `global`,
+/// so bare `fallow` and `fallow audit` answer both with "unexpected argument"
+/// and need the `--dupes-` prefixed spellings. Bare `fallow` honors those
+/// prefixed flags; `fallow audit` parses them and then builds its
+/// `DupesOptions` from `DuplicatesConfig` alone, so only the config keys change
+/// what audit reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DupesOptOutScope {
+    /// `fallow dupes`, where the opt-outs are subcommand-scoped flags.
+    Subcommand,
+    /// Bare `fallow`, where they are `--dupes-` prefixed globals.
+    Combined,
+    /// `fallow audit`, where the globals parse but only config moves the
+    /// outcome.
+    Audit,
+}
+
+impl DupesOptOutScope {
+    /// The module-wiring opt-out this mode honors.
+    const fn ignore_imports_opt_out(self) -> &'static str {
+        match self {
+            Self::Subcommand => "--no-ignore-imports",
+            Self::Combined => "--dupes-no-ignore-imports",
+            Self::Audit => "duplicates.ignoreImports: false",
+        }
+    }
+
+    /// The `minOccurrences` control this mode honors.
+    const fn min_occurrences_control(self) -> &'static str {
+        match self {
+            Self::Subcommand => "--min-occurrences",
+            Self::Combined => "--dupes-min-occurrences",
+            Self::Audit => "duplicates.minOccurrences",
+        }
+    }
+}
+
+/// The module-wiring note lines: what clone detection left out, then the
+/// opt-out the mode doing the printing honors.
+///
+/// The opt-out sits on its own line the way `default_ignore_note_lines` puts
+/// its route there: the combined spelling renders at 82 columns inline, so a
+/// single-line note would hold under 80 in one mode and not the other.
+fn ignore_imports_note_lines(scope: DupesOptOutScope) -> Vec<String> {
+    vec![
+        "note: module wiring excluded from clones".to_string(),
+        format!("  ({} to include it)", scope.ignore_imports_opt_out()),
+    ]
 }
 
 /// Emit a stderr note when module wiring was excluded from clone detection.
 /// Human-format only, so machine readers never see decorative stderr noise.
 /// Fires only when clone groups were reported, so a clean run stays quiet; it
 /// tells users the report excludes a category and how to opt back in.
-pub fn print_ignore_imports_note(result: &DupesResult, quiet: bool) {
+fn print_ignore_imports_note(result: &DupesResult, quiet: bool, scope: DupesOptOutScope) {
     if quiet
         || !result.ignore_imports
         || result.report.clone_groups.is_empty()
@@ -922,9 +1415,9 @@ pub fn print_ignore_imports_note(result: &DupesResult, quiet: bool) {
         return;
     }
 
-    eprintln!(
-        "note: module wiring excluded from clone detection (--no-ignore-imports to include it)"
-    );
+    for line in ignore_imports_note_lines(scope) {
+        eprintln!("{line}");
+    }
 }
 
 #[cfg(test)]
@@ -932,13 +1425,17 @@ mod tests {
     use super::*;
     use crate::baseline::{DuplicationBaselineData, filter_new_clone_groups, recompute_stats};
     use fallow_config::{DetectionMode, DuplicatesConfig, NormalizationConfig};
+    use fallow_engine::changed_files::filter_duplication_by_changed_files as filter_by_changed_files;
+    use fallow_engine::diff_scope::filter_duplication_by_diff as filter_by_diff;
+    use fallow_engine::duplicates::filter_to_workspaces as filter_by_workspaces;
     use fallow_types::duplicates::{
-        CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
+        CloneGroup, CloneInstance, DefaultIgnoreSkipCount, DuplicationReport, DuplicationStats,
     };
     use std::path::{Path, PathBuf};
 
     fn instance(file: &str, start: usize, end: usize) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(file),
             start_line: start,
             end_line: end,
@@ -963,6 +1460,7 @@ mod tests {
         total_lines: usize,
     ) -> DuplicationReport {
         let clone_instances: usize = groups.iter().map(|g| g.instances.len()).sum();
+        let group_count = groups.len();
         DuplicationReport {
             clone_groups: groups,
             clone_families: vec![],
@@ -974,7 +1472,8 @@ mod tests {
                 duplicated_lines: 0,
                 total_tokens: 0,
                 duplicated_tokens: 0,
-                clone_groups: 0,
+                clone_groups: group_count,
+                clone_families: 0,
                 clone_instances,
                 duplication_percentage: 0.0,
                 clone_groups_below_min_occurrences: 0,
@@ -1000,18 +1499,20 @@ mod tests {
             threads: 1,
             quiet: true,
             allow_remote_extends: false,
-            mode: Some(mode),
-            near: false,
-            min_tokens: Some(50),
-            min_lines: Some(5),
-            min_occurrences: Some(2),
-            threshold: Some(0.0),
-            skip_local: false,
-            cross_language: false,
-            ignore_imports: None,
+            overrides: DupesOverrides {
+                mode: Some(mode),
+                min_tokens: Some(50),
+                min_lines: Some(5),
+                min_occurrences: Some(2),
+                threshold: Some(0.0),
+                ..DupesOverrides::default()
+            },
             top: None,
             baseline_path: None,
+            baseline_flag: "--baseline",
             save_baseline_path: None,
+            fail_on_stale_baseline: false,
+            fail_on_issues: false,
             production: false,
             production_override: None,
             trace: None,
@@ -1019,6 +1520,8 @@ mod tests {
             diff_index: None,
             use_shared_diff_index: true,
             changed_files: None,
+            change_scope_owner: ChangeScopeOwner::Run,
+            no_package_baselines: false,
             workspace: None,
             changed_workspaces: None,
             explain: false,
@@ -1026,7 +1529,52 @@ mod tests {
             summary: false,
             group_by: None,
             performance: false,
+            include_fragments: true,
+            retain_unfiltered_report: false,
+            scope: None,
         }
+    }
+
+    #[test]
+    fn top_with_group_by_is_refused_as_invalid_input() {
+        let root = Path::new("/project");
+        let mut opts = default_opts_for_config(root, DupesMode::Mild);
+        opts.top = Some(1);
+        opts.group_by = Some(crate::GroupBy::Directory);
+
+        let code = validate_dupes_flag_combination(&opts)
+            .expect_err("--top with --group-by must be refused");
+
+        assert_eq!(code, ExitCode::from(2));
+        assert!(
+            TOP_WITH_GROUP_BY_MESSAGE.contains("--top")
+                && TOP_WITH_GROUP_BY_MESSAGE.contains("--group-by"),
+            "the refusal must name both flags"
+        );
+        assert!(
+            TOP_WITH_GROUP_BY_HINT.contains("per-bucket stats"),
+            "the hint must say why the pair cannot be served"
+        );
+        assert!(
+            TOP_WITH_GROUP_BY_MESSAGE.len() < 60,
+            "the actionable half must fit one terminal line: {} chars",
+            TOP_WITH_GROUP_BY_MESSAGE.len()
+        );
+    }
+
+    #[test]
+    fn either_flag_on_its_own_is_accepted() {
+        let root = Path::new("/project");
+        let mut top_only = default_opts_for_config(root, DupesMode::Mild);
+        top_only.top = Some(1);
+        assert!(validate_dupes_flag_combination(&top_only).is_ok());
+
+        let mut grouped_only = default_opts_for_config(root, DupesMode::Mild);
+        grouped_only.group_by = Some(crate::GroupBy::Directory);
+        assert!(validate_dupes_flag_combination(&grouped_only).is_ok());
+
+        let neither = default_opts_for_config(root, DupesMode::Mild);
+        assert!(validate_dupes_flag_combination(&neither).is_ok());
     }
 
     #[test]
@@ -1039,30 +1587,257 @@ mod tests {
     #[test]
     fn reviewed_clones_note_pluralizes_and_explains_resurfacing() {
         assert_eq!(
-            reviewed_clones_note(1).as_deref(),
-            Some(
-                "note: hid 1 reviewed clone group from duplicates.ignoredClones (remove a key to review it again)"
+            reviewed_clones_note_lines(1),
+            vec![
+                "note: hid 1 reviewed clone group".to_string(),
+                "  (duplicates.ignoredClones: remove a key to review it again)".to_string(),
+            ]
+        );
+        assert_eq!(
+            reviewed_clones_note_lines(2)[0],
+            "note: hid 2 reviewed clone groups"
+        );
+        assert!(reviewed_clones_note_lines(0).is_empty());
+    }
+
+    #[test]
+    fn min_occurrences_note_names_the_control_the_printing_mode_honors() {
+        assert_eq!(
+            min_occurrences_note_lines(3, 2, DupesOptOutScope::Subcommand),
+            vec![
+                "note: hid 3 clone groups below minOccurrences".to_string(),
+                "  (lower --min-occurrences from 2 to see them)".to_string(),
+            ]
+        );
+        assert_eq!(
+            min_occurrences_note_lines(3, 2, DupesOptOutScope::Combined)[1],
+            "  (lower --dupes-min-occurrences from 2 to see them)"
+        );
+        // Audit rebuilds its `DupesOptions` from `DuplicatesConfig`, so both
+        // flag spellings are inert there and the note has to name the key.
+        assert_eq!(
+            min_occurrences_note_lines(3, 2, DupesOptOutScope::Audit)[1],
+            "  (lower duplicates.minOccurrences from 2 to see them)"
+        );
+        assert_eq!(
+            min_occurrences_note_lines(1, 5, DupesOptOutScope::Subcommand)[0],
+            "note: hid 1 clone group below minOccurrences"
+        );
+        assert!(min_occurrences_note_lines(0, 2, DupesOptOutScope::Subcommand).is_empty());
+    }
+
+    #[test]
+    fn default_ignore_note_pins_its_wording_in_both_branches() {
+        let skips = DefaultIgnoreSkips {
+            total: 1234,
+            by_pattern: vec![DefaultIgnoreSkipCount {
+                pattern: "**/storybook-static/**",
+                count: 1234,
+            }],
+        };
+
+        let lines = default_ignore_note_lines(&skips, false);
+        assert_eq!(
+            lines,
+            vec![
+                "note: skipped 1234 files matching default duplicates ignores".to_string(),
+                "  (--explain-skipped for the list)".to_string(),
+            ]
+        );
+
+        let explained = default_ignore_note_lines(&skips, true);
+        assert_eq!(
+            explained[0],
+            format!("{}:", lines[0]),
+            "both branches open with the same clause, so only the tail differs"
+        );
+        assert_eq!(explained[1], "   1234  **/storybook-static/**");
+    }
+
+    #[test]
+    fn default_ignore_note_is_singular_for_one_file_and_silent_for_none() {
+        assert!(default_ignore_note_lines(&DefaultIgnoreSkips::default(), false).is_empty());
+        assert!(default_ignore_note_lines(&DefaultIgnoreSkips::default(), true).is_empty());
+
+        let one = DefaultIgnoreSkips {
+            total: 1,
+            by_pattern: vec![DefaultIgnoreSkipCount {
+                pattern: "**/*.test.*",
+                count: 1,
+            }],
+        };
+        assert_eq!(
+            default_ignore_note_lines(&one, false)[0],
+            "note: skipped 1 file matching default duplicates ignores"
+        );
+    }
+
+    #[test]
+    fn ignore_imports_note_names_the_opt_out_the_printing_mode_honors() {
+        assert_eq!(
+            ignore_imports_note_lines(DupesOptOutScope::Subcommand),
+            vec![
+                "note: module wiring excluded from clones".to_string(),
+                "  (--no-ignore-imports to include it)".to_string(),
+            ]
+        );
+        assert_eq!(
+            ignore_imports_note_lines(DupesOptOutScope::Combined),
+            vec![
+                "note: module wiring excluded from clones".to_string(),
+                "  (--dupes-no-ignore-imports to include it)".to_string(),
+            ]
+        );
+        assert_eq!(
+            ignore_imports_note_lines(DupesOptOutScope::Audit),
+            vec![
+                "note: module wiring excluded from clones".to_string(),
+                "  (duplicates.ignoreImports: false to include it)".to_string(),
+            ]
+        );
+
+        // Combined mode's spelling is the subcommand flag under a `--dupes-`
+        // prefix: clap declares the subcommand one without `global`, so bare
+        // `fallow` answers it with "unexpected argument". Audit deliberately
+        // breaks that pattern, because the prefixed flag parses there and then
+        // changes nothing; `crates/cli/tests/dupes_tests.rs` pins both against
+        // the built binary.
+        assert_eq!(
+            DupesOptOutScope::Combined.ignore_imports_opt_out(),
+            format!(
+                "--dupes-{}",
+                DupesOptOutScope::Subcommand
+                    .ignore_imports_opt_out()
+                    .trim_start_matches("--")
             )
         );
         assert!(
-            reviewed_clones_note(2)
-                .unwrap()
-                .contains("2 reviewed clone groups")
+            !DupesOptOutScope::Audit
+                .ignore_imports_opt_out()
+                .starts_with('-'),
+            "audit's opt-out is a config key, not a flag"
         );
-        assert!(reviewed_clones_note(0).is_none());
+    }
+
+    const ALL_SCOPES: [DupesOptOutScope; 3] = [
+        DupesOptOutScope::Subcommand,
+        DupesOptOutScope::Combined,
+        DupesOptOutScope::Audit,
+    ];
+
+    /// Names a scope for the width table. Exhaustive, so a fourth mode cannot
+    /// reach the notes without being named here first.
+    const fn scope_label(scope: DupesOptOutScope) -> &'static str {
+        match scope {
+            DupesOptOutScope::Subcommand => "dupes",
+            DupesOptOutScope::Combined => "combined",
+            DupesOptOutScope::Audit => "audit",
+        }
+    }
+
+    /// Every dupes note rendered at its widest: unbounded counts pushed to
+    /// `usize::MAX`, plural nouns, both branches of the default-ignore note,
+    /// and every mode's spelling of the two scoped notes. A note missing from
+    /// this list is a note nothing measures.
+    fn widest_note_renderings() -> Vec<(String, Vec<String>)> {
+        // `DefaultIgnoreSkipCount::pattern` is `&'static str` because the
+        // breakdown only ever names the engine's built-in ignore list, whose
+        // longest entry is `**/storybook-static/**` (DUPES_DEFAULT_IGNORES).
+        let widest_skips = DefaultIgnoreSkips {
+            total: usize::MAX,
+            by_pattern: vec![DefaultIgnoreSkipCount {
+                pattern: "**/storybook-static/**",
+                count: usize::MAX,
+            }],
+        };
+        let mut renderings = vec![
+            (
+                "default-ignore-route".to_string(),
+                default_ignore_note_lines(&widest_skips, false),
+            ),
+            (
+                "default-ignore-breakdown".to_string(),
+                default_ignore_note_lines(&widest_skips, true),
+            ),
+            (
+                "reviewed-clones".to_string(),
+                reviewed_clones_note_lines(usize::MAX),
+            ),
+            (
+                "near-candidates".to_string(),
+                near_candidates_skipped_note_lines(usize::MAX),
+            ),
+        ];
+        for scope in ALL_SCOPES {
+            let label = scope_label(scope);
+            renderings.push((
+                format!("min-occurrences ({label})"),
+                min_occurrences_note_lines(usize::MAX, usize::MAX, scope),
+            ));
+            renderings.push((
+                format!("ignore-imports ({label})"),
+                ignore_imports_note_lines(scope),
+            ));
+        }
+        renderings
+    }
+
+    #[test]
+    fn every_dupes_note_holds_under_eighty_columns_at_its_widest() {
+        let widths: Vec<(String, Vec<usize>)> = widest_note_renderings()
+            .into_iter()
+            .map(|(name, lines)| {
+                let columns = lines.iter().map(|line| line.chars().count()).collect();
+                (name, columns)
+            })
+            .collect();
+
+        // Pinned per line rather than bounded by one shared number: a line that
+        // gains four columns has to fail here even when the 80-column assertion
+        // below still passes because that line started narrow. The fixtures put
+        // every unbounded count at its maximum, so these are the real ceilings.
+        assert_eq!(
+            widths,
+            vec![
+                ("default-ignore-route".to_string(), vec![76, 34]),
+                ("default-ignore-breakdown".to_string(), vec![77, 46]),
+                ("reviewed-clones".to_string(), vec![52, 61]),
+                ("near-candidates".to_string(), vec![44, 79, 46]),
+                ("min-occurrences (dupes)".to_string(), vec![64, 65]),
+                ("ignore-imports (dupes)".to_string(), vec![40, 37]),
+                ("min-occurrences (combined)".to_string(), vec![64, 71]),
+                ("ignore-imports (combined)".to_string(), vec![40, 43]),
+                ("min-occurrences (audit)".to_string(), vec![64, 73]),
+                ("ignore-imports (audit)".to_string(), vec![40, 49]),
+            ]
+        );
+
+        for (name, lines) in widest_note_renderings() {
+            for line in lines {
+                assert!(
+                    line.chars().count() <= 80,
+                    "the {name} note must hold under 80 columns: {} chars in {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
     }
 
     #[test]
     fn near_candidates_skipped_note_pluralizes_and_gives_next_step() {
-        assert!(
-            near_candidates_skipped_note(1)
-                .unwrap()
-                .contains("skipped 1 candidate comparison")
+        assert_eq!(
+            near_candidates_skipped_note_lines(1),
+            vec![
+                "warning: near-miss results may be incomplete".to_string(),
+                "  skipped 1 candidate comparison to stay within work limits".to_string(),
+                "  (narrow with --workspace or --changed-since)".to_string(),
+            ]
         );
-        let plural = near_candidates_skipped_note(2).unwrap();
-        assert!(plural.contains("skipped 2 candidate comparisons"));
-        assert!(plural.contains("--workspace or --changed-since"));
-        assert!(near_candidates_skipped_note(0).is_none());
+        assert_eq!(
+            near_candidates_skipped_note_lines(2)[1],
+            "  skipped 2 candidate comparisons to stay within work limits"
+        );
+        assert!(near_candidates_skipped_note_lines(0).is_empty());
     }
 
     #[test]
@@ -1237,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_top_recomputes_clone_groups_and_clone_instances_stats() {
+    fn apply_top_keeps_all_four_stats_on_the_measured_corpus() {
         let groups = vec![
             make_group(vec![instance("a.ts", 1, 10); 5], 50, 10),
             make_group(vec![instance("b.ts", 1, 10); 3], 50, 10),
@@ -1245,6 +2020,8 @@ mod tests {
             make_group(vec![instance("d.ts", 1, 10); 2], 50, 10),
         ];
         let mut report = make_report(groups, 4, 100);
+        report.stats.files_with_clones = 4;
+        report.stats.duplication_percentage = 4.7268;
         report.sort();
 
         apply_top(&mut report, 1, Path::new("/project"));
@@ -1256,14 +2033,93 @@ mod tests {
             "kept group is the 5-instance group"
         );
         assert_eq!(
-            report.stats.clone_groups,
-            report.clone_groups.len(),
-            "stats.clone_groups must match the truncated array length"
+            report.stats.clone_groups, 4,
+            "stats.clone_groups stays on the corpus the run measured"
         );
         assert_eq!(
-            report.stats.clone_instances, 5,
-            "stats.clone_instances must reflect the surviving instances"
+            report.stats.clone_instances, 12,
+            "stats.clone_instances stays on the corpus the run measured"
         );
+        assert_eq!(
+            report.stats.files_with_clones, 4,
+            "files_with_clones was never truncated and must stay corpus-wide"
+        );
+        assert!(
+            (report.stats.duplication_percentage - 4.7268).abs() < f64::EPSILON,
+            "duplication_percentage was never truncated and must stay corpus-wide"
+        );
+        assert_eq!(report.clone_groups_shown(), 1);
+        assert_eq!(report.clone_groups_omitted(), 3);
+    }
+
+    /// `--top` rebuilds the families from the groups that survive the cap, so
+    /// `clone_families[]` narrows exactly like `clone_groups[]`. The corpus
+    /// family count has to survive that rebuild or the drop is unrecoverable:
+    /// a consumer reading the array alone cannot tell three families from a
+    /// project with three from a project with a hundred and sixty.
+    #[test]
+    fn apply_top_keeps_the_family_count_on_the_measured_corpus() {
+        let groups = vec![
+            make_group(
+                vec![instance("a.ts", 1, 10), instance("b.ts", 1, 10)],
+                50,
+                10,
+            ),
+            make_group(
+                vec![instance("a.ts", 30, 40), instance("b.ts", 30, 40)],
+                50,
+                10,
+            ),
+            make_group(
+                vec![instance("c.ts", 1, 10), instance("d.ts", 1, 10)],
+                40,
+                8,
+            ),
+            make_group(
+                vec![instance("c.ts", 30, 40), instance("d.ts", 30, 40)],
+                40,
+                8,
+            ),
+        ];
+        let root = Path::new("/project");
+        let mut report = make_report(groups, 4, 100);
+        fallow_engine::duplicates::refresh_clone_families(&mut report, root);
+        report.stats.clone_families = report.clone_families.len();
+        assert_eq!(
+            report.clone_families.len(),
+            2,
+            "the two file pairs must build two families"
+        );
+
+        apply_top(&mut report, 1, root);
+
+        assert_eq!(
+            report.stats.clone_families, 2,
+            "stats.clone_families stays on the corpus the run measured"
+        );
+        assert_eq!(report.clone_families_shown(), report.clone_families.len());
+        assert_eq!(
+            report.clone_families_shown() + report.clone_families_omitted(),
+            report.stats.clone_families,
+            "shown plus omitted must reconstruct the corpus family count"
+        );
+        assert!(
+            report.clone_families_omitted() > 0,
+            "top 1 keeps one file pair, so it must withhold the other family"
+        );
+    }
+
+    #[test]
+    fn untruncated_report_omits_nothing() {
+        let groups = vec![
+            make_group(vec![instance("a.ts", 1, 10); 5], 50, 10),
+            make_group(vec![instance("b.ts", 1, 10); 3], 50, 10),
+        ];
+        let report = make_report(groups, 2, 100);
+
+        assert_eq!(report.clone_groups_shown(), 2);
+        assert_eq!(report.clone_groups_omitted(), 0);
+        assert_eq!(report.clone_families_omitted(), 0);
     }
 
     #[test]
@@ -1314,7 +2170,7 @@ mod tests {
     fn build_config_cross_language_cli_true_overrides_toml_false() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.cross_language = true;
+        opts.overrides.cross_language = true;
         let toml = DuplicatesConfig::default(); // cross_language = false
         let config = build_dupes_config(&opts, &toml);
         assert!(config.cross_language);
@@ -1375,8 +2231,8 @@ mod tests {
     fn build_config_uses_cli_min_tokens_and_lines() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.min_tokens = Some(100);
-        opts.min_lines = Some(10);
+        opts.overrides.min_tokens = Some(100);
+        opts.overrides.min_lines = Some(10);
         let toml = DuplicatesConfig::default();
         let config = build_dupes_config(&opts, &toml);
         assert_eq!(config.min_tokens, 100);
@@ -1387,7 +2243,7 @@ mod tests {
     fn build_config_uses_cli_threshold() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.threshold = Some(7.5);
+        opts.overrides.threshold = Some(7.5);
         let toml = DuplicatesConfig::default();
         let config = build_dupes_config(&opts, &toml);
         assert!((config.threshold - 7.5).abs() < f64::EPSILON);
@@ -1397,7 +2253,7 @@ mod tests {
     fn build_config_uses_cli_skip_local() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.skip_local = true;
+        opts.overrides.skip_local = true;
         let toml = DuplicatesConfig::default();
         let config = build_dupes_config(&opts, &toml);
         assert!(config.skip_local);
@@ -1407,7 +2263,7 @@ mod tests {
     fn build_config_falls_back_to_toml_min_lines_when_cli_unset() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.min_lines = None;
+        opts.overrides.min_lines = None;
         let toml = DuplicatesConfig {
             min_lines: 8,
             ..DuplicatesConfig::default()
@@ -1423,7 +2279,7 @@ mod tests {
     fn build_config_falls_back_to_toml_min_tokens_when_cli_unset() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.min_tokens = None;
+        opts.overrides.min_tokens = None;
         let toml = DuplicatesConfig {
             min_tokens: 200,
             ..DuplicatesConfig::default()
@@ -1439,7 +2295,7 @@ mod tests {
     fn build_config_falls_back_to_toml_threshold_when_cli_unset() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.threshold = None;
+        opts.overrides.threshold = None;
         let toml = DuplicatesConfig {
             threshold: 12.5,
             ..DuplicatesConfig::default()
@@ -1455,7 +2311,7 @@ mod tests {
     fn build_config_falls_back_to_toml_mode_when_cli_unset() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.mode = None;
+        opts.overrides.mode = None;
         let toml = DuplicatesConfig {
             mode: fallow_config::DetectionMode::Strict,
             ..DuplicatesConfig::default()
@@ -1471,7 +2327,7 @@ mod tests {
     fn build_config_cli_min_lines_overrides_toml() {
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.min_lines = Some(3);
+        opts.overrides.min_lines = Some(3);
         let toml = DuplicatesConfig {
             min_lines: 8,
             ..DuplicatesConfig::default()
@@ -1513,7 +2369,7 @@ mod tests {
         // `--no-ignore-imports` (Some(false)) wins over a config `ignoreImports: true`.
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.ignore_imports = Some(false);
+        opts.overrides.ignore_imports = Some(false);
         let toml = DuplicatesConfig {
             ignore_imports: true,
             ..DuplicatesConfig::default()
@@ -1527,7 +2383,7 @@ mod tests {
         // `--ignore-imports` (Some(true)) wins over a config `ignoreImports: false`.
         let root = PathBuf::from("/project");
         let mut opts = default_opts_for_config(&root, DupesMode::Mild);
-        opts.ignore_imports = Some(true);
+        opts.overrides.ignore_imports = Some(true);
         let toml = DuplicatesConfig {
             ignore_imports: false,
             ..DuplicatesConfig::default()
@@ -1547,6 +2403,29 @@ mod tests {
         };
         let config = build_dupes_config(&opts, &toml);
         assert!(!config.ignore_imports);
+    }
+
+    #[test]
+    fn build_config_ignore_symlinks_cli_overrides_config_both_ways() {
+        let root = PathBuf::from("/project");
+        let mut opts = default_opts_for_config(&root, DupesMode::Mild);
+        let config_on = DuplicatesConfig {
+            ignore_symlinks: true,
+            ..DuplicatesConfig::default()
+        };
+        assert!(build_dupes_config(&opts, &config_on).ignore_symlinks);
+        assert!(!build_dupes_config(&opts, &DuplicatesConfig::default()).ignore_symlinks);
+
+        opts.overrides.ignore_symlinks = Some(false);
+        assert!(
+            !build_dupes_config(&opts, &config_on).ignore_symlinks,
+            "--no-ignore-symlinks must win over config"
+        );
+        opts.overrides.ignore_symlinks = Some(true);
+        assert!(
+            build_dupes_config(&opts, &DuplicatesConfig::default()).ignore_symlinks,
+            "--ignore-symlinks must win over config"
+        );
     }
 
     #[test]

@@ -24,14 +24,14 @@ use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use cache::{TokenCache, TokenCacheEntry, TokenCacheMode};
 pub use deepdive::{
     CloneFingerprintKey, CloneFingerprintSet, FINGERPRINT_PREFIX, clone_fingerprint,
-    dominant_identifier, fingerprint_for_fragment, group_refactoring_suggestion,
+    dominant_identifier, group_refactoring_suggestion, is_unparsed_collision_key,
 };
 use detect::CloneDetector;
 use normalize::normalize_and_hash_resolved;
@@ -41,6 +41,7 @@ pub use types::DetectionMode;
 pub use types::{DefaultIgnoreSkipCount, DefaultIgnoreSkips, DuplicatesConfig, DuplicationReport};
 
 use crate::discover::DiscoveredFile;
+use crate::results::DuplicationAnalysis;
 use crate::suppress::{self, IssueKind, Suppression};
 
 /// Built-in duplicates ignores for generated framework, tool, and test output.
@@ -79,10 +80,6 @@ struct IgnoreSet {
     defaults: Vec<&'static str>,
 }
 
-pub(super) fn refresh_near_group_metrics(group: &mut types::CloneGroup) {
-    near::refresh_near_group_metrics(group);
-}
-
 enum IgnoreMatch {
     Default(usize),
     User,
@@ -98,11 +95,6 @@ impl IgnoreSet {
             Some(IgnoreMatch::User)
         }
     }
-}
-
-struct DuplicationRun {
-    report: DuplicationReport,
-    default_ignore_skips: DefaultIgnoreSkips,
 }
 
 struct DuplicationTokenizeContext<'a> {
@@ -140,86 +132,7 @@ pub fn find_duplicates(
     files: &[DiscoveredFile],
     config: &DuplicatesConfig,
 ) -> DuplicationReport {
-    find_duplicates_inner(root, files, config, None, None).report
-}
-
-/// Run duplication detection and return human-format sidecar metadata for
-/// files skipped by built-in duplicates ignores.
-pub fn find_duplicates_with_default_ignore_skips(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-) -> (DuplicationReport, DefaultIgnoreSkips) {
-    let run = find_duplicates_inner(root, files, config, None, None);
-    (run.report, run.default_ignore_skips)
-}
-
-/// Run duplication detection with the persistent token cache enabled.
-pub fn find_duplicates_cached(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    cache_root: &Path,
-) -> DuplicationReport {
-    find_duplicates_inner(root, files, config, None, Some(cache_root)).report
-}
-
-/// Run cached duplication detection and return human-format sidecar metadata for
-/// files skipped by built-in duplicates ignores.
-pub fn find_duplicates_cached_with_default_ignore_skips(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    cache_root: &Path,
-) -> (DuplicationReport, DefaultIgnoreSkips) {
-    let run = find_duplicates_inner(root, files, config, None, Some(cache_root));
-    (run.report, run.default_ignore_skips)
-}
-
-/// Run duplication detection and only return clone groups touching `focus_files`.
-///
-/// This keeps all files in the matching corpus, which preserves changed-file
-/// versus unchanged-file detection for diff-scoped audit runs, but avoids
-/// materializing duplicate groups that cannot appear in the scoped report.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "focused non-cached entry point is exercised by tests"
-    )
-)]
-pub fn find_duplicates_touching_files(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    focus_files: &FxHashSet<PathBuf>,
-) -> DuplicationReport {
-    find_duplicates_inner(root, files, config, Some(focus_files), None).report
-}
-
-/// Run focused duplication detection and return human-format sidecar metadata
-/// for files skipped by built-in duplicates ignores.
-pub fn find_duplicates_touching_files_with_default_ignore_skips(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    focus_files: &FxHashSet<PathBuf>,
-) -> (DuplicationReport, DefaultIgnoreSkips) {
-    let run = find_duplicates_inner(root, files, config, Some(focus_files), None);
-    (run.report, run.default_ignore_skips)
-}
-
-/// Run cached focused duplication detection and return human-format sidecar
-/// metadata for files skipped by built-in duplicates ignores.
-pub fn find_duplicates_touching_files_cached_with_default_ignore_skips(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    focus_files: &FxHashSet<PathBuf>,
-    cache_root: &Path,
-) -> (DuplicationReport, DefaultIgnoreSkips) {
-    let run = find_duplicates_inner(root, files, config, Some(focus_files), Some(cache_root));
-    (run.report, run.default_ignore_skips)
+    detect_duplicates(root, files, config, None, None).report
 }
 
 /// Tokenize the corpus for duplication detection: resolves normalization and
@@ -245,6 +158,7 @@ fn tokenize_corpus_for_duplicates(
         .filter(|_| files.len() >= config.min_corpus_size_for_token_cache);
     let token_cache = cache_root.map(TokenCache::load);
 
+    let read_started_ns = fallow_types::source_fingerprint::now_ns();
     let file_data = tokenize_duplication_files(
         files,
         &DuplicationTokenizeContext {
@@ -261,7 +175,16 @@ fn tokenize_corpus_for_duplicates(
     );
 
     if let (Some(cache_root), Some(cache)) = (cache_root, token_cache) {
-        save_duplication_token_cache(cache_root, cache, files, &file_data, token_cache_mode);
+        save_duplication_token_cache(
+            cache_root,
+            cache,
+            files,
+            &file_data,
+            TokenCacheWrite {
+                mode: token_cache_mode,
+                read_started_ns,
+            },
+        );
     }
 
     tracing::info!(
@@ -349,12 +272,43 @@ fn detect_and_postprocess(
 
     apply_ignored_clones_filter(&mut report, &config.ignored_clones);
     apply_min_occurrences_filter(&mut report, config.min_occurrences);
+    // Families copy their groups, so mark the instances before the copy.
+    mark_symlinked_instances(&mut report, root);
 
     report.clone_families = families::group_into_families(&report.clone_groups, root);
     report.mirrored_directories =
         families::detect_mirrored_directories(&report.clone_families, root);
+    report.stats.clone_families = report.clone_families.len();
     report.sort();
     report
+}
+
+/// Whether `path` is a symlink, or lies under a symlinked directory, below
+/// `root`. Components of `root` itself are not checked, so a project that is
+/// opened through a symlinked path (for example `/tmp` on macOS) is not
+/// affected.
+fn is_symlinked_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    relative.components().any(|component| {
+        current.push(component);
+        std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    })
+}
+
+fn mark_symlinked_instances(report: &mut DuplicationReport, root: &Path) {
+    let mut symlinked: FxHashMap<PathBuf, bool> = FxHashMap::default();
+    for instance in report
+        .clone_groups
+        .iter_mut()
+        .flat_map(|group| group.instances.iter_mut())
+    {
+        instance.is_symlink = *symlinked
+            .entry(instance.file.clone())
+            .or_insert_with(|| is_symlinked_path(root, &instance.file));
+    }
 }
 
 fn apply_ignored_clones_filter(report: &mut DuplicationReport, ignored: &[String]) {
@@ -377,13 +331,19 @@ fn apply_ignored_clones_filter(report: &mut DuplicationReport, ignored: &[String
     report.stats = crate::duplicates::recompute_stats(report);
 }
 
-fn find_duplicates_inner(
+/// Run duplication detection with optional focus files and token cache.
+///
+/// With `focus_files`, all files stay in the matching corpus, but the report
+/// keeps only clone groups that touch a focus file. This keeps changed-file
+/// versus unchanged-file matches for diff-scoped audit runs. With
+/// `cache_root`, the persistent token cache is used.
+pub fn detect_duplicates(
     root: &Path,
     files: &[DiscoveredFile],
     config: &DuplicatesConfig,
     focus_files: Option<&FxHashSet<PathBuf>>,
     cache_root: Option<&Path>,
-) -> DuplicationRun {
+) -> DuplicationAnalysis {
     let _span = tracing::info_span!("find_duplicates").entered();
 
     let extra_ignores = build_ignore_set(config);
@@ -410,7 +370,7 @@ fn find_duplicates_inner(
     let default_ignore_skips =
         build_default_ignore_skips(extra_ignores.as_ref(), &default_skip_counts);
 
-    DuplicationRun {
+    DuplicationAnalysis {
         report,
         default_ignore_skips,
     }
@@ -455,6 +415,9 @@ fn tokenize_duplication_file(
 }
 
 fn should_skip_duplicate_file(file: &DiscoveredFile, ctx: &DuplicationTokenizeContext<'_>) -> bool {
+    if ctx.config.ignore_symlinks && is_symlinked_path(ctx.root, &file.path) {
+        return true;
+    }
     let relative = file.path.strip_prefix(ctx.root).unwrap_or(&file.path);
     let Some(ignores) = ctx.extra_ignores else {
         return false;
@@ -515,21 +478,33 @@ fn tokenize_duplication_source(
     }
 }
 
+/// How the token cache stores the tokens of one run.
+#[derive(Clone, Copy)]
+struct TokenCacheWrite {
+    mode: TokenCacheMode,
+    /// The time before the run took file metadata and read sources.
+    read_started_ns: u64,
+}
+
 fn save_duplication_token_cache(
     cache_root: &Path,
     mut cache: TokenCache,
     files: &[DiscoveredFile],
     file_data: &[TokenizedFile],
-    mode: TokenCacheMode,
+    write: TokenCacheWrite,
 ) {
     for file in file_data {
-        if !file.cache_hit
-            && let Some(metadata) = &file.metadata
-        {
+        let Some(metadata) = &file.metadata else {
+            continue;
+        };
+        if file.cache_hit {
+            cache.refresh_fingerprint(&file.path, metadata, write.read_started_ns);
+        } else {
             cache.insert(
                 &file.path,
                 metadata,
-                mode,
+                write.read_started_ns,
+                write.mode,
                 &cache::TokenPayload {
                     hashed_tokens: &file.hashed_tokens,
                     file_tokens: &file.file_tokens,
@@ -627,7 +602,8 @@ fn build_ignore_set(config: &DuplicatesConfig) -> Option<IgnoreSet> {
 
     if config.ignore_defaults {
         for pattern in DUPES_DEFAULT_IGNORES {
-            let glob = Glob::new(pattern).expect("default duplication ignore pattern is valid");
+            let glob = fallow_config::compile_path_glob(pattern)
+                .expect("default duplication ignore pattern is valid");
             defaults.push(*pattern);
             builder.add(glob);
         }
@@ -635,7 +611,7 @@ fn build_ignore_set(config: &DuplicatesConfig) -> Option<IgnoreSet> {
 
     for pattern in &config.ignore {
         builder.add(
-            Glob::new(pattern)
+            fallow_config::compile_path_glob(pattern)
                 .expect("duplicates.ignore pattern was validated at config load time"),
         );
     }
@@ -753,6 +729,18 @@ mod tests {
     }
 
     #[test]
+    fn build_ignore_set_single_star_stays_within_one_segment() {
+        let config = DuplicatesConfig {
+            ignore_defaults: false,
+            ignore: vec!["src/gen/*.ts".to_string()],
+            ..DuplicatesConfig::default()
+        };
+        let set = build_ignore_set(&config).expect("ignore set");
+        assert!(ignore_set_matches(&set, "src/gen/a.ts"));
+        assert!(!ignore_set_matches(&set, "src/gen/deep/a.ts"));
+    }
+
+    #[test]
     fn build_ignore_set_merges_defaults_with_user_patterns() {
         let config = DuplicatesConfig {
             ignore: vec!["**/foo/**".to_string()],
@@ -820,11 +808,10 @@ export function repeatedTestHelper(input: string): string {
             ..DuplicatesConfig::default()
         };
 
-        let (report, skips) =
-            find_duplicates_with_default_ignore_skips(dir.path(), &files, &config);
+        let run = detect_duplicates(dir.path(), &files, &config, None, None);
 
-        assert!(report.clone_groups.is_empty());
-        assert_eq!(skips.total, 2);
+        assert!(run.report.clone_groups.is_empty());
+        assert_eq!(run.default_ignore_skips.total, 2);
     }
 
     #[test]
@@ -1028,7 +1015,7 @@ export function renderInvoice(id: string): string {
         };
         let cache_root = dir.path().join(".fallow");
 
-        let report = find_duplicates_cached(dir.path(), &files, &config, &cache_root);
+        let report = detect_duplicates(dir.path(), &files, &config, None, Some(&cache_root)).report;
 
         assert!(!report.clone_groups.is_empty());
         assert!(
@@ -1101,7 +1088,7 @@ export function untouched(input: string): string {
         focus.insert(changed_path.clone());
 
         let full_report = find_duplicates(dir.path(), &files, &config);
-        let report = find_duplicates_touching_files(dir.path(), &files, &config, &focus);
+        let report = detect_duplicates(dir.path(), &files, &config, Some(&focus), None).report;
         let expected_touching = full_report
             .clone_groups
             .iter()
@@ -1378,5 +1365,157 @@ export function shared(input: string): string {
             report.stats.clone_instances, 0,
             "stats.clone_instances must match the empty post-filter array"
         );
+    }
+
+    #[cfg(unix)]
+    mod symlinks {
+        use super::*;
+
+        const CODE: &str = r#"
+export function repeatedHelper(input: string): string {
+    const trimmed = input.trim();
+    const lowered = trimmed.toLowerCase();
+    const compact = lowered.replaceAll(" ", "-");
+    return compact;
+}
+"#;
+        const OTHER: &str = r"
+export function otherHelper(value: number): number {
+    const doubled = value * 2;
+    const shifted = doubled + 7;
+    const clamped = Math.min(shifted, 100);
+    return clamped;
+}
+";
+
+        /// `src/real.ts` with a file symlink `src/link.ts` to it, a directory
+        /// symlink `src/linked-dir` to `shared/`, and two real copies of
+        /// `OTHER` (`shared/other.ts` and `src/other-copy.ts`).
+        fn fixture() -> (tempfile::TempDir, Vec<DiscoveredFile>) {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let src = dir.path().join("src");
+            let shared = dir.path().join("shared");
+            std::fs::create_dir_all(&src).expect("create src");
+            std::fs::create_dir_all(&shared).expect("create shared");
+            std::fs::write(src.join("real.ts"), CODE).expect("write real");
+            std::os::unix::fs::symlink("real.ts", src.join("link.ts")).expect("file symlink");
+            std::fs::write(shared.join("other.ts"), OTHER).expect("write other");
+            std::fs::write(src.join("other-copy.ts"), OTHER).expect("write copy");
+            std::os::unix::fs::symlink("../shared", src.join("linked-dir"))
+                .expect("directory symlink");
+            let paths = [
+                src.join("real.ts"),
+                src.join("link.ts"),
+                shared.join("other.ts"),
+                src.join("other-copy.ts"),
+                src.join("linked-dir").join("other.ts"),
+            ];
+            let files = paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| DiscoveredFile {
+                    id: FileId(u32::try_from(index).expect("small index")),
+                    path,
+                    size_bytes: 0,
+                })
+                .collect();
+            (dir, files)
+        }
+
+        fn config(ignore_symlinks: bool) -> DuplicatesConfig {
+            DuplicatesConfig {
+                min_tokens: 5,
+                min_lines: 2,
+                ignore_symlinks,
+                ..DuplicatesConfig::default()
+            }
+        }
+
+        fn instances(report: &DuplicationReport, root: &Path) -> Vec<Vec<(String, bool)>> {
+            report
+                .clone_groups
+                .iter()
+                .map(|group| {
+                    let mut instances: Vec<(String, bool)> = group
+                        .instances
+                        .iter()
+                        .map(|instance| {
+                            let relative = instance.file.strip_prefix(root).expect("under root");
+                            (
+                                relative.to_string_lossy().replace('\\', "/"),
+                                instance.is_symlink,
+                            )
+                        })
+                        .collect();
+                    instances.sort();
+                    instances
+                })
+                .collect()
+        }
+
+        #[test]
+        fn symlinked_instances_are_reported_and_marked_by_default() {
+            let (dir, files) = fixture();
+            let report = detect_duplicates(dir.path(), &files, &config(false), None, None).report;
+            let mut groups = instances(&report, dir.path());
+            groups.sort();
+            assert_eq!(
+                groups,
+                vec![
+                    vec![
+                        ("shared/other.ts".to_owned(), false),
+                        ("src/linked-dir/other.ts".to_owned(), true),
+                        ("src/other-copy.ts".to_owned(), false),
+                    ],
+                    vec![
+                        ("src/link.ts".to_owned(), true),
+                        ("src/real.ts".to_owned(), false),
+                    ],
+                ]
+            );
+            let json = serde_json::to_value(&report.clone_groups[0].instances).expect("json");
+            for instance in json.as_array().expect("array") {
+                assert_ne!(
+                    instance.get("is_symlink"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "is_symlink is omitted when false"
+                );
+            }
+            let mut family_marks: Vec<(String, bool)> = report
+                .clone_families
+                .iter()
+                .flat_map(|family| family.groups.iter())
+                .flat_map(|group| group.instances.iter())
+                .filter(|instance| instance.is_symlink)
+                .map(|instance| {
+                    let relative = instance.file.strip_prefix(dir.path()).expect("under root");
+                    (relative.to_string_lossy().replace('\\', "/"), true)
+                })
+                .collect();
+            family_marks.sort();
+            assert_eq!(
+                family_marks,
+                vec![
+                    ("src/link.ts".to_owned(), true),
+                    ("src/linked-dir/other.ts".to_owned(), true),
+                ],
+                "clone families carry the same symlink marks as clone groups"
+            );
+        }
+
+        #[test]
+        fn ignore_symlinks_drops_symlinked_instances_and_keeps_real_duplication() {
+            let (dir, files) = fixture();
+            let report = detect_duplicates(dir.path(), &files, &config(true), None, None).report;
+            assert_eq!(
+                instances(&report, dir.path()),
+                vec![vec![
+                    ("shared/other.ts".to_owned(), false),
+                    ("src/other-copy.ts".to_owned(), false),
+                ]],
+                "the file-symlink group has one instance left and disappears"
+            );
+            assert_eq!(report.stats.total_files, 3);
+        }
     }
 }

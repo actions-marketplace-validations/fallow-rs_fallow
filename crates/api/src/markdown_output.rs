@@ -40,6 +40,22 @@ fn escape_markdown_prose(s: &str) -> String {
     s.replace('`', "\\`")
 }
 
+/// Escape every character that inline markdown treats as syntax, so free
+/// text from a source comment renders as plain text.
+fn escape_markdown_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '#'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn display_complexity_entry_name(name: &str) -> Cow<'_, str> {
     match name {
         "<template>" => Cow::Borrowed("<template> (template complexity)"),
@@ -58,22 +74,51 @@ pub fn build_markdown(results: &AnalysisResults, root: &Path) -> String {
 
     if total == 0 {
         out.push_str("## Fallow: no issues found\n");
-        return out;
+        if health_signal_count(results) == 0 {
+            push_cascade_note(&mut out, results.cascade_hidden);
+            return out;
+        }
+        out.push('\n');
+    } else {
+        let _ = write!(out, "## Fallow: {total} issue{} found\n\n", plural(total));
     }
 
-    let _ = write!(out, "## Fallow: {total} issue{} found\n\n", plural(total));
-
-    push_markdown_primary_sections(&mut out, results, root);
-    push_markdown_import_sections(&mut out, results, root);
-    push_markdown_dependency_detail_sections(&mut out, results, root);
-    push_markdown_graph_sections(&mut out, results, &|path| {
-        markdown_relative_path(path, root)
-    });
-    push_markdown_catalog_sections(&mut out, results, &|path| {
-        markdown_relative_path(path, root)
-    });
-
+    push_markdown_sections(&mut out, results, root);
+    push_cascade_note(&mut out, results.cascade_hidden);
     out
+}
+
+/// One line that names the findings the cascade filter hid. Markdown has no
+/// entry for a hidden finding, so this line is the only sign of them.
+fn push_cascade_note(out: &mut String, hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    let verb = if hidden == 1 { "is" } else { "are" };
+    let _ = writeln!(
+        out,
+        "_{hidden} finding{} in unused files {verb} hidden; use `--show-cascade` to list them._",
+        plural(hidden)
+    );
+}
+
+/// The number of advisory component health signals in `results`. These do not
+/// count toward `total_issues`, but the report lists them.
+fn health_signal_count(results: &AnalysisResults) -> usize {
+    results.prop_drilling_chains.len() - results.enforced_prop_drilling_count()
+        + results.thin_wrappers.len()
+        + results.duplicate_prop_shapes.len()
+}
+
+fn push_markdown_sections(out: &mut String, results: &AnalysisResults, root: &Path) {
+    push_markdown_primary_sections(out, results, root);
+    push_markdown_import_sections(out, results, root);
+    push_markdown_dependency_detail_sections(out, results, root);
+    push_markdown_graph_sections(out, results, &|path| markdown_relative_path(path, root));
+    push_markdown_catalog_sections(out, results, &|path| markdown_relative_path(path, root));
 }
 
 fn markdown_relative_path(path: &Path, root: &Path) -> String {
@@ -83,8 +128,9 @@ fn markdown_relative_path(path: &Path, root: &Path) -> String {
 fn push_markdown_primary_sections(out: &mut String, results: &AnalysisResults, root: &Path) {
     markdown_section(out, &results.unused_files, "Unused files", |file| {
         vec![format!(
-            "- {}",
-            markdown_code_span(&markdown_relative_path(&file.file.path, root))
+            "- {}{}",
+            markdown_code_span(&markdown_relative_path(&file.file.path, root)),
+            markdown_caveat_suffix(&file.reachability_caveats)
         )]
     });
 
@@ -94,7 +140,7 @@ fn push_markdown_primary_sections(out: &mut String, results: &AnalysisResults, r
         "Unused exports",
         root,
         |e| e.export.path.as_path(),
-        |e: &UnusedExportFinding| format_export(&e.export),
+        |e: &UnusedExportFinding| format_export(&e.export, &e.reachability_caveats),
     );
 
     markdown_grouped_section(
@@ -103,7 +149,7 @@ fn push_markdown_primary_sections(out: &mut String, results: &AnalysisResults, r
         "Unused type exports",
         root,
         |e| e.export.path.as_path(),
-        |e: &UnusedTypeFinding| format_export(&e.export),
+        |e: &UnusedTypeFinding| format_export(&e.export, &e.reachability_caveats),
     );
 
     markdown_grouped_section(
@@ -113,6 +159,15 @@ fn push_markdown_primary_sections(out: &mut String, results: &AnalysisResults, r
         root,
         |e| e.leak.path.as_path(),
         format_private_type_leak,
+    );
+
+    markdown_grouped_section(
+        out,
+        &results.deprecated_exports_in_use,
+        "Deprecated exports in use",
+        root,
+        |e| e.export.path.as_path(),
+        format_deprecated_export_in_use,
     );
 
     push_markdown_dependency_sections(out, results, root);
@@ -173,6 +228,7 @@ fn push_markdown_dependency_sections(out: &mut String, results: &AnalysisResults
                 &dep.dep.path,
                 &dep.dep.used_in_workspaces,
                 root,
+                &dep.reachability_caveats,
             )
         },
     );
@@ -186,6 +242,7 @@ fn push_markdown_dependency_sections(out: &mut String, results: &AnalysisResults
                 &dep.dep.path,
                 &dep.dep.used_in_workspaces,
                 root,
+                &dep.reachability_caveats,
             )
         },
     );
@@ -199,6 +256,7 @@ fn push_markdown_dependency_sections(out: &mut String, results: &AnalysisResults
                 &dep.dep.path,
                 &dep.dep.used_in_workspaces,
                 root,
+                &dep.reachability_caveats,
             )
         },
     );
@@ -211,7 +269,7 @@ fn push_markdown_member_sections(out: &mut String, results: &AnalysisResults, ro
         "Unused enum members",
         root,
         |m| m.member.path.as_path(),
-        |m: &UnusedEnumMemberFinding| format_member(&m.member),
+        |m: &UnusedEnumMemberFinding| format_member(&m.member, &m.reachability_caveats),
     );
     markdown_grouped_section(
         out,
@@ -219,7 +277,7 @@ fn push_markdown_member_sections(out: &mut String, results: &AnalysisResults, ro
         "Unused class members",
         root,
         |m| m.member.path.as_path(),
-        |m: &UnusedClassMemberFinding| format_member(&m.member),
+        |m: &UnusedClassMemberFinding| format_member(&m.member, &m.reachability_caveats),
     );
     markdown_grouped_section(
         out,
@@ -227,7 +285,7 @@ fn push_markdown_member_sections(out: &mut String, results: &AnalysisResults, ro
         "Unused store members",
         root,
         |m| m.member.path.as_path(),
-        |m: &UnusedStoreMemberFinding| format_member(&m.member),
+        |m: &UnusedStoreMemberFinding| format_member(&m.member, &m.reachability_caveats),
     );
 }
 
@@ -240,19 +298,19 @@ fn push_markdown_dependency_detail_sections(
         out,
         &results.type_only_dependencies,
         "Type-only dependencies (consider moving to devDependencies)",
-        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root),
+        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root, &[]),
     );
     markdown_section(
         out,
         &results.test_only_dependencies,
         "Test-only production dependencies (consider moving to devDependencies)",
-        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root),
+        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root, &[]),
     );
     markdown_section(
         out,
         &results.dev_dependencies_in_production,
         "Dev dependencies used in production (consider moving to dependencies)",
-        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root),
+        |dep| format_dependency(&dep.dep.package_name, &dep.dep.path, &[], root, &[]),
     );
 }
 
@@ -264,7 +322,69 @@ fn push_markdown_graph_sections(
     push_markdown_structure_sections(out, results, rel);
     push_markdown_framework_sections(out, results, rel);
     push_markdown_component_sections(out, results, rel);
+    push_markdown_component_health_sections(out, results, rel);
     push_markdown_suppression_sections(out, results, rel);
+}
+
+/// The opt-in React/Preact component health signals. Advisory findings do not count
+/// toward `total_issues`, but the other full reports list them.
+fn push_markdown_component_health_sections(
+    out: &mut String,
+    results: &AnalysisResults,
+    rel: &dyn Fn(&Path) -> String,
+) {
+    markdown_section(out, &results.prop_drilling_chains, "Prop drilling", |c| {
+        format_markdown_prop_drilling_chain(c, rel)
+    });
+    markdown_section(out, &results.thin_wrappers, "Thin wrappers", |w| {
+        let w = &w.wrapper;
+        vec![format!(
+            "- {}:{} {} is a thin wrapper around {} (candidate for inlining at call sites or deleting)",
+            markdown_code_span(&rel(&w.file)),
+            w.line,
+            markdown_code_span(&w.component),
+            markdown_code_span(&w.child_component),
+        )]
+    });
+    markdown_section(
+        out,
+        &results.duplicate_prop_shapes,
+        "Duplicate prop shapes",
+        |d| {
+            let d = &d.shape;
+            vec![format!(
+                "- {}:{} {} shares an identical prop shape {} with {} other component(s) (extract a shared Props type)",
+                markdown_code_span(&rel(&d.file)),
+                d.line,
+                markdown_code_span(&d.component),
+                markdown_code_span(&format!("{{{}}}", d.shape.join(", "))),
+                d.group_size.saturating_sub(1),
+            )]
+        },
+    );
+}
+
+fn format_markdown_prop_drilling_chain(
+    entry: &PropDrillingChainFinding,
+    rel: &dyn Fn(&Path) -> String,
+) -> Vec<String> {
+    let c = &entry.chain;
+    let (path, line) = c
+        .hops
+        .first()
+        .map_or((String::new(), 0), |hop| (rel(&hop.file), hop.line));
+    let trail = c
+        .hops
+        .iter()
+        .map(|hop| escape_markdown_prose(&hop.component))
+        .collect::<Vec<_>>()
+        .join(" \u{2192} ");
+    vec![format!(
+        "- {}:{line} {} is forwarded unused through {trail} (depth {}); colocate the consumer or lift it to a context at a mid-chain hop",
+        markdown_code_span(&path),
+        markdown_code_span(&c.prop),
+        c.depth,
+    )]
 }
 
 fn push_markdown_structure_sections(
@@ -284,6 +404,9 @@ fn push_markdown_structure_sections(
         "Re-export cycles",
         |cycle| format_markdown_re_export_cycle(cycle, rel),
     );
+    markdown_section(out, &results.package_cycles, "Package cycles", |cycle| {
+        format_markdown_package_cycle(cycle, rel)
+    });
     markdown_section(
         out,
         &results.boundary_violations,
@@ -347,6 +470,55 @@ fn push_markdown_framework_sections(
     );
 }
 
+/// Push the Effect sections: unused layers, unused tagged errors and
+/// unproduced catch tags.
+fn push_markdown_effect_sections(
+    out: &mut String,
+    results: &AnalysisResults,
+    rel: &dyn Fn(&Path) -> String,
+) {
+    markdown_section(
+        out,
+        &results.unused_effect_layers,
+        "Unused Effect layers",
+        |f| {
+            vec![format!(
+                "- {}:{} {} is composed only into layers that nothing uses ({})",
+                markdown_code_span(&rel(&f.layer.path)),
+                f.layer.line,
+                markdown_code_span(&f.layer.name),
+                f.layer.dead_consumers.join(", "),
+            )]
+        },
+    );
+    markdown_section(
+        out,
+        &results.unused_tagged_errors,
+        "Unused tagged errors",
+        |f| {
+            vec![format!(
+                "- {}:{} {} is never constructed or failed with (remove it or fail with it)",
+                markdown_code_span(&rel(&f.error.path)),
+                f.error.line,
+                markdown_code_span(&f.error.name),
+            )]
+        },
+    );
+    markdown_section(
+        out,
+        &results.unproduced_catch_tags,
+        "Unproduced catch tags",
+        |f| {
+            vec![format!(
+                "- {}:{} catchTag {} handles a tag that no code produces",
+                markdown_code_span(&rel(&f.catch_tag.path)),
+                f.catch_tag.line,
+                markdown_code_span(&f.catch_tag.tag),
+            )]
+        },
+    );
+}
+
 fn push_markdown_component_sections(
     out: &mut String,
     results: &AnalysisResults,
@@ -357,6 +529,33 @@ fn push_markdown_component_sections(
         &results.unrendered_components,
         "Unrendered components",
         |c| format_markdown_unrendered_component(c, rel),
+    );
+    markdown_section(
+        out,
+        &results.absent_component_props,
+        "Absent optional component props",
+        |finding| {
+            let prop = &finding.prop;
+            let callers = prop
+                .inspected_call_sites
+                .iter()
+                .map(|site| markdown_code_span(&format!("{}:{}", rel(&site.path), site.line)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![format!(
+                "- {} in {} ({}; default: {}). {} Inspected callers: {}",
+                markdown_code_span(&format!("{}.{}", prop.component_name, prop.prop_name)),
+                markdown_code_span(&format!("{}:{}", rel(&prop.path), prop.line)),
+                prop.framework,
+                if prop.has_default {
+                    "present"
+                } else {
+                    "absent"
+                },
+                prop.explanation,
+                callers
+            )]
+        },
     );
     markdown_section(
         out,
@@ -388,6 +587,7 @@ fn push_markdown_component_sections(
         "Unused Svelte events",
         |e| format_markdown_unused_svelte_event(e, rel),
     );
+    push_markdown_effect_sections(out, results, rel);
     markdown_section(
         out,
         &results.unused_server_actions,
@@ -468,17 +668,59 @@ fn format_markdown_re_export_cycle(
     )]
 }
 
+fn format_markdown_package_cycle(
+    cycle: &fallow_types::output_dead_code::PackageCycleFinding,
+    rel: &dyn Fn(&Path) -> String,
+) -> Vec<String> {
+    let mut chain: Vec<String> = cycle
+        .cycle
+        .packages
+        .iter()
+        .map(|name| markdown_code_span(name))
+        .collect();
+    if let Some(first) = chain.first().cloned() {
+        chain.push(first);
+    }
+    let note = if cycle.cycle.group_truncated {
+        format!(
+            " *({})*",
+            fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+        )
+    } else {
+        String::new()
+    };
+    let mut lines = vec![format!("- {}{note}", chain.join(" \u{2192} "))];
+    for edge in &cycle.cycle.edges {
+        let type_tag = if edge.type_only { " *(type-only)*" } else { "" };
+        lines.push(format!(
+            "  - {} imports {}{}",
+            markdown_code_span(&format!("{}:{}", rel(&edge.path), edge.line)),
+            markdown_code_span(&rel(&edge.target_path)),
+            type_tag
+        ));
+    }
+    lines
+}
+
 fn format_markdown_boundary_violation(
     v: &fallow_types::output_dead_code::BoundaryViolationFinding,
     rel: &dyn Fn(&Path) -> String,
 ) -> Vec<String> {
+    let via = v
+        .violation
+        .via_path
+        .as_ref()
+        .map_or_else(String::new, |via| {
+            format!(" via {}", markdown_code_span(&rel(via)))
+        });
     vec![format!(
-        "- {}:{}  \u{2192} {} ({} \u{2192} {})",
+        "- {}:{}  \u{2192} {} ({} \u{2192} {}){}",
         markdown_code_span(&rel(&v.violation.from_path)),
         v.violation.line,
         markdown_code_span(&rel(&v.violation.to_path)),
         v.violation.from_zone,
         v.violation.to_zone,
+        via,
     )]
 }
 
@@ -833,30 +1075,45 @@ fn format_unused_dependency_override(
 }
 
 /// Build grouped markdown output: each group gets a heading and issue sections.
+///
+/// `cascade_hidden` is the count of the whole run. The groups do not carry
+/// it, so the report names it once, after the last group.
 #[must_use]
-pub fn build_grouped_markdown(groups: &[ResultGroup], root: &Path) -> String {
+pub fn build_grouped_markdown(
+    groups: &[ResultGroup],
+    root: &Path,
+    cascade_hidden: usize,
+) -> String {
     let total: usize = groups.iter().map(|g| g.results.total_issues()).sum();
+    let signals: usize = groups.iter().map(|g| health_signal_count(&g.results)).sum();
     let mut out = String::new();
 
-    if total == 0 {
+    if total == 0 && signals == 0 {
         out.push_str("## Fallow: no issues found\n");
+        push_cascade_note(&mut out, cascade_hidden);
         return out;
     }
 
-    let _ = writeln!(
-        out,
-        "## Fallow: {total} issue{} found (grouped)\n",
-        plural(total)
-    );
+    if total == 0 {
+        out.push_str("## Fallow: no issues found (grouped)\n\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "## Fallow: {total} issue{} found (grouped)\n",
+            plural(total)
+        );
+    }
 
     for group in groups {
         let count = group.results.total_issues();
-        if count == 0 {
+        let group_signals = health_signal_count(&group.results);
+        if count == 0 && group_signals == 0 {
             continue;
         }
+        let signal_part = crate::grouped_output::health_signal_header_part(&group.results);
         let _ = writeln!(
             out,
-            "## {} ({count} issue{})\n",
+            "## {} ({count} issue{}{signal_part})\n",
             escape_markdown_prose(&group.key),
             plural(count)
         );
@@ -870,20 +1127,55 @@ pub fn build_grouped_markdown(groups: &[ResultGroup], root: &Path) -> String {
                 .join(" ");
             let _ = writeln!(out, "Owners: {joined}\n");
         }
-        let body = build_markdown(&group.results, root);
-        let sections = body
-            .strip_prefix("## Fallow: no issues found\n")
-            .or_else(|| body.find("\n\n").map(|pos| &body[pos + 2..]))
-            .unwrap_or(&body);
-        out.push_str(sections);
+        push_markdown_sections(&mut out, &group.results, root);
     }
 
+    push_cascade_note(&mut out, cascade_hidden);
     out
 }
 
-fn format_export(e: &UnusedExport) -> String {
+/// The italic caveat parenthetical a markdown finding line ends with, or an
+/// empty string when the run analyzed every file it discovered.
+///
+/// Markdown is the PR-comment surface, so a reader acts on this listing. The
+/// same words the human report and the SARIF message use, italicized so the
+/// hedge is visible without competing with the finding itself.
+fn markdown_caveat_suffix(caveats: &[ReachabilityCaveat]) -> String {
+    caveat_labels(caveats).map_or_else(String::new, |labels| format!(" *(caveat: {labels})*"))
+}
+
+fn format_export(e: &UnusedExport, caveats: &[ReachabilityCaveat]) -> String {
     let re = if e.is_re_export { " (re-export)" } else { "" };
-    format!(":{} {}{re}", e.line, markdown_code_span(&e.export_name))
+    let deprecated = if e.deprecated {
+        " (marked @deprecated)"
+    } else {
+        ""
+    };
+    format!(
+        ":{} {}{re}{deprecated}{}",
+        e.line,
+        markdown_code_span(&e.export_name),
+        markdown_caveat_suffix(caveats)
+    )
+}
+
+fn format_deprecated_export_in_use(
+    entry: &fallow_types::output_dead_code::DeprecatedExportInUseFinding,
+) -> String {
+    let e = &entry.export;
+    let consumers = format!("{} consumer{}", e.consumer_count, plural(e.consumer_count));
+    let scope = if e.public_api { " (public API)" } else { "" };
+    let reason = e
+        .deprecated_reason
+        .as_deref()
+        .map_or_else(String::new, |reason| {
+            format!(": {}", escape_markdown_inline(reason))
+        });
+    format!(
+        ":{} {} still used by {consumers}{scope}{reason}",
+        e.line,
+        markdown_code_span(&e.export_name),
+    )
 }
 
 fn format_private_type_leak(
@@ -898,9 +1190,14 @@ fn format_private_type_leak(
     )
 }
 
-fn format_member(m: &UnusedMember) -> String {
+fn format_member(m: &UnusedMember, caveats: &[ReachabilityCaveat]) -> String {
     let member = format!("{}.{}", m.parent_name, m.member_name);
-    format!(":{} {}", m.line, markdown_code_span(&member))
+    format!(
+        ":{} {}{}",
+        m.line,
+        markdown_code_span(&member),
+        markdown_caveat_suffix(caveats)
+    )
 }
 
 fn format_dependency(
@@ -908,7 +1205,9 @@ fn format_dependency(
     pkg_path: &Path,
     used_in_workspaces: &[std::path::PathBuf],
     root: &Path,
+    caveats: &[ReachabilityCaveat],
 ) -> Vec<String> {
+    let caveat = markdown_caveat_suffix(caveats);
     let name = markdown_code_span(dep_name);
     let pkg_label = relative_path(pkg_path, root).display().to_string();
     let workspace_context = if used_in_workspaces.is_empty() {
@@ -922,14 +1221,14 @@ fn format_dependency(
         format!("; imported in {workspaces}")
     };
     if pkg_label == "package.json" && workspace_context.is_empty() {
-        vec![format!("- {name}")]
+        vec![format!("- {name}{caveat}")]
     } else {
         let label = if pkg_label == "package.json" {
             workspace_context.trim_start_matches("; ").to_string()
         } else {
             format!("{}{workspace_context}", markdown_code_span(&pkg_label))
         };
-        vec![format!("- {name} ({label})")]
+        vec![format!("- {name} ({label}){caveat}")]
     }
 }
 
@@ -983,6 +1282,42 @@ fn markdown_grouped_section<'a, T>(
     out.push('\n');
 }
 
+/// Name what a display limit withheld from the listing below, so the corpus
+/// counts in the heading and summary are not read as the size of the listing.
+///
+/// Emits nothing on an untruncated run, which keeps the default document
+/// byte-identical.
+fn write_duplication_omission_note(out: &mut String, report: &DuplicationReport) {
+    let groups_omitted = report.clone_groups_omitted();
+    let families_omitted = report.clone_families_omitted();
+    if groups_omitted == 0 && families_omitted == 0 {
+        return;
+    }
+
+    let mut withheld: Vec<String> = Vec::with_capacity(2);
+    if groups_omitted > 0 {
+        withheld.push(format!(
+            "{} more clone group{}",
+            groups_omitted,
+            plural(groups_omitted)
+        ));
+    }
+    if families_omitted > 0 {
+        withheld.push(format!(
+            "{} more clone famil{}",
+            families_omitted,
+            if families_omitted == 1 { "y" } else { "ies" }
+        ));
+    }
+
+    let _ = write!(
+        out,
+        "_Listing {} of them; {} withheld by a display limit._\n\n",
+        report.clone_groups_shown(),
+        withheld.join(" and "),
+    );
+}
+
 /// Build markdown output for duplication results.
 #[must_use]
 pub fn build_duplication_markdown(report: &DuplicationReport, root: &Path) -> String {
@@ -994,13 +1329,19 @@ pub fn build_duplication_markdown(report: &DuplicationReport, root: &Path) -> St
     }
 
     let stats = &report.stats;
+    // The heading and the duplication rate beside it must describe one scope.
+    // `--top` narrows the listing below, never the corpus the run measured, so
+    // the heading counts the corpus and a separate note names what a display
+    // limit withheld.
+    let corpus_groups = report.clone_groups_total();
     let _ = write!(
         out,
         "## Fallow: {} clone group{} found ({:.1}% duplication)\n\n",
-        stats.clone_groups,
-        plural(stats.clone_groups),
+        corpus_groups,
+        plural(corpus_groups),
         stats.duplication_percentage,
     );
+    write_duplication_omission_note(&mut out, report);
 
     write_duplication_groups(&mut out, report, root);
     write_duplication_families(&mut out, report, root);
@@ -1073,6 +1414,121 @@ fn write_duplication_families(out: &mut String, report: &DuplicationReport, root
     }
 }
 
+/// What a health report says about its complexity findings. Markdown and the
+/// job summary build it from the report and use one rule, so the two
+/// surfaces agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComplexityListing {
+    /// The length of the finding list.
+    pub listed: usize,
+    /// `summary.functions_above_threshold`, which fallow counts before the
+    /// baseline.
+    pub above: usize,
+    /// `Some(true)` when `sections` contains `complexity`, `Some(false)` when
+    /// `sections` does not, and `None` for an older report without `sections`.
+    pub complexity_section: Option<bool>,
+    /// True when the report has no `vital_signs`, which only a score-only run
+    /// omits. The rule reads it only when `complexity_section` is `None`.
+    pub score_only: bool,
+    /// True when the run loaded a baseline.
+    pub baselined: bool,
+    /// `summary.baseline_staleness.remaining_findings`: the functions above a
+    /// threshold that the baseline does not accept. `None` without a baseline
+    /// and in an older report.
+    pub remaining: Option<usize>,
+}
+
+impl ComplexityListing {
+    /// Tell if the complexity section gives the count of functions above a
+    /// threshold instead of a clean result.
+    ///
+    /// A run that did not produce the `complexity` section does not list
+    /// findings, so an empty list does not make it clean. A run that lists
+    /// findings, with an empty list and a baseline, is clean: the baseline
+    /// accepts every finding.
+    ///
+    /// An older report without `sections` falls back to the earlier rule: a
+    /// score-only run gives the count, and another run gives the count only
+    /// without a baseline.
+    #[must_use]
+    pub const fn count_unlisted(&self) -> bool {
+        if self.above == 0 {
+            return false;
+        }
+        match self.complexity_section {
+            Some(listed_section) => !listed_section,
+            None => self.listed == 0 && (self.score_only || !self.baselined),
+        }
+    }
+
+    /// The sentences after the count of functions that the run does not list.
+    ///
+    /// With a baseline, the note tells how many functions the baseline accepts
+    /// and how many are new. An older report without `remaining_findings`
+    /// says that the count includes the accepted functions.
+    #[must_use]
+    pub fn not_listed_note(&self) -> String {
+        const NOT_LISTED: &str = "This run does not list the functions.";
+        if !self.baselined {
+            return format!("{NOT_LISTED} Run `fallow health --complexity` to list them.");
+        }
+        let Some(remaining) = self.remaining else {
+            return format!(
+                "{NOT_LISTED} The count includes the functions that the baseline accepts. \
+                 Run `fallow health --complexity` with the same `--baseline` to list the \
+                 functions that the baseline does not accept."
+            );
+        };
+        let accepted = self.above.saturating_sub(remaining);
+        let verb = if remaining == 1 { "is" } else { "are" };
+        let mut note =
+            format!("The baseline accepts {accepted}. {remaining} {verb} new. {NOT_LISTED}");
+        if remaining > 0 {
+            note.push_str(
+                " Run `fallow health --complexity` with the same `--baseline` to list the \
+                 new functions.",
+            );
+        }
+        note
+    }
+}
+
+/// The complexity listing facts of a typed health report.
+fn complexity_listing(report: &fallow_output::HealthReport) -> ComplexityListing {
+    let staleness = report.summary.baseline_staleness.as_ref();
+    ComplexityListing {
+        listed: report.findings.len(),
+        above: report.summary.functions_above_threshold,
+        complexity_section: report
+            .sections
+            .as_ref()
+            .map(|sections| sections.contains(&fallow_output::HealthSection::Complexity)),
+        score_only: report.vital_signs.is_none(),
+        baselined: staleness.is_some(),
+        remaining: staleness.and_then(|staleness| staleness.remaining_findings),
+    }
+}
+
+fn write_complexity_not_listed(
+    out: &mut String,
+    summary: &fallow_output::HealthSummary,
+    listing: &ComplexityListing,
+) {
+    let above = summary.functions_above_threshold;
+    let _ = writeln!(
+        out,
+        "## Fallow: {above} function{} exceed{} complexity thresholds\n\n\
+         **{}** functions analyzed (max cyclomatic: {}, max cognitive: {}, max CRAP: {:.1}). {}",
+        if above == 1 { "" } else { "s" },
+        if above == 1 { "s" } else { "" },
+        summary.functions_analyzed,
+        summary.max_cyclomatic_threshold,
+        summary.max_cognitive_threshold,
+        summary.max_crap_threshold,
+        listing.not_listed_note(),
+    );
+}
+
 /// Build markdown output for health (complexity) results.
 #[must_use]
 pub fn build_health_markdown(report: &fallow_output::HealthReport, root: &Path) -> String {
@@ -1089,6 +1545,10 @@ pub fn build_health_markdown(report: &fallow_output::HealthReport, root: &Path) 
         && report.file_scores.is_empty()
         && report.coverage_gaps.is_none()
         && report.hotspots.is_empty()
+        && report
+            .change_coupling
+            .as_ref()
+            .is_none_or(|coupling| coupling.pairs.is_empty())
         && report.targets.is_empty()
         && report.runtime_coverage.is_none()
         && report.coverage_intelligence.is_none()
@@ -1096,7 +1556,13 @@ pub fn build_health_markdown(report: &fallow_output::HealthReport, root: &Path) 
         && report.css_analytics.is_none()
         && report.styling_findings.is_empty()
     {
-        if report.vital_signs.is_none() {
+        // Only a score-only run omits `vital_signs`. Another run that does not
+        // list complexity findings has no complexity section, as in the human
+        // output.
+        let listing = complexity_listing(report);
+        if report.vital_signs.is_none() && listing.count_unlisted() {
+            write_complexity_not_listed(&mut out, &report.summary, &listing);
+        } else if report.vital_signs.is_none() {
             let _ = write!(
                 out,
                 "## Fallow: no functions exceed complexity thresholds\n\n\
@@ -1118,10 +1584,49 @@ pub fn build_health_markdown(report: &fallow_output::HealthReport, root: &Path) 
     write_coverage_gaps_section(&mut out, report, root);
     write_file_scores_section(&mut out, report, root);
     write_hotspots_section(&mut out, report, root);
+    write_change_coupling_section(&mut out, report, root);
     write_targets_section(&mut out, report, root);
     write_css_analytics_section(&mut out, report);
     write_metric_legend(&mut out, report);
 
+    out
+}
+
+/// Markdown section for the diff-risk findings of `fallow audit`: one table
+/// row for each finding. Every finding is introduced by the change and can set
+/// the verdict, so the table has no cap. Empty when there is no finding.
+#[must_use]
+pub fn build_diff_risk_markdown(report: &fallow_output::DiffRiskReport) -> String {
+    if report.findings.is_empty() {
+        return String::new();
+    }
+    let count = report.findings.len();
+    let mut out = format!("## Fallow: {count} diff-risk finding{}\n\n", plural(count));
+    out.push_str("| Location | Rule | Severity | Evidence |\n");
+    out.push_str("|:---------|:-----|:---------|:---------|\n");
+    for finding in &report.findings {
+        let location = finding.line.map_or_else(
+            || finding.path.clone(),
+            |line| format!("{}:{line}", finding.path),
+        );
+        let rule = finding.kind.map_or_else(
+            || markdown_table_code_span(finding.rule.code()),
+            |kind| {
+                format!(
+                    "{} / {}",
+                    markdown_table_code_span(finding.rule.code()),
+                    markdown_table_code_span(kind.code())
+                )
+            },
+        );
+        let _ = writeln!(
+            out,
+            "| {} | {rule} | {} | {} |",
+            markdown_table_code_span(&location),
+            finding.severity.code(),
+            markdown_table_code_span(&finding.evidence),
+        );
+    }
     out
 }
 
@@ -1534,6 +2039,16 @@ fn write_trend_section(out: &mut String, report: &fallow_output::HealthReport) {
             .unwrap_or(&trend.compared_to.timestamp),
         sha_str,
     );
+    if let Some(current) = report.health_score.as_ref()
+        && trend.compared_to.score.is_some()
+        && !trend.metrics.iter().any(|metric| metric.name == "score")
+        && let Some(note) = fallow_output::health_score_comparison_note(
+            trend.compared_to.score_formula_version,
+            Some(current.formula_version),
+        )
+    {
+        let _ = writeln!(out, "*{note}*\n");
+    }
     out.push_str("| Metric | Previous | Current | Delta | Direction |\n");
     out.push_str("|:-------|:---------|:--------|:------|:----------|\n");
     for m in &trend.metrics {
@@ -1607,6 +2122,19 @@ fn write_vital_signs_section(out: &mut String, report: &fallow_output::HealthRep
     }
     let _ = writeln!(out, "| Avg Cyclomatic | {:.1} |", vs.avg_cyclomatic);
     let _ = writeln!(out, "| P90 Cyclomatic | {} |", vs.p90_cyclomatic);
+    if let Some(population) = &vs.cyclomatic_population {
+        let _ = writeln!(
+            out,
+            "| Cyclomatic units | Functions: {}, module scopes: {}, templates: {} |",
+            population.functions.count, population.modules.count, population.templates.count
+        );
+        if let Some(max) = population.modules.max {
+            let _ = writeln!(
+                out,
+                "| Module-scope max cyclomatic (aggregate only) | {max} |"
+            );
+        }
+    }
     if let Some(v) = vs.dead_file_pct {
         let _ = writeln!(out, "| Dead Files | {v:.1}% |");
     }
@@ -1849,26 +2377,36 @@ fn write_file_scores_section(out: &mut String, report: &fallow_output::HealthRep
     let rel = |p: &Path| normalize_uri(&relative_path(p, root).display().to_string());
 
     out.push('\n');
+    let count = report.file_scores.len();
     let _ = writeln!(
         out,
-        "### File Health Scores ({} files)\n",
-        report.file_scores.len(),
+        "### File Health Scores ({count} file{})\n",
+        plural(count),
     );
     out.push_str("| File | Maintainability | Fan-in | Fan-out | Dead Code | Density | Risk |\n");
     out.push_str("|:-----|:---------------|:-------|:--------|:----------|:--------|:-----|\n");
 
     for score in &report.file_scores {
         let file_str = rel(&score.path);
+        let signal = fallow_engine::health::scoring::file_score_crap_signal(
+            score,
+            report.summary.max_crap_threshold,
+        );
+        let suppression = if score.crap_suppressed > 0 {
+            " (complexity suppression)"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "| {} | {mi:.1} | {fi} | {fan_out} | {dead:.0}% | {density:.2} | {crap:.1} |",
+            "| {} | {mi:.1} | {fi} | {fan_out} | {dead:.0}% | {density:.2} | {crap:.1}{suppression} |",
             markdown_table_code_span(&file_str),
             mi = score.maintainability_index,
             fi = score.fan_in,
             fan_out = score.fan_out,
             dead = score.dead_code_ratio * 100.0,
             density = score.complexity_density,
-            crap = score.crap_max,
+            crap = signal.maximum,
         );
     }
 
@@ -1980,12 +2518,13 @@ fn write_hotspots_section(out: &mut String, report: &fallow_output::HealthReport
     }
 
     out.push('\n');
+    let count = report.hotspots.len();
     let header = report.hotspot_summary.as_ref().map_or_else(
-        || format!("### Hotspots ({} files)\n", report.hotspots.len()),
+        || format!("### Hotspots ({count} file{})\n", plural(count)),
         |summary| {
             format!(
-                "### Hotspots ({} files, since {})\n",
-                report.hotspots.len(),
+                "### Hotspots ({count} file{}, since {})\n",
+                plural(count),
                 summary.since,
             )
         },
@@ -2009,6 +2548,52 @@ fn write_hotspots_section(out: &mut String, report: &fallow_output::HealthReport
             summary.min_commits,
         );
     }
+}
+
+/// Write the hidden change-coupling pairs. Silent when the section is absent
+/// or lists no pair.
+fn write_change_coupling_section(
+    out: &mut String,
+    report: &fallow_output::HealthReport,
+    root: &Path,
+) {
+    let Some(coupling) = report.change_coupling.as_ref() else {
+        return;
+    };
+    if coupling.pairs.is_empty() {
+        return;
+    }
+    let count = coupling.total_pairs;
+    let _ = write!(
+        out,
+        "\n### Hidden Change Coupling ({count} pair{}, since {})\n\n",
+        plural(count),
+        coupling.since,
+    );
+    out.push_str("| File A | File B | Degree | Shared | Commits A | Commits B | Strong |\n");
+    out.push_str("|:-------|:-------|:-------|:-------|:----------|:----------|:-------|\n");
+    for pair in &coupling.pairs {
+        let path_a = normalize_uri(&relative_path(&pair.path_a, root).display().to_string());
+        let path_b = normalize_uri(&relative_path(&pair.path_b, root).display().to_string());
+        let _ = writeln!(
+            out,
+            "| {} | {} | {:.0}% | {} | {} | {} | {} |",
+            markdown_table_code_span(&path_a),
+            markdown_table_code_span(&path_b),
+            pair.degree * 100.0,
+            pair.shared_revisions,
+            pair.revisions_a,
+            pair.revisions_b,
+            if pair.strong { "**strong**" } else { "" },
+        );
+    }
+    let hidden = count.saturating_sub(coupling.pairs.len());
+    if hidden > 0 {
+        let _ = writeln!(out, "\n*{hidden} more pair{} not shown*", plural(hidden));
+    }
+    out.push_str(
+        "\n*Files that change together in the commit history with no import between them.*\n",
+    );
 }
 
 /// Write the hotspots table header, widening with ownership columns when present.
@@ -2130,7 +2715,7 @@ fn write_metric_legend(out: &mut String, report: &fallow_output::HealthReport) {
         out.push_str("- **Confidence**: recommendation reliability (high = deterministic analysis, medium = heuristic, low = git-dependent)\n");
     }
     out.push_str(
-        "\n[Full metric reference](https://docs.fallow.tools/explanations/metrics)\n\n</details>\n",
+        "\n[Full metric reference](https://fallow.tools/docs/explanations/health/)\n\n</details>\n",
     );
 }
 
@@ -2486,12 +3071,296 @@ fn walkthrough_effort_label(effort: fallow_output::ReviewEffort) -> &'static str
 }
 
 #[cfg(test)]
+mod duplication_markdown_tests {
+    use std::path::{Path, PathBuf};
+
+    use fallow_types::duplicates::{
+        CloneFamily, CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
+    };
+
+    use super::build_duplication_markdown;
+
+    fn capped_report(
+        shown: usize,
+        corpus_groups: usize,
+        corpus_families: usize,
+    ) -> DuplicationReport {
+        let group = |n: usize| CloneGroup {
+            instances: vec![CloneInstance {
+                is_symlink: false,
+                file: PathBuf::from(format!("/project/src/a{n}.ts")),
+                start_line: 1,
+                end_line: 4,
+                start_col: 0,
+                end_col: 10,
+                fragment: "const a = 1;".to_string(),
+            }],
+            token_count: 8,
+            line_count: 4,
+            similarity: None,
+        };
+        let family = |n: usize| CloneFamily {
+            files: vec![PathBuf::from(format!("/project/src/a{n}.ts"))],
+            groups: vec![group(n)],
+            total_duplicated_lines: 4,
+            total_duplicated_tokens: 8,
+            suggestions: Vec::new(),
+        };
+        DuplicationReport {
+            clone_groups: (0..shown).map(group).collect(),
+            clone_families: (0..shown.min(corpus_families)).map(family).collect(),
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats {
+                clone_groups: corpus_groups,
+                clone_families: corpus_families,
+                clone_instances: corpus_groups,
+                total_files: 40,
+                files_with_clones: 12,
+                total_lines: 1000,
+                duplicated_lines: 252,
+                total_tokens: 5000,
+                duplicated_tokens: 1200,
+                duplication_percentage: 25.2,
+                ..DuplicationStats::default()
+            },
+        }
+    }
+
+    // The heading and the duplication rate beside it are read as one sentence
+    // about one scope, so a capped listing must not rewrite the heading.
+    #[test]
+    fn a_capped_listing_still_names_the_measured_corpus() {
+        let md = build_duplication_markdown(&capped_report(3, 251, 163), Path::new("/project"));
+        assert!(
+            md.starts_with("## Fallow: 251 clone groups found (25.2% duplication)"),
+            "got: {md}"
+        );
+        assert!(
+            md.contains("_Listing 3 of them; 248 more clone groups and 160 more clone families withheld by a display limit._"),
+            "got: {md}"
+        );
+    }
+
+    // An untruncated run must render exactly as before, note included.
+    #[test]
+    fn an_untruncated_listing_carries_no_omission_note() {
+        let md = build_duplication_markdown(&capped_report(3, 3, 0), Path::new("/project"));
+        assert!(
+            md.starts_with("## Fallow: 3 clone groups found (25.2% duplication)"),
+            "got: {md}"
+        );
+        assert!(!md.contains("withheld by a display limit"), "got: {md}");
+    }
+}
+
+#[cfg(test)]
 mod health_markdown_tests {
     use std::path::Path;
 
     use fallow_output::{HealthReport, StylingFinding, StylingFindingSeverity};
 
     use super::build_health_markdown;
+
+    fn one_file_report(root: &Path, since: Option<&str>) -> HealthReport {
+        HealthReport {
+            file_scores: vec![fallow_output::FileHealthScore {
+                path: root.join("src/core.ts"),
+                fan_in: 1,
+                fan_out: 0,
+                dead_code_ratio: 0.0,
+                complexity_density: 0.5,
+                maintainability_index: 80.0,
+                total_cyclomatic: 4,
+                total_cognitive: 2,
+                function_count: 1,
+                lines: 10,
+                crap_max: 4.0,
+                crap_above_threshold: 0,
+                crap_exempted: 0,
+                crap_suppressed: 0,
+                crap_unsuppressed_max: None,
+                crap_unsuppressed_effective_threshold: None,
+                crap_effective_threshold: None,
+            }],
+            hotspots: vec![
+                fallow_output::HotspotEntry {
+                    path: root.join("src/core.ts"),
+                    score: 75.0,
+                    commits: 4,
+                    weighted_commits: 3.0,
+                    lines_added: 10,
+                    lines_deleted: 2,
+                    complexity_density: 0.5,
+                    fan_in: 1,
+                    trend: fallow_types::churn::ChurnTrend::Stable,
+                    median_files_per_commit: None,
+                    median_lines_per_commit: None,
+                    ownership: None,
+                    is_test_path: false,
+                }
+                .into(),
+            ],
+            hotspot_summary: since.map(|since| fallow_output::HotspotSummary {
+                since: since.to_string(),
+                min_commits: 3,
+                files_analyzed: 1,
+                files_excluded: 0,
+                shallow_clone: false,
+                clock: None,
+            }),
+            ..HealthReport::default()
+        }
+    }
+
+    /// A score-only report has no finding list, but its summary still counts
+    /// the functions above a threshold. The section must give that count.
+    #[test]
+    fn score_only_markdown_counts_unlisted_functions() {
+        let root = Path::new("/project");
+        let mut report = HealthReport::default();
+        report.summary.functions_analyzed = 5;
+        report.summary.functions_above_threshold = 1;
+        let output = build_health_markdown(&report, root);
+        assert!(
+            output.contains("## Fallow: 1 function exceeds complexity thresholds"),
+            "{output}"
+        );
+        assert!(output.contains("`fallow health --complexity`"), "{output}");
+        assert!(!output.contains("baseline"), "{output}");
+
+        report.summary.functions_above_threshold = 0;
+        let output = build_health_markdown(&report, root);
+        assert!(
+            output.contains("## Fallow: no functions exceed complexity thresholds"),
+            "{output}"
+        );
+    }
+
+    fn accepting_baseline() -> fallow_output::BaselineStaleness {
+        fallow_output::BaselineStaleness {
+            baseline_entries: 1,
+            matched_entries: 1,
+            stale_entries: 0,
+            current_findings: 1,
+            remaining_findings: None,
+            change_scoped: false,
+            stale: false,
+            warning: fallow_output::BaselineStalenessAdvisory::None,
+            gate_trips: false,
+            moved_entries: 0,
+            unrecognised_format: false,
+            saved_by: None,
+            format: None,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty(),
+        }
+    }
+
+    /// A score-only run does not list findings, so a baseline does not make
+    /// it clean. The count comes before the baseline, and the section says so.
+    #[test]
+    fn baselined_score_only_markdown_counts_unlisted_functions() {
+        let root = Path::new("/project");
+        let mut report = HealthReport::default();
+        report.summary.functions_analyzed = 5;
+        report.summary.functions_above_threshold = 1;
+        report.summary.baseline_staleness = Some(accepting_baseline());
+        let output = build_health_markdown(&report, root);
+        assert!(
+            output.contains("## Fallow: 1 function exceeds complexity thresholds"),
+            "{output}"
+        );
+        assert!(
+            output.contains("The count includes the functions that the baseline accepts."),
+            "{output}"
+        );
+        assert!(
+            output.contains("Run `fallow health --complexity` with the same `--baseline`"),
+            "{output}"
+        );
+        assert!(!output.contains("no functions exceed"), "{output}");
+    }
+
+    /// A run that lists findings and has a baseline that accepts every
+    /// finding is clean. The section must not give the count or ask for a
+    /// rerun.
+    #[test]
+    fn baselined_listed_markdown_stays_clean() {
+        let root = Path::new("/project");
+        let mut report = HealthReport {
+            vital_signs: Some(fallow_output::VitalSigns::default()),
+            ..HealthReport::default()
+        };
+        report.summary.functions_analyzed = 5;
+        report.summary.functions_above_threshold = 1;
+        report.summary.baseline_staleness = Some(accepting_baseline());
+        let output = build_health_markdown(&report, root);
+        assert!(!output.contains("exceeds complexity"), "{output}");
+        assert!(!output.contains("--complexity"), "{output}");
+    }
+
+    /// A score-only report with `sections` and `remaining_findings` gives the
+    /// number of accepted and new functions instead of the older note.
+    #[test]
+    fn score_only_markdown_names_the_new_functions() {
+        let root = Path::new("/project");
+        let mut report = HealthReport {
+            sections: Some(vec![fallow_output::HealthSection::Score]),
+            ..HealthReport::default()
+        };
+        report.summary.functions_analyzed = 5;
+        report.summary.functions_above_threshold = 3;
+        report.summary.baseline_staleness = Some(fallow_output::BaselineStaleness {
+            remaining_findings: Some(1),
+            ..accepting_baseline()
+        });
+        let output = build_health_markdown(&report, root);
+        assert!(
+            output.contains("## Fallow: 3 functions exceed complexity thresholds"),
+            "{output}"
+        );
+        assert!(
+            output.contains("The baseline accepts 2. 1 is new."),
+            "{output}"
+        );
+        assert!(!output.contains("The count includes"), "{output}");
+    }
+
+    /// A report whose `sections` names `complexity` and has an empty list is
+    /// clean, also without `vital_signs`.
+    #[test]
+    fn listed_markdown_with_sections_stays_clean() {
+        let root = Path::new("/project");
+        let mut report = HealthReport {
+            sections: Some(vec![fallow_output::HealthSection::Complexity]),
+            ..HealthReport::default()
+        };
+        report.summary.functions_above_threshold = 1;
+        report.summary.baseline_staleness = Some(accepting_baseline());
+        let output = build_health_markdown(&report, root);
+        assert!(
+            output.contains("## Fallow: no functions exceed complexity thresholds"),
+            "{output}"
+        );
+        assert!(!output.contains("--complexity"), "{output}");
+    }
+
+    #[test]
+    fn health_markdown_headers_use_the_singular_for_one_file() {
+        let root = Path::new("/project");
+
+        let output = build_health_markdown(&one_file_report(root, None), root);
+        assert!(
+            output.contains("### File Health Scores (1 file)"),
+            "{output}"
+        );
+        assert!(output.contains("### Hotspots (1 file)"), "{output}");
+
+        let output = build_health_markdown(&one_file_report(root, Some("6 months")), root);
+        assert!(
+            output.contains("### Hotspots (1 file, since 6 months)"),
+            "{output}"
+        );
+    }
 
     #[test]
     fn health_markdown_includes_styling_findings() {
@@ -2579,6 +3448,136 @@ mod health_markdown_tests {
 }
 
 #[cfg(test)]
+mod caveat_markdown_tests {
+    use std::path::{Path, PathBuf};
+
+    use fallow_types::extract::MemberKind;
+    use fallow_types::output_dead_code::{
+        ReachabilityCaveat, UnusedClassMemberFinding, UnusedDependencyFinding,
+        UnusedEnumMemberFinding, UnusedExportFinding, UnusedFileFinding, UnusedStoreMemberFinding,
+    };
+    use fallow_types::results::{
+        AnalysisResults, DependencyLocation, UnusedDependency, UnusedExport, UnusedFile,
+        UnusedMember,
+    };
+
+    use super::build_markdown;
+
+    fn caveated_results(root: &Path) -> AnalysisResults {
+        let caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        let mut results = AnalysisResults::default();
+
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/lib.ts"),
+        });
+        file.reachability_caveats.clone_from(&caveats);
+        results.unused_files.push(file);
+
+        let mut export = UnusedExportFinding::with_actions(UnusedExport {
+            path: root.join("src/api.ts"),
+            export_name: "needed".to_owned(),
+            is_type_only: false,
+            line: 3,
+            col: 0,
+            span_start: 0,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        });
+        export.reachability_caveats.clone_from(&caveats);
+        results.unused_exports.push(export);
+
+        let mut dep = UnusedDependencyFinding::with_actions(UnusedDependency {
+            package_name: "left-pad".to_owned(),
+            location: DependencyLocation::Dependencies,
+            path: root.join("package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        });
+        dep.reachability_caveats.clone_from(&caveats);
+        results.unused_dependencies.push(dep);
+
+        let member = |parent: &str, name: &str, kind| UnusedMember {
+            path: root.join("src/api.ts"),
+            parent_name: parent.to_owned(),
+            member_name: name.to_owned(),
+            kind,
+            line: 7,
+            col: 2,
+        };
+        let mut enum_member =
+            UnusedEnumMemberFinding::with_actions(member("Mode", "Legacy", MemberKind::EnumMember));
+        enum_member.reachability_caveats.clone_from(&caveats);
+        results.unused_enum_members.push(enum_member);
+
+        let mut class_member = UnusedClassMemberFinding::with_actions(member(
+            "Widget",
+            "render",
+            MemberKind::ClassMethod,
+        ));
+        class_member.reachability_caveats.clone_from(&caveats);
+        results.unused_class_members.push(class_member);
+
+        let mut store_member = UnusedStoreMemberFinding::with_actions(member(
+            "useCart",
+            "subtotal",
+            MemberKind::StoreMember,
+        ));
+        store_member.reachability_caveats.clone_from(&caveats);
+        results.unused_store_members.push(store_member);
+
+        results
+    }
+
+    /// The markdown document is the PR-comment surface, so a reader deletes
+    /// straight off this listing. Every caveated finding line has to hedge.
+    #[test]
+    fn caveated_findings_hedge_their_markdown_lines() {
+        let root = PathBuf::from("/project");
+
+        let out = build_markdown(&caveated_results(&root), &root);
+
+        assert!(
+            out.contains("- `src/lib.ts` *(caveat: incomplete import graph)*"),
+            "{out}"
+        );
+        assert!(
+            out.contains("- :3 `needed` *(caveat: incomplete import graph)*"),
+            "{out}"
+        );
+        assert!(
+            out.contains("- `left-pad` *(caveat: incomplete import graph)*"),
+            "{out}"
+        );
+        for expected in [
+            "- :7 `Mode.Legacy` *(caveat: incomplete import graph)*",
+            "- :7 `Widget.render` *(caveat: incomplete import graph)*",
+            "- :7 `useCart.subtotal` *(caveat: incomplete import graph)*",
+        ] {
+            assert!(out.contains(expected), "missing {expected}: {out}");
+        }
+    }
+
+    /// A run that read every file it discovered renders exactly as before.
+    #[test]
+    fn a_clean_run_renders_no_caveat() {
+        let root = PathBuf::from("/project");
+        let mut results = caveated_results(&root);
+        results.unused_files[0].reachability_caveats.clear();
+        results.unused_exports[0].reachability_caveats.clear();
+        results.unused_dependencies[0].reachability_caveats.clear();
+        results.unused_enum_members[0].reachability_caveats.clear();
+        results.unused_class_members[0].reachability_caveats.clear();
+        results.unused_store_members[0].reachability_caveats.clear();
+
+        let out = build_markdown(&results, &root);
+
+        assert!(!out.contains("caveat"), "{out}");
+    }
+}
+
+#[cfg(test)]
 mod markdown_code_span_tests {
     use std::path::{Path, PathBuf};
 
@@ -2660,6 +3659,8 @@ mod walkthrough_markdown_tests {
             tradeoff: String::new(),
         };
         let digest = StandardReviewBriefOutput {
+            branching: None,
+            test_reach: None,
             schema_version: ReviewBriefSchemaVersion::default(),
             version: "test".to_string(),
             command: "audit-brief".to_string(),
@@ -2673,7 +3674,6 @@ mod walkthrough_markdown_tests {
             graph_facts: GraphFacts {
                 exports_added: 0,
                 api_width_delta: 0,
-                reachable_from: Vec::new(),
                 boundaries_touched: Vec::new(),
             },
             partition: PartitionFacts::default(),
@@ -2685,6 +3685,7 @@ mod walkthrough_markdown_tests {
             deltas: ReviewDeltas::default(),
             weakening: Vec::new(),
             routing: RoutingFacts::default(),
+            ownership: None,
             decisions: DecisionSurface {
                 decisions: vec![decision],
                 truncated: None,
@@ -2827,5 +3828,69 @@ mod walkthrough_markdown_tests {
         );
         assert!(md.contains("`package.json`"), "got: {md}");
         assert!(!md.contains("orientation only"), "got: {md}");
+    }
+}
+
+#[cfg(test)]
+mod diff_risk_markdown_tests {
+    use super::build_diff_risk_markdown;
+    use fallow_output::{
+        DiffRiskFinding, DiffRiskReport, DiffRiskRule, DiffRiskSeverity, WeakenedTestsKind,
+    };
+
+    fn finding(
+        rule: DiffRiskRule,
+        kind: Option<WeakenedTestsKind>,
+        location: (&str, u32),
+        evidence: &str,
+        severity: DiffRiskSeverity,
+    ) -> DiffRiskFinding {
+        DiffRiskFinding {
+            rule,
+            kind,
+            path: location.0.to_owned(),
+            line: Some(location.1),
+            message: "m".to_owned(),
+            evidence: evidence.to_owned(),
+            severity,
+            introduced: true,
+            related: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diff_risk_markdown_is_empty_without_findings() {
+        assert_eq!(build_diff_risk_markdown(&DiffRiskReport::default()), "");
+    }
+
+    #[test]
+    fn diff_risk_markdown_lists_each_finding_in_a_table() {
+        let report = DiffRiskReport {
+            findings: vec![
+                finding(
+                    DiffRiskRule::WeakenedTests,
+                    Some(WeakenedTestsKind::SkipOnly),
+                    ("src/a.test.ts", 4),
+                    "it.skip",
+                    DiffRiskSeverity::Warn,
+                ),
+                finding(
+                    DiffRiskRule::AddedSuppression,
+                    None,
+                    ("src/b.ts", 9),
+                    "eslint-disable | x",
+                    DiffRiskSeverity::Error,
+                ),
+            ],
+        };
+        assert_eq!(
+            build_diff_risk_markdown(&report),
+            "## Fallow: 2 diff-risk findings\n\n\
+             | Location | Rule | Severity | Evidence |\n\
+             |:---------|:-----|:---------|:---------|\n\
+             | `src/a.test.ts:4` | `weakened-tests` / `skip-only` | warn | `it.skip` |\n\
+             | `src/b.ts:9` | `added-suppression` | error | `eslint-disable \\| x` |\n"
+        );
     }
 }

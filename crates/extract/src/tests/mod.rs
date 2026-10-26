@@ -1,8 +1,13 @@
 mod astro;
+mod component_contracts;
 mod css;
+mod deep_shapes;
+mod effect;
 mod graphql;
 mod js_ts;
+mod linear_cost;
 mod mdx;
+mod nesting;
 mod regex_compile;
 mod sfc;
 
@@ -11,7 +16,7 @@ use std::path::Path;
 use fallow_types::discover::FileId;
 use fallow_types::extract::ModuleInfo;
 
-use crate::parse::parse_source_to_module;
+use crate::parse_source_to_module;
 
 /// Shared test helper: parse TypeScript source and return `ModuleInfo`.
 pub fn parse_ts(source: &str) -> ModuleInfo {
@@ -32,6 +37,27 @@ pub fn parse_tsx(source: &str) -> ModuleInfo {
 /// extraction such as the SvelteKit `load()` harvest needs the real filename).
 pub fn parse_at_path(path: &str, source: &str) -> ModuleInfo {
     parse_source_to_module(FileId(0), Path::new(path), source, 0, false)
+}
+
+/// The sources of the dynamic imports that extraction marks as eager.
+pub fn eager_dynamic_import_sources(info: &ModuleInfo) -> Vec<&str> {
+    let eager_starts: Vec<u32> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            fallow_types::extract::SemanticFact::ImportLoadKindOverride(fact)
+                if fact.kind == fallow_types::extract::ImportLoadKind::Static =>
+            {
+                Some(fact.span_start)
+            }
+            _ => None,
+        })
+        .collect();
+    info.dynamic_imports
+        .iter()
+        .filter(|import| eager_starts.contains(&import.span.start))
+        .map(|import| import.source.as_str())
+        .collect()
 }
 
 #[test]

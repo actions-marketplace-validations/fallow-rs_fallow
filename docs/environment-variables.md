@@ -1,10 +1,9 @@
 # Environment variables
 
-Fallow works with zero configuration, but a handful of environment variables let
-you and your CI operators override defaults without editing a config file or
-passing flags. CLI flags always win over the matching environment variable, and
-environment variables win over the corresponding config-file field unless noted
-otherwise.
+Use environment variables to override defaults without editing a config file or
+passing flags. CLI flags take precedence over matching environment variables.
+Environment variables take precedence over corresponding config-file fields
+unless noted otherwise.
 
 The same user-facing list is emitted as a machine-readable manifest by
 `fallow schema` (under `environment_variables`), so agents and tooling can
@@ -17,18 +16,43 @@ documented here for completeness but stay out of the manifest.
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
 | `FALLOW_FORMAT` | Default output format (`json`, `human`, `sarif`, `compact`, `markdown`, `codeclimate`, `gitlab-codequality`, `pr-comment-github`, `pr-comment-gitlab`, `review-github`, `review-gitlab`, `badge`, `github-annotations`, `github-summary`). The `--format` flag overrides it. | `human` | `FALLOW_FORMAT=json` |
-| `FALLOW_QUIET` | Set to `1` or `true` to suppress progress output. The `--quiet` flag overrides it. | unset (off) | `FALLOW_QUIET=1` |
-| `FALLOW_SUGGESTIONS` | Set to `off`/`0`/`false`/`no`/`disabled` to suppress the `next_steps[]` array in JSON output and the human `Next:` line. Useful for CI consumers that snapshot-diff raw `--format json`. | `on` | `FALLOW_SUGGESTIONS=off` |
+| `FALLOW_QUIET` | Set to `1` or `true` to suppress progress output. The `--quiet` flag overrides it. Like `--quiet`, it also hides the stderr warnings that repeat a `workspace_diagnostics[]` entry. An explicit `RUST_LOG` shows them again. | unset (off) | `FALLOW_QUIET=1` |
+| `FALLOW_SUGGESTIONS` | Set to `off`/`0`/`false`/`no`/`disabled` to suppress the `next_steps[]` array in JSON output and the human `Next:` line. Useful for CI consumers that snapshot-diff raw `--format json`. With suggestions off, fallow also starts no `git` probe for the next steps. | `on` | `FALLOW_SUGGESTIONS=off` |
+| `FALLOW_CLAUDE_CODE_HINT` | Set to `off`/`0`/`false`/`no`/`disabled` to suppress the Claude Code plugin hint. Fallow writes one `<claude-code-hint />` line to stderr only when all of these are true: a Claude Code session marker (`CLAUDECODE` or `CLAUDE_CODE_CHILD_SESSION`) is set, the output format is `human`, `--quiet` is off, the run is not in CI, `FALLOW_SUGGESTIONS` is not off, and the project has no Fallow plugin or skill for Claude Code. Claude Code shows the install prompt only for plugins in an official marketplace. | unset (on) | `FALLOW_CLAUDE_CODE_HINT=off` |
 | `FALLOW_UPDATE_CHECK` | Set to `off`/`0`/`false`/`disabled`/`no` to disable the human-TTY upgrade nudge and its background version check. | unset (on) | `FALLOW_UPDATE_CHECK=off` |
 
 ## Caching
 
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
-| `FALLOW_CACHE_DIR` | Directory for fallow's persistent analysis cache. Relative paths resolve from the project root and override the `cache.dir` config field. | `.fallow/cache` | `FALLOW_CACHE_DIR=.cache/fallow` |
-| `FALLOW_CACHE_MAX_SIZE` | Extraction cache size cap in megabytes. Wins over the `cache.maxSizeMb` config field. | `256` | `FALLOW_CACHE_MAX_SIZE=512` |
+| `FALLOW_CACHE_DIR` | Directory for fallow's persistent analysis cache. The CLI, the language server, the MCP server and the Node bindings read it. It wins over the `cache.dir` config field, and `--no-cache` turns the cache off. Relative paths resolve from the project root. | `.fallow` | `FALLOW_CACHE_DIR=.cache/fallow` |
+| `FALLOW_CACHE_MAX_SIZE` | Extraction cache size cap in megabytes. The CLI, the language server, the MCP server and the Node bindings read it. It wins over the `cache.maxSizeMb` config field. | `256` | `FALLOW_CACHE_MAX_SIZE=512` |
+| `FALLOW_PACKAGE_BASELINES` | Set to `false`, `0`, `no` or `off` (in any case) to ignore `workspaces.changedSince` for every run of the process, like `--no-package-baselines`. Other values keep the map. The CLI, the language server, the MCP server and the Node bindings read it. | unset | `FALLOW_PACKAGE_BASELINES=false` |
 | `FALLOW_MAX_FILE_SIZE` | Per-file size ceiling in megabytes for source discovery; `0` means no limit. The `--max-file-size` flag overrides it. | `5` | `FALLOW_MAX_FILE_SIZE=10` |
 | `FALLOW_EXTENDS_TIMEOUT_SECS` | Timeout in seconds after a host explicitly permits `https://` config inheritance. This does not enable remote extends; use `--allow-remote-extends` or the typed library option. | `5` | `FALLOW_EXTENDS_TIMEOUT_SECS=15` |
+
+### One cache directory for several projects
+
+A relative `FALLOW_CACHE_DIR`, and the default `.fallow`, resolve inside each
+project root. An absolute `FALLOW_CACHE_DIR` or `cache.dir` outside the root
+is one directory for every project. The hosts use it in two ways:
+
+- The CLI, the MCP server and the Node bindings write `cache.bin` and
+  `graph-cache.bin` directly into the directory. The parse cache keys on paths
+  relative to the root, so a CI job still gets parse cache hits when the
+  checkout path changes. The graph cache belongs to one root path and is
+  built again after a path change. One directory holds the cache of one
+  project. When two projects use the same directory, each run replaces the
+  cache of the other project.
+- The language server writes into one subdirectory for each project root. The
+  subdirectory name is the folder name of the root and a hash of the full
+  root path, for example `web-3f2a9c1d8e7b6a50`. Two editor windows on two
+  projects can thus share one `FALLOW_CACHE_DIR` and keep both caches.
+
+`fallow audit` analyzes the base commit in a temporary worktree. With an
+absolute cache directory, the base run and the head run share the parse cache,
+which helps because most files are the same. The graph cache belongs to one
+root, so the two runs can replace the graph cache of each other.
 
 ## Production mode
 
@@ -43,7 +67,7 @@ documented here for completeness but stay out of the manifest.
 
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
-| `FALLOW_LICENSE` | License JWT (full string) for the paid runtime intelligence layer; intended for shared CI runners. | unset | `FALLOW_LICENSE=eyJhbGci...` |
+| `FALLOW_LICENSE` | License JWT (full string) for Fallow Cloud, the paid product; intended for shared CI runners. | unset | `FALLOW_LICENSE=eyJhbGci...` |
 | `FALLOW_LICENSE_PATH` | File path containing the license JWT. | unset | `FALLOW_LICENSE_PATH=/etc/fallow/license.jwt` |
 | `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS` | Clock-skew tolerance applied to the license JWT's `iat` claim. Unset/empty/invalid values fall back to the default. | `86400` | `FALLOW_LICENSE_SKEW_TOLERANCE_SECONDS=3600` |
 
@@ -52,40 +76,43 @@ documented here for completeness but stay out of the manifest.
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
 | `FALLOW_AUDIT_BASE` | Pins the `fallow audit` comparison base ref when no `--base`/`--changed-since` is passed. A malformed value is a hard error. | auto-detected | `FALLOW_AUDIT_BASE=upstream/main` |
-| `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` | GC threshold in days for reusable audit base-snapshot caches; `0` disables the sweep. Wins over the `audit.cacheMaxAgeDays` config field; invalid values log a warning and fall back to config / default. Each sweep also reclaims abandoned cache entries minted under other repo identities (deleted or moved repos, other git worktrees) once they age past this threshold; entries whose recorded owner root still exists are skipped and stay governed by that repo's own setting, so its `0` (never sweep) cannot be defeated from the outside. `fallow audit-cache prune` applies the same policy on demand and reports per-entry decisions; its `--max-age-days` flag overrides this variable for one invocation. | `30` | `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS=7` |
+| `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` | GC threshold in days for reusable audit base-snapshot caches and for the base-snapshot files in the project cache directory (audit also keeps only the newest 32 of those files); `0` disables the age-based sweep. Wins over the `audit.cacheMaxAgeDays` config field; invalid values log a warning and fall back to config / default. Each sweep also reclaims abandoned cache entries minted under other repo identities (deleted or moved repos, other git worktrees) once they age past this threshold; entries whose recorded owner root still exists are skipped and stay governed by that repo's own setting, so its `0` (never sweep) cannot be defeated from the outside. `fallow audit-cache prune` applies the same policy on demand and reports per-entry decisions; its `--max-age-days` flag overrides this variable for one invocation. | `30` | `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS=7` |
 | `FALLOW_IMPACT_STORE_MAX_AGE_DAYS` | GC threshold in days for per-project `fallow impact` stores; unset/`0` keeps every store forever. | unset | `FALLOW_IMPACT_STORE_MAX_AGE_DAYS=90` |
+| `FALLOW_CLOCK_EPOCH` | Reference instant, in unix seconds, that the run measures commit recency and ownership staleness against. Fallow otherwise reads HEAD's committer timestamp, so two runs over one commit already agree; set this to compare two checkouts against one fixed instant, or to pin churn-derived numbers in a project whose history is imported with `--churn-file` rather than read from git. An empty or non-numeric value is ignored with a warning. | HEAD committer timestamp | `FALLOW_CLOCK_EPOCH=1788782400` |
 
 ## Runtime coverage
 
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
-| `FALLOW_COVERAGE` | Path to Istanbul coverage data (`coverage-final.json`) for accurate per-function CRAP scores. The `--coverage` flag overrides it; it wins over the `health.coverage` config field. Honored by the `health`, bare `fallow`, and `audit` CLI commands and by the MCP `audit` and `check_health` tools on both their typed route and their CLI fallback, where the explicit `coverage` parameter overrides it. | unset | `FALLOW_COVERAGE=coverage/coverage-final.json` |
-| `FALLOW_COVERAGE_ROOT` | Absolute coverage-data path prefix for rebasing Istanbul paths in CI or containers. The `--coverage-root` flag overrides it; it wins over the `health.coverageRoot` config field. Honored by the `health`, bare `fallow`, and `audit` CLI commands and by the MCP `audit` and `check_health` tools on both their typed route and their CLI fallback, where the explicit `coverage_root` parameter overrides it. | unset | `FALLOW_COVERAGE_ROOT=/ci/workspace` |
+| `FALLOW_COVERAGE` | Path to Istanbul coverage data (`coverage-final.json`) for accurate per-function CRAP scores. The `--coverage` flag overrides it; it wins over the `health.coverage` config field. Honored by the `health`, bare `fallow`, `audit`, and `viz` CLI commands and by the MCP `audit` and `check_health` tools on both their typed route and their CLI fallback, where the explicit `coverage` parameter overrides it. `viz` reads it through the same precedence and has no coverage flag of its own. | unset | `FALLOW_COVERAGE=coverage/coverage-final.json` |
+| `FALLOW_COVERAGE_ROOT` | Absolute coverage-data path prefix for rebasing Istanbul paths in CI or containers. The `--coverage-root` flag overrides it; it wins over the `health.coverageRoot` config field. Honored by the `health`, bare `fallow`, `audit`, and `viz` CLI commands and by the MCP `audit` and `check_health` tools on both their typed route and their CLI fallback, where the explicit `coverage_root` parameter overrides it. `viz` reads it through the same precedence and has no coverage flag of its own. | unset | `FALLOW_COVERAGE_ROOT=/ci/workspace` |
 | `FALLOW_COV_BIN` | Explicit path override for the `fallow-cov` runtime-coverage sidecar binary. | discovered | `FALLOW_COV_BIN=/usr/local/bin/fallow-cov` |
 | `FALLOW_COV_BINARY_PATH` | Secondary path override for the sidecar, checked after `FALLOW_COV_BIN` (air-gapped installs, distro-packaged sidecars, shared Docker images). | discovered | `FALLOW_COV_BINARY_PATH=/opt/fallow/fallow-cov` |
 | `FALLOW_TYPE_AWARE` | Enable or disable TypeScript semantic (type-aware) analysis for the run. Accepts `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`; any other value is a hard error. Sits mid-chain in the precedence: the `--type-aware`/`--no-type-aware` CLI flags win over it, and it wins over the `audit.typeAware` config field, which wins over `typeAware.enabled`. | unset | `FALLOW_TYPE_AWARE=false` |
+| `FALLOW_TYPE_AWARE_BACKEND` | Experimental. Selects the type-checker backend of the semantic sidecar. `typescript-go` is the default. `tsrs` uses the Rust port of the TypeScript 7 checker and needs the exact `tsrs` version that `crates/api/type-aware-protocol.json` pins, installed where `fallow-type-aware` can resolve it. An unknown value makes the type-aware pass unavailable, and `type-aware status` names the known values. | `typescript-go` | `FALLOW_TYPE_AWARE_BACKEND=tsrs` |
 | `FALLOW_TYPE_AWARE_BIN` | Trusted executable override for the TypeScript semantic refinement sidecar used by `dead-code --type-aware`. Relative paths resolve from the caller's working directory before `--root` is applied. Fallow intentionally does not search project `node_modules` or `PATH`. The `fallow` npm launcher sets this itself when a version-matched `fallow-type-aware` npm package is installed, marking that wiring with the internal `FALLOW_TYPE_AWARE_BIN_SOURCE=npm-wrapper` variable so `type-aware status` reports `npm-wrapper` instead of `environment-override`. | sibling of active Fallow executable | `FALLOW_TYPE_AWARE_BIN=./node_modules/.bin/fallow-type-aware` |
+| `FALLOW_TYPE_AWARE_TIMEOUT_SECS` | Wall clock in seconds allowed for one semantic sidecar request. A semantic query scans the whole TypeScript program, so a very large program (or a slower sidecar transport, such as the named pipe used on Windows) can need more than the default. Unset, `0`, or a non-numeric value keeps the default. When the request does exceed the limit and `typeAware.require` is `best-effort`, the run continues with the conservative syntactic findings instead of failing. | `120` | `FALLOW_TYPE_AWARE_TIMEOUT_SECS=600` |
 | `FALLOW_RUNTIME_COVERAGE_SOURCE` | Set to `cloud` to select cloud runtime coverage in `fallow coverage analyze` without passing `--cloud`. | local | `FALLOW_RUNTIME_COVERAGE_SOURCE=cloud` |
 
 ## Cloud API
 
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
-| `FALLOW_API_URL` | Base URL override for fallow cloud API calls (license refresh, trial, coverage uploads). Trailing slashes are trimmed. | `https://api.fallow.cloud` | `FALLOW_API_URL=https://staging.fallow.cloud` |
-| `FALLOW_API_KEY` | fallow cloud bearer token for coverage upload commands. | unset | `FALLOW_API_KEY=fk_live_...` |
+| `FALLOW_API_URL` | Base URL override for Fallow Cloud API calls (license refresh, trial, coverage uploads). Trailing slashes are trimmed. | `https://api.fallow.cloud` | `FALLOW_API_URL=https://staging.fallow.cloud` |
+| `FALLOW_API_KEY` | Fallow Cloud bearer token for coverage upload commands, and the fallback bearer for fallow license refresh when the stored license JWT is missing or too stale. | unset | `FALLOW_API_KEY=fk_live_...` |
 | `FALLOW_API_RETRIES` | Maximum HTTP attempts for review-comment reconciliation API calls. | `3` | `FALLOW_API_RETRIES=5` |
 | `FALLOW_API_RETRY_DELAY` | Floor delay in seconds between HTTP retry attempts; a server-supplied `Retry-After` overrides it on 429 responses. | `2` | `FALLOW_API_RETRY_DELAY=5` |
-| `FALLOW_CA_BUNDLE` | Path to a PEM certificate bundle for fallow cloud and provider HTTP calls; replaces the default WebPKI roots. Relative paths resolve from the process cwd. | unset | `FALLOW_CA_BUNDLE=/etc/ssl/corp-bundle.pem` |
+| `FALLOW_CA_BUNDLE` | Path to a PEM certificate bundle for Fallow Cloud and provider HTTP calls; replaces the default WebPKI roots. Relative paths resolve from the process cwd. | unset | `FALLOW_CA_BUNDLE=/etc/ssl/corp-bundle.pem` |
 | `FALLOW_REPO` | `owner/repo` fallback for `fallow coverage analyze --cloud` when `--repo` is not passed (otherwise parsed from the git origin remote). | git origin | `FALLOW_REPO=acme/widgets` |
 
 ## Change-scope & diff
 
 | Variable | Description | Default | Example |
 | --- | --- | --- | --- |
-| `FALLOW_CHANGED_SINCE` | git ref that scopes file discovery for analysis tools (MCP server). | unset | `FALLOW_CHANGED_SINCE=origin/main` |
-| `FALLOW_DIFF_FILE` | Path to a unified diff that scopes all findings by changed line (MCP server). | unset | `FALLOW_DIFF_FILE=/tmp/pr.diff` |
+| `FALLOW_CHANGED_SINCE` | git ref that scopes file discovery for analysis tools (MCP server). A ref that does not resolve does not fail the call: the analysis runs at full scope and `request_outcomes["changed-since"]` states the reason. The `audit` and `decision_surface` tools read it as their base ref, and `project_info` and `list_boundaries` carry no `request_outcomes`, so these four still fail on a bad ref. | unset | `FALLOW_CHANGED_SINCE=origin/main` |
+| `FALLOW_DIFF_FILE` | Path to a unified diff that scopes all findings by changed line (MCP server). A file that cannot be read or placed does not fail the call: the analysis runs at full scope and `request_outcomes["diff-filter"]` states the reason, on the CLI route and the typed route alike. | unset | `FALLOW_DIFF_FILE=/tmp/pr.diff` |
 | `FALLOW_DIFF_CONTEXT` | Line radius around changed diff lines when scoping findings to a diff in the review/PR-comment formats. | `3` | `FALLOW_DIFF_CONTEXT=5` |
-| `FALLOW_ROOT` | Project root used by the `review-github`/`review-gitlab` renderers to read source for suggestion blocks. Set it alongside `--root` when rendering review formats outside the bundled CI integrations. | `--root` value | `FALLOW_ROOT=/workspace/repo` |
+| `FALLOW_ROOT` | Project root used by the `review-github`/`review-gitlab` renderers to read source for suggestion blocks, and for the note that replaces one on a finding carrying `reachability_caveats[]`. It does not follow `--root`, so set it alongside `--root` when rendering review formats outside the bundled CI integrations; without it a `--root` run renders neither the block nor the note. | working directory | `FALLOW_ROOT=/workspace/repo` |
 | `FALLOW_MAX_COMMENTS` | Maximum number of inline review comments emitted by `review-github`/`review-gitlab`. CI-integration plumbing: the bundled GitHub Action sets it from its `max-comments` input and the GitLab template wires it through its job configuration, so you normally tune those surfaces instead of exporting this variable yourself. Sticky summary comments are not counted against this limit. | `50` | `FALLOW_MAX_COMMENTS=30` |
 | `FALLOW_SUMMARY_SCOPE` | Summary scope for `pr-comment-github`/`pr-comment-gitlab`: `all` keeps project-level dependency/catalog/override findings outside the diff filter; `diff` applies the diff filter to them too. | `all` | `FALLOW_SUMMARY_SCOPE=diff` |
 | `FALLOW_PR_COMMENT_LAYOUT` | Sticky PR comment layout: `default`, `compact`, `gate-only`, or `details`. Useful when teams prefer provider-native checks and want less Markdown in the PR conversation. | `default` | `FALLOW_PR_COMMENT_LAYOUT=gate-only` |
@@ -100,9 +127,27 @@ documented here for completeness but stay out of the manifest.
 | --- | --- | --- | --- |
 | `FALLOW_BIN` | Path to the fallow binary; used by the `fallow-mcp` server to spawn the CLI. | discovered | `FALLOW_BIN=/usr/local/bin/fallow` |
 | `FALLOW_TIMEOUT_SECS` | MCP server per-tool-call CLI subprocess timeout in seconds. Raise it for long runs like production coverage on large dumps. | `120` | `FALLOW_TIMEOUT_SECS=300` |
+| `FALLOW_MCP_WARM_SESSION` | MCP server: set to `0`, `false`, `off` or `no` to stop typed tool calls from keeping parsed modules in memory between calls. With the store on, a call on an unchanged file list does no parse work. The store keeps at most 4 file lists and about 512 MiB of parsed modules. The memory is an estimate of 12 bytes for each source byte, so a project with more than about 40 MiB of source is not kept. This is a temporary opt-out: it goes away when the store is stable. | on | `FALLOW_MCP_WARM_SESSION=0` |
 | `FALLOW_AGENT_SOURCE` | Normalized agent vendor for telemetry classification (e.g. `claude_code`, `codex`, `cursor`). Only read when telemetry is on. | unset | `FALLOW_AGENT_SOURCE=claude_code` |
 | `FALLOW_INTEGRATION_SURFACE` | Telemetry `integration_surface` override for non-CLI surfaces (`mcp`/`lsp`/`vscode`/`napi`/`programmatic`). Set by the MCP server on the CLI it spawns. | auto-derived | `FALLOW_INTEGRATION_SURFACE=mcp` |
 | `FALLOW_MCP_TOOL` | Telemetry `mcp_tool` dimension, validated against the MCP tool-name allowlist. Set by the MCP server alongside `FALLOW_INTEGRATION_SURFACE=mcp`. | unset | `FALLOW_MCP_TOOL=check_health` |
+
+## Agent gate
+
+The agent gate script that `fallow agent install` writes reads these variables. The fallow binary does not read them. See [backwards-compatibility.md](backwards-compatibility.md).
+
+| Variable | Description | Default | Example |
+| --- | --- | --- | --- |
+| `FALLOW_GATE_REPORT` | Path of the full JSON report that the gate writes on a block. A relative path resolves against the audited tree. | `.fallow/gate-report.json` | `FALLOW_GATE_REPORT=/tmp/gate.json` |
+| `FALLOW_GATE_OUTPUT` | Set to `json` to print the full JSON report on stderr instead of the compact block message. | unset (compact message) | `FALLOW_GATE_OUTPUT=json` |
+| `FALLOW_GATE_MIN_VERSION` | Lowest fallow version that the gate accepts. Set it to the empty string to disable the check. | `2.85.0` | `FALLOW_GATE_MIN_VERSION=` |
+| `FALLOW_GATE_DEBUG` | Set to a non-empty value to log each command that the gate skips because it is not a git commit or push. | unset (off) | `FALLOW_GATE_DEBUG=1` |
+
+## Editor
+
+| Variable | Description | Default | Example |
+| --- | --- | --- | --- |
+| `FALLOW_LSP_REUSE_SESSION` | Language server: set to `0`, `false`, `off` or `no` to load a new project session on each analysis run. By default the server keeps one session for each project root between saves and parses only the changed files. | unset (on) | `FALLOW_LSP_REUSE_SESSION=0` |
 
 ## Telemetry
 
@@ -117,4 +162,4 @@ Telemetry is opt-in and off by default. See [telemetry.md](telemetry.md) for the
 
 ## Internal markers
 
-Fallow sets the following variables itself (telemetry sentinels, error markers, test/probe gates, and bundled-CI plumbing); they are not user knobs and you should not set them: `FALLOW_GITLAB_BASE_SHA`, `FALLOW_GITLAB_START_SHA`, `FALLOW_GITLAB_HEAD_SHA`, `FALLOW_COMMENT_ID`, `FALLOW_DIFF_FILTER` (set by the bundled Action/CI scripts), `FALLOW_PR_COMMENT_ENVELOPE_FILE`, `FALLOW_PR_DECISION_FILE`, `FALLOW_PR_DETAILS_FILE`, `FALLOW_GATE_MIN_VERSION` and `FALLOW_GATE_DEBUG` (consumed by the generated agent gate script, not the fallow binary; see [backwards-compatibility.md](backwards-compatibility.md)), `FALLOW_GATE_SCRIPT`, `FALLOW_GATE_POSIX_SUFFIX`, `FALLOW_GATE_WINDOWS_SUFFIX`, `FALLOW_MUTUALLY_EXCLUSIVE_SCOPE`, `FALLOW_NODE_ERROR`, `FALLOW_CONFIG_LOAD_FAILED`, `FALLOW_CWD_UNAVAILABLE`, `FALLOW_CHANGED_FILES_FAILED`, `FALLOW_CHANGED_WORKSPACES_FAILED`, `FALLOW_DEAD_CODE_FAILED`, `FALLOW_THREAD_POOL_INIT_FAILED`, `FALLOW_INVALID_CONFIG_PATH`, `FALLOW_INVALID_COVERAGE_PATH`, `FALLOW_INVALID_COVERAGE_ROOT`, `FALLOW_INVALID_DIFF_FILE`, `FALLOW_INVALID_ROOT`, `FALLOW_INVALID_THREADS`, `FALLOW_INVALID_WORKSPACE_PATTERN`, `FALLOW_WORKSPACE_PATTERN_UNMATCHED`, `FALLOW_WORKSPACE_SCOPE_EMPTY`, `FALLOW_WORKSPACES_NOT_FOUND`, `FALLOW_GENERIC_ATTR_PROBE`, `FALLOW_DUPES_ROLLING`, `FALLOW_OUTPUT_VARIANTS`, `FALLOW_STUB_MODE`, `FALLOW_TEST_SIGNAL_HELPER`, `FALLOW_RAYON_STACK_PROBE_CHILD`, and `FALLOW_PROGRAMMATIC_SHARED_DIFF_CHILD`.
+Fallow sets the following variables itself (telemetry sentinels, error markers, test/probe gates, and bundled-CI plumbing); they are not user knobs and you should not set them: `FALLOW_GITLAB_BASE_SHA`, `FALLOW_GITLAB_START_SHA`, `FALLOW_GITLAB_HEAD_SHA`, `FALLOW_COMMENT_ID`, `FALLOW_DIFF_FILTER` (set by the bundled Action/CI scripts), `FALLOW_PR_COMMENT_ENVELOPE_FILE`, `FALLOW_PR_DECISION_FILE`, `FALLOW_PR_DETAILS_FILE`, `FALLOW_GATE_SCRIPT`, `FALLOW_GATE_POSIX_SUFFIX`, `FALLOW_GATE_WINDOWS_SUFFIX`, `FALLOW_MUTUALLY_EXCLUSIVE_SCOPE`, `FALLOW_NODE_ERROR`, `FALLOW_CONFIG_LOAD_FAILED`, `FALLOW_CWD_UNAVAILABLE`, `FALLOW_CHANGED_FILES_FAILED`, `FALLOW_CHANGED_WORKSPACES_FAILED`, `FALLOW_DEAD_CODE_FAILED`, `FALLOW_THREAD_POOL_INIT_FAILED`, `FALLOW_INVALID_CONFIG_PATH`, `FALLOW_INVALID_COVERAGE_PATH`, `FALLOW_INVALID_COVERAGE_ROOT`, `FALLOW_INVALID_DIFF_FILE`, `FALLOW_INVALID_ROOT`, `FALLOW_INVALID_THREADS`, `FALLOW_INVALID_WORKSPACE_PATTERN`, `FALLOW_WORKSPACE_PATTERN_UNMATCHED`, `FALLOW_WORKSPACE_SCOPE_EMPTY`, `FALLOW_WORKSPACES_NOT_FOUND`, `FALLOW_GENERIC_ATTR_PROBE`, `FALLOW_DUPES_ROLLING`, `FALLOW_OUTPUT_VARIANTS`, `FALLOW_STUB_MODE`, `FALLOW_TEST_SIGNAL_HELPER`, `FALLOW_MUTATION_E2E_REQUIRED` (see [quality-gates.md](development/quality-gates.md)), `FALLOW_RAYON_STACK_PROBE_CHILD`, and `FALLOW_PROGRAMMATIC_SHARED_DIFF_CHILD`.

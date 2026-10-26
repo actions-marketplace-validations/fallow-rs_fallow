@@ -1,5 +1,6 @@
 #![cfg(all(test, not(miri)))]
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::*;
@@ -13,6 +14,75 @@ use fallow_types::extract::{
 use helpers::regex_pattern_to_suffix;
 
 const LEGACY_SEMANTIC_TEST_OBJECT_PREFIXES: &[&str] = &["__fallow_", "__angular_"];
+
+#[test]
+fn top_level_runtime_statements_record_one_module_fact() {
+    for source in [
+        "globalThis.foo = 1; console.log('init'); export type A = string;",
+        "await Promise.resolve(); export type A = string;",
+        "const initialized = Date.now(); export type A = string;",
+        "let value: string; export type A = string;",
+        "class Setup { static { console.log('init'); } } export type A = string;",
+        "enum Value { One } export type A = string;",
+        "namespace Setup { console.log('init'); } export type A = string;",
+    ] {
+        let module = parse(source);
+        assert_eq!(
+            module
+                .semantic_facts
+                .iter()
+                .filter(|fact| matches!(fact, SemanticFact::TopLevelRuntimeStatement))
+                .count(),
+            1,
+            "runtime source should record exactly one module fact: {source}"
+        );
+    }
+}
+
+#[test]
+fn erased_declarations_and_static_imports_do_not_record_runtime_statement_facts() {
+    for source in [
+        "; export type A = string;",
+        "export interface A {}",
+        "export default interface A {}",
+        "declare const value: string; export type A = string;",
+        "declare function initialize(): void; export type A = string;",
+        "declare class Setup {} export type A = string;",
+        "declare enum Value { One } export type A = string;",
+        "declare namespace Setup { const value: string; } export type A = string;",
+        "namespace Shapes { export interface Shape {} } export type A = string;",
+        "import type { A } from './a'; export type { A };",
+        "import { type A } from './a'; export { type A };",
+        "export { type A } from './a';",
+        "export type * from './a';",
+    ] {
+        let module = parse(source);
+        assert!(
+            !module
+                .semantic_facts
+                .contains(&SemanticFact::TopLevelRuntimeStatement),
+            "erased declarations and static import records stay separate: {source}"
+        );
+    }
+}
+
+#[test]
+fn module_imports_and_exports_use_their_existing_runtime_records() {
+    for source in [
+        "export const value = 1;",
+        "export default console.log('init');",
+        "import './init'; export type A = string;",
+        "export * from './values';",
+    ] {
+        let module = parse(source);
+        assert!(
+            !module
+                .semantic_facts
+                .contains(&SemanticFact::TopLevelRuntimeStatement),
+            "module declarations already have dedicated runtime records: {source}"
+        );
+    }
+}
 
 #[test]
 fn into_module_info_transfers_exports() {
@@ -143,6 +213,34 @@ fn has_any_playwright_fixture_definition_fact(info: &crate::ModuleInfo) -> bool 
     info.semantic_facts
         .iter()
         .any(|fact| matches!(fact, SemanticFact::PlaywrightFixtureDefinition(_)))
+}
+
+fn has_playwright_conditional_fixture_definition_fact(
+    info: &crate::ModuleInfo,
+    test_name: &str,
+    base_name: &str,
+    fixture_name: &str,
+    type_name: &str,
+) -> bool {
+    info.semantic_facts.iter().any(|fact| {
+        matches!(
+            fact,
+            SemanticFact::PlaywrightConditionalFixtureDefinition(access)
+                if access.test_name == test_name
+                    && access.base_name == base_name
+                    && access.fixture_name == fixture_name
+                    && access.type_name == type_name
+        )
+    })
+}
+
+fn has_playwright_test_binding_fact(info: &crate::ModuleInfo, test_name: &str) -> bool {
+    info.semantic_facts.iter().any(|fact| {
+        matches!(
+            fact,
+            SemanticFact::PlaywrightTestBinding(binding) if binding.test_name == test_name
+        )
+    })
 }
 
 fn has_playwright_fixture_alias_fact(
@@ -279,6 +377,69 @@ fn pinia_credits_original_key_for_aliased_inline_store_to_refs_member() {
 }
 
 #[test]
+fn pinia_setup_store_credits_returned_members_read_in_setup_body() {
+    // Issue #3348 case B: Pinia needs returned state for registration and
+    // hydration, so a returned member that the setup body reads is live.
+    let info = parse(
+        "import { defineStore } from 'pinia'\nimport { computed, ref } from 'vue'\nexport const useCounterStore = defineStore('counter', () => {\n  const count = ref(1)\n  const step = ref(2)\n  const unused = ref(0)\n  const token = ref('')\n  const hits = ref(0)\n  const doubled = computed(() => count.value * 2)\n  function bump() { step.value++; hits.value += 1 }\n  function setToken(next) { token.value = next }\n  return { count, total: step, unused, token, hits, doubled, bump, setToken }\n})",
+    );
+    let accesses = store_member_accesses(&info);
+    for credited in ["count", "total", "hits"] {
+        assert!(
+            accesses.contains(&("useCounterStore".to_string(), credited.to_string())),
+            "{credited} is read in the setup body and must be credited: {accesses:?}"
+        );
+    }
+    for dead in ["unused", "token", "doubled", "bump", "setToken"] {
+        assert!(
+            !accesses
+                .iter()
+                .any(|(object, member)| object == "useCounterStore" && member == dead),
+            "{dead} is only returned or written and must not be credited: {accesses:?}"
+        );
+    }
+}
+
+#[test]
+fn pinia_credits_member_read_on_param_typed_return_type_of_type_only_store_import() {
+    // Issue #3348 case A: a helper in another file reads a store member through
+    // a param typed `ReturnType<typeof useCounterStore>` with a type-only import.
+    let info = parse(
+        "import type { useCounterStore } from './store'\nexport function readDoubled(store: ReturnType<typeof useCounterStore>) {\n  return store.doubled\n}",
+    );
+    let accesses = store_member_accesses(&info);
+    assert!(
+        accesses.contains(&("useCounterStore".to_string(), "doubled".to_string())),
+        "a read on a ReturnType-typed store param should credit the store factory: {accesses:?}"
+    );
+}
+
+#[test]
+fn pinia_credits_member_read_on_param_typed_store_alias() {
+    let info = parse(
+        "import type { useCounterStore } from './store'\ntype CounterStore = ReturnType<typeof useCounterStore>\nexport const readCount = (store: CounterStore) => store.count",
+    );
+    let accesses = store_member_accesses(&info);
+    assert!(
+        accesses.contains(&("useCounterStore".to_string(), "count".to_string())),
+        "a read on an alias-typed store param should credit the store factory: {accesses:?}"
+    );
+}
+
+#[test]
+fn pinia_credits_member_read_on_param_typed_later_declared_store_alias() {
+    // Issue #3357: the alias is declared after the helper that uses it.
+    let info = parse(
+        "import type { useCounterStore } from './store'\nexport const readCount = (store: CounterStore) => store.count\ntype CounterStore = ReturnType<typeof useCounterStore>",
+    );
+    let accesses = store_member_accesses(&info);
+    assert!(
+        accesses.contains(&("useCounterStore".to_string(), "count".to_string())),
+        "a read on a later-declared alias should credit the store factory: {accesses:?}"
+    );
+}
+
+#[test]
 fn pinia_does_not_credit_non_store_inline_refs_arg() {
     let info = parse(
         "import { storeToRefs } from 'pinia'\nfunction makeThing() { return { count: 1 } }\nconst { count } = storeToRefs(makeThing())",
@@ -379,6 +540,60 @@ fn factory_return_arrow_bodies_credit_member_on_class() {
             "arrow factory-return should credit the member on the class: {source:?}"
         );
     }
+}
+
+#[test]
+fn awaited_same_file_async_factory_credits_member_on_class() {
+    // `await makeWidget()` gives the `Widget` that the async factory resolves to,
+    // at the top level and inside an async function.
+    for source in [
+        "class Widget { used() {} }\nasync function makeWidget() { return new Widget() }\nconst w = await makeWidget()\nw.used()",
+        "class Widget { used() {} }\nconst makeWidget = async () => new Widget()\nasync function run() { const w = await makeWidget(); w.used() }",
+        "class Widget { used() {} }\nasync function makeWidget(): Promise<Widget> { return {} as Widget }\nconst w = await makeWidget()\nw.used()",
+    ] {
+        let info = parse(source);
+        assert!(
+            has_member_access(&info, "Widget", "used"),
+            "an awaited async factory should credit the member on the class: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn unawaited_same_file_async_factory_does_not_credit_member_on_class() {
+    // Without `await`, the local holds a promise and not a `Widget`. The awaited
+    // form of the same source is the positive control.
+    let unawaited = parse(
+        "class Widget { used() {} }\nasync function makeWidget() { return new Widget() }\nconst p = makeWidget()\np.used()",
+    );
+    assert!(
+        !has_member_access(&unawaited, "Widget", "used"),
+        "a promise from an async factory must not credit the class: {:?}",
+        unawaited.member_accesses
+    );
+    let awaited = parse(
+        "class Widget { used() {} }\nasync function makeWidget() { return new Widget() }\nconst p = await makeWidget()\np.used()",
+    );
+    assert!(has_member_access(&awaited, "Widget", "used"));
+}
+
+#[test]
+fn awaited_imported_factory_emits_awaited_fact() {
+    // `const api = await useApi()` with an imported callee emits the factory-fn
+    // fact with the awaited flag, so the analyze layer can match an async export.
+    let info = parse(
+        "import { useApi } from './api'\nconst api = await useApi()\napi.Plan()\nconst sync = useApi()\nsync.Other()",
+    );
+    let flag = |member: &str| {
+        info.semantic_facts.iter().find_map(|fact| match fact {
+            SemanticFact::FactoryFnMemberAccess(access) if access.member == member => {
+                Some(access.awaited)
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(flag("Plan"), Some(true), "{:?}", info.semantic_facts);
+    assert_eq!(flag("Other"), Some(false), "{:?}", info.semantic_facts);
 }
 
 #[test]
@@ -491,17 +706,31 @@ fn exported_factory_returns_records_return_type_annotation_arrow() {
     );
 }
 
+fn exported_factory_return_entries(info: &crate::ModuleInfo) -> Vec<(&str, &str, bool)> {
+    info.exported_factory_returns
+        .iter()
+        .map(|fr| {
+            (
+                fr.export_name.as_str(),
+                fr.class_local_name.as_str(),
+                fr.is_async,
+            )
+        })
+        .collect()
+}
+
 #[test]
-fn exported_factory_returns_return_type_abstains_on_async() {
+fn exported_factory_returns_return_type_marks_async() {
     // Even with a return-type annotation, an async factory returns a Promise, not
-    // the class instance, so the annotation must NOT record a strict entry.
+    // the class instance. The entry carries `is_async`, so only an awaited call
+    // result credits the class, never a plain `const x = make()`.
     let info = parse(
         "class Ctrl { m() {} }\nexport async function make(): Promise<Ctrl> { return {} as Ctrl }",
     );
-    assert!(
-        info.exported_factory_returns.is_empty(),
-        "async return-type factory must abstain: {:?}",
-        info.exported_factory_returns
+    assert_eq!(
+        exported_factory_return_entries(&info),
+        [("make", "Ctrl", true)],
+        "async return-type factory must be recorded as async only"
     );
 }
 
@@ -533,15 +762,16 @@ fn exported_factory_returns_abstains_on_conflicting_returns() {
 }
 
 #[test]
-fn exported_factory_returns_abstains_on_async_factory() {
-    // `async function make()` returns Promise<RESTApi>, not RESTApi. Must abstain.
+fn exported_factory_returns_marks_async_factory() {
+    // `async function make()` returns Promise<RESTApi>, not RESTApi. The entry
+    // carries `is_async`, so only an awaited call result credits the class.
     let info = parse(
         "class RESTApi { Plan() {} }\nexport async function make(): Promise<RESTApi> { return new RESTApi() }",
     );
-    assert!(
-        info.exported_factory_returns.is_empty(),
-        "an async factory must not be exported cross-module: {:?}",
-        info.exported_factory_returns
+    assert_eq!(
+        exported_factory_return_entries(&info),
+        [("make", "RESTApi", true)],
+        "an async factory must be exported as async only"
     );
 }
 
@@ -1302,6 +1532,80 @@ fn has_validation_control(source: &str, callee: &str) -> bool {
 }
 
 #[test]
+fn security_origin_guard_observations_preserve_unsanitized_sinks() {
+    for guard in [
+        r#"if (destination.origin !== "https://api.example.com") throw new Error();"#,
+        r#"if ("https://api.example.com" !== destination.origin) { return; }"#,
+        r"if (destination.origin === ORIGIN) {} else { throw new Error(); }",
+        r"if (ORIGIN === destination.origin) {} else return;",
+        r"if ((destination.origin) !== (ALIAS)) { throw new Error(); }",
+    ] {
+        let source = format!(
+            r#"const ORIGIN = "https://api.example.com";
+            const ALIAS = ORIGIN;
+            export function handle(req) {{
+                const destination = new URL(req.query.url);
+                {guard}
+                fetch(destination.href);
+            }}"#
+        );
+        let info = parse(&source);
+        let control = info
+            .security_control_sites
+            .iter()
+            .find(|control| control.callee_path == "origin-equality-guard")
+            .unwrap_or_else(|| panic!("missing origin comparison observation: {guard}"));
+        assert_eq!(control.kind, SecurityControlKind::Validation);
+        assert_eq!(
+            &source[control.span_start as usize..control.span_end as usize],
+            guard
+        );
+        assert!(
+            info.sanitized_sink_args.is_empty(),
+            "observations must not sanitize: {guard}"
+        );
+        assert!(
+            info.security_sinks
+                .iter()
+                .any(|sink| sink.callee_path == "fetch")
+        );
+    }
+}
+
+#[test]
+fn security_origin_guard_observations_reject_unproven_comparisons() {
+    for guard in [
+        r"if (destination.origin != ORIGIN) throw new Error();",
+        r"if (destination.origin == ORIGIN) {} else return;",
+        r"if (destination.origin.startsWith(ORIGIN)) {} else return;",
+        r"if (destination.origin !== ORIGIN) log();",
+        r"if (destination.origin === ORIGIN) return;",
+        r"if (destination.origin !== unknownOrigin) return;",
+        r"if (destination.origin !== 42) return;",
+        r"if (destination.origin !== ORIGIN || other) return;",
+        r"if (destination.host !== ORIGIN) return;",
+        r"if (destination.origin !== ORIGIN) { if (other) return; }",
+        r"{ const ORIGIN = getOrigin(); if (destination.origin !== ORIGIN) return; }",
+    ] {
+        let source = format!(
+            r#"const ORIGIN = "https://api.example.com";
+            export function handle(req) {{ const destination = new URL(req.query.url); {guard} fetch(destination.href); }}"#
+        );
+        assert!(
+            !has_validation_control(&source, "origin-equality-guard"),
+            "{guard}"
+        );
+    }
+    assert!(!has_validation_control(
+        r#"const ORIGIN = "https://api.example.com";
+        export function handle(ORIGIN, destination) {
+            if (destination.origin !== ORIGIN) return;
+        }"#,
+        "origin-equality-guard"
+    ));
+}
+
+#[test]
 fn security_control_capture_records_elysia_route_validation() {
     assert!(has_validation_control(
         r#"
@@ -1608,6 +1912,42 @@ fn security_object_sink_capture_records_nested_literal_properties() {
             .any(|property| property.key == "webPreferences.webSecurity"
                 && property.value == SinkLiteralValue::Boolean(false))
     );
+}
+
+#[test]
+fn security_write_head_static_headers_are_not_captured() {
+    let cases: &[(&str, &[u32])] = &[
+        ("res.writeHead(200, { 'Content-Type': 'text/html' });", &[]),
+        ("res.writeHead(200, { 'Set-Cookie': ['a=1', 'b=2'] });", &[]),
+        ("res.writeHead(200, { 'X-Empty': [] });", &[]),
+        ("res.writeHead(200, { 'X-Value': [input] });", &[1]),
+        ("res.writeHead(200, { 'X-Hole': ['a', , 'b'] });", &[1]),
+        ("res.writeHead(200, { 'X-Nested': { value: 'a' } });", &[1]),
+        ("res.writeHead(200, { 'X-Nested': [['a']] });", &[1]),
+        ("res.writeHead(200, { 'X-Pattern': /a/ });", &[1]),
+        ("res.writeHead(200, { [name]: 'a' });", &[1]),
+        ("res.writeHead(200, { ...headers });", &[1]),
+        (
+            "res.writeHead(200, { get value() { return input; } });",
+            &[1],
+        ),
+        (
+            "res.writeHead(200, status, { 'Content-Type': 'text/html' });",
+            &[1],
+        ),
+        ("res.writeHead(200, 'OK', headers);", &[2]),
+        ("res.writeHead(200, status, headers);", &[1, 2]),
+    ];
+    for &(source, expected) in cases {
+        let info = parse(source);
+        let arguments: Vec<_> = info
+            .security_sinks
+            .iter()
+            .filter(|sink| sink.callee_path == "res.writeHead")
+            .map(|sink| sink.arg_index)
+            .collect();
+        assert_eq!(arguments, expected, "header argument capture for {source}");
+    }
 }
 
 #[test]
@@ -1937,6 +2277,83 @@ fn skips_constructor_in_class_members() {
         "constructor should be skipped"
     );
     assert!(members.iter().any(|m| m.name == "doWork"));
+}
+
+#[test]
+fn destructured_class_member_is_recorded_as_used() {
+    let info = parse(
+        r"
+            class Foo {
+                bar = 0;
+                unused = 1;
+            }
+            const foo = new Foo();
+            const { bar } = foo;
+        ",
+    );
+
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Foo" && access.member == "bar"),
+        "destructured class member should credit the class member"
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Foo" && access.member == "unused"),
+        "unrelated class members must not be credited"
+    );
+}
+
+#[test]
+fn destructured_class_member_static_patterns_preserve_property_identity() {
+    for pattern in [
+        "{ bar: renamed }",
+        "{ bar = {} }",
+        "{ bar: renamed = {} }",
+        "{ bar: { nested } }",
+        "{ ['bar']: renamed }",
+    ] {
+        let info = parse(&format!(
+            "class Foo {{ bar = {{ nested: 0 }}; unused = 1; }}
+             const foo = new Foo(); const alias = foo;
+             const {pattern} = (alias as Foo);"
+        ));
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == "Foo" && access.member == "bar"),
+            "pattern {pattern} must credit the source property"
+        );
+        assert!(
+            !info.member_accesses.iter().any(|access| {
+                access.object == "Foo"
+                    && matches!(access.member.as_str(), "unused" | "nested" | "renamed")
+            }),
+            "pattern {pattern} must not attribute a binding or nested key to Foo"
+        );
+        assert!(!info.whole_object_uses.iter().any(|name| name == "Foo"));
+    }
+}
+
+#[test]
+fn destructured_class_member_opaque_patterns_credit_whole_instance() {
+    for pattern in ["{ bar, ...rest }", "{ [key]: selected }"] {
+        let info = parse(&format!(
+            "class Foo {{ bar = 0; other = 1; }}
+             const foo = new Foo(); const key = getKey();
+             const {pattern} = foo;"
+        ));
+        assert!(
+            info.whole_object_uses.iter().any(|name| name == "Foo"),
+            "pattern {pattern} may consume every member"
+        );
+        assert!(!info.member_accesses.iter().any(|access| {
+            access.object == "Foo" && matches!(access.member.as_str(), "key" | "selected" | "rest")
+        }));
+    }
 }
 
 #[test]
@@ -2310,6 +2727,37 @@ fn instance_member_access_mapped_to_class() {
 }
 
 #[test]
+fn type_predicate_keeps_declared_parameter_member_evidence() {
+    let info = parse(
+        r"
+        class BaseError {
+            get flag(): boolean { return true; }
+        }
+        class AppError extends BaseError {
+            override get flag(): boolean { return true; }
+        }
+        export function isAppError(error: BaseError): error is AppError {
+            return error.flag;
+        }
+        ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "BaseError" && access.member == "flag"),
+        "the declared parameter type must retain its member read: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "AppError" && access.member == "flag"),
+        "a return predicate must not replace the declared receiver type"
+    );
+}
+
+#[test]
 fn structural_typed_call_direct_new_maps_parameter_members_to_class() {
     let info = parse(
         r"
@@ -2497,6 +2945,1127 @@ fn instance_property_access_mapped_to_class() {
             .iter()
             .any(|a| a.object == "MyClass" && a.member == "name"),
         "obj.name should be mapped to MyClass.name, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn object_property_instance_access_mapped_to_class() {
+    let info = parse(
+        r"
+            import { Foo } from './foo';
+            const holder = { property: new Foo() };
+            console.log(holder.property.bar);
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Foo" && access.member == "bar"),
+        "holder.property.bar should be mapped to Foo.bar, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn builtin_object_property_instance_is_not_mapped_to_class() {
+    let info = parse(
+        r"
+            const holder = { property: new Map() };
+            holder.property.get('key');
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Map"),
+        "built-in object-property instances should not emit class accesses, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn nested_shadow_maps_each_object_property_binding_to_its_own_class() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            function nested() {
+                const holder = { property: new Beta() };
+                holder.property.betaOnly();
+            }
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the outer holder should remain mapped to Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the nested holder should be mapped to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn function_local_object_property_instance_access_mapped_to_class() {
+    let info = parse(
+        r"
+            import { Foo } from './foo';
+            function run() {
+                const holder = { property: new Foo() };
+                holder.property.bar();
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Foo" && access.member == "bar"),
+        "a function-local holder should be mapped to Foo, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn shadowed_parameter_does_not_credit_module_object_property_binding() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            function inspect(holder: unknown) {
+                holder.property.unrelated();
+            }
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the module holder should remain mapped to Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "unrelated"),
+        "a shadowing parameter must not credit Alpha, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn forward_module_object_property_binding_survives_sibling_shadow() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+
+            function early() {
+                holder.property.alphaOnly();
+            }
+
+            function nested() {
+                const holder = { property: new Beta() };
+                holder.property.betaOnly();
+            }
+
+            const holder = { property: new Alpha() };
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the forward module access should map to Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the sibling local access should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn loop_initializer_object_property_binding_does_not_leak() {
+    let info = parse(
+        r"
+            import { Beta } from './services';
+
+            for (let holder = { property: new Beta() }; false;) {}
+
+            const holder = { property: { betaOnly() {} } };
+            holder.property.betaOnly();
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the loop initializer target must not leak, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn switch_object_property_binding_does_not_leak_to_module_scope() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+
+            switch (value) {
+                case 1:
+                    const holder = { property: new Beta() };
+                    holder.property.betaOnly();
+                    break;
+            }
+
+            const holder = { property: new Alpha() };
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the module target should remain Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the switch-local target should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "alphaOnly"),
+        "the module access must not be credited to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn direct_and_identifier_object_property_bindings_do_not_cross_credit() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            function nested() {
+                const beta = new Beta();
+                const holder = { property: beta };
+                holder.property.betaOnly();
+            }
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the direct module target should map to Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the identifier-backed local target should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "alphaOnly"),
+        "the module access must not be credited to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn duplicate_object_property_uses_the_last_initializer() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const beta = new Beta();
+            const holder = {
+                property: new Alpha(),
+                property: beta,
+            };
+            holder.property.betaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the last property initializer should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "betaOnly"),
+        "the overwritten Alpha initializer must not receive the access, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn bare_identifier_assignment_replaces_direct_target() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            let holder = { property: new Alpha() };
+
+            holder.property.alphaOnly();
+            holder = { property: new Beta() };
+            holder.property.betaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the access before assignment should map to Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the replacement target should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn identifier_assignment_copies_nested_direct_targets() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const replacement = { property: new Beta() };
+            let holder = { property: new Alpha() };
+
+            holder = replacement;
+            holder.property.betaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the identifier assignment should copy replacement's nested target, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn property_declaration_alias_copies_direct_target() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { service: new Service() };
+            const service = holder.service;
+            service.used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the property alias should map to Service, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn object_declaration_alias_copies_nested_direct_targets() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const source = { service: new Service() };
+            const holder = source;
+            holder.service.used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the object alias should retain nested Service targets, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn object_destructure_alias_copies_direct_target() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { service: new Service() };
+            const { service: renamed } = holder;
+            renamed.used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the renamed destructure should map to Service, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn nested_object_destructure_copies_direct_target() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { nested: { service: new Service() } };
+            const { nested: { service } } = holder;
+            service.used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the nested destructure should map to Service, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn defaulted_object_destructure_retains_source_and_fallback_targets() {
+    let info = parse(
+        r"
+            import { Fallback, Service } from './services';
+            const holder = { service: new Service() };
+            const { service = new Fallback() } = holder;
+            service.used();
+            ",
+    );
+    for class_name in ["Fallback", "Service"] {
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == class_name && access.member == "used"),
+            "the defaulted destructure should conservatively map to {class_name}, found: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn nested_defaulted_destructure_retains_source_and_object_fallback_targets() {
+    let info = parse(
+        r"
+            import { Fallback, Service } from './services';
+            const holder = { nested: { service: new Service() } };
+            const { nested: { service } = { service: new Fallback() } } = holder;
+            service.used();
+            ",
+    );
+    for class_name in ["Fallback", "Service"] {
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == class_name && access.member == "used"),
+            "the nested default should conservatively map to {class_name}, found: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn object_default_bound_to_identifier_retains_nested_target() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = {};
+            const { nested = { service: new Service() } } = holder;
+            nested.service.used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the object fallback should retain its nested Service target, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn static_computed_object_property_access_maps_to_class() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { service: new Service() };
+            holder['service'].used();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Service" && access.member == "used"),
+        "the string-computed property should map to Service, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn dynamic_computed_object_property_access_maps_all_possible_targets() {
+    let info = parse(
+        r"
+            import { Primary, Secondary } from './services';
+            const holder = {
+                primary: new Primary(),
+                secondary: new Secondary(),
+            };
+            holder[key].used();
+            ",
+    );
+    for class_name in ["Primary", "Secondary"] {
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == class_name && access.member == "used"),
+            "the dynamic key should conservatively map to {class_name}, found: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn namespace_qualified_constructor_retains_export_path() {
+    let info = parse(
+        r"
+            import * as Services from './services';
+            const holder = { service: new Services.Service() };
+            holder.service.used();
+            ",
+    );
+    assert!(
+        info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+                    && access.class_export_name == "Service"
+                    && access.member == "used"
+        )),
+        "the qualified constructor should retain its namespace export path, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn function_local_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            class LocalService { usedLocal() {} }
+            function inspect() {
+                const Services = { Service: LocalService };
+                const holder = { service: new Services.Service() };
+                holder.service.usedLocal();
+            }
+            inspect();
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a function-local Services binding must shadow the namespace import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn nested_block_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            class LocalService { usedLocal() {} }
+            {
+                const Services = { Service: LocalService };
+                const holder = { service: new Services.Service() };
+                holder.service.usedLocal();
+            }
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a block-local Services binding must shadow the namespace import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn namespace_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            class LocalService { usedLocal() {} }
+            namespace Local {
+                const Services = { Service: LocalService };
+                const holder = { service: new Services.Service() };
+                holder.service.usedLocal();
+            }
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a namespace-local Services binding must shadow the import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn static_block_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            class LocalService { usedLocal() {} }
+            class Consumer {
+                static {
+                    const Services = { Service: LocalService };
+                    const holder = { service: new Services.Service() };
+                    holder.service.usedLocal();
+                }
+            }
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a static-block Services binding must shadow the import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn catch_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            try {} catch (Services) {
+                const holder = { service: new Services.Service() };
+                holder.service.usedLocal();
+            }
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a catch Services binding must shadow the import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn loop_binding_shadows_namespace_import_during_preseed() {
+    let info = parse(
+        r"
+            import * as Services from './external';
+            class LocalService { usedLocal() {} }
+            for (const Services = { Service: LocalService }; condition; ) {
+                const holder = { service: new Services.Service() };
+                holder.service.usedLocal();
+            }
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Services"
+        )),
+        "a loop-local Services binding must shadow the import, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn local_qualified_constructor_does_not_create_class_target() {
+    let info = parse(
+        r"
+            const Factories = { Service: Map };
+            const holder = { service: new Factories.Service() };
+            holder.service.get('key');
+            ",
+    );
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::QualifiedClassMemberAccess(access)
+                if access.namespace_local == "Factories"
+        )),
+        "a local qualified callee must not become a class target, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn shadowed_alias_and_dynamic_key_do_not_credit_module_target() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { service: new Service() };
+
+            function inspect(holder: unknown, key: string) {
+                const service = holder.service;
+                service.unrelated();
+                holder[key].alsoUnrelated();
+            }
+
+            holder.service.used();
+            ",
+    );
+    for member in ["unrelated", "alsoUnrelated"] {
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "Service" && access.member == member),
+            "a shadowed receiver must not credit Service.{member}, found: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn forward_namespace_exported_holder_shadows_module_holder() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            namespace Example {
+                export function useHolder() {
+                    holder.property.betaOnly();
+                }
+                export const holder = { property: new Beta() };
+            }
+
+            Example.useHolder();
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the module holder should retain Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the forward namespace holder should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "betaOnly"),
+        "the namespace access must not be credited to Alpha, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn exported_object_records_instance_property_fact() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            const holder = { service: new Service() };
+            export { holder as services };
+            ",
+    );
+    assert!(
+        info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::ExportedObjectInstanceProperty(property)
+                if property.export_name == "services"
+                    && property.property_path == "service"
+                    && property.class_local_name == "Service"
+        )),
+        "the exported container should persist its instance property, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn directly_exported_object_records_instance_property_fact() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            export const holder = { service: new Service() };
+            ",
+    );
+    assert!(
+        info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::ExportedObjectInstanceProperty(property)
+                if property.export_name == "holder"
+                    && property.property_path == "service"
+                    && property.class_local_name == "Service"
+        )),
+        "the directly exported container should persist its instance property, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn function_assignment_adds_possible_module_target() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            function mutate() {
+                holder.property = new Beta();
+                holder.property.betaOnly();
+            }
+
+            holder.property.alphaOnly();
+            console.log(mutate);
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the module target should remain Alpha, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the function-local replacement should map to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn called_function_assignment_credits_possible_replacement() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            function mutate() {
+                holder.property = new Beta();
+            }
+
+            mutate();
+            holder.property.betaOnly();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the possible replacement should map the later access to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn static_block_assignment_credits_possible_replacement() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            class Example {
+                static {
+                    holder.property = new Beta();
+                }
+            }
+
+            holder.property.betaOnly();
+            console.log(Example);
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the static-block replacement should map the later access to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn namespace_assignment_credits_possible_replacement() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            namespace Example {
+                holder.property = new Beta();
+            }
+
+            holder.property.betaOnly();
+            console.log(Example);
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "betaOnly"),
+        "the namespace replacement should map the later access to Beta, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn function_var_non_class_binding_blocks_module_target_fallback() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            function inspect() {
+                var holder = { property: { unrelated() {} } };
+                holder.property.unrelated();
+            }
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "unrelated"),
+        "a function var must block module target fallback, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn static_block_var_binding_blocks_module_target_fallback() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            class Example {
+                static {
+                    var holder = { property: { unrelated() {} } };
+                    holder.property.unrelated();
+                }
+            }
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "unrelated"),
+        "a static-block var must block module target fallback, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn named_function_expression_binding_blocks_module_target_fallback() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            const inspect = function holder() {
+                holder.property.unrelated();
+            };
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "unrelated"),
+        "a named function expression must block module fallback, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn named_class_expression_binding_blocks_module_target_fallback() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            const Example = class holder {
+                static inspect() {
+                    holder.property.unrelated();
+                }
+            };
+
+            holder.property.alphaOnly();
+            ",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "unrelated"),
+        "a named class expression must block module fallback, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn namespace_var_binding_does_not_escape_to_enclosing_function() {
+    let info = parse(
+        r"
+            import { Alpha, Beta } from './services';
+            const holder = { property: new Alpha() };
+
+            function inspect() {
+                namespace Inner {
+                    var holder = { property: new Beta() };
+                    holder.property.betaOnly();
+                }
+                holder.property.alphaOnly();
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the namespace var must not replace the enclosing Alpha target, found: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "Beta" && access.member == "alphaOnly"),
+        "the namespace var must not escape into the enclosing function, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn namespace_can_use_unshadowed_module_object_property_target() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            namespace Consumers {
+                export function use() {
+                    holder.property.alphaOnly();
+                }
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the unshadowed module target should remain visible in the namespace, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn function_default_parameter_resolves_before_body_var_scope() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            function inspect(value = holder.property.alphaOnly()) {
+                var holder = { property: { unrelated() {} } };
+                console.log(value, holder);
+            }
+            inspect();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the default parameter should resolve the module target, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn arrow_default_parameter_resolves_before_body_var_scope() {
+    let info = parse(
+        r"
+            import { Alpha } from './services';
+            const holder = { property: new Alpha() };
+
+            const inspect = (value = holder.property.alphaOnly()) => {
+                var holder = { property: { unrelated() {} } };
+                console.log(value, holder);
+            };
+            inspect();
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Alpha" && access.member == "alphaOnly"),
+        "the arrow default should resolve the module target, found: {:?}",
         info.member_accesses
     );
 }
@@ -3008,6 +4577,66 @@ fn destructured_formal_parameter_typed_by_interface_mapped_to_class() {
             .iter()
             .any(|a| a.object == "ResultState" && a.member == "pin"),
         "destructured formal parameter typed by an interface should map resultState.pin() to ResultState.pin, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn destructure_of_parameter_typed_by_inline_type_literal_mapped_to_class() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            export function run(input: { service: Service }) {
+                const { service } = input;
+                service.used();
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Service" && a.member == "used"),
+        "destructure of a parameter typed by an inline type literal should map service.used() to Service.used, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn renamed_destructure_of_parameter_typed_by_inline_type_literal_mapped_to_class() {
+    let info = parse(
+        r"
+            import { Client } from './services';
+            export function run(options: { client: Client }) {
+                const { client: renamed } = options;
+                renamed.used();
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Client" && a.member == "used"),
+        "renamed destructure of a parameter typed by an inline type literal should map renamed.used() to Client.used, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn nested_destructure_of_parameter_typed_by_inline_type_literal_mapped_to_class() {
+    let info = parse(
+        r"
+            import { Service } from './services';
+            export function run(input: { nested: { service: Service } }) {
+                const { nested: { service } } = input;
+                service.used();
+            }
+            ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "Service" && a.member == "used"),
+        "nested destructure of a parameter typed by an inline type literal should map service.used() to Service.used, found: {:?}",
         info.member_accesses
     );
 }
@@ -3709,6 +5338,60 @@ fn playwright_aliased_merge_tests_records_fixture_aliases() {
 }
 
 #[test]
+fn playwright_test_subpath_import_records_merge_and_extend_facts() {
+    // The `playwright` package exports the same test runner at
+    // `playwright/test`. The `mergeTests` and `test` imports from that
+    // source must behave as the `@playwright/test` imports.
+    let info = parse(
+        r"
+            import { mergeTests } from 'playwright/test';
+            import { appTest } from './app-fixture';
+            import { ReportsPage } from './reports-page';
+
+            export const test = mergeTests(appTest).extend<{ reports: ReportsPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_alias_fact(&info, "test", "appTest"),
+        "mergeTests from playwright/test should alias the merged test, found: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        has_playwright_fixture_definition_fact(&info, "test", "reports", "ReportsPage"),
+        "mergeTests from playwright/test should define the fixtures of T, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_test_subpath_raw_test_base_records_definitions_without_alias() {
+    let info = parse(
+        r"
+            import { test as base } from 'playwright/test';
+            import { AdminPage } from './admin-page';
+
+            type MyFixtures = {
+                adminPage: AdminPage;
+            };
+
+            export const test = base.extend<MyFixtures>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_definition_fact(&info, "test", "adminPage", "AdminPage"),
+        "the playwright/test `test` base should define the fixtures of T, found: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        !has_playwright_fixture_alias_fact(&info, "test", "base"),
+        "the raw playwright/test `test` base must not emit an alias fact, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
 fn playwright_wrapper_extend_records_fixture_alias() {
     let info = parse(
         r"
@@ -3742,6 +5425,307 @@ fn non_playwright_merge_tests_does_not_record_fixture_aliases() {
     assert!(
         !has_any_playwright_fixture_alias_fact(&info),
         "local mergeTests should not emit typed Playwright fixture aliases, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_chained_merge_tests_extend_records_aliases_and_definitions() {
+    // Issue #3462: the receiver of `.extend` is the `mergeTests(...)` call.
+    let info = parse(
+        r"
+            import { mergeTests } from '@playwright/test';
+            import { appTest } from './app-fixture';
+            import { ReportsPage } from './reports-page';
+
+            export const test = mergeTests(appTest).extend<{ reports: ReportsPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_alias_fact(&info, "test", "appTest"),
+        "chained mergeTests(...).extend should alias the merged test, found: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        has_playwright_fixture_definition_fact(&info, "test", "reports", "ReportsPage"),
+        "chained mergeTests(...).extend<T> should define the fixtures of T, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_extend_of_local_merged_test_records_definitions() {
+    // Issue #3462: `.extend<T>` on a local const that holds a merged test.
+    let info = parse(
+        r"
+            import { mergeTests } from '@playwright/test';
+            import { appTest } from './app-fixture';
+            import { SettingsPage } from './settings-page';
+
+            const mergedTest = mergeTests(appTest);
+            export const test = mergedTest.extend<{ settings: SettingsPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_definition_fact(&info, "test", "settings", "SettingsPage"),
+        "extend<T> of a local merged test should define the fixtures of T, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_helper_returning_chained_merge_tests_extend_records_definitions() {
+    let info = parse(
+        r"
+            import { mergeTests } from '@playwright/test';
+            import { appTest } from './app-fixture';
+            import { AuditPage } from './audit-page';
+
+            export const auditTest = () =>
+                mergeTests(appTest).extend<{ audit: AuditPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_alias_fact(&info, "auditTest", "appTest"),
+        "helper returning mergeTests(...).extend should alias the merged test, found: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        has_playwright_fixture_definition_fact(&info, "auditTest", "audit", "AuditPage"),
+        "helper returning mergeTests(...).extend<T> should define the fixtures of T, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_multi_level_extend_chain_records_every_definition() {
+    // Issue #3462: each `.extend<T>` in a chain defines the fixtures of `T`.
+    let info = parse(
+        r"
+            import { mergeTests, test as base } from '@playwright/test';
+            import { appTest } from './app-fixture';
+            import { ChartPage } from './chart-page';
+            import { ExportPage } from './export-page';
+            import { GridPage } from './grid-page';
+            import { HelpPage } from './help-page';
+
+            export const mergedChain = mergeTests(appTest)
+                .extend<{ chart: ChartPage }>({})
+                .extend<{ exporter: ExportPage }>({});
+            export const baseChain = base.extend<{ grid: GridPage }>({}).extend<{ help: HelpPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_alias_fact(&info, "mergedChain", "appTest"),
+        "a multi-level mergeTests chain should alias the merged test, found: {:?}",
+        info.semantic_facts
+    );
+    for (test_name, fixture_name, type_name) in [
+        ("mergedChain", "chart", "ChartPage"),
+        ("mergedChain", "exporter", "ExportPage"),
+        ("baseChain", "grid", "GridPage"),
+        ("baseChain", "help", "HelpPage"),
+    ] {
+        assert!(
+            has_playwright_fixture_definition_fact(&info, test_name, fixture_name, type_name),
+            "{test_name} should define {fixture_name}: {type_name}, found: {:?}",
+            info.semantic_facts
+        );
+    }
+}
+
+#[test]
+fn playwright_helper_returning_multi_level_extend_chain_records_definitions() {
+    let info = parse(
+        r"
+            import { mergeTests } from '@playwright/test';
+            import { appTest } from './app-fixture';
+            import { ChartPage } from './chart-page';
+            import { ExportPage } from './export-page';
+
+            export const chainTest = () =>
+                mergeTests(appTest)
+                    .extend<{ chart: ChartPage }>({})
+                    .extend<{ exporter: ExportPage }>({});
+        ",
+    );
+
+    assert!(
+        has_playwright_fixture_alias_fact(&info, "chainTest", "appTest"),
+        "a helper returning a multi-level chain should alias the merged test, found: {:?}",
+        info.semantic_facts
+    );
+    for (fixture_name, type_name) in [("chart", "ChartPage"), ("exporter", "ExportPage")] {
+        assert!(
+            has_playwright_fixture_definition_fact(&info, "chainTest", fixture_name, type_name),
+            "chainTest should define {fixture_name}: {type_name}, found: {:?}",
+            info.semantic_facts
+        );
+    }
+}
+
+#[test]
+fn non_playwright_multi_level_extend_chain_records_no_definitions() {
+    let info = parse(
+        r"
+            import { extend } from './framework';
+            import { ChartPage } from './chart-page';
+            import { ExportPage } from './export-page';
+
+            export const test = extend.extend<{ chart: ChartPage }>({}).extend<{ exporter: ExportPage }>({});
+        ",
+    );
+
+    assert!(
+        !has_any_playwright_fixture_definition_fact(&info),
+        "a non-Playwright extend chain should not emit definitions, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn non_playwright_chained_merge_tests_extend_records_nothing() {
+    let info = parse(
+        r"
+            import { appTest } from './app-fixture';
+            import { BillingPage } from './billing-page';
+
+            const mergeTests = (value: unknown) => ({ extend: <T>(fixtures: unknown) => value });
+
+            export const test = mergeTests(appTest).extend<{ billing: BillingPage }>({});
+            export const helper = () => mergeTests(appTest).extend<{ billing: BillingPage }>({});
+        ",
+    );
+
+    assert!(
+        !has_any_playwright_fixture_alias_fact(&info),
+        "a local mergeTests chain should not emit Playwright aliases, found: {:?}",
+        info.semantic_facts
+    );
+    assert!(
+        !has_any_playwright_fixture_definition_fact(&info),
+        "a local mergeTests chain should not emit Playwright definitions, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_extend_of_imported_base_records_conditional_definitions() {
+    // `appTest` comes from another file. The extractor cannot prove that it is
+    // a Playwright test, so the definitions of `T` wait for analysis.
+    let info = parse(
+        r"
+            import { appTest } from './app-fixture';
+            import { BPage } from './b-page';
+
+            export const bTest = appTest.extend<{ b: BPage }>({});
+            export const makeBTest = () => appTest.extend<{ b: BPage }>({});
+        ",
+    );
+
+    for test_name in ["bTest", "makeBTest"] {
+        assert!(
+            has_playwright_conditional_fixture_definition_fact(
+                &info, test_name, "appTest", "b", "BPage"
+            ),
+            "{test_name} should define b: BPage when appTest is a Playwright test, found: {:?}",
+            info.semantic_facts
+        );
+        assert!(
+            has_playwright_fixture_alias_fact(&info, test_name, "appTest"),
+            "{test_name} should alias appTest, found: {:?}",
+            info.semantic_facts
+        );
+    }
+    assert!(
+        !has_any_playwright_fixture_definition_fact(&info),
+        "an imported base must not emit unconditional definitions, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_same_file_chain_on_imported_base_records_conditional_definitions() {
+    // `bTest` holds a Playwright test only when the imported `appTest` does,
+    // so an extend of `bTest` in the same file also waits for analysis.
+    let info = parse(
+        r"
+            import { appTest } from './app-fixture';
+            import { BPage } from './b-page';
+            import { CPage } from './c-page';
+
+            const plainTest = appTest.extend({});
+            export const bTest = appTest.extend<{ b: BPage }>({});
+            export const cTest = bTest.extend<{ c: CPage }>({});
+            export const dTest = plainTest.extend<{ c: CPage }>({});
+            export const makeCTest = () => bTest.extend<{ c: CPage }>({});
+        ",
+    );
+
+    for (test_name, base_name) in [
+        ("cTest", "bTest"),
+        ("dTest", "plainTest"),
+        ("makeCTest", "bTest"),
+    ] {
+        assert!(
+            has_playwright_conditional_fixture_definition_fact(
+                &info, test_name, base_name, "c", "CPage"
+            ),
+            "{test_name} should define c: CPage when {base_name} is a Playwright test, found: {:?}",
+            info.semantic_facts
+        );
+    }
+}
+
+#[test]
+fn playwright_extend_of_local_unknown_base_records_no_conditional_definitions() {
+    let info = parse(
+        r"
+            import { BPage } from './b-page';
+
+            const framework = { extend: <T>(fixtures: unknown) => fixtures };
+            export const bTest = framework.extend<{ b: BPage }>({});
+        ",
+    );
+
+    assert!(
+        !info.semantic_facts.iter().any(|fact| matches!(
+            fact,
+            SemanticFact::PlaywrightConditionalFixtureDefinition(_)
+        )),
+        "a local non-Playwright base cannot become a Playwright test, found: {:?}",
+        info.semantic_facts
+    );
+}
+
+#[test]
+fn playwright_untyped_extend_records_test_binding() {
+    // `base.extend({...})` without a type argument emits no definition, so a
+    // binding fact tells analysis that `appTest` holds a Playwright test.
+    let info = parse(
+        r"
+            import { test as base, mergeTests } from '@playwright/test';
+            import { otherTest } from './other-fixture';
+
+            export const appTest = base.extend({});
+            export const mergedTest = mergeTests(otherTest);
+        ",
+    );
+
+    for test_name in ["appTest", "mergedTest"] {
+        assert!(
+            has_playwright_test_binding_fact(&info, test_name),
+            "{test_name} should be marked as a Playwright test, found: {:?}",
+            info.semantic_facts
+        );
+    }
+    assert!(
+        !has_playwright_test_binding_fact(&info, "otherTest"),
+        "an imported name is not proven in this file, found: {:?}",
         info.semantic_facts
     );
 }
@@ -4588,6 +6572,147 @@ fn parameter_property_maps_this_field_member_access() {
 }
 
 #[test]
+fn class_array_parameter_properties_credit_iterated_members_before_constructor() {
+    for declaration in [
+        "private layers: Controller[]",
+        "public layers: Array<Controller>",
+        "protected layers: readonly Controller[]",
+        "readonly layers: ReadonlyArray<Controller>",
+        "private readonly layers: (Controller[] | null)",
+    ] {
+        let info = parse(&format!(
+            "import {{ Controller }} from './controller';
+             class Runner {{
+                 run() {{
+                     this.layers?.forEach(layer => layer.init?.());
+                     for (const layer of this.layers!) layer.tick?.();
+                 }}
+                 constructor({declaration}) {{}}
+             }}"
+        ));
+        for member in ["init", "tick"] {
+            assert!(
+                info.member_accesses
+                    .iter()
+                    .any(|access| access.object == "Controller" && access.member == member),
+                "{declaration} should credit Controller.{member}, found: {:?}",
+                info.member_accesses
+            );
+        }
+    }
+}
+
+#[test]
+fn class_array_fields_credit_iterated_members_before_field_declaration() {
+    for (field, annotation) in [
+        ("layers", "Controller[]"),
+        ("layers", "readonly Controller[]"),
+        ("layers", "ReadonlyArray<Controller>"),
+        ("#layers", "(Controller[] | null | undefined)"),
+    ] {
+        let info = parse(&format!(
+            "import {{ Controller }} from './controller';
+             class Runner {{
+                 run() {{
+                     this.{field}?.forEach(layer => layer.init?.());
+                     for (const layer of this.{field}!) layer.tick?.();
+                 }}
+                 {field}: {annotation};
+             }}"
+        ));
+        for member in ["init", "tick"] {
+            assert!(
+                info.member_accesses
+                    .iter()
+                    .any(|access| access.object == "Controller" && access.member == member),
+                "{field}: {annotation} should credit Controller.{member}, found: {:?}",
+                info.member_accesses
+            );
+        }
+    }
+}
+
+#[test]
+fn class_array_fields_keep_sibling_and_nested_receivers_isolated() {
+    let info = parse(
+        r"
+        import { OuterPort, InnerPort, SiblingPort } from './ports';
+        class Outer {
+            run() {
+                this.layers.forEach(layer => layer.before());
+                class Inner {
+                    run() { this.layers.forEach(layer => layer.inner()); }
+                    readonly layers: InnerPort[];
+                }
+                new Inner().run();
+                for (const layer of this.layers) layer.after();
+            }
+            readonly layers: OuterPort[];
+        }
+        class Sibling {
+            run() { this.layers.forEach(layer => layer.sibling()); }
+            constructor(readonly layers: SiblingPort[]) {}
+        }
+        ",
+    );
+    for (object, member) in [
+        ("OuterPort", "before"),
+        ("OuterPort", "after"),
+        ("InnerPort", "inner"),
+        ("SiblingPort", "sibling"),
+    ] {
+        let receivers: Vec<&str> = info
+            .member_accesses
+            .iter()
+            .filter(|access| access.member == member && access.object.ends_with("Port"))
+            .map(|access| access.object.as_str())
+            .collect();
+        assert_eq!(receivers, [object], "{member} must use its enclosing class");
+    }
+}
+
+#[test]
+fn class_array_fields_abstain_on_local_parameters_static_and_ambiguous_types() {
+    let info = parse(
+        r"
+        import { LocalPort, StaticPort, AmbiguousPort, OtherPort, ControlPort } from './ports';
+        class Local {
+            constructor(layers: LocalPort[]) {}
+            run() { this.layers.forEach(layer => layer.local()); }
+        }
+        class Static {
+            run() { this.layers.forEach(layer => layer.staticOnly()); }
+            static layers: StaticPort[];
+        }
+        class Ambiguous {
+            run() { this.layers.forEach(layer => layer.ambiguous()); }
+            layers: AmbiguousPort[] | OtherPort[];
+        }
+        class Control {
+            run() { this.layers.forEach(layer => layer.control()); }
+            layers: ControlPort[];
+        }
+        ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "ControlPort" && access.member == "control"),
+        "the valid instance field must still receive credit"
+    );
+    for object in ["LocalPort", "StaticPort", "AmbiguousPort", "OtherPort"] {
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == object),
+            "{object} has no proven instance array, found: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
 fn this_field_builtin_constructor_not_tracked() {
     let info = parse(
         r"
@@ -4967,12 +7092,6 @@ fn import_meta_glob_string_pattern() {
     let info = parse("const mods = import.meta.glob('./modules/*.ts');");
     assert_eq!(info.dynamic_import_patterns.len(), 1);
     assert_eq!(info.dynamic_import_patterns[0].prefix, "./modules/*.ts");
-}
-
-#[test]
-fn import_meta_glob_array_patterns() {
-    let info = parse("const mods = import.meta.glob(['./a/*.ts', './b/*.ts']);");
-    assert_eq!(info.dynamic_import_patterns.len(), 2);
 }
 
 #[test]
@@ -6114,12 +8233,13 @@ fn dynamic_import_in_object_property_function_callback_credits_default() {
 }
 
 #[test]
-fn dynamic_import_in_unknown_object_property_callback_stays_side_effect_only() {
+fn dynamic_import_in_unknown_object_property_callback_credits_whole_module() {
     let info = parse("const loaders = { arbitrary: () => import('./maybe-side-effect') };");
     assert_eq!(info.dynamic_imports.len(), 1);
     assert_eq!(info.dynamic_imports[0].source, "./maybe-side-effect");
     assert!(info.dynamic_imports[0].destructured_names.is_empty());
     assert!(info.dynamic_imports[0].local_name.is_none());
+    assert!(info.dynamic_imports[0].value_escapes);
 }
 
 #[test]
@@ -7134,6 +9254,104 @@ fn destructured_receiver_alias_respects_nested_value_shadowing() {
 }
 
 #[test]
+fn typed_this_constructor_assignment_preserves_ordinary_receiver_facts() {
+    let cases = [
+        (
+            "no assignment",
+            "",
+            "this.cacheHandler?.notify?.()",
+            "this.cacheHandler",
+        ),
+        (
+            "direct constructor",
+            "constructor(){this.cacheHandler=new Strategy();}",
+            "this.cacheHandler?.notify?.()",
+            "Strategy",
+        ),
+        (
+            "parameter optional",
+            "constructor({Current}:{Current?:typeof Strategy}){if(Current)this.cacheHandler=new Current();}",
+            "this.cacheHandler?.notify?.()",
+            "this.cacheHandler",
+        ),
+        (
+            "parameter normal",
+            "constructor({Current}:{Current?:typeof Strategy}){if(Current)this.cacheHandler=new Current();}",
+            "this.cacheHandler!.notify()",
+            "this.cacheHandler",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        for (label, constructor, call, expected) in cases {
+            let subclass = if capture {
+                "import * as ns from './base'; class Sub extends ns.Base {} Sub.live();"
+            } else {
+                ""
+            };
+            let info = parse(&format!(
+                "{subclass} export class Strategy{{notify(){{}}dead(){{}}}} export class Registry{{readonly cacheHandler?:Strategy;{constructor}call(){{{call};unknownReceiver.unbound();}}}}"
+            ));
+            if !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == expected && access.member == "notify")
+            {
+                failures.push(format!(
+                    "{label}, capture={capture}: expected {expected}.notify, got {:?}",
+                    info.member_accesses
+                ));
+            }
+            assert!(info.member_accesses.iter().any(|access| {
+                access.object == "unknownReceiver" && access.member == "unbound"
+            }));
+            assert!(
+                !info
+                    .member_accesses
+                    .iter()
+                    .any(|access| { access.object == "Strategy" && access.member == "unbound" })
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn typed_field_initializer_keeps_ordinary_this_alias_resolution() {
+    let info = parse(
+        r"
+        interface Strategy { notify(): void; }
+        export class Registry {
+          current!: Strategy;
+          flush(): void {
+            const service = this.current;
+            service.notify();
+            unknownReceiver.unbound();
+          }
+        }
+        ",
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == "Strategy" && access.member == "notify"),
+        "ordinary typed-field aliases should resolve without subclass references: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|access| { access.object == "unknownReceiver" && access.member == "unbound" })
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|access| { access.object == "Strategy" && access.member == "unbound" })
+    );
+}
+
+#[test]
 fn typed_field_initializer_binds_local_receiver() {
     let info = parse(
         r"
@@ -7679,25 +9897,18 @@ fn fluent_chain_emits_typed_member_facts() {
             }
         })
         .collect();
-    assert!(
-        fluent_facts
-            .iter()
-            .any(|fact| fact.root_object == "EventBuilder"
-                && fact.root_method == "create"
-                && fact.chain.is_empty()
-                && fact.member == "setProcessId"),
-        "first chained call should emit typed fluent fact, found: {:?}",
-        info.semantic_facts,
-    );
-    assert!(
-        fluent_facts
-            .iter()
-            .any(|fact| fact.root_object == "EventBuilder"
-                && fact.root_method == "create"
-                && fact.chain == vec!["setProcessId".to_string(), "setSubject".to_string()]
-                && fact.member == "build"),
-        "terminal call should emit typed fluent fact with full prior chain, found: {:?}",
-        info.semantic_facts,
+    assert_eq!(
+        fluent_facts,
+        [&fallow_types::extract::FluentChainMemberAccessFact {
+            root_object: "EventBuilder".to_string(),
+            root_method: "create".to_string(),
+            steps: vec![
+                "setProcessId".to_string(),
+                "setSubject".to_string(),
+                "build".to_string(),
+            ],
+        }],
+        "the chain should emit one typed fluent fact with every step",
     );
 }
 
@@ -7751,23 +9962,14 @@ fn new_expression_fluent_chain_emits_typed_member_facts() {
             }
         })
         .collect();
-    assert!(
-        fluent_new_facts
-            .iter()
-            .any(|fact| fact.class_name == "OptionBuilder"
-                && fact.chain == vec!["addDefault".to_string()]
-                && fact.member == "addFromCli"),
-        "second chained call should emit typed fluent-new fact, found: {:?}",
-        info.semantic_facts,
-    );
-    assert!(
-        fluent_new_facts
-            .iter()
-            .any(|fact| fact.class_name == "OptionBuilder"
-                && fact.chain == vec!["addDefault".to_string(), "addFromCli".to_string()]
-                && fact.member == "build"),
-        "terminal call should emit typed fluent-new fact, found: {:?}",
-        info.semantic_facts,
+    assert_eq!(
+        fluent_new_facts,
+        [&fallow_types::extract::FluentChainNewMemberAccessFact {
+            class_name: "OptionBuilder".to_string(),
+            first_method: "addDefault".to_string(),
+            steps: vec!["addFromCli".to_string(), "build".to_string()],
+        }],
+        "the chain should emit one typed fluent-new fact with every later step",
     );
 }
 
@@ -8252,14 +10454,18 @@ fn dynamic_import_namespace_destructuring() {
 }
 
 #[test]
-fn non_namespace_destructuring_not_tracked() {
-    let info = parse("const obj = { a: 1 };\nconst { a } = obj;");
+fn this_field_destructuring_records_this_member_access() {
+    // `const { m } = this.svc` reads `this.svc.m`, so it records the same
+    // access as the member expression, with the `this.` spelling restored.
+    let info = parse(
+        "class Host {\n  constructor(private svc: Svc) {}\n  run() { const { m } = this.svc; m(); }\n}",
+    );
     assert!(
-        !info
-            .member_accesses
+        info.member_accesses
             .iter()
-            .any(|a| a.object == "obj" && a.member == "a"),
-        "destructuring of non-namespace vars should not produce member accesses"
+            .any(|a| a.object == "this.svc" && a.member == "m"),
+        "got {:?}",
+        info.member_accesses
     );
 }
 
@@ -8322,7 +10528,13 @@ fn import_meta_glob_string() {
 #[test]
 fn import_meta_glob_array() {
     let info = parse("import.meta.glob(['./a/*.ts', './b/*.ts']);");
-    assert_eq!(info.dynamic_import_patterns.len(), 2);
+    assert_eq!(
+        info.dynamic_import_patterns
+            .iter()
+            .map(|pattern| pattern.prefix.as_str())
+            .collect::<Vec<_>>(),
+        ["./a/*.ts", "./b/*.ts"]
+    );
 }
 
 #[test]
@@ -8557,6 +10769,73 @@ fn default_export_then_import_is_re_export_of_default() {
     assert_eq!(info.re_exports[0].source, "./a");
     assert_eq!(info.re_exports[0].imported_name, "default");
     assert_eq!(info.re_exports[0].exported_name, "D");
+}
+
+#[test]
+fn export_default_of_default_import_is_re_export_of_default() {
+    let info = parse("import Thing from './a';\nexport default Thing;");
+    assert_eq!(info.re_exports.len(), 1);
+    assert_eq!(info.exports.len(), 0);
+    assert_eq!(info.re_exports[0].source, "./a");
+    assert_eq!(info.re_exports[0].imported_name, "default");
+    assert_eq!(info.re_exports[0].exported_name, "default");
+    assert!(!info.re_exports[0].is_type_only);
+    assert!(!info.has_cjs_exports);
+}
+
+#[test]
+fn export_default_before_named_import_is_re_export_of_default() {
+    let info = parse("export default Thing;\nimport { Thing } from './a';");
+    assert_eq!(info.re_exports.len(), 1);
+    assert_eq!(info.exports.len(), 0);
+    assert_eq!(info.re_exports[0].imported_name, "Thing");
+    assert_eq!(info.re_exports[0].exported_name, "default");
+}
+
+#[test]
+fn export_default_of_type_import_is_type_only_re_export() {
+    let info = parse("import type { Shape } from './a';\nexport default Shape;");
+    assert_eq!(info.re_exports.len(), 1);
+    assert!(info.re_exports[0].is_type_only);
+}
+
+#[test]
+fn export_default_of_local_or_namespace_binding_stays_local() {
+    for source in [
+        "function Thing() {}\nexport default Thing;",
+        "import * as ns from './a';\nexport default ns;",
+        "export default Unbound;",
+    ] {
+        let info = parse(source);
+        assert_eq!(info.re_exports.len(), 0, "{source}");
+        assert_eq!(info.exports.len(), 1, "{source}");
+        assert_eq!(info.exports[0].name, ExportName::Default, "{source}");
+    }
+}
+
+#[test]
+fn export_assignment_of_import_is_re_export_of_default() {
+    let info = parse("import Thing from './a';\nexport = Thing;");
+    assert_eq!(info.re_exports.len(), 1);
+    assert_eq!(info.exports.len(), 0);
+    assert_eq!(info.re_exports[0].source, "./a");
+    assert_eq!(info.re_exports[0].imported_name, "default");
+    assert_eq!(info.re_exports[0].exported_name, "default");
+    assert!(info.has_cjs_exports);
+}
+
+#[test]
+fn export_assignment_of_local_binding_records_nothing() {
+    let info = parse("const Thing = 1;\nexport = Thing;");
+    assert_eq!(info.re_exports.len(), 0);
+    assert!(!info.has_cjs_exports);
+}
+
+#[test]
+fn export_assignment_inside_ambient_module_is_not_a_file_forward() {
+    let info = parse("import Thing from './a';\ndeclare module 'pkg' {\n  export = Thing;\n}");
+    assert_eq!(info.re_exports.len(), 0);
+    assert!(!info.has_cjs_exports);
 }
 
 #[test]
@@ -9505,7 +11784,7 @@ fn ts_import_type_inside_declare_global() {
 
 #[test]
 fn ts_import_type_inside_actual_dts_file() {
-    use crate::parse::parse_source_to_module;
+    use crate::parse_source_to_module;
     use fallow_types::discover::FileId;
     use std::path::Path;
 
@@ -9662,6 +11941,90 @@ fn exported_function_without_use_server_is_not_captured() {
         "an ordinary exported function is not an inline action: {:?}",
         info.inline_server_action_exports
     );
+}
+
+/// Issue #2941: the `"use server"` export-shape flag for the client cone.
+fn server_action_module(source: &str) -> bool {
+    parse(source).is_server_action_module
+}
+
+#[test]
+fn use_server_module_with_async_function_exports_is_an_action_module() {
+    assert!(server_action_module(
+        "\"use server\";\nexport async function f() {}\nexport default async function g() {}\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_async_arrow_const_is_an_action_module() {
+    assert!(server_action_module(
+        "\"use server\";\nexport const f = async (id: string) => id;\nexport const g = async function () {};\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_local_async_specifier_export_is_an_action_module() {
+    assert!(server_action_module(
+        "\"use server\";\nasync function f() {}\nconst g = async () => {};\nexport { f, g as h };\nexport default f;\n"
+    ));
+}
+
+#[test]
+fn use_server_module_type_exports_do_not_count() {
+    assert!(server_action_module(
+        "\"use server\";\nexport type Id = string;\nexport interface User { id: Id }\ninterface Local {}\nexport type { Local };\nexport async function f() {}\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_non_async_const_is_not_an_action_module() {
+    assert!(!server_action_module(
+        "\"use server\";\nexport async function f() {}\nexport const config = { a: 1 };\n"
+    ));
+    assert!(!server_action_module(
+        "\"use server\";\nexport const f = () => 1;\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_non_async_function_is_not_an_action_module() {
+    assert!(!server_action_module(
+        "\"use server\";\nexport function f() {}\n"
+    ));
+    assert!(!server_action_module(
+        "\"use server\";\nfunction f() {}\nexport { f };\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_re_export_is_not_an_action_module() {
+    assert!(!server_action_module(
+        "\"use server\";\nexport { f } from \"./actions\";\n"
+    ));
+    assert!(!server_action_module(
+        "\"use server\";\nexport * from \"./actions\";\n"
+    ));
+    assert!(!server_action_module(
+        "\"use server\";\nimport { f } from \"./actions\";\nexport { f };\n"
+    ));
+}
+
+#[test]
+fn use_server_module_with_default_value_is_not_an_action_module() {
+    assert!(!server_action_module(
+        "\"use server\";\nexport default { a: 1 };\n"
+    ));
+    assert!(!server_action_module(
+        "\"use server\";\nexport default class A {}\n"
+    ));
+}
+
+#[test]
+fn module_without_use_server_prologue_is_not_an_action_module() {
+    assert!(!server_action_module("export async function f() {}\n"));
+    assert!(!server_action_module(
+        "import x from \"./x\";\n\"use server\";\nexport async function f() {}\n"
+    ));
 }
 
 fn di_sites(info: &crate::ModuleInfo) -> Vec<(String, DiRole, DiFramework)> {
@@ -11455,4 +13818,3236 @@ fn shadowed_destructured_alias_does_not_credit_typed_property_member() {
         !facts.contains(&("Context", "strategy", "reset")),
         "a redeclared alias name must not credit the typed property: {facts:?}"
     );
+}
+
+/// An interface heritage name (`extends NS.Star`) records the same member
+/// accesses and namespace marks as the member expression it was before Oxc
+/// 0.151, also for a nested name and under a shadowing local.
+#[test]
+fn interface_heritage_name_reads_like_a_member_expression() {
+    let has_access = |info: &ModuleInfo, object: &str, member: &str| {
+        info.member_accesses
+            .iter()
+            .any(|access| access.object == object && access.member == member)
+    };
+
+    let info = parse("import * as NS from './ns';\nexport interface X extends NS.Star {}");
+    assert!(
+        has_access(&info, "NS", "Star"),
+        "{:?}",
+        info.member_accesses
+    );
+    assert!(!info.whole_object_uses.contains(&"NS".to_string()));
+
+    let info = parse("import * as NS from './ns';\nexport interface X extends NS.Inner.Deep {}");
+    assert!(
+        has_access(&info, "NS", "Inner"),
+        "{:?}",
+        info.member_accesses
+    );
+    assert!(
+        has_access(&info, "NS.Inner", "Deep"),
+        "{:?}",
+        info.member_accesses
+    );
+
+    let info = parse(
+        "import * as NS from './ns';\nexport function f(NS: unknown) {\n  interface X extends NS.Star {}\n  return NS;\n}",
+    );
+    let base = parse(
+        "import * as NS from './ns';\nexport function f(NS: unknown) {\n  const x = NS.Star;\n  return NS;\n}",
+    );
+    assert_eq!(info.whole_object_uses, base.whole_object_uses);
+}
+
+#[test]
+fn nullish_fallback_new_binds_class() {
+    let info = parse(
+        r"
+        class Cache { used() {} }
+        class Pool { used() {} }
+        export function run(o: { cache?: Cache }, x: unknown) {
+          const c = o.cache ?? new Cache();
+          c.used();
+          const p = x || new Pool();
+          p.used();
+        }
+        ",
+    );
+    assert!(
+        has_member_access(&info, "Cache", "used"),
+        "`??` fallback should bind the constructed class: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        has_member_access(&info, "Pool", "used"),
+        "`||` fallback should bind the constructed class: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn nullable_ternary_new_binds_class() {
+    let info = parse(
+        r"
+        class Queue { viaNull() {} viaUndefined() {} viaVoid() {} }
+        export function run(f: boolean) {
+          const a = f ? new Queue() : null;
+          a?.viaNull();
+          const b = f ? undefined : new Queue();
+          b?.viaUndefined();
+          const c = f ? new Queue() : void 0;
+          c?.viaVoid();
+        }
+        ",
+    );
+    for member in ["viaNull", "viaUndefined", "viaVoid"] {
+        assert!(
+            has_member_access(&info, "Queue", member),
+            "nullable ternary should bind the constructed class for {member}: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn nullable_ternary_static_factory_binds_class() {
+    let info = parse(
+        r"
+        export class Link {
+          static open(path: string): Link { return new Link(); }
+          used() {}
+        }
+        export function run(f: boolean) {
+          const l = f ? Link.open('p') : undefined;
+          l?.used();
+        }
+        ",
+    );
+    assert!(
+        has_member_access(&info, "Link", "used"),
+        "nullable ternary should bind the static factory product: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn fallback_with_two_different_classes_does_not_bind() {
+    let info = parse(
+        r"
+        class Primary { shared() {} }
+        class Backup { shared() {} }
+        export function run(f: boolean) {
+          const primary = new Primary();
+          const v = primary ?? new Backup();
+          v.shared();
+          const w = f ? new Primary() : new Backup();
+          w.shared();
+        }
+        ",
+    );
+    assert!(
+        !has_member_access(&info, "Primary", "shared")
+            && !has_member_access(&info, "Backup", "shared"),
+        "operands with two different classes must not bind one class: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn map_get_result_credits_the_map_value_class() {
+    let info = parse(
+        r"
+        import { Session, Entry, Slot } from './lib';
+        class Registry {
+          private sessions = new Map<string, Session>();
+          private entries: Map<string, Entry> = new Map();
+          run(id: string) {
+            this.sessions.get(id)?.open();
+            this.entries.get(id)!.close();
+          }
+        }
+        export function useSlot(slots: Map<string, Slot>) {
+          const slot = slots.get('key');
+          slot?.fill();
+        }
+        ",
+    );
+    assert!(has_member_access(&info, "Session", "open"));
+    assert!(has_member_access(&info, "Entry", "close"));
+    assert!(
+        has_member_access(&info, "Slot", "fill"),
+        "a local bound to map.get(...) must credit the value class, found: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn map_get_result_ignores_builtin_values_and_other_receivers() {
+    let info = parse(
+        r"
+        import { Session } from './lib';
+        export function first(counts: Map<string, number>, other: Session) {
+          counts.get('a')?.toFixed();
+          other.get('a')?.open();
+        }
+        export function second() {
+          sessions.get('a')?.close();
+        }
+        export function third(sessions: Map<string, Session>) {
+          sessions.get()?.reset();
+        }
+        ",
+    );
+    assert!(!has_member_access(&info, "number", "toFixed"));
+    assert!(!has_member_access(&info, "Session", "open"));
+    assert!(
+        !has_member_access(&info, "Session", "close"),
+        "a map parameter of one function must not type a sibling function's free name"
+    );
+    assert!(!has_member_access(&info, "Session", "reset"));
+}
+
+#[test]
+fn imported_call_sites_preserve_aliases_arguments_and_repeated_sites() {
+    let source = r#"
+        import { defineProof as create } from "@gdp-ts/core";
+        import * as gdp from "./barrel";
+        create("CanRead");
+        create("CanWrite");
+        create(kind);
+        create();
+        gdp.defineProof("CanRead");
+        gdp.inner.defineProof("CanDelete");
+    "#;
+    let info = parse(source);
+    let calls: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| {
+            (
+                call.local_name.as_str(),
+                call.member_path.as_str(),
+                call.first_argument.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("create", "", Some("CanRead")),
+            ("create", "", Some("CanWrite")),
+            ("create", "", None),
+            ("create", "", None),
+            ("gdp", "defineProof", Some("CanRead")),
+            ("gdp", "inner.defineProof", Some("CanDelete")),
+        ]
+    );
+    let positions: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| call.span_start)
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        info.imported_call_sites
+            .iter()
+            .all(|call| source[call.span_start as usize..].starts_with(&call.local_name))
+    );
+}
+
+#[test]
+fn imported_call_sites_preserve_static_labels_through_transparent_syntax() {
+    let info = parse(
+        r"
+        import { defineProof as make } from '@gdp-ts/core';
+        make(('CanDelete'));
+        make(`CanDelete`);
+        make('CanDelete' as const);
+        make(`Can${kind}`);
+        make(kind);
+    ",
+    );
+    let labels: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| call.first_argument.as_deref())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            Some("CanDelete"),
+            Some("CanDelete"),
+            Some("CanDelete"),
+            None,
+            None
+        ]
+    );
+}
+
+#[test]
+fn imported_call_sites_mdx_require_scope_identity_and_original_offsets() {
+    let source = r#"# Proof example
+
+import { defineProof as make } from "@gdp-ts/core";
+
+export const trusted = make("Allowed");
+
+export const other = (() => { const make = (kind: string) => kind; return make("Shadow"); })();
+"#;
+    let info = crate::parse_from_content(FileId(0), Path::new("proofs.mdx"), source);
+    let calls: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| {
+            (
+                call.local_name.as_str(),
+                call.first_argument.as_deref(),
+                call.span_start as usize,
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(
+            "make",
+            Some("Allowed"),
+            source.find("make(\"Allowed\")").unwrap()
+        )]
+    );
+}
+
+#[test]
+fn imported_identifier_default_export_preserves_binding_identity() {
+    // `export default make` forwards the import, so the default export is a
+    // re-export that names the original binding (issue #3392).
+    let info = parse(r#"import { defineProof as make } from "@gdp-ts/core"; export default make;"#);
+    let re_export = info
+        .re_exports
+        .iter()
+        .find(|re_export| re_export.exported_name == "default")
+        .unwrap();
+    assert_eq!(re_export.source, "@gdp-ts/core");
+    assert_eq!(re_export.imported_name, "defineProof");
+}
+
+#[test]
+fn imported_call_sites_require_lexical_runtime_esm_bindings() {
+    let source = r#"
+        create("BeforeImport");
+        import { defineProof as create } from "@gdp-ts/core";
+        import * as ns from "./barrel";
+        import defaultFactory from "./default-api";
+        import type { defineProof as erased } from "@gdp-ts/core";
+        import { type defineProof as erasedMember } from "@gdp-ts/core";
+        function shadow(create: (kind: string) => unknown, ns: { defineProof: (kind: string) => unknown }) {
+            create("Parameter");
+            ns.defineProof("NamespaceParameter");
+        }
+        {
+            const create = (kind: string) => kind;
+            create("Block");
+        }
+        function inner() {
+            create("NestedImport");
+            ns.defineProof("NamespaceImport");
+        }
+        const alias = create;
+        alias("ValueAlias");
+        erased("TypeImport");
+        erasedMember("TypeSpecifier");
+        globalFactory("Global");
+        create?.("OptionalCall");
+        ns?.defineProof("OptionalMember");
+        ns.defineProof?.("OptionalNamespaceCall");
+        ns["defineProof"]("Computed");
+        defaultFactory("DefaultImport");
+        create(`Template`);
+    "#;
+    let info = parse(source);
+    let calls: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| {
+            (
+                call.local_name.as_str(),
+                call.member_path.as_str(),
+                call.first_argument.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("create", "", Some("BeforeImport")),
+            ("create", "", Some("NestedImport")),
+            ("ns", "defineProof", Some("NamespaceImport")),
+            ("defaultFactory", "", Some("DefaultImport")),
+            ("create", "", Some("Template")),
+        ]
+    );
+}
+
+#[test]
+fn imported_call_sites_abstain_on_redeclared_and_non_esm_bindings() {
+    let source = r#"
+        import { defineProof as trusted } from "@gdp-ts/core";
+        trusted("Control");
+        import { defineProof as duplicate } from "@gdp-ts/core";
+        const duplicate = (kind: string) => kind;
+        duplicate("Redeclared");
+        const { defineProof: required } = require("@gdp-ts/core");
+        required("CommonJS");
+        import legacy = require("@gdp-ts/core");
+        legacy.defineProof("ImportEquals");
+    "#;
+    let info = parse(source);
+    let calls: Vec<_> = info
+        .imported_call_sites
+        .iter()
+        .map(|call| (call.local_name.as_str(), call.first_argument.as_deref()))
+        .collect();
+    assert_eq!(calls, vec![("trusted", Some("Control"))]);
+}
+
+#[test]
+fn imported_call_sites_remap_a_call_at_the_start_of_an_embedded_script() {
+    let body = "make(\"First\");\nimport { defineProof as make } from \"@gdp-ts/core\";\n";
+    let cases = [
+        (
+            "view.vue",
+            format!(
+                "<template><p>Example</p></template>\n<script setup lang=\"ts\">{body}</script>"
+            ),
+        ),
+        (
+            "view.svelte",
+            format!("<p>Example</p>\n<script lang=\"ts\">{body}</script>"),
+        ),
+    ];
+    for (path, source) in cases {
+        let info = crate::parse_from_content(FileId(0), Path::new(path), &source);
+        let offsets: Vec<_> = info
+            .imported_call_sites
+            .iter()
+            .map(|call| call.span_start as usize)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![source.find("make(\"First\")").unwrap()],
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn imported_call_sites_preserve_embedded_script_scope_and_offsets() {
+    let body = r#"
+import { defineProof as make } from "@gdp-ts/core";
+make("Control");
+function shadow(make: (kind: string) => unknown) { make("Shadow"); }
+"#;
+    let cases = [
+        (
+            "view.vue",
+            format!(
+                "<template><p>Example</p></template>\n<script setup lang=\"ts\">{body}</script>"
+            ),
+        ),
+        (
+            "view.svelte",
+            format!("<p>Example</p>\n<script lang=\"ts\">{body}</script>"),
+        ),
+        ("view.astro", format!("---{body}---\n<p>Example</p>")),
+        (
+            "view.gts",
+            format!("<template><p>Example</p></template>\n{body}"),
+        ),
+    ];
+    for (path, source) in cases {
+        let info = crate::parse_from_content(FileId(0), Path::new(path), &source);
+        let calls: Vec<_> = info
+            .imported_call_sites
+            .iter()
+            .map(|call| {
+                (
+                    call.local_name.as_str(),
+                    call.first_argument.as_deref(),
+                    call.span_start as usize,
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![(
+                "make",
+                Some("Control"),
+                source.find("make(\"Control\")").unwrap()
+            )],
+            "{path}"
+        );
+    }
+}
+
+type BindingReferenceRow<'a> = (
+    &'a str,
+    &'a str,
+    fallow_types::extract::ImportBindingReferenceKind,
+    usize,
+    Option<&'a str>,
+);
+
+/// Each import binding reference as (local name, member path, kind, offset,
+/// declared name).
+fn binding_references(info: &ModuleInfo) -> Vec<BindingReferenceRow<'_>> {
+    info.import_binding_references
+        .iter()
+        .map(|reference| {
+            (
+                info.imports[reference.import_index as usize]
+                    .local_name
+                    .as_str(),
+                &*reference.member_path,
+                reference.kind,
+                reference.span_start as usize,
+                reference.declared_name.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn offset_of(source: &str, needle: &str) -> usize {
+    source
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle} is in the source"))
+}
+
+#[test]
+fn import_binding_references_record_value_aliases_at_top_level_and_nested() {
+    use fallow_types::extract::ImportBindingReferenceKind::ValueAlias;
+    let source = "import { useDispatch, useSelector } from 'pkg';\n\
+        const top = useDispatch;\n\
+        export const exported: () => void = useDispatch;\n\
+        function f() { const inner = useSelector; return inner; }\n";
+    let info = parse(source);
+    assert_eq!(
+        binding_references(&info),
+        vec![
+            (
+                "useDispatch",
+                "",
+                ValueAlias,
+                offset_of(source, "useDispatch;\nexport"),
+                Some("top")
+            ),
+            (
+                "useDispatch",
+                "",
+                ValueAlias,
+                offset_of(source, "useDispatch;\nfunction"),
+                Some("exported")
+            ),
+            (
+                "useSelector",
+                "",
+                ValueAlias,
+                offset_of(source, "useSelector; return"),
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
+fn import_binding_references_see_through_typescript_wrappers() {
+    use fallow_types::extract::ImportBindingReferenceKind::{InitializerCall, ValueAlias};
+    let source = "import { a } from 'pkg';\n\
+        export const w1 = a as unknown;\n\
+        export const w2 = a satisfies unknown;\n\
+        export const w3 = a!;\n\
+        export const w4 = a<string>;\n\
+        export const w5 = (a);\n\
+        export const w6 = (a.b.withTypes<string>() as unknown);\n";
+    let info = parse(source);
+    let rows: Vec<_> = binding_references(&info)
+        .into_iter()
+        .map(|(local, member, kind, _, declared)| (local, member, kind, declared))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("a", "", ValueAlias, Some("w1")),
+            ("a", "", ValueAlias, Some("w2")),
+            ("a", "", ValueAlias, Some("w3")),
+            ("a", "", ValueAlias, Some("w4")),
+            ("a", "", ValueAlias, Some("w5")),
+            ("a", "b.withTypes", InitializerCall, Some("w6")),
+        ]
+    );
+}
+
+#[test]
+fn import_binding_references_record_jsx_opening_elements_only() {
+    use fallow_types::extract::ImportBindingReferenceKind::JsxElement;
+    let source = "import { Provider } from 'pkg';\n\
+        import * as RR from 'pkg';\n\
+        export const A = () => <Provider><RR.Provider.Inner /></Provider>;\n";
+    let info = crate::parse_from_content(FileId(0), Path::new("view.tsx"), source);
+    assert_eq!(
+        binding_references(&info),
+        vec![
+            (
+                "Provider",
+                "",
+                JsxElement,
+                offset_of(source, "Provider><RR"),
+                None
+            ),
+            (
+                "RR",
+                "Provider.Inner",
+                JsxElement,
+                offset_of(source, "RR.Provider.Inner"),
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
+fn import_binding_references_record_namespace_member_chains_and_other_uses() {
+    use fallow_types::extract::ImportBindingReferenceKind::Other;
+    let source = "import * as RR from 'pkg';\n\
+        import { pick } from 'pkg';\n\
+        export const hooks = [RR.useDispatch, RR.a.b];\n\
+        consume(RR.useStore);\n\
+        export const maybe = () => pick?.(1);\n\
+        RR['useSelector']();\n";
+    let info = parse(source);
+    let rows: Vec<_> = binding_references(&info)
+        .into_iter()
+        .map(|(local, member, kind, offset, declared)| {
+            (local, member, kind, &source[offset..offset + 2], declared)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("RR", "useDispatch", Other, "RR", None),
+            ("RR", "a.b", Other, "RR", None),
+            ("RR", "useStore", Other, "RR", None),
+            ("pick", "", Other, "pi", None),
+            ("RR", "", Other, "RR", None),
+        ]
+    );
+}
+
+#[test]
+fn import_binding_references_record_top_level_initializer_calls_only() {
+    use fallow_types::extract::ImportBindingReferenceKind::InitializerCall;
+    let source = "import { useSelector } from 'pkg';\n\
+        export const s = useSelector.withTypes<{ n: number }>();\n\
+        const local = useSelector.withTypes();\n\
+        function f() { const x = useSelector.withTypes(); return x; }\n\
+        export const t = useSelector.withTypes()(1);\n\
+        useSelector(1);\n";
+    let info = parse(source);
+    assert_eq!(
+        binding_references(&info),
+        vec![
+            (
+                "useSelector",
+                "withTypes",
+                InitializerCall,
+                offset_of(source, "useSelector.withTypes<"),
+                Some("s")
+            ),
+            (
+                "useSelector",
+                "withTypes",
+                InitializerCall,
+                offset_of(source, "useSelector.withTypes();\nfunction"),
+                Some("local")
+            ),
+        ]
+    );
+    // The admitted calls stay call sites.
+    assert_eq!(info.imported_call_sites.len(), 5);
+}
+
+#[test]
+fn import_binding_references_skip_type_queries_shadowed_and_type_only_bindings() {
+    let source = "import { useSelector } from 'pkg';\n\
+        import * as RR from 'pkg';\n\
+        import type { Hook } from 'pkg';\n\
+        import { type Other } from 'pkg';\n\
+        type T = typeof useSelector;\n\
+        let v: typeof RR.useStore;\n\
+        function f(useSelector: unknown) { return useSelector; }\n\
+        export const h = Hook;\n\
+        export const o = Other;\n";
+    let info = parse(source);
+    assert_eq!(binding_references(&info), vec![]);
+}
+
+#[test]
+fn import_binding_references_remap_and_rebase_in_vue_scripts() {
+    use fallow_types::extract::ImportBindingReferenceKind::ValueAlias;
+    let source = "<script lang=\"ts\">\nimport { a } from 'pkg';\nexport const q = a;\n</script>\n\
+        <script setup lang=\"ts\">\nimport { b } from 'pkg';\nconst c = b;\n</script>\n\
+        <template><p>{{ c }}</p></template>\n";
+    let info = crate::parse_from_content(FileId(0), Path::new("view.vue"), source);
+    let rows = binding_references(&info);
+    assert!(
+        rows.contains(&(
+            "a",
+            "",
+            ValueAlias,
+            offset_of(source, "a;\n</script>"),
+            Some("q")
+        )),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(
+            "b",
+            "",
+            ValueAlias,
+            offset_of(source, "b;\n</script>"),
+            Some("c")
+        )),
+        "{rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+#[test]
+fn import_binding_references_skip_local_export_specifiers() {
+    // `ReExportInfo` records `export { x }` of an imported binding, so a
+    // binding reference here would count the same use twice.
+    let source = "import { useSelector } from 'pkg';\n\
+        export { useSelector };\n\
+        export { useSelector as select };\n";
+    let info = parse(source);
+    assert_eq!(binding_references(&info), vec![]);
+    assert_eq!(info.re_exports.len(), 2);
+}
+
+type ThroughReferenceRow<'a> = (
+    &'a str,
+    &'a str,
+    fallow_types::extract::ImportBindingReferenceKind,
+    &'a str,
+    Option<&'a str>,
+);
+
+/// Each reference through a wrapper as (wrapper, member path, kind, source
+/// text at the offset, declared name).
+fn through_references<'a>(info: &'a ModuleInfo, source: &'a str) -> Vec<ThroughReferenceRow<'a>> {
+    info.import_binding_references
+        .iter()
+        .filter_map(|reference| {
+            let through = reference.through.as_deref()?;
+            let offset = reference.span_start as usize;
+            Some((
+                through,
+                &*reference.member_path,
+                reference.kind,
+                &source[offset..offset + 6],
+                reference.declared_name.as_deref(),
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn import_binding_references_record_uses_of_an_exported_wrapper_in_its_module() {
+    use fallow_types::extract::ImportBindingReferenceKind::{
+        Call, InitializerCall, Other, ValueAlias,
+    };
+    let source = "import { useSelector } from 'pkg';\n\
+        export const useApp = useSelector.withTypes();\n\
+        export const useCount = () => useApp((s) => s.c);\n\
+        const alias = useApp;\n\
+        export const again = useApp;\n\
+        export const value = useApp(1);\n\
+        useApp.member();\n\
+        useApp?.(2);\n\
+        const typedPick = useSelector;\n\
+        export default typedPick;\n\
+        export { typedPick as usePick };\n\
+        typedPick(3);\n\
+        const local = useSelector;\n\
+        local(4);\n";
+    let info = parse(source);
+    assert_eq!(
+        through_references(&info, source),
+        vec![
+            ("useApp", "", Call, "useApp", None),
+            ("useApp", "", ValueAlias, "useApp", Some("alias")),
+            ("useApp", "", ValueAlias, "useApp", Some("again")),
+            ("useApp", "", InitializerCall, "useApp", Some("value")),
+            ("useApp", "member", Call, "useApp", None),
+            ("useApp", "", Other, "useApp", None),
+            ("typedPick", "", Call, "typedP", None),
+        ]
+    );
+    // The direct references keep their rows: the two wrapper definitions and
+    // the alias that the module does not export.
+    let direct = info
+        .import_binding_references
+        .iter()
+        .filter(|reference| reference.through.is_none())
+        .count();
+    assert_eq!(direct, 3);
+}
+
+#[test]
+fn class_member_remediation_awaited_destructure_preserves_factory_boundaries() {
+    let info = parse(
+        r"
+        class Service { used() {} promiseOnly() {} generatorOnly() {} }
+        async function make() { return new Service(); }
+        function* generate() { return new Service(); }
+        const { used: alias } = await make();
+        const { promiseOnly } = make();
+        const { generatorOnly } = await generate();
+        ",
+    );
+    assert!(has_member_access(&info, "Service", "used"));
+    assert!(!has_member_access(&info, "Service", "promiseOnly"));
+    assert!(!has_member_access(&info, "Service", "generatorOnly"));
+
+    let imported = parse(
+        "import { make } from './service'; const { used } = await make(); const { promiseOnly } = make();",
+    );
+    let facts: Vec<_> = imported
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            SemanticFact::FactoryFnMemberAccess(access) => Some((
+                access.callee_name.as_str(),
+                access.member.as_str(),
+                access.awaited,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        [("make", "used", true), ("make", "promiseOnly", false)]
+    );
+}
+
+#[test]
+fn class_member_remediation_map_iteration_keeps_value_bindings_scoped() {
+    let info = parse(
+        r"
+        import { Item } from './lib';
+        const items = new Map<string, Item>();
+        for (const [, value] of items.entries()) value.entriesUsed();
+        items.forEach(value => value.callbackUsed());
+        items.forEach((other, value) => value.keyOnly());
+        for (const [value] of items.entries()) value.keyOnly();
+        function unrelated(items: unknown) {
+            items.forEach(value => value.unknownOnly());
+        }
+        ",
+    );
+    assert!(has_member_access(&info, "Item", "entriesUsed"));
+    assert!(has_member_access(&info, "Item", "callbackUsed"));
+    assert!(!has_member_access(&info, "Item", "keyOnly"));
+    assert!(!has_member_access(&info, "Item", "unknownOnly"));
+}
+
+#[test]
+fn namespace_subclass_member_facts_preserve_binding_identity() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class Sub extends ns.C {}
+        class Child extends Sub {}
+        Sub.live();
+        const value = new Child();
+        value.instance();
+        const callback = Child.passed;
+        const shadow = (Sub: { wrong(): void }): void => { Sub.wrong(); };
+        const unknown = (value: { unknown(): void }): void => { value.unknown(); };
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(
+        facts,
+        [
+            ("ns", "C", "instance"),
+            ("ns", "C", "live"),
+            ("ns", "C", "passed")
+        ]
+    );
+}
+
+#[test]
+fn namespace_subclass_unproven_heritage_and_receivers_have_no_precise_fact() {
+    for unproven in [
+        "class Bad extends mixin(ns.C) {}; Bad.wrong();",
+        "class Bad extends (condition ? ns.C : Other) {}; Bad.wrong();",
+        "class Bad extends ns[key] {}; Bad.wrong();",
+        "class Bad extends ns.deep.C {}; Bad.wrong();",
+        "class Bad extends fallback.C {}; Bad.wrong();",
+        "const fake = { C: class {} }; class Bad extends fake.C {}; Bad.wrong();",
+        "const alias = ns; class Bad extends alias.C {}; Bad.wrong();",
+        "class Bad extends types.C {}; Bad.wrong();",
+        "const shadow = (Sub: { wrong(): void }): void => { Sub.wrong(); };",
+        "const construct = (Sub: new () => { wrong(): void }): void => { const value = new Sub(); value.wrong(); };",
+        "const shadow = (): void => { const ns = { C: class {} }; class Bad extends ns.C {}; Bad.wrong(); };",
+        "const unknown = { wrong: (): void => {} }; unknown.wrong();",
+        "let value = new Sub(); value = opaque; value.wrong();",
+        "const holder = { item: new Sub() }; const shadow = (Sub: new () => { wrong(): void }): void => { holder.item = new Sub(); holder.item.wrong(); };",
+        "class A extends B {}; class B extends A {}; A.wrong();",
+    ] {
+        let info = parse(&format!(
+            r"
+            import * as ns from './base';
+            import fallback from './base';
+            import type * as types from './base';
+            class Sub extends ns.C {{}}
+            Sub.live();
+            {unproven}
+        "
+        ));
+        let facts: Vec<_> = info
+            .semantic_facts
+            .iter()
+            .filter_map(|fact| {
+                let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                    return None;
+                };
+                Some((
+                    fact.namespace_local.as_str(),
+                    fact.class_export_name.as_str(),
+                    fact.member.as_str(),
+                ))
+            })
+            .collect();
+        assert_eq!(facts, [("ns", "C", "live")], "unproven case: {unproven}");
+    }
+}
+
+#[test]
+fn local_subclass_alias_path_cycles_terminate() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class Sub extends ns.C {}
+        Sub.live();
+        const first = second.item;
+        const second = first;
+        first.wrong();
+    ",
+    );
+    let facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    assert_eq!(facts, [("ns", "C", "live")]);
+}
+
+#[test]
+fn local_subclass_property_writes_keep_source_time_provenance() {
+    for mutation in [
+        "const shadow = (Sub: new () => { wrong(): void }): void => { holder.item = new Sub(); holder.item.wrong(); };",
+        "const alias = holder; const shadow = (Sub: new () => { wrong(): void }): void => { alias.item = new Sub(); holder.item.wrong(); };",
+        "holder.item = opaque; holder.item.wrong();",
+        "holder.item += opaque; holder.item.wrong();",
+        "holder[key] = new Sub(); holder.item.wrong();",
+        "delete holder.item; holder.item.wrong();",
+        "holder.item++; holder.item.wrong();",
+        "const container = { inner: holder }; container.inner.item = opaque; holder.item.wrong();",
+    ] {
+        let info = parse(&format!(
+            r"
+            import * as ns from './base';
+            class Sub extends ns.C {{}}
+            const holder = {{ item: new Sub() }};
+            holder.item.before();
+            holder.item = new Sub();
+            holder.item.replaced();
+            {mutation}
+        "
+        ));
+        let mut facts: Vec<_> = info
+            .semantic_facts
+            .iter()
+            .filter_map(|fact| {
+                let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                    return None;
+                };
+                Some((
+                    fact.namespace_local.as_str(),
+                    fact.class_export_name.as_str(),
+                    fact.member.as_str(),
+                ))
+            })
+            .collect();
+        facts.sort_unstable();
+        assert_eq!(
+            facts,
+            [("ns", "C", "before"), ("ns", "C", "replaced")],
+            "mutation: {mutation}"
+        );
+    }
+}
+
+#[test]
+fn bare_subclass_member_facts_preserve_binding_identity() {
+    let info = parse(
+        r"
+        import { C } from './base';
+        class Sub extends C {}
+        Sub.live();
+        const value = new Sub();
+        value.instance();
+        const shadow = (Sub: { wrong(): void }): void => { Sub.wrong(); };
+        const unknown = (value: { unknown(): void }): void => { value.unknown(); };
+    ",
+    );
+    let mut members: Vec<_> = info
+        .member_accesses
+        .iter()
+        .filter(|access| access.object == "C")
+        .map(|access| access.member.as_str())
+        .collect();
+    members.sort_unstable();
+    assert_eq!(members, ["instance", "live"]);
+}
+
+#[test]
+fn local_subclass_copied_instance_retains_initial_property_target() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class Sub extends ns.C {}
+        const holder = { item: new Sub() };
+        holder.item.before();
+        const captured = holder.item;
+        holder.item = opaque;
+        captured.retained();
+        holder.item.wrong();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(facts, [("ns", "C", "before"), ("ns", "C", "retained")]);
+}
+
+#[test]
+fn local_subclass_alias_chain_has_no_depth_cap() {
+    let mut source = String::from(
+        "import * as ns from './base'; class Sub extends ns.C {} const first = new Sub();",
+    );
+    for index in 0..128 {
+        let previous = if index == 0 {
+            String::from("first")
+        } else {
+            format!("alias{}", index - 1)
+        };
+        write!(source, "const alias{index} = {previous};").unwrap();
+    }
+    source.push_str("alias127.used(); Sub.live();");
+    let info = parse(&source);
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(facts, [("ns", "C", "live"), ("ns", "C", "used")]);
+}
+
+#[test]
+fn local_subclass_reads_before_declaration_keep_binding_identity() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        const read = (): void => {
+            Sub.staticUsed();
+            const instance = new Sub();
+            instance.instanceUsed();
+        };
+        class Sub extends ns.C {}
+        read();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(
+        facts,
+        [("ns", "C", "instanceUsed"), ("ns", "C", "staticUsed")]
+    );
+}
+
+#[test]
+fn local_subclass_holder_rebind_keeps_old_object_alias() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class D extends ns.C {}
+        D.live();
+        let h = { item: new D() };
+        const alias = h;
+        h = { item: unknown };
+        alias.item.used();
+        h.item.wrong();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(facts, [("ns", "C", "live"), ("ns", "C", "used")]);
+}
+
+#[test]
+fn local_subclass_object_mutation_invalidates_all_container_aliases() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class D extends ns.C {}
+        D.live();
+        const h = { item: new D() };
+        h.item.before();
+        const alias = h;
+        alias.item = unknown;
+        h.item.wrong();
+        alias.item.alsoWrong();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(facts, [("ns", "C", "before"), ("ns", "C", "live")]);
+}
+
+#[test]
+fn local_subclass_ancestor_replacement_detaches_old_container_alias() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class D extends ns.C {}
+        D.live();
+        const h = { inner: { item: new D() } };
+        const alias = h.inner;
+        h.inner = { item: unknown };
+        alias.item.used();
+        h.inner.item.wrong();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(facts, [("ns", "C", "live"), ("ns", "C", "used")]);
+}
+
+#[test]
+fn local_subclass_existing_type_rewrites_keep_terminal_origin() {
+    for source in [
+        "interface Options { item: Sub }; const read = (opts: Options): void => { opts.item.used(); }; read({ item: new Sub() });",
+        "type Options = { item: Sub }; const read = ({ item }: Options): void => { item.used(); }; read({ item: new Sub() });",
+        "class Holder<T extends Sub> { item: T; read(): void { this.item.used(); } }",
+    ] {
+        let info = parse(&format!(
+            r"
+            import * as ns from './base';
+            class Sub extends ns.C {{}}
+            Sub.live();
+            {source}
+        "
+        ));
+        let mut facts: Vec<_> = info
+            .semantic_facts
+            .iter()
+            .filter_map(|fact| {
+                let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                    return None;
+                };
+                Some((
+                    fact.namespace_local.as_str(),
+                    fact.class_export_name.as_str(),
+                    fact.member.as_str(),
+                ))
+            })
+            .collect();
+        facts.sort_unstable();
+        assert_eq!(
+            facts,
+            [("ns", "C", "live"), ("ns", "C", "used")],
+            "existing type route: {source}"
+        );
+    }
+}
+
+#[test]
+fn local_subclass_class_field_this_requires_lexical_ownership() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class Sub extends ns.C {}
+        Sub.live();
+        class Holder {
+            item: Sub = new Sub();
+            read(): void {
+                this.item.used();
+                const arrow = (): void => { this.item.lexical(); }; arrow();
+                function unrelated(this: { item: { wrong(): void } }): void { this.item.wrong(); }
+                unrelated.call({ item: { wrong() {} } });
+            }
+        }
+        new Holder().read();
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(
+        facts,
+        [
+            ("ns", "C", "lexical"),
+            ("ns", "C", "live"),
+            ("ns", "C", "used")
+        ]
+    );
+}
+
+#[test]
+fn local_subclass_existing_map_routes_keep_source_and_type_identity() {
+    let info = parse(
+        r"
+        import * as ns from './base';
+        class Sub extends ns.C {}
+        Sub.live();
+        const values = new Map<string, Sub>();
+        for (const item of values.values()) item.valueMember();
+        for (const [key, item] of values.entries()) { key.keyOnly(); item.entryMember(); }
+        values.forEach((item, key) => { item.callbackMember(); key.keyOnly(); });
+        values.get('one')!.getMember();
+        const shadow = (values: Map<string, { wrong(): void }>): void => {
+            for (const item of values.values()) item.wrong();
+        };
+        shadow(new Map());
+    ",
+    );
+    let mut facts: Vec<_> = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| {
+            let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                return None;
+            };
+            Some((
+                fact.namespace_local.as_str(),
+                fact.class_export_name.as_str(),
+                fact.member.as_str(),
+            ))
+        })
+        .collect();
+    facts.sort_unstable();
+    assert_eq!(
+        facts,
+        [
+            ("ns", "C", "callbackMember"),
+            ("ns", "C", "entryMember"),
+            ("ns", "C", "getMember"),
+            ("ns", "C", "live"),
+            ("ns", "C", "valueMember")
+        ]
+    );
+}
+
+fn assert_namespace_subclass_members(cases: &[(&str, &str, &[&str])]) {
+    let mut failures = Vec::new();
+    for (label, body, expected) in cases {
+        let info = parse(&format!(
+            "import * as ns from './base'; class Sub extends ns.C {{}} Sub.live(); {body}"
+        ));
+        let mut actual: Vec<_> = info
+            .semantic_facts
+            .iter()
+            .filter_map(|fact| {
+                let SemanticFact::QualifiedClassMemberAccess(fact) = fact else {
+                    return None;
+                };
+                (fact.namespace_local == "ns" && fact.class_export_name == "C")
+                    .then_some(fact.member.as_str())
+            })
+            .collect();
+        actual.sort_unstable();
+        actual.dedup();
+        if actual != *expected {
+            failures.push(format!("{label}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn local_subclass_review_boundaries_keep_current_value_proof() {
+    assert_namespace_subclass_members(&[
+        (
+            "named mutation",
+            r"interface Options { item: Sub } const factory = (): Options => ({ item: new Sub() }); const opts: Options = factory(); opts.item.before(); const saved = opts.item; const alias = opts; alias.item = { wrong() {} }; opts.item.wrong(); saved.used();",
+            &["before", "live", "used"],
+        ),
+        (
+            "named dynamic mutation",
+            r"interface Options { item: Sub } const factory = (): Options => ({ item: new Sub() }); const opts: Options = factory(); opts.item.before(); const key: string = 'item'; opts[key] = { wrong() {} }; opts.item.wrong();",
+            &["before", "live"],
+        ),
+        (
+            "map rebind",
+            r"let values = new Map<string, Sub>(); for (const item of values.values()) item.before(); values = new Map<string, { wrong(): void }>(); for (const item of values.values()) item.wrong(); for (const [key, item] of values.entries()) item.wrong(); values.forEach(item => item.wrong()); values.get('one')!.wrong();",
+            &["before", "live"],
+        ),
+        (
+            "map alias and replacement",
+            r"let values = new Map<string, Sub>(); const saved = values; values = new Map<string, { wrong(): void }>(); for (const item of saved.values()) item.used(); values = new Map<string, Sub>(); for (const item of values.values()) item.after();",
+            &["after", "live", "used"],
+        ),
+        (
+            "overlap",
+            r"let holder = { item: new Sub(), inner: { item: new Sub() } }; holder.item = holder.item; holder.item.used(); holder = holder.inner; holder.item.after(); let item = new Sub(); item = item; item.scalar();",
+            &["after", "live", "scalar", "used"],
+        ),
+        (
+            "duplicate unknown",
+            r"const holder = { item: new Sub(), item: null }; holder.item?.wrong(); const valid = { item: null, item: new Sub() }; valid.item.used();",
+            &["live", "used"],
+        ),
+        (
+            "this writes",
+            r"class Holder { item: Sub = new Sub(); read(): void { this.item.before(); this['item'] = { wrong() {} }; this.item.wrong(); } } new Holder().read();",
+            &["before", "live"],
+        ),
+        (
+            "this delete",
+            r"class Holder { item: Sub = new Sub(); read(): void { this.item.before(); delete this.item; this.item.wrong(); } } new Holder().read();",
+            &["before", "live"],
+        ),
+        (
+            "this update",
+            r"class Holder { item: Sub = new Sub(); read(): void { this.item.before(); this.item++; this.item.wrong(); } } new Holder().read();",
+            &["before", "live"],
+        ),
+        (
+            "this dynamic",
+            r"class Holder { item: Sub = new Sub(); read(): void { this.item.before(); const key: string = 'item'; this[key] = null; this.item.wrong(); } } new Holder().read();",
+            &["before", "live"],
+        ),
+        (
+            "array routes",
+            r"const values: Sub[] = [new Sub()]; for (const item of values) item.iterated(); values.forEach(item => item.callback()); const unknown = [{ wrong() {} }]; for (const item of unknown) item.wrong();",
+            &["callback", "iterated", "live"],
+        ),
+        (
+            "local typed property",
+            r"class Holder { item: Sub = new Sub(); } const holder = new Holder(); holder.item.used(); const read = (holder: Holder): void => holder.item.parameter(); read(holder);",
+            &["live", "parameter", "used"],
+        ),
+    ]);
+}
+
+#[test]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "TypeScript fixture braces are source syntax, not Rust formatting arguments"
+)]
+fn local_subclass_review_boundaries_keep_current_value_proof_additional() {
+    assert_namespace_subclass_members(&[
+        (
+            "nullable map",
+            r"const values: Map<string, Sub> | null = new Map(); for (const item of values!.values()) item.used();",
+            &["live", "used"],
+        ),
+        (
+            "memo",
+            r"const useMemo = <T>(factory:()=>T, deps:unknown[]):T => factory(); const item=useMemo(()=>new Sub(),[]); item.used();",
+            &["live", "used"],
+        ),
+        (
+            "derived",
+            r"declare const $derived: {<T>(value:T):T; by<T>(factory:()=>T):T}; const item=$derived(new Sub()); item.used(); const other=$derived.by(()=>new Sub()); other.callback();",
+            &["callback", "live", "used"],
+        ),
+        (
+            "factory array",
+            r"const wrap = <T>(factory:()=>T):[T] => [factory()]; const [item]=wrap(()=>new Sub()); item.used();",
+            &["live", "used"],
+        ),
+        (
+            "nullable assertion",
+            r"const flag=true; const value:unknown=new Sub(); const item=flag ? (value as Sub) : null; item?.used();",
+            &["live", "used"],
+        ),
+        (
+            "async memo",
+            r"const useMemo=<T>(factory:()=>T,deps:unknown[]):T=>factory(); const item=useMemo(async()=>new Sub(),[]); item.wrong();",
+            &["live"],
+        ),
+        (
+            "generator wrapper",
+            r"const wrap=<T>(factory:()=>T):[T]=>[factory()]; const [item]=wrap(function*(){return new Sub();}); item.wrong();",
+            &["live"],
+        ),
+        (
+            "array literal",
+            r"const values=[new Sub()]; for(const item of values) item.used(); values.forEach(item=>item.callback());",
+            &["callback", "live", "used"],
+        ),
+        (
+            "readonly array",
+            r"const values: ReadonlyArray<Sub> | null=[new Sub()]; for(const item of values!) item.used(); values!.forEach(item=>item.callback());",
+            &["callback", "live", "used"],
+        ),
+        (
+            "object array",
+            r"const holder:{items:Sub[]}={items:[new Sub()]}; for(const item of holder.items) item.used(); holder.items.forEach(item=>item.callback());",
+            &["callback", "live", "used"],
+        ),
+        (
+            "reactive array",
+            r"const ref=<T>(value:T):{value:T}=>({value}); const values=ref<Sub[]>([new Sub()]); for(const item of values.value) item.used(); values.value.forEach(item=>item.callback());",
+            &["callback", "live", "used"],
+        ),
+        (
+            "array parameter",
+            r"const read=(values:Sub[]):void=>{for(const item of values) item.used(); values.forEach(item=>item.callback());}; read([new Sub()]);",
+            &["callback", "live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+fn local_subclass_review_boundaries_keep_current_value_proof_remaining() {
+    assert_namespace_subclass_members(&[
+        (
+            "bound map result",
+            r"const values=new Map<string,Sub>(); const item=values.get('one')!; item.used();",
+            &["live", "used"],
+        ),
+        (
+            "assertion only",
+            r"declare const value:unknown; const item=true ? (value as Sub):null; item?.used();",
+            &["live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+fn local_subclass_late_producers_keep_call_time_and_projection_identity() {
+    assert_namespace_subclass_members(&[
+        (
+            "bound factory",
+            r"const make=()=>new Sub(); const item=make(); item.used();",
+            &["live", "used"],
+        ),
+        (
+            "unnamed factory",
+            r"const make=()=>new Sub(); make().used();",
+            &["live", "used"],
+        ),
+        (
+            "hoisted bound factory",
+            r"const item=make(); item.used(); function make(){return new Sub();}",
+            &["live", "used"],
+        ),
+        (
+            "hoisted unnamed factory",
+            r"make().used(); function make(){return new Sub();}",
+            &["live", "used"],
+        ),
+        (
+            "hoisted unrelated factory",
+            r"const item=make(); item.wrong(); function make(){return {wrong(){}};}",
+            &["live"],
+        ),
+        (
+            "object factory",
+            r"const make=()=>({item:new Sub()}); const result=make(); result.item.used();",
+            &["live", "used"],
+        ),
+        (
+            "late box",
+            r"const make=()=>new Sub(); const item=make(); const box={item}; box.item.used();",
+            &["live", "used"],
+        ),
+        (
+            "static factory",
+            r"class FactorySub extends ns.C {static create(){return new FactorySub();}} const item=FactorySub.create(); item.used();",
+            &["create", "live", "used"],
+        ),
+        (
+            "narrowing",
+            r"const read=(item:unknown)=>{if(item instanceof Sub)item.used();}; read(new Sub());",
+            &["live", "used"],
+        ),
+        (
+            "narrowing guard boundary",
+            r"const read=(item:unknown)=>{if(item instanceof Sub){item.used();}else{item.wrong();}item.wrong();}; read(new Sub());",
+            &["live", "used"],
+        ),
+        (
+            "narrowing rebind",
+            r"const read=(item:unknown)=>{if(item instanceof Sub){item.before();item={wrong(){}};item.wrong();}item.wrong();}; read(new Sub());",
+            &["before", "live"],
+        ),
+        (
+            "member destructure",
+            r"const item=new Sub(); const {used}=item; used();",
+            &["live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+fn local_subclass_late_producers_keep_call_time_and_projection_identity_additional() {
+    assert_namespace_subclass_members(&[
+        (
+            "inline assertion",
+            r"const item:unknown=new Sub(); (item as Sub).used();",
+            &["live", "used"],
+        ),
+        (
+            "super chain",
+            r"class Child extends Sub {call(){super.used();}} new Child().call();",
+            &["call", "live", "used"],
+        ),
+        (
+            "constructor field",
+            r"class Holder {item; constructor(){this.item=new Sub();} call(){this.item.used();}} new Holder().call();",
+            &["live", "used"],
+        ),
+        (
+            "factory rebind",
+            r"let make=()=>new Sub(); const saved=make(); make=()=>({wrong(){}}); const later=make(); saved.before(); later.wrong();",
+            &["before", "live"],
+        ),
+        (
+            "unnamed factory rebind",
+            r"let make=()=>new Sub(); make().before(); make=()=>({wrong(){}}); make().wrong();",
+            &["before", "live"],
+        ),
+        (
+            "static method rebind",
+            r"class FactorySub extends ns.C {static create(){return new FactorySub();}} const saved=FactorySub.create(); FactorySub.create=()=>({wrong(){}}); const later=FactorySub.create(); saved.before(); later.wrong();",
+            &["before", "create", "live"],
+        ),
+        (
+            "callee shadow",
+            r"const make=()=>new Sub(); const saved=make(); saved.before(); const read=(make:()=>{wrong():void})=>make().wrong(); read(()=>({wrong(){}}));",
+            &["before", "live"],
+        ),
+        (
+            "pending child alias mutation",
+            r"const make=()=>({item:new Sub()}); const result=make(); result.item.before(); const saved=result.item; const alias=result; alias.item={wrong(){}}; saved.retained(); result.item.wrong();",
+            &["before", "live", "retained"],
+        ),
+        (
+            "pending child dynamic mutation",
+            r"const make=()=>({item:new Sub()}); const result=make(); result.item.before(); const saved=result.item; const key:string='item'; result[key]=null; saved.retained(); result.item.wrong();",
+            &["before", "live", "retained"],
+        ),
+        (
+            "pending child replacement",
+            r"const make=()=>({item:new Sub()}); const result=make(); const saved=result.item; result.item=new Sub(); saved.before(); result.item.replacement();",
+            &["before", "live", "replacement"],
+        ),
+        (
+            "fresh object results",
+            r"const make=()=>({item:new Sub()}); const first=make(); const second=make(); first.item={wrong(){}}; first.item.wrong(); second.item.used();",
+            &["live", "used"],
+        ),
+        (
+            "pending root rebind",
+            r"const make=()=>({item:new Sub()}); let result=make(); const old=result; result={item:{wrong(){}}}; old.item.used(); result.item.wrong();",
+            &["live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+fn local_subclass_late_producers_keep_call_time_and_projection_identity_remaining() {
+    assert_namespace_subclass_members(&[
+        (
+            "async eligibility",
+            r"const make=async()=>new Sub(); const read=async()=>{const item=await make(); item.used(); const promise=make(); promise.wrong();}; read();",
+            &["live", "used"],
+        ),
+        (
+            "generator ineligible",
+            r"function* make(){return new Sub();} const item=make(); item.wrong();",
+            &["live"],
+        ),
+        (
+            "baseline negative alias",
+            r"const make=()=>{const saved=new Sub(); return saved;}; const item=make(); item.wrong();",
+            &["live"],
+        ),
+        (
+            "baseline negative unbound object",
+            r"const make=()=>({item:new Sub()}); make().item.wrong();",
+            &["live"],
+        ),
+        (
+            "baseline negative structural",
+            r"const read=(item:{wrong():void})=>item.wrong(); read(new Sub());",
+            &["live"],
+        ),
+    ]);
+}
+
+#[test]
+fn local_subclass_late_review_keeps_contracts_and_assignment_identity() {
+    assert_namespace_subclass_members(&[
+        (
+            "async contract",
+            r"const held=new Sub(); async function make():Promise<Sub>{return (()=>held)();} async function read():Promise<void>{const item=await make(); item.used(); const promise=make(); promise.wrong();} read();",
+            &["live", "used"],
+        ),
+        (
+            "factory member destructure",
+            r"function make():Sub{return new Sub();} const {used}=make(); used();",
+            &["live", "used"],
+        ),
+        (
+            "destructure receiver write",
+            r"let item=new Sub(); const saved=item; item.used(); ({item}={item:{wrong(){}}}); item.wrong(); saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "destructure factory write",
+            r"let make=()=>new Sub(); const saved=make(); ({make}={make:()=>({wrong(){}})}); const item=make(); item.wrong(); saved.used();",
+            &["live", "used"],
+        ),
+        (
+            "destructure container write",
+            r"const holder={item:new Sub()}; const saved=holder.item; holder.item.used(); ({item:holder.item}={item:{wrong(){}}}); holder.item.wrong(); saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "iteration existing receiver write",
+            r"let item=new Sub(); const saved=item; item.used(); for(item of [{wrong(){}}]){item.wrong();} saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "typed getter",
+            r"class Holder{get item():Sub{return new Sub();}} const holder=new Holder(); holder.item.used();",
+            &["live", "used"],
+        ),
+        (
+            "typed field lexical this alias",
+            r"class Holder{item:Sub=new Sub();call(){const item=this.item;item.used();}}new Holder().call();",
+            &["live", "used"],
+        ),
+        (
+            "initialized field lexical this alias",
+            r"class Holder{item=new Sub();call(){const item=this.item;item.used();}}new Holder().call();",
+            &["live", "used"],
+        ),
+        (
+            "arrow lexical this alias",
+            r"class Holder{item:Sub=new Sub();call(){const read=()=>{const item=this.item;item.used();};read();}}new Holder().call();",
+            &["live", "used"],
+        ),
+        (
+            "independent this alias",
+            r"class Holder{item:Sub=new Sub();call(){const item=this.item;item.used();function read(this:{item:{wrong():void}}){const item=this.item;item.wrong();}read.call({item:{wrong(){}}});}}new Holder().call();",
+            &["live", "used"],
+        ),
+        (
+            "constructor property",
+            r"class Holder{constructor(public item:Sub){}} const holder=new Holder(new Sub()); holder.item.used();",
+            &["live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "TypeScript fixture braces are source syntax, not Rust formatting arguments"
+)]
+fn local_subclass_late_review_keeps_contracts_and_assignment_identity_additional() {
+    assert_namespace_subclass_members(&[
+        (
+            "getter terminal shadow",
+            r"class Holder<Sub>{get item():Sub{return null as Sub;}} const holder=new Holder<{wrong():void}>();holder.item.wrong();",
+            &["live"],
+        ),
+        (
+            "constructor terminal shadow",
+            r"class Holder<Sub>{constructor(public item:Sub){}} const holder=new Holder({wrong(){}});holder.item.wrong();",
+            &["live"],
+        ),
+        (
+            "nested array property write",
+            r"const holder={item:new Sub()};const saved=holder.item;holder.item.used();({nested:[holder.item]}={nested:[{wrong(){}}]});holder.item.wrong();saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "array default receiver write",
+            r"let item=new Sub();const saved=item;item.used();[item={wrong(){}}]=[];item.wrong();saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "object rest receiver write",
+            r"let item=new Sub();const saved=item;item.used();({...item}={wrong(){}});item.wrong();saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "for in receiver write",
+            r"let item=new Sub();const saved=item;item.used();for(item in {key:0}){item.wrong();}saved.retained();",
+            &["live", "retained", "used"],
+        ),
+        (
+            "awaited factory member destructure",
+            r"const held=new Sub();async function make():Promise<Sub>{return (()=>held)();}async function read(){const {used}=await make();used();const {wrong}=make();wrong();}read();",
+            &["live", "used"],
+        ),
+        (
+            "factory destructure rebind",
+            r"let make=()=>new Sub();const {used}=make();used();({make}={make:()=>({wrong(){}})});const {wrong}=make();wrong();",
+            &["live", "used"],
+        ),
+        (
+            "factory destructure shadow",
+            r"function make():Sub{return new Sub();}const {used}=make();used();const read=(make:()=>{wrong():void})=>{const {wrong}=make();wrong();};read(()=>({wrong(){}}));",
+            &["live", "used"],
+        ),
+        (
+            "promise all baseline negative",
+            r"async function read():Promise<void>{const values=await Promise.all([0].map(async():Promise<Sub>=>new Sub())); for(const item of values)item.wrong();} read();",
+            &["live"],
+        ),
+    ]);
+}
+
+#[test]
+fn entry_script_iteration_preserves_original_writer_callback_facts() {
+    let source =
+        include_str!("../../../../tests/fixtures/issue-1793-entry-script-iteration/src/main.ts");
+    let info = parse(source);
+    let mut actual: Vec<_> = info
+        .member_accesses
+        .iter()
+        .filter(|access| access.object == "SyntheticSchemaWriter")
+        .map(|access| access.member.as_str())
+        .collect();
+    actual.sort_unstable();
+    actual.dedup();
+    assert_eq!(
+        actual,
+        [
+            "resetSchema",
+            "writeGraphDiagram",
+            "writeSchemaData",
+            "writeSchemaTyped"
+        ],
+        "the original entry-script's declared CreatedDb callback must retain its existing property join: {:?}",
+        info.member_accesses
+    );
+}
+
+#[test]
+fn entry_script_iteration_keeps_scoped_named_callback_targets() {
+    for capture in [false, true] {
+        let subclass = if capture {
+            "import * as ns from './base'; class Sub extends ns.Base {} Sub.live();"
+        } else {
+            ""
+        };
+        let source = format!(
+            "{subclass} {}",
+            r"
+            import { SyntheticSchemaWriter, OtherWriter } from './writer';
+            type CreatedDb = { writer: SyntheticSchemaWriter };
+            type OtherDb = { writer: OtherWriter };
+            async function createDb(): Promise<CreatedDb> { return null as CreatedDb; }
+            export async function generate() {
+                const inferred = await Promise.all(['one'].map(async () => createDb()));
+                inferred.map(dbMapped => dbMapped.writer.inferred());
+                const direct: SyntheticSchemaWriter[] = [];
+                direct.map(directWriter => directWriter.direct());
+                const declared: CreatedDb[] = [];
+                declared.map((typedDb: CreatedDb) => typedDb.writer.typed());
+                const sibling: OtherDb[] = [];
+                sibling.map(dbMapped => dbMapped.writer.otherOnly());
+                inferred.map(dbMapped => {
+                    const read = (dbMapped: { writer: { nestedShadow(): void } }) => dbMapped.writer.nestedShadow();
+                    read({ writer: { nestedShadow() {} } });
+                    dbMapped.writer.inferred();
+                });
+                const unknown = [{ writer: { unknownOnly() {} } }];
+                unknown.map(dbMapped => dbMapped.writer.unknownOnly());
+                const read = (dbMapped: { writer: { shadowOnly(): void } }) => dbMapped.writer.shadowOnly();
+                read({ writer: { shadowOnly() {} } });
+            }
+        "
+        );
+        let info = parse(&source);
+        let mut actual: Vec<_> = info
+            .member_accesses
+            .iter()
+            .filter(|access| access.object == "SyntheticSchemaWriter")
+            .map(|access| access.member.as_str())
+            .collect();
+        actual.sort_unstable();
+        actual.dedup();
+        let other: Vec<_> = info
+            .member_accesses
+            .iter()
+            .filter(|access| access.object == "OtherWriter")
+            .map(|access| access.member.as_str())
+            .collect();
+        assert_eq!(
+            other,
+            ["otherOnly"],
+            "the sibling callback retains its own target"
+        );
+        assert_eq!(
+            actual,
+            ["direct", "inferred", "typed"],
+            "capture={capture}: declared callback targets must survive scope exit without unknown or same-name parameter credit: {:?}",
+            info.member_accesses
+        );
+    }
+}
+
+#[test]
+fn entry_script_iteration_invalidates_replaced_ordinary_paths() {
+    assert_ordinary_callback_writer_members(&[
+        (
+            "property opaque",
+            "rows.map(row => { row.writer.live(); row.writer = opaque(); row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "property object",
+            "rows.map(row => { row.writer.live(); row.writer = {wrong(){}}; row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "root opaque",
+            "rows.map(row => { row.writer.live(); row = opaque(); row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "intermediate opaque",
+            "holders.map(holder => { holder.nested.writer.live(); holder.nested = opaque(); holder.nested.writer.wrong(); });",
+            false,
+        ),
+        (
+            "known property",
+            "rows.map(row => { row.writer.live(); row.writer = new Other(); row.writer.other(); });",
+            true,
+        ),
+        (
+            "known root",
+            "rows.map(row => { row.writer.live(); row = {writer:new Other()}; row.writer.other(); });",
+            true,
+        ),
+        (
+            "known intermediate",
+            "holders.map(holder => { holder.nested.writer.live(); holder.nested = new OtherRow(); holder.nested.writer.other(); });",
+            true,
+        ),
+        (
+            "property delete",
+            "rows.map(row => { row.writer.live(); delete row.writer; row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "property update",
+            "rows.map(row => { row.writer.live(); row.writer++; row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "unknown key",
+            "rows.map(row => { row.writer.live(); row[key] = opaque(); row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "destructure leaf",
+            "rows.map(row => { row.writer.live(); ({item:row.writer}={item:opaque()}); row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "loop leaf",
+            "rows.map(row => { row.writer.live(); for(row.writer of [opaque()]) row.writer.wrong(); });",
+            false,
+        ),
+        (
+            "copy barrier",
+            "rows.map(row => { row.writer.live(); row.writer=opaque(); const saved=row; saved.writer.wrong(); });",
+            false,
+        ),
+        (
+            "overlapping copy",
+            "holders.map(holder => { holder.nested.writer.live(); holder.nested.writer=opaque(); holder=holder.nested; holder.writer.wrong(); });",
+            false,
+        ),
+    ]);
+}
+
+fn assert_ordinary_callback_writer_members(cases: &[(&str, &str, bool)]) {
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        for (label, body, other_used) in cases {
+            let subclass = if capture {
+                "import * as ns from './base'; class Sub extends ns.Base {} Sub.live();"
+            } else {
+                ""
+            };
+            let source = format!(
+                "{subclass} {} {body}",
+                r"
+                import { Writer } from './writer'; import { Other } from './other';
+                type Row={writer:Writer}; type Holder={nested:Row};
+                class OtherRow{writer:Other=new Other();}
+                const opaque=()=>({writer:{wrong(){}},wrong(){}});
+                const rows:Row[]=[]; const holders:Holder[]=[];
+            "
+            );
+            let info = parse(&source);
+            let mut writer: Vec<_> = info
+                .member_accesses
+                .iter()
+                .filter(|a| a.object == "Writer")
+                .map(|a| a.member.as_str())
+                .collect();
+            writer.sort_unstable();
+            writer.dedup();
+            let mut other: Vec<_> = info
+                .member_accesses
+                .iter()
+                .filter(|a| a.object == "Other")
+                .map(|a| a.member.as_str())
+                .collect();
+            other.sort_unstable();
+            other.dedup();
+            let expected_other: &[&str] = if *other_used { &["other"] } else { &[] };
+            if writer != ["live"] || other != expected_other {
+                failures.push(format!(
+                    "{label}, capture={capture}: Writer={writer:?}, Other={other:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "replaced ordinary receiver paths must not regain old terminal types: {failures:?}"
+    );
+}
+
+#[test]
+fn entry_script_iteration_invalidates_opaque_object_replacement_prefixes() {
+    assert_ordinary_callback_writer_members(&[
+        (
+            "property spread",
+            "rows.map(row=>{row.writer.live();row.writer={...opaque()};row.writer.wrong();});",
+            false,
+        ),
+        (
+            "computed object key",
+            "rows.map(row=>{row.writer.live();row.writer={[key]:opaque()};row.writer.wrong();});",
+            false,
+        ),
+        (
+            "spread after known child",
+            "rows.map(row=>{row.writer.live();row.writer={child:new Other(),...opaque()};row.writer.wrong();});",
+            false,
+        ),
+        (
+            "known child after spread",
+            "rows.map(row=>{row.writer.live();row.writer={...opaque(),child:new Other()};row.writer.child.other();});",
+            true,
+        ),
+    ]);
+}
+
+#[test]
+fn ordinary_path_barriers_preserve_initializer_and_function_ownership() {
+    type OwnershipCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let cases: &[OwnershipCase<'_>] = &[
+        (
+            "duplicate identifier initializer",
+            "const beta=new Beta(); const holder={property:new Alpha(),property:beta}; holder.property.betaOnly();",
+            &[("Beta", "betaOnly")],
+        ),
+        (
+            "function replacement",
+            "const holder={property:new Alpha()}; function mutate(){holder.property=new Beta();holder.property.betaOnly();} holder.property.alphaOnly();console.log(mutate);",
+            &[
+                ("Alpha", "alphaOnly"),
+                ("Beta", "alphaOnly"),
+                ("Beta", "betaOnly"),
+            ],
+        ),
+        (
+            "called function replacement",
+            "const holder={property:new Alpha()};function mutate(){holder.property=new Beta();}mutate();holder.property.betaOnly();",
+            &[("Alpha", "betaOnly"), ("Beta", "betaOnly")],
+        ),
+        (
+            "known candidate after root spread",
+            "let holder={property:new Alpha()};function mutate(){holder={...unknown(),property:new Beta()};}mutate();holder.property.betaOnly();",
+            &[("Alpha", "betaOnly"), ("Beta", "betaOnly")],
+        ),
+        (
+            "local shadow stays local",
+            "const holder={property:new Alpha()};function mutate(){const holder={property:new Beta()};holder.property.betaOnly();}holder.property.alphaOnly();console.log(mutate);",
+            &[("Alpha", "alphaOnly"), ("Beta", "betaOnly")],
+        ),
+        (
+            "nested block in function",
+            "const holder={property:new Alpha()}; function mutate(){{holder.property=new Beta();}holder.property.betaOnly();}holder.property.alphaOnly();console.log(mutate);",
+            &[
+                ("Alpha", "alphaOnly"),
+                ("Beta", "alphaOnly"),
+                ("Beta", "betaOnly"),
+            ],
+        ),
+        (
+            "sibling function",
+            "const holder={property:new Alpha()}; function mutate(){holder.property=new Beta();holder.property.betaOnly();}function read(){holder.property.alphaOnly();}console.log(mutate,read);",
+            &[
+                ("Alpha", "alphaOnly"),
+                ("Beta", "alphaOnly"),
+                ("Beta", "betaOnly"),
+            ],
+        ),
+        (
+            "enclosing function owner",
+            "function outer(){const holder={property:new Alpha()}; function mutate(){holder.property=new Beta();holder.property.betaOnly();}function read(){holder.property.alphaOnly();}holder.property.alphaOnly();console.log(mutate,read);}console.log(outer);",
+            &[
+                ("Alpha", "alphaOnly"),
+                ("Beta", "alphaOnly"),
+                ("Beta", "betaOnly"),
+            ],
+        ),
+        (
+            "opaque function replacement",
+            "const holder={property:new Alpha()};function mutate(){holder.property.alphaBefore();{holder.property=unknown();}holder.property.wrong();}holder.property.alphaOnly();console.log(mutate);",
+            &[("Alpha", "alphaBefore"), ("Alpha", "alphaOnly")],
+        ),
+        (
+            "module block replacement",
+            "const holder={property:new Alpha()};holder.property.alphaBefore();{holder.property=new Beta();}holder.property.betaOnly();",
+            &[("Alpha", "alphaBefore"), ("Beta", "betaOnly")],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        for (label, body, expected) in cases {
+            let subclass = if capture {
+                "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+            } else {
+                ""
+            };
+            let info = parse(&format!(
+                "{subclass} import {{Alpha,Beta}} from './services';{body}"
+            ));
+            let mut actual = info
+                .member_accesses
+                .iter()
+                .filter(|a| matches!(a.object.as_str(), "Alpha" | "Beta"))
+                .map(|a| (a.object.as_str(), a.member.as_str()))
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            actual.dedup();
+            if actual != *expected {
+                failures.push(format!("{label},capture={capture}: {actual:?}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ordinary owner and deferred initializer preservation: {failures:?}"
+    );
+}
+
+#[test]
+fn ordinary_function_fork_keeps_subclass_value_identity() {
+    assert_namespace_subclass_members(&[
+        (
+            "root rebind keeps outer owner",
+            "let holder={item:new Sub()}; function replace(){holder={item:unknown};holder.item.wrong();}holder.item.used();console.log(replace);",
+            &["live", "used"],
+        ),
+        (
+            "saved child and local alias",
+            "const holder={item:new Sub()};function replace(){const alias=holder;const saved=holder.item;alias.item=unknown;holder.item.wrong();saved.used();}console.log(replace);",
+            &["live", "used"],
+        ),
+    ]);
+}
+
+#[test]
+fn refused_ordinary_function_fork_does_not_mutate_outer_targets() {
+    use std::fmt::Write as _;
+
+    const DENSE_OBJECT_PROPERTIES: usize = 5000;
+    let mut padding = String::new();
+    for index in 0..DENSE_OBJECT_PROPERTIES {
+        write!(&mut padding, "p{index}:new Beta(),").expect("writing to a String cannot fail");
+    }
+    for capture in [false, true] {
+        let subclass = if capture {
+            "import * as ns from './base';class Sub extends ns.Base{}Sub.live();"
+        } else {
+            ""
+        };
+        let source = format!(
+            "{subclass} import {{Alpha,Beta}} from './services';let holder={{property:new Alpha(),{padding}}};holder.property.before();function mutate(){{if(holder instanceof Object){{holder.property=new Beta();holder.property.wrong();}}holder.property=unknown();holder.property.wrong();holder.property=new Beta();holder.property.wrong();holder={{...unknown(),property:new Beta()}};holder.property.wrong();}}holder.property.after();console.log(mutate);"
+        );
+        let info = parse(&source);
+        let mut alpha = info
+            .member_accesses
+            .iter()
+            .filter(|a| a.object == "Alpha")
+            .map(|a| a.member.as_str())
+            .collect::<Vec<_>>();
+        alpha.sort_unstable();
+        alpha.dedup();
+        assert_eq!(alpha, ["after", "before"], "capture={capture}");
+        assert!(
+            !info.whole_object_uses.iter().any(|name| name == "Alpha"),
+            "function fork refusal must not globally abstain Alpha: capture={capture}"
+        );
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|a| matches!(a.object.as_str(), "Alpha" | "Beta") && a.member == "wrong"),
+            "refused current-function admission must block stale precise targets: capture={capture}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_narrowing_overlay_keeps_immediate_function_slot() {
+    let cases = [
+        (
+            "first guarded assignment",
+            "const holder={property:new Alpha()};holder.property.before();function mutate(){if(holder instanceof Object){holder.property=new Beta();}}mutate();holder.property.used();holder.property=unknown();holder.property.wrong();",
+        ),
+        (
+            "guard after fork",
+            "const holder={property:new Alpha()};holder.property.before();function mutate(){holder.property=new Alpha();if(holder instanceof Object){holder.property=new Beta();}holder.property.used();holder.property=unknown();holder.property.wrong();}console.log(mutate);",
+        ),
+        (
+            "nested owner chain",
+            "const holder={property:new Alpha()};holder.property.before();function outer(){holder.property=new Alpha();function mutate(){if(holder instanceof Object){holder.property=new Beta();}}mutate();holder.property.used();holder.property=unknown();holder.property.wrong();}outer();holder.property.used();",
+        ),
+        (
+            "sibling frame reuse",
+            "const holder={property:new Alpha()};holder.property.before();function mutate(){if(holder instanceof Object){holder.property=new Beta();}}function sibling(){const holder={property:new Alpha()};holder.property=unknown();holder.property.wrong();}mutate();sibling();holder.property.used();",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        for (label, body) in cases {
+            let subclass = if capture {
+                "import * as ns from './base';class Sub extends ns.Base{}Sub.live();"
+            } else {
+                ""
+            };
+            let info = parse(&format!(
+                "{subclass}import {{Alpha,Beta}} from './services';{body}"
+            ));
+            let alpha_before = info
+                .member_accesses
+                .iter()
+                .any(|a| a.object == "Alpha" && a.member == "before");
+            let beta_used = info
+                .member_accesses
+                .iter()
+                .any(|a| a.object == "Beta" && a.member == "used");
+            let wrong = info
+                .member_accesses
+                .iter()
+                .any(|a| matches!(a.object.as_str(), "Alpha" | "Beta") && a.member == "wrong");
+            if !alpha_before || !beta_used || wrong {
+                failures.push(format!(
+                    "{label},capture={capture}: {:?}",
+                    info.member_accesses
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "narrowing must preserve immediate ordinary slot ownership: {failures:?}"
+    );
+}
+
+#[test]
+fn ordinary_conditional_first_write_joins_reachable_targets() {
+    let cases = [
+        (
+            "first write",
+            "if(flag){holder.property=new Beta();}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "compound narrowing",
+            "if(flag && holder instanceof Object){holder.property=new Beta();}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "prefork replacement",
+            "holder.property=new Gamma();if(flag){holder.property=new Beta();}",
+            vec!["Beta", "Gamma"],
+        ),
+        (
+            "exhaustive alternatives",
+            "if(flag){holder.property=new Beta();}else{holder.property=new Gamma();}",
+            vec!["Beta", "Gamma"],
+        ),
+        (
+            "nested alternative",
+            "if(flag){if(other){holder.property=new Beta();}}else{holder.property=new Gamma();}",
+            vec!["Alpha", "Beta", "Gamma"],
+        ),
+        (
+            "unknown alternative",
+            "if(flag){holder.property=unknown();}else{holder.property=new Beta();}",
+            vec!["Beta"],
+        ),
+        (
+            "unknown after join",
+            "if(flag){holder.property=new Beta();}holder.property=unknown();",
+            vec![],
+        ),
+        (
+            "unconditional replacement",
+            "holder.property=new Beta();",
+            vec!["Beta"],
+        ),
+    ];
+    assert_ordinary_conditional_targets(&cases);
+}
+
+#[test]
+fn ordinary_conditional_expressions_and_loops_join_reachable_targets() {
+    let cases = [
+        (
+            "ternary",
+            "flag ? holder.property=new Beta() : undefined;",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "and",
+            "flag && (holder.property=new Beta());",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "or",
+            "flag || (holder.property=new Beta());",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "nullish",
+            "value ?? (holder.property=new Beta());",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "while",
+            "while(flag){holder.property=new Beta();break;}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "for",
+            "for(let i=0;i<(flag?1:0);i++){holder.property=new Beta();}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "for-of",
+            "for(const item of (flag?[1]:[])){holder.property=new Beta();}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "for-in",
+            "for(const key in (flag?{ x: 1 }:{})){holder.property=new Beta();}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "switch",
+            "switch(flag){case true:holder.property=new Beta();break;}",
+            vec!["Alpha", "Beta"],
+        ),
+        (
+            "do-while replacement",
+            "do{holder.property=new Beta();}while(false);",
+            vec!["Beta"],
+        ),
+    ];
+    assert_ordinary_conditional_targets(&cases);
+}
+
+fn assert_ordinary_conditional_targets(cases: &[(&str, &str, Vec<&str>)]) {
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        for (label, body, expected) in cases {
+            let marker = if capture {
+                "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+            } else {
+                ""
+            };
+            let info = parse(&format!(
+                "{marker}import {{Alpha,Beta,Gamma}} from './services';const holder={{property:new Alpha()}};function mutate(flag:boolean,other:boolean){{{body}holder.property.used();}}mutate(flag,other);"
+            ));
+            let mut actual = info
+                .member_accesses
+                .iter()
+                .filter(|a| {
+                    a.member == "used" && matches!(a.object.as_str(), "Alpha" | "Beta" | "Gamma")
+                })
+                .map(|a| a.object.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            actual.dedup();
+            if actual != *expected {
+                failures.push(format!(
+                    "{label},capture={capture}: expected {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "conditional reachable targets: {failures:?}"
+    );
+}
+
+#[test]
+fn ordinary_conditional_writes_keep_local_order_and_outer_possibilities() {
+    let cases = [
+        (
+            "branch order",
+            "const holder={property:new Alpha()};function mutate(){if(flag){holder.property=new Beta();holder.property.inside();}holder.property.after();}console.log(mutate);",
+            vec![("Alpha", "after"), ("Beta", "after"), ("Beta", "inside")],
+        ),
+        (
+            "outer union",
+            "const holder={property:new Alpha()};function mutate(){holder.property=new Gamma();if(flag){holder.property=new Beta();}}mutate();holder.property.after();",
+            vec![("Alpha", "after"), ("Beta", "after"), ("Gamma", "after")],
+        ),
+        (
+            "lexical shadow",
+            "const holder={property:new Alpha()};function mutate(){if(flag){let holder={property:new Gamma()};holder.property=new Beta();holder.property.inside();}holder.property.after();}console.log(mutate);",
+            vec![("Alpha", "after"), ("Beta", "inside")],
+        ),
+        (
+            "unknown parent on both arms",
+            "const holder={child:{property:new Alpha()}};function mutate(){holder.child.property.before();if(flag){holder.child=unknown();}else{holder.child=unknown();}holder.child.property.wrong();}console.log(mutate);",
+            vec![("Alpha", "before")],
+        ),
+        (
+            "known and unknown parent",
+            "const holder={child:{property:new Alpha()}};function mutate(){if(flag){holder.child=unknown();}else{holder.child.property=new Beta();}holder.child.property.after();}console.log(mutate);",
+            vec![("Beta", "after")],
+        ),
+        (
+            "module conditional",
+            "const holder={property:new Alpha()};if(flag){holder.property=new Beta();}holder.property.after();",
+            vec![("Alpha", "after"), ("Beta", "after")],
+        ),
+    ];
+    for capture in [false, true] {
+        for (label, body, expected) in &cases {
+            let marker = if capture {
+                "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+            } else {
+                ""
+            };
+            let info = parse(&format!(
+                "{marker}import {{Alpha,Beta,Gamma}} from './services';{body}"
+            ));
+            let mut actual = info
+                .member_accesses
+                .iter()
+                .filter(|a| matches!(a.object.as_str(), "Alpha" | "Beta" | "Gamma"))
+                .map(|a| (a.object.as_str(), a.member.as_str()))
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            actual.dedup();
+            assert_eq!(actual, *expected, "{label},capture={capture}");
+        }
+    }
+}
+
+#[test]
+fn ordinary_conditional_join_refusal_stays_local_and_blocks_stale_descendants() {
+    use std::fmt::Write as _;
+    const DENSE_OBJECT_PROPERTIES: usize = 1000;
+    let mut properties = String::new();
+    for index in 0..DENSE_OBJECT_PROPERTIES {
+        write!(&mut properties, "p{index}:new Alpha(),").unwrap();
+    }
+    for capture in [false, true] {
+        let marker = if capture {
+            "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+        } else {
+            ""
+        };
+        let info = parse(&format!(
+            "{marker}import {{Alpha,Beta,Gamma}} from './services';const holder={{property:new Alpha(),{properties}}};holder.property.before();function mutate(){{if(flag){{holder.property=new Beta();}}else{{holder.property=new Gamma();}}holder.property.wrong();holder.property=unknown();holder.property.wrong();}}holder.property.after();console.log(mutate);"
+        ));
+        let mut alpha = info
+            .member_accesses
+            .iter()
+            .filter(|a| a.object == "Alpha")
+            .map(|a| a.member.as_str())
+            .collect::<Vec<_>>();
+        alpha.sort_unstable();
+        alpha.dedup();
+        assert_eq!(alpha, ["after", "before"], "capture={capture}");
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|a| matches!(a.object.as_str(), "Alpha" | "Beta" | "Gamma")
+                    && a.member == "wrong"),
+            "refused joined root stays blocked, capture={capture}"
+        );
+        assert!(
+            !info.whole_object_uses.iter().any(|name| name == "Alpha"),
+            "local refusal must not abstain the outer class"
+        );
+    }
+}
+
+#[test]
+fn ordinary_for_update_reaches_later_iteration_members() {
+    let mut failures = Vec::new();
+    for capture in [false, true] {
+        let marker = if capture {
+            "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+        } else {
+            ""
+        };
+        let info = parse(&format!(
+            "{marker}import {{Alpha,Beta}} from './services';const holder={{property:new Alpha()}};function mutate(){{for(let i=0;i<2;holder.property=new Beta(),i++){{holder.property.used();}}}}mutate();"
+        ));
+        for class in ["Alpha", "Beta"] {
+            if !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == class && access.member == "used")
+            {
+                failures.push(format!(
+                    "capture={capture}, class={class}: {:?}",
+                    info.member_accesses
+                ));
+            }
+        }
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "Beta" && access.member == "dead"),
+            "unused sibling stays uncredited"
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "loop update must reach the next iteration: {failures:?}"
+    );
+}
+
+#[test]
+fn nested_conditional_root_replacements_do_not_restore_subclass_proof() {
+    assert_namespace_subclass_members(&[
+        (
+            "outer replacement control",
+            "let holder={item:new Sub(),other:0};holder.item.before();if(flag){holder.other=1;if(other){holder=opaque();}else{holder=opaque();}}else{holder=opaque();}holder.item.wrong();",
+            &["before", "live"],
+        ),
+        (
+            "both nested outer arms",
+            "let holder={item:new Sub(),other:0};holder.item.before();if(flag){holder.other=1;if(other){holder=opaque();}else{holder=opaque();}}else{holder.other=1;if(other){holder=opaque();}else{holder=opaque();}}holder.item.wrong();",
+            &["before", "live"],
+        ),
+    ]);
+}
+
+#[test]
+fn ordinary_for_update_body_replacement_preserves_local_order() {
+    for capture in [false, true] {
+        let marker = if capture {
+            "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+        } else {
+            ""
+        };
+        let info = parse(&format!(
+            "{marker}import {{Alpha,Beta,Gamma}} from './services';const holder={{property:new Alpha()}};function mutate(){{for(let i=0;i<2;(holder.property.updateRead(),holder.property=new Beta(),i++)){{holder.property=new Gamma();holder.property.bodyRead();}}}}mutate();"
+        ));
+        let mut actual = info
+            .member_accesses
+            .iter()
+            .filter(|a| matches!(a.object.as_str(), "Alpha" | "Beta" | "Gamma"))
+            .map(|a| (a.object.as_str(), a.member.as_str()))
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        actual.dedup();
+        assert!(
+            actual.contains(&("Gamma", "updateRead")),
+            "body receiver reaches the update: {actual:?}"
+        );
+        let body = actual
+            .iter()
+            .filter(|(_, member)| *member == "bodyRead")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body,
+            [("Gamma", "bodyRead")],
+            "body assignment replaces loop input"
+        );
+    }
+}
+
+#[test]
+fn ordinary_for_update_read_overwrite_boundaries() {
+    for capture in [false, true] {
+        for (label, update, gamma, beta) in [
+            (
+                "straight",
+                "holder.nested.property=new Beta(),holder.nested.property.updateRead()",
+                false,
+                true,
+            ),
+            (
+                "optional",
+                "flag&&(holder.nested.property=new Beta()),holder.nested.property.updateRead()",
+                true,
+                true,
+            ),
+            (
+                "unknown root",
+                "holder=opaque(),holder.nested.property.updateRead()",
+                false,
+                false,
+            ),
+            (
+                "unknown parent",
+                "holder.nested=opaque(),holder.nested.property.updateRead()",
+                false,
+                false,
+            ),
+            (
+                "optional unknown",
+                "flag&&(holder.nested=opaque()),holder.nested.property.updateRead()",
+                true,
+                false,
+            ),
+            (
+                "sibling",
+                "holder.other=1,holder.nested.property.updateRead()",
+                true,
+                false,
+            ),
+            (
+                "exhaustive",
+                "flag?(holder.nested.property=new Beta()):(holder.nested=new Beta()),holder.nested.property.updateRead()",
+                false,
+                true,
+            ),
+        ] {
+            assert_for_update_read_members(label, update, capture, gamma, beta);
+        }
+    }
+}
+
+#[test]
+fn ordinary_for_update_read_scope_and_timing_boundaries() {
+    for capture in [false, true] {
+        for (label, update, gamma, beta) in [
+            (
+                "function shadow",
+                "(()=>{const holder={nested:{property:new Beta()}};holder.nested.property.updateRead();})()",
+                false,
+                true,
+            ),
+            (
+                "parameter shadow",
+                "(holder=>{holder.nested.property=new Beta();holder.nested.property.updateRead();})(opaque())",
+                false,
+                true,
+            ),
+            (
+                "lexical shadow",
+                "(class {static {const holder={nested:{property:new Beta()}};holder.nested.property.updateRead();}})",
+                false,
+                true,
+            ),
+            (
+                "nested function write",
+                "(()=>{holder.nested.property=new Beta();}),holder.nested.property.updateRead()",
+                true,
+                true,
+            ),
+            (
+                "parent before optional",
+                "holder.nested=opaque(),flag&&(holder.other=1),holder.nested.property.updateRead()",
+                false,
+                false,
+            ),
+            (
+                "inside written arm",
+                "flag&&(holder.nested.property=new Beta(),holder.nested.property.updateRead())",
+                false,
+                true,
+            ),
+            (
+                "different siblings",
+                "flag?(holder.other=1):(holder.another=2),holder.nested.property.updateRead()",
+                true,
+                false,
+            ),
+            (
+                "right hand read",
+                "holder.nested.property=(holder.nested.property.updateRead(),new Beta())",
+                true,
+                false,
+            ),
+        ] {
+            assert_for_update_read_members(label, update, capture, gamma, beta);
+        }
+    }
+}
+
+fn assert_for_update_read_members(
+    label: &str,
+    update: &str,
+    capture: bool,
+    gamma: bool,
+    beta: bool,
+) {
+    let marker = if capture {
+        "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+    } else {
+        ""
+    };
+    let info = parse(&format!(
+        "{marker}import {{Alpha,Beta,Gamma}} from './services';let holder={{nested:{{property:new Alpha()}},other:0}};function mutate(flag){{for(let i=0;i<2;({update},i++)){{holder.nested.property=new Gamma();holder.nested.property.bodyRead();}}}}mutate(true);"
+    ));
+    for (class, expected) in [("Gamma", gamma), ("Beta", beta)] {
+        let actual = info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == class && a.member == "updateRead");
+        assert_eq!(
+            actual, expected,
+            "{label}, capture={capture}, {class}: {:?}",
+            info.member_accesses
+        );
+    }
+    assert!(
+        !info.member_accesses.iter().any(|a| a.member == "dead"),
+        "dead siblings remain uncredited"
+    );
+}
+
+#[test]
+fn ordinary_for_update_observes_initially_unresolved_property() {
+    for capture in [false, true] {
+        let marker = if capture {
+            "import * as ns from './base';class Sub extends ns.Base{}Sub.used();"
+        } else {
+            ""
+        };
+        let info = parse(&format!(
+            "{marker}import {{Gamma}} from './services';const holder={{property:opaque()}};function mutate(){{for(let i=0;i<2;(holder.property.updateRead(),i++)){{holder.property=new Gamma();}}}}mutate();"
+        ));
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|a| a.object == "Gamma" && a.member == "updateRead"),
+            "body makes unresolved ordinary path reachable, capture={capture}"
+        );
+        assert!(!info.member_accesses.iter().any(|a| a.member == "dead"));
+    }
+}
+
+#[test]
+fn indexed_projection_alias_and_write_boundaries() {
+    let cases = [
+        ("const alias = items; alias[0]!.widget.used();", true),
+        (
+            "const saved = items[0]!.widget; items[0]!.widget = unknown(); saved.used();",
+            true,
+        ),
+        (
+            "const alias = items; items = unknown(); alias[0]!.widget.used();",
+            true,
+        ),
+        (
+            "const alias = items; alias[0]!.widget = unknown(); items[0]!.widget.used();",
+            false,
+        ),
+        (
+            "const alias = items; alias[0] = unknown(); items[0]!.widget.used();",
+            false,
+        ),
+        ("delete items[0]!.widget; items[0]!.widget.used();", false),
+        ("items[opaque]!.widget.used();", false),
+        (
+            "{ const items = unknown(); items[0]!.widget.used(); }",
+            false,
+        ),
+        (
+            "((...items: unknown[]) => items[0].widget.used())();",
+            false,
+        ),
+    ];
+    for capture in ["", "class Marker extends Array {}"] {
+        for (body, expected) in cases {
+            let source = format!(
+                "import {{ C }} from './c'; {capture} function consume(items: {{widget:C}}[]) {{ {body} }}"
+            );
+            let info = parse(&source);
+            let used = info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "C" && access.member == "used");
+            assert_eq!(used, expected, "{source}");
+            assert!(
+                !info.whole_object_uses.iter().any(|name| name == "C"),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_projection_numeric_and_type_ownership() {
+    let cases = [
+        (
+            "function consume(items: Array<{ widget: C }>, index:number) { items[index]!.widget.used(); }",
+            true,
+        ),
+        (
+            "function consume(items: ReadonlyArray<{ widget: C }>) { (items[0]!).widget.used(); }",
+            true,
+        ),
+        ("function consume(items: C[]) { items[0]!.used(); }", true),
+        (
+            "function consume(items: { widget: C }[], index:string) { items[index]!.widget.used(); }",
+            false,
+        ),
+        (
+            "function consume(items: { widget: C }[], index:number) { {const index = 'widget';items[index]!.widget.used();} }",
+            false,
+        ),
+        (
+            "function consume<C>(items: { widget: C }[]) { items[0]!.widget.used(); }",
+            false,
+        ),
+        (
+            "function consume(items: [{ widget: C },{ widget: Other }]) { items[1]!.widget.used(); }",
+            false,
+        ),
+    ];
+    for (body, expected) in cases {
+        let source = format!("import {{C}} from './c'; {body}");
+        let info = parse(&source);
+        let used = info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "C" && access.member == "used");
+        assert_eq!(used, expected, "{source}");
+    }
+}
+
+const INDEXED_REVIEW_SOURCES: &[(&str, bool)] = &[
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-shadow-array-capture-off/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-shadow-array-capture-on/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-shadow-readonly-array-capture-off/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-shadow-readonly-array-capture-on/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-builtin-array-control-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-builtin-array-control-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-builtin-readonly-array-control-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-builtin-readonly-array-control-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-typed-alias-write-capture-off/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-typed-alias-write-capture-on/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-ordinary-alias-write-control-capture-off/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-ordinary-alias-write-control-capture-on/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-typed-alias-untouched-control-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-typed-alias-untouched-control-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-ordinary-alias-untouched-control-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-ordinary-alias-untouched-control-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-conditional-alternate-read-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-conditional-alternate-read-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-conditional-untouched-control-capture-off/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-conditional-untouched-control-capture-on/src/index.ts"
+        ),
+        true,
+    ),
+];
+
+#[test]
+fn indexed_review_exact_caller_extraction() {
+    for &(source, expected) in INDEXED_REVIEW_SOURCES {
+        let info = parse(source);
+        let used = info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "C" && access.member == "used");
+        assert_eq!(used, expected, "{source}");
+    }
+}
+
+#[test]
+fn indexed_branch_join_and_scalar_snapshot_boundaries() {
+    let cases = [
+        (
+            "if(flag) { items[0].widget = opaque(); } items[0].widget.used();",
+            false,
+        ),
+        (
+            "if(flag) { items[0].widget = opaque(); } else { items[0].widget.used(); }",
+            true,
+        ),
+        (
+            "if(flag) { items[0] = opaque(); } else { items[0].widget.used(); }",
+            true,
+        ),
+        (
+            "const saved = items[0].widget; if(flag) { items[0].widget = opaque(); } saved.used();",
+            true,
+        ),
+        (
+            "const alias: { widget: C }[] = items; if(flag) { alias[0].widget = opaque(); } items[0].widget.used();",
+            false,
+        ),
+        (
+            "if(flag) { if(other) { items[0].widget = opaque(); } else { items[0].widget.used(); } }",
+            true,
+        ),
+        (
+            "if(flag) { if(other) { items[0].widget = opaque(); } } items[0].widget.used();",
+            false,
+        ),
+    ];
+    for capture in ["", "class Marker extends Array {}"] {
+        for (body, expected) in cases {
+            let source = format!(
+                "import {{C}} from './c'; {capture} function consume(items: {{widget:C}}[], flag:boolean,other:boolean) {{ {body} }}"
+            );
+            let info = parse(&source);
+            let used = info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "C" && access.member == "used");
+            assert_eq!(used, expected, "{source}");
+        }
+    }
+}
+
+const INDEXED_SHARED_READER_SOURCES: &[(&str, bool)] = &[
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-array-shadow/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-array-builtin-control/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-readonly-array-shadow/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-readonly-array-builtin-control/src/index.ts"
+        ),
+        true,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-overlay-write/src/index.ts"
+        ),
+        false,
+    ),
+    (
+        include_str!(
+            "../../../../tests/fixtures/class-value-review-subclass-overlay-no-write-control/src/index.ts"
+        ),
+        true,
+    ),
+];
+
+#[test]
+fn indexed_shared_subclass_reader_facts() {
+    for &(source, expected) in INDEXED_SHARED_READER_SOURCES {
+        let info = parse(source);
+        let used = info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "C" && access.member == "used");
+        assert_eq!(used, expected, "{source}");
+    }
+}
+
+#[test]
+fn indexed_shared_reader_alias_snapshot_and_branch_boundaries() {
+    let cases = [
+        (
+            "const saved = items[0]; if(flag) { saved.widget = opaque(); saved.widget.used(); }",
+            false,
+        ),
+        (
+            "const saved = items[0]; if(flag) { saved.widget = opaque(); } else { saved.widget.used(); }",
+            true,
+        ),
+        (
+            "const saved = items[0]; if(flag) { saved.widget = opaque(); } saved.widget.used();",
+            false,
+        ),
+        (
+            "const saved = items[0].widget; if(flag) { items[0].widget = opaque(); } saved.used();",
+            true,
+        ),
+        (
+            "const saved = items[0]; const alias = saved; if(flag) { alias.widget = opaque(); saved.widget.used(); }",
+            false,
+        ),
+        (
+            "const saved = items[0]; if(flag) { saved.widget.used(); saved.widget = opaque(); }",
+            true,
+        ),
+        (
+            "const saved = items[0]; if(flag) { saved[key] = opaque(); saved.widget.used(); }",
+            false,
+        ),
+        (
+            "const saved = items[0]; if(flag) { saved.widget = opaque(); const {widget} = saved; widget.used(); }",
+            false,
+        ),
+    ];
+    for (body, expected) in cases {
+        let source = format!(
+            "import {{C}} from './c'; class Sub extends C {{}} function opaque() {{ return {{used() {{}}}}; }} function consume(items: {{ widget: Sub }}[], flag: boolean, key: string) {{ {body} }}"
+        );
+        let info = parse(&source);
+        let used = info
+            .member_accesses
+            .iter()
+            .any(|access| access.object == "C" && access.member == "used");
+        assert_eq!(used, expected, "{source}");
+    }
+}
+
+#[test]
+fn indexed_shared_container_conditions_survive_existing_proof_conversions() {
+    for container in ["Array", "ReadonlyArray"] {
+        for shadow in [false, true] {
+            for body in [
+                "const saved = items[0]; const copied = saved; copied.used();",
+                "for (const saved of items) { saved.used(); }",
+                "items.forEach(saved => saved.used());",
+            ] {
+                let alias = if shadow {
+                    format!("type {container}<T> = Other[];")
+                } else {
+                    String::new()
+                };
+                let source = format!(
+                    "import {{C, Other}} from './c'; class Sub extends C {{}} {alias} function consume(items: {container}<Sub>) {{ {body} }}"
+                );
+                let info = parse(&source);
+                let used = info
+                    .member_accesses
+                    .iter()
+                    .any(|access| access.object == "C" && access.member == "used");
+                assert_eq!(used, !shadow, "{source}");
+            }
+        }
+    }
+}
+
+#[test]
+fn indexed_refusal_branch_barriers_do_not_share_written_properties() {
+    const PROJECTION_ARENA_BUDGET: usize = 8192;
+    let pressure = (0..PROJECTION_ARENA_BUDGET).fold(String::new(), |mut source, index| {
+        writeln!(source, "const filler{index}: number = 0;").expect("write fixture source");
+        source
+    });
+    for subclass in [false, true] {
+        let heritage = if subclass {
+            "class Sub extends C {}"
+        } else {
+            ""
+        };
+        let target = if subclass { "Sub" } else { "C" };
+        let source = format!("import {{C}} from './classes'; {heritage}
+            function opaque() {{ return {{after() {{}}}}; }}
+            function consume(left: {{ widget: {target} }}[], right: {{ widget: {target} }}[], flag: boolean) {{
+                const first = left[0]; const second = right[0]; const scalar = first.widget;
+                first.widget.before(); {pressure}
+                if(flag) {{ first.widget = opaque(); second.widget = opaque(); first.widget = new {target}(); second.widget.after(); }}
+                else {{ second.widget.alternate(); }}
+                scalar.snapshot();
+            }}
+            consume([{{widget:new {target}()}}], [{{widget:new {target}()}}], true);
+            new C().direct();");
+        let info = parse(&source);
+        for (member, expected) in [
+            ("before", true),
+            ("after", false),
+            ("alternate", true),
+            ("snapshot", true),
+            ("direct", true),
+            ("dead", false),
+        ] {
+            let actual = info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "C" && access.member == member);
+            assert_eq!(actual, expected, "subclass={subclass}, member={member}");
+        }
+        assert!(!info.whole_object_uses.iter().any(|name| name == "C"));
+    }
+}
+
+#[test]
+fn constructor_alternatives_preserve_jsx_receiver_spelling() {
+    let source = "class Widgets { Card = () => null; dead() {} } const w = new Widgets(); export const R = () => <w.Card />;";
+    for prefix in ["", "class Base {} class Sub extends Base {}\n"] {
+        let info = crate::parse_from_content(
+            FileId(0),
+            Path::new("view.tsx"),
+            &format!("{prefix}{source}"),
+        );
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == "w" && access.member == "Card")
+        );
+        assert!(
+            !info
+                .member_accesses
+                .iter()
+                .any(|access| access.object == "Widgets" && access.member == "dead")
+        );
+    }
 }

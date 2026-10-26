@@ -3,14 +3,16 @@ use std::path::PathBuf;
 use fallow_config::{ConfigOverride, FallowConfig, OutputFormat, PartialRulesConfig, RulesConfig};
 
 pub fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("tests")
-        .join("fixtures")
-        .join(name)
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .join("tests")
+    .join("fixtures")
+    .join(name)
 }
 
 pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
@@ -25,6 +27,7 @@ pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -33,8 +36,10 @@ pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -53,7 +58,9 @@ pub fn create_config(root: PathBuf) -> fallow_config::ResolvedConfig {
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
@@ -73,6 +80,7 @@ pub fn create_production_config(root: PathBuf) -> fallow_config::ResolvedConfig 
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -81,8 +89,10 @@ pub fn create_production_config(root: PathBuf) -> fallow_config::ResolvedConfig 
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -101,7 +111,9 @@ pub fn create_production_config(root: PathBuf) -> fallow_config::ResolvedConfig 
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
@@ -152,6 +164,7 @@ pub fn create_config_with_cache(
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -160,8 +173,10 @@ pub fn create_config_with_cache(
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -180,7 +195,9 @@ pub fn create_config_with_cache(
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, false, true, None); // no_cache = false to enable caching
@@ -205,6 +222,7 @@ where
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -213,8 +231,10 @@ where
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules,
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -233,7 +253,9 @@ where
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
@@ -261,6 +283,7 @@ pub fn create_config_with_overrides(
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -269,8 +292,10 @@ pub fn create_config_with_overrides(
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -289,7 +314,9 @@ pub fn create_config_with_overrides(
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
@@ -310,6 +337,7 @@ pub fn create_config_with_ignore_decorators(
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -318,8 +346,10 @@ pub fn create_config_with_ignore_decorators(
         used_class_members: vec![],
         ignore_decorators,
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -338,8 +368,30 @@ pub fn create_config_with_ignore_decorators(
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
+}
+
+/// Copy a fixture tree without its `.fallow` cache directory. CLI tests run the
+/// binary directly on shared fixtures and write cache files there in parallel
+/// (nextest runs test binaries at the same time), so a cache file can disappear
+/// between the listing and the copy. A copy also wants a cold cache.
+pub fn copy_fixture_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).expect("create dest dir");
+    for entry in std::fs::read_dir(src).expect("read fixture dir") {
+        let entry = entry.expect("dir entry");
+        if entry.file_name() == ".fallow" {
+            continue;
+        }
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_fixture_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).expect("copy file");
+        }
+    }
 }

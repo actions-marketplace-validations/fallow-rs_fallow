@@ -12,9 +12,10 @@ use fallow_config::OutputFormat;
 use crate::report::sink::outln;
 
 pub use fallow_api::{
-    CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, RuleDef, RuleGuide, SECURITY_RULES,
-    coverage_analyze_meta, coverage_setup_meta, rule_by_id, rule_by_token, rule_docs_url,
-    rule_guide, rule_severity_key, security_meta, serialize_explain_programmatic_json,
+    AUDIT_RULES, CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, RuleDef, RuleGuide,
+    SECURITY_RULES, coverage_analyze_meta, coverage_setup_meta, rule_by_id, rule_by_token,
+    rule_docs_url, rule_guide, rule_severity_key, security_meta,
+    serialize_explain_programmatic_json,
 };
 
 /// Run the standalone explain subcommand.
@@ -25,10 +26,10 @@ pub(crate) fn run_explain(
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
     let Some(rule) = rule_by_token(issue_type) else {
-        return crate::error::emit_error(
-            &fallow_api::unknown_explain_error(issue_type).message,
-            2,
+        return crate::error::emit_programmatic_error(
+            &fallow_api::unknown_explain_error(issue_type),
             output,
+            json_style,
         );
     };
     let guide = rule_guide(rule);
@@ -38,12 +39,7 @@ pub(crate) fn run_explain(
                 outln!("{json}");
                 ExitCode::SUCCESS
             }
-            Err(error) => crate::error::emit_error_with_style(
-                &error.message,
-                error.exit_code,
-                output,
-                json_style,
-            ),
+            Err(error) => crate::error::emit_programmatic_error(&error, output, json_style),
         },
         OutputFormat::Human => print_explain_human(rule, &guide),
         OutputFormat::Compact => print_explain_compact(rule),
@@ -70,7 +66,6 @@ fn render_explain_json(
 ) -> Result<String, fallow_api::ProgrammaticError> {
     let value = serialize_explain_programmatic_json(
         issue_type,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )?;
     json_style.serialize(&value).map_err(|error| {

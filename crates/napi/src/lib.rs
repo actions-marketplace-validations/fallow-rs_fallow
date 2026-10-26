@@ -31,6 +31,8 @@ pub struct DeadCodeOptions {
     pub diff_file: Option<String>,
     pub production: Option<bool>,
     pub changed_since: Option<String>,
+    /// Ignore the per-package refs of `workspaces.changedSince` for this call.
+    pub no_package_baselines: Option<bool>,
     pub workspace: Option<Vec<String>>,
     pub changed_workspaces: Option<String>,
     pub explain: Option<bool>,
@@ -40,16 +42,21 @@ pub struct DeadCodeOptions {
     pub unused_deps: Option<bool>,
     pub unused_types: Option<bool>,
     pub private_type_leaks: Option<bool>,
+    pub deprecated_exports_in_use: Option<bool>,
     pub unused_enum_members: Option<bool>,
     pub unused_class_members: Option<bool>,
     pub unused_store_members: Option<bool>,
     pub unprovided_injects: Option<bool>,
     pub unrendered_components: Option<bool>,
     pub unused_component_props: Option<bool>,
+    pub absent_component_props: Option<bool>,
     pub unused_component_emits: Option<bool>,
     pub unused_component_inputs: Option<bool>,
     pub unused_component_outputs: Option<bool>,
     pub unused_svelte_events: Option<bool>,
+    pub unused_effect_layers: Option<bool>,
+    pub unused_tagged_errors: Option<bool>,
+    pub unproduced_catch_tags: Option<bool>,
     pub unused_server_actions: Option<bool>,
     pub unused_load_data_keys: Option<bool>,
     pub unresolved_imports: Option<bool>,
@@ -57,6 +64,7 @@ pub struct DeadCodeOptions {
     pub duplicate_exports: Option<bool>,
     pub circular_deps: Option<bool>,
     pub re_export_cycles: Option<bool>,
+    pub package_cycles: Option<bool>,
     pub boundary_violations: Option<bool>,
     pub policy_violations: Option<bool>,
     pub stale_suppressions: Option<bool>,
@@ -67,6 +75,35 @@ pub struct DeadCodeOptions {
     pub misconfigured_dependency_overrides: Option<bool>,
     pub files: Option<Vec<String>>,
     pub include_entry_exports: Option<bool>,
+    pub show_cascade: Option<bool>,
+    pub finding_ids: Option<Vec<String>>,
+}
+
+/// Options for `detectArchitecture`: import cycles, boundary violations and
+/// rule-pack policy violations. No selector reports every kind.
+#[napi(object)]
+#[derive(Default)]
+pub struct ArchitectureOptions {
+    pub root: Option<String>,
+    pub config_path: Option<String>,
+    pub allow_remote_extends: Option<bool>,
+    pub no_cache: Option<bool>,
+    pub threads: Option<u32>,
+    pub diff_file: Option<String>,
+    pub production: Option<bool>,
+    pub changed_since: Option<String>,
+    /// Ignore the per-package refs of `workspaces.changedSince` for this call.
+    pub no_package_baselines: Option<bool>,
+    pub workspace: Option<Vec<String>>,
+    pub changed_workspaces: Option<String>,
+    pub explain: Option<bool>,
+    /// Report only import cycles.
+    pub cycles: Option<bool>,
+    /// Report only boundary violations, boundary coverage and forbidden calls.
+    pub boundaries: Option<bool>,
+    /// Report only rule-pack policy violations.
+    pub policy: Option<bool>,
+    pub files: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -80,6 +117,8 @@ pub struct DuplicationOptions {
     pub diff_file: Option<String>,
     pub production: Option<bool>,
     pub changed_since: Option<String>,
+    /// Ignore the per-package refs of `workspaces.changedSince` for this call.
+    pub no_package_baselines: Option<bool>,
     pub workspace: Option<Vec<String>>,
     pub changed_workspaces: Option<String>,
     pub explain: Option<bool>,
@@ -92,6 +131,9 @@ pub struct DuplicationOptions {
     pub min_occurrences: Option<u32>,
     pub threshold: Option<f64>,
     pub skip_local: Option<bool>,
+    /// Omit clone instances whose path is a symlink or lies under a symlinked
+    /// directory. `None` defers to the project config.
+    pub ignore_symlinks: Option<bool>,
     pub cross_language: Option<bool>,
     pub ignore_imports: Option<bool>,
     pub top: Option<u32>,
@@ -183,6 +225,7 @@ struct CommonOptionsInput {
     diff_file: Option<String>,
     production: Option<bool>,
     changed_since: Option<String>,
+    no_package_baselines: Option<bool>,
     workspace: Option<Vec<String>>,
     changed_workspaces: Option<String>,
     explain: Option<bool>,
@@ -212,10 +255,14 @@ fn map_common_options(input: CommonOptionsInput) -> napi::Result<api::AnalysisOp
         production: input.production.unwrap_or(false),
         production_override: input.production,
         changed_since: input.changed_since,
+        no_package_baselines: input.no_package_baselines.unwrap_or(false),
         workspace: input.workspace,
         changed_workspaces: input.changed_workspaces,
         explain: input.explain.unwrap_or(false),
         type_aware,
+        // A JS embedder cannot hold a Rust cancellation token, so the napi
+        // surface never carries one.
+        ..api::AnalysisOptions::default()
     })
 }
 
@@ -235,7 +282,7 @@ fn map_type_aware_options(input: Option<TypeAwareOptions>) -> napi::Result<api::
         }
     };
     Ok(api::TypeAwareOptions {
-        enabled: input.enabled.unwrap_or(false),
+        enabled: input.enabled,
         projects: input
             .projects
             .unwrap_or_default()
@@ -246,11 +293,20 @@ fn map_type_aware_options(input: Option<TypeAwareOptions>) -> napi::Result<api::
     })
 }
 
+/// Refusal for a string option that is not one of a field's accepted literals.
+///
+/// The accepted set is in hand at the refusal point, so a near miss names the
+/// literal the caller meant. Novel values get no suggestion, because a guess
+/// that is not one edit away is worse than the plain list.
 fn invalid_enum_value(field: &str, value: &str, allowed: &[&str]) -> napi::Error {
+    let suggestion = api::closest_match(&normalize_enum_literal(value), allowed.iter().copied())
+        .map_or_else(String::new, |nearest| {
+            format!(" (did you mean `{nearest}`?)")
+        });
     napi::Error::new(
         Status::InvalidArg,
         format!(
-            "invalid `{field}` value `{value}`; expected one of: {}",
+            "invalid `{field}` value `{value}`{suggestion}; expected one of: {}",
             allowed.join(", ")
         ),
     )
@@ -343,6 +399,7 @@ impl TryFrom<DeadCodeOptions> for api::DeadCodeOptions {
 
     fn try_from(value: DeadCodeOptions) -> Result<Self, Self::Error> {
         Ok(Self {
+            finding_ids: value.finding_ids.unwrap_or_default(),
             analysis: map_common_options(CommonOptionsInput {
                 root: value.root,
                 config_path: value.config_path,
@@ -352,6 +409,7 @@ impl TryFrom<DeadCodeOptions> for api::DeadCodeOptions {
                 diff_file: value.diff_file,
                 production: value.production,
                 changed_since: value.changed_since,
+                no_package_baselines: value.no_package_baselines,
                 workspace: value.workspace,
                 changed_workspaces: value.changed_workspaces,
                 explain: value.explain,
@@ -363,16 +421,21 @@ impl TryFrom<DeadCodeOptions> for api::DeadCodeOptions {
                 unused_deps: value.unused_deps.unwrap_or(false),
                 unused_types: value.unused_types.unwrap_or(false),
                 private_type_leaks: value.private_type_leaks.unwrap_or(false),
+                deprecated_exports_in_use: value.deprecated_exports_in_use.unwrap_or(false),
                 unused_enum_members: value.unused_enum_members.unwrap_or(false),
                 unused_class_members: value.unused_class_members.unwrap_or(false),
                 unused_store_members: value.unused_store_members.unwrap_or(false),
                 unprovided_injects: value.unprovided_injects.unwrap_or(false),
                 unrendered_components: value.unrendered_components.unwrap_or(false),
                 unused_component_props: value.unused_component_props.unwrap_or(false),
+                absent_component_props: value.absent_component_props.unwrap_or(false),
                 unused_component_emits: value.unused_component_emits.unwrap_or(false),
                 unused_component_inputs: value.unused_component_inputs.unwrap_or(false),
                 unused_component_outputs: value.unused_component_outputs.unwrap_or(false),
                 unused_svelte_events: value.unused_svelte_events.unwrap_or(false),
+                unused_effect_layers: value.unused_effect_layers.unwrap_or(false),
+                unused_tagged_errors: value.unused_tagged_errors.unwrap_or(false),
+                unproduced_catch_tags: value.unproduced_catch_tags.unwrap_or(false),
                 unused_server_actions: value.unused_server_actions.unwrap_or(false),
                 unused_load_data_keys: value.unused_load_data_keys.unwrap_or(false),
                 unresolved_imports: value.unresolved_imports.unwrap_or(false),
@@ -380,6 +443,7 @@ impl TryFrom<DeadCodeOptions> for api::DeadCodeOptions {
                 duplicate_exports: value.duplicate_exports.unwrap_or(false),
                 circular_deps: value.circular_deps.unwrap_or(false),
                 re_export_cycles: value.re_export_cycles.unwrap_or(false),
+                package_cycles: value.package_cycles.unwrap_or(false),
                 boundary_violations: value.boundary_violations.unwrap_or(false),
                 policy_violations: value.policy_violations.unwrap_or(false),
                 stale_suppressions: value.stale_suppressions.unwrap_or(false),
@@ -398,6 +462,40 @@ impl TryFrom<DeadCodeOptions> for api::DeadCodeOptions {
                 .map(std::path::PathBuf::from)
                 .collect(),
             include_entry_exports: value.include_entry_exports.unwrap_or(false),
+            show_cascade: value.show_cascade.unwrap_or(false),
+        })
+    }
+}
+
+impl TryFrom<ArchitectureOptions> for api::ArchitectureOptions {
+    type Error = napi::Error;
+
+    fn try_from(value: ArchitectureOptions) -> Result<Self, Self::Error> {
+        Ok(Self {
+            analysis: map_common_options(CommonOptionsInput {
+                root: value.root,
+                config_path: value.config_path,
+                allow_remote_extends: value.allow_remote_extends,
+                no_cache: value.no_cache,
+                threads: value.threads,
+                diff_file: value.diff_file,
+                production: value.production,
+                changed_since: value.changed_since,
+                no_package_baselines: value.no_package_baselines,
+                workspace: value.workspace,
+                changed_workspaces: value.changed_workspaces,
+                explain: value.explain,
+                type_aware: None,
+            })?,
+            files: value
+                .files
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            cycles: value.cycles.unwrap_or(false),
+            boundaries: value.boundaries.unwrap_or(false),
+            policy: value.policy.unwrap_or(false),
         })
     }
 }
@@ -416,6 +514,7 @@ impl TryFrom<DuplicationOptions> for api::DuplicationOptions {
                 diff_file: value.diff_file,
                 production: value.production,
                 changed_since: value.changed_since,
+                no_package_baselines: value.no_package_baselines,
                 workspace: value.workspace,
                 changed_workspaces: value.changed_workspaces,
                 explain: value.explain,
@@ -436,11 +535,16 @@ impl TryFrom<DuplicationOptions> for api::DuplicationOptions {
             },
             threshold: value.threshold,
             skip_local: value.skip_local,
+            ignore_symlinks: value.ignore_symlinks,
             cross_language: value.cross_language,
             // `None` defers to the project config (default `true`); `Some(false)`
             // forces import blocks to be counted. No `unwrap_or` so the
             // defer-to-config semantics survive (#1224).
             ignore_imports: value.ignore_imports,
+            // The node bindings mirror the CLI, where fragments are on by
+            // default; `None` defers to that default. Only MCP suppresses
+            // fragments, and it does so through its own params struct.
+            include_fragments: None,
             top: value.top.map(|n| n as usize),
         })
     }
@@ -481,6 +585,7 @@ impl TryFrom<SimilarCodeOptions> for api::SimilarCodeOptions {
                 diff_file: value.diff_file,
                 production: None,
                 changed_since: value.changed_since,
+                no_package_baselines: None,
                 workspace: value.workspace,
                 changed_workspaces: value.changed_workspaces,
                 explain: Some(true),
@@ -514,12 +619,14 @@ impl TryFrom<FeatureFlagsOptions> for api::FeatureFlagsOptions {
                 diff_file: value.diff_file,
                 production: value.production,
                 changed_since: value.changed_since,
+                no_package_baselines: None,
                 workspace: value.workspace,
                 changed_workspaces: value.changed_workspaces,
                 explain: value.explain,
                 type_aware: None,
             })?,
             top: value.top.map(|n| n as usize),
+            retirement: None,
         })
     }
 }
@@ -538,6 +645,7 @@ impl TryFrom<ComplexityOptions> for api::ComplexityOptions {
                 diff_file: value.diff_file,
                 production: value.production,
                 changed_since: value.changed_since,
+                no_package_baselines: None,
                 workspace: value.workspace,
                 changed_workspaces: value.changed_workspaces,
                 explain: value.explain,
@@ -613,6 +721,7 @@ pub enum ProgrammaticOutput {
     DeadCode(Box<api::DeadCodeProgrammaticOutput>),
     CircularDependencies(Box<api::CircularDependenciesProgrammaticOutput>),
     BoundaryViolations(Box<api::BoundaryViolationsProgrammaticOutput>),
+    Architecture(Box<api::ArchitectureProgrammaticOutput>),
     Duplication(Box<api::DuplicationProgrammaticOutput>),
     FeatureFlags(Box<api::FeatureFlagsProgrammaticOutput>),
     Health(Box<api::HealthProgrammaticOutput>),
@@ -629,17 +738,17 @@ impl ProgrammaticOutput {
             Self::BoundaryViolations(output) => {
                 api::serialize_boundary_violations_programmatic_json(*output)
             }
+            Self::Architecture(output) => api::serialize_architecture_programmatic_json(*output),
             Self::Duplication(output) => api::serialize_duplication_programmatic_json(*output),
             Self::FeatureFlags(output) => api::serialize_feature_flags_programmatic_json(*output),
             Self::Health(output) => api::serialize_health_programmatic_json(*output),
             Self::SimilarCode(output) => {
-                api::serialize_similar_code_json_output(*output, api::RootEnvelopeMode::Tagged)
-                    .map_err(|error| {
-                        api::ProgrammaticError::new(
-                            format!("failed to serialize similar-code output: {error}"),
-                            2,
-                        )
-                    })
+                api::serialize_similar_code_json_output(*output).map_err(|error| {
+                    api::ProgrammaticError::new(
+                        format!("failed to serialize similar-code output: {error}"),
+                        2,
+                    )
+                })
             }
         }
     }
@@ -760,6 +869,18 @@ pub fn detect_boundary_violations(
     })))
 }
 
+#[napi(js_name = "detectArchitecture")]
+pub fn detect_architecture(
+    options: Option<ArchitectureOptions>,
+) -> napi::Result<AsyncTask<ProgrammaticTask>> {
+    let options = api::ArchitectureOptions::try_from(options.unwrap_or_default())?;
+    Ok(AsyncTask::new(ProgrammaticTask::new(move || {
+        api::run_architecture(&options)
+            .map(Box::new)
+            .map(ProgrammaticOutput::Architecture)
+    })))
+}
+
 #[napi(js_name = "detectDuplication")]
 pub fn detect_duplication(
     options: Option<DuplicationOptions>,
@@ -833,6 +954,46 @@ mod tests {
         }
     }
 
+    fn assert_every_filter_on(filters: &api::DeadCodeFilters) {
+        assert!(filters.unused_files);
+        assert!(filters.unused_exports);
+        assert!(filters.unused_deps);
+        assert!(filters.unused_types);
+        assert!(filters.private_type_leaks);
+        assert!(filters.deprecated_exports_in_use);
+        assert!(filters.unused_enum_members);
+        assert!(filters.unused_class_members);
+        assert!(filters.unused_store_members);
+        assert!(filters.absent_component_props);
+        assert!(filters.unresolved_imports);
+        assert!(filters.unlisted_deps);
+        assert!(filters.duplicate_exports);
+        assert!(filters.circular_deps);
+        assert!(filters.re_export_cycles);
+        assert!(filters.package_cycles);
+        assert!(filters.boundary_violations);
+        assert!(filters.stale_suppressions);
+        assert!(filters.unused_catalog_entries);
+        assert!(filters.empty_catalog_groups);
+        assert!(filters.unresolved_catalog_references);
+        assert!(filters.unused_dependency_overrides);
+        assert!(filters.misconfigured_dependency_overrides);
+    }
+
+    #[test]
+    fn absent_component_prop_opt_in_maps_without_enabling_unused_props() {
+        let options = api::DeadCodeOptions::try_from(DeadCodeOptions {
+            absent_component_props: Some(true),
+            ..DeadCodeOptions::default()
+        })
+        .expect("options");
+        assert!(options.filters.absent_component_props);
+        assert!(!options.filters.unused_component_props);
+        let defaults =
+            api::DeadCodeOptions::try_from(DeadCodeOptions::default()).expect("defaults");
+        assert!(!defaults.filters.absent_component_props);
+    }
+
     #[test]
     fn dead_code_options_map_common_fields_filters_and_files() {
         let options = api::DeadCodeOptions::try_from(DeadCodeOptions {
@@ -844,6 +1005,7 @@ mod tests {
             diff_file: Some("/tmp/diff.patch".to_string()),
             production: Some(true),
             changed_since: Some("origin/main".to_string()),
+            no_package_baselines: Some(true),
             workspace: Some(vec!["apps/web".to_string()]),
             changed_workspaces: None,
             explain: Some(true),
@@ -857,16 +1019,21 @@ mod tests {
             unused_deps: Some(true),
             unused_types: Some(true),
             private_type_leaks: Some(true),
+            deprecated_exports_in_use: Some(true),
             unused_enum_members: Some(true),
             unused_class_members: Some(true),
             unused_store_members: Some(true),
             unprovided_injects: Some(true),
             unrendered_components: Some(true),
             unused_component_props: Some(true),
+            absent_component_props: Some(true),
             unused_component_emits: Some(true),
             unused_component_inputs: Some(true),
             unused_component_outputs: Some(true),
             unused_svelte_events: Some(true),
+            unused_effect_layers: Some(true),
+            unused_tagged_errors: Some(true),
+            unproduced_catch_tags: Some(true),
             unused_server_actions: Some(true),
             unused_load_data_keys: Some(true),
             unresolved_imports: Some(true),
@@ -874,6 +1041,7 @@ mod tests {
             duplicate_exports: Some(true),
             circular_deps: Some(true),
             re_export_cycles: Some(true),
+            package_cycles: Some(true),
             boundary_violations: Some(true),
             policy_violations: Some(true),
             stale_suppressions: Some(true),
@@ -884,20 +1052,21 @@ mod tests {
             misconfigured_dependency_overrides: Some(true),
             files: Some(vec!["src/app.ts".to_string(), "src/lib.ts".to_string()]),
             include_entry_exports: Some(true),
+            show_cascade: Some(true),
+            finding_ids: None,
         })
         .expect("options should map");
 
         assert_eq!(options.analysis.root.as_deref(), Some(Path::new("/repo")));
-        assert_eq!(
-            options.analysis.config_path.as_deref(),
-            Some(Path::new("/repo/fallow.toml"))
-        );
+        let config_path = options.analysis.config_path.as_deref();
+        assert_eq!(config_path, Some(Path::new("/repo/fallow.toml")));
         assert!(options.analysis.no_cache);
         assert_eq!(options.analysis.threads, Some(4));
         assert_eq!(
             options.analysis.diff_file.as_deref(),
             Some(Path::new("/tmp/diff.patch"))
         );
+        assert!(options.analysis.no_package_baselines);
         assert!(options.analysis.production);
         assert_eq!(options.analysis.production_override, Some(true));
         assert_eq!(
@@ -909,31 +1078,25 @@ mod tests {
             Some(vec!["apps/web".to_string()])
         );
         assert!(options.analysis.explain);
-        assert!(options.filters.unused_files);
-        assert!(options.filters.unused_exports);
-        assert!(options.filters.unused_deps);
-        assert!(options.filters.unused_types);
-        assert!(options.filters.private_type_leaks);
-        assert!(options.filters.unused_enum_members);
-        assert!(options.filters.unused_class_members);
-        assert!(options.filters.unused_store_members);
-        assert!(options.filters.unresolved_imports);
-        assert!(options.filters.unlisted_deps);
-        assert!(options.filters.duplicate_exports);
-        assert!(options.filters.circular_deps);
-        assert!(options.filters.re_export_cycles);
-        assert!(options.filters.boundary_violations);
-        assert!(options.filters.stale_suppressions);
-        assert!(options.filters.unused_catalog_entries);
-        assert!(options.filters.empty_catalog_groups);
-        assert!(options.filters.unresolved_catalog_references);
-        assert!(options.filters.unused_dependency_overrides);
-        assert!(options.filters.misconfigured_dependency_overrides);
+        assert_every_filter_on(&options.filters);
         assert_eq!(
             options.files,
             vec![Path::new("src/app.ts"), Path::new("src/lib.ts")]
         );
         assert!(options.include_entry_exports);
+        assert!(options.show_cascade);
+    }
+
+    #[test]
+    fn dead_code_options_map_finding_ids() {
+        let id = "dc1:unused-export:0123456789abcdef".to_string();
+        let options = api::DeadCodeOptions::try_from(DeadCodeOptions {
+            finding_ids: Some(vec![id.clone()]),
+            ..DeadCodeOptions::default()
+        })
+        .expect("options should map");
+
+        assert_eq!(options.finding_ids, vec![id]);
     }
 
     #[test]
@@ -956,94 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn dead_code_explain_uses_api_runtime_meta() {
-        let project = tiny_dead_code_project();
-        let root = project.path();
-
-        let json = api::run_dead_code(&api::DeadCodeOptions {
-            analysis: api::AnalysisOptions {
-                root: Some(root.to_path_buf()),
-                explain: true,
-                ..api::AnalysisOptions::default()
-            },
-            filters: api::DeadCodeFilters {
-                unused_exports: true,
-                ..api::DeadCodeFilters::default()
-            },
-            ..api::DeadCodeOptions::default()
-        })
-        .and_then(api::serialize_dead_code_programmatic_json)
-        .expect("api runtime succeeds");
-
-        assert!(json["_meta"].is_object());
-        assert_eq!(unused_export_names(&json), vec!["dead"]);
-    }
-
-    #[test]
-    fn dead_code_diff_file_uses_api_runtime_without_fallback() {
-        let project = tiny_dead_code_project();
-        let root = project.path();
-        std::fs::write(
-            root.join("feature.diff"),
-            "diff --git a/src/feature.ts b/src/feature.ts\n+++ b/src/feature.ts\n@@ -1 +1 @@\n+export const dead = 1;\n",
-        )
-        .expect("diff");
-
-        let json = api::run_dead_code(&api::DeadCodeOptions {
-            analysis: api::AnalysisOptions {
-                root: Some(root.to_path_buf()),
-                diff_file: Some(Path::new("feature.diff").to_path_buf()),
-                ..api::AnalysisOptions::default()
-            },
-            filters: api::DeadCodeFilters {
-                unused_exports: true,
-                ..api::DeadCodeFilters::default()
-            },
-            ..api::DeadCodeOptions::default()
-        })
-        .and_then(api::serialize_dead_code_programmatic_json)
-        .expect("api diff runtime succeeds");
-
-        assert!(json.get("_meta").is_none());
-        assert_eq!(unused_export_names(&json), vec!["dead"]);
-    }
-
-    #[test]
-    fn dead_code_family_helpers_use_api_filtered_envelopes() {
-        let project = tiny_dead_code_project();
-        let root = project.path();
-        let options = api::DeadCodeOptions {
-            analysis: api::AnalysisOptions {
-                root: Some(root.to_path_buf()),
-                ..api::AnalysisOptions::default()
-            },
-            ..api::DeadCodeOptions::default()
-        };
-
-        let circular = api::run_circular_dependencies(&options)
-            .and_then(api::serialize_circular_dependencies_programmatic_json)
-            .expect("circular helper");
-        let boundary = api::run_boundary_violations(&options)
-            .and_then(api::serialize_boundary_violations_programmatic_json)
-            .expect("boundary helper");
-
-        assert_eq!(circular["kind"], "dead-code");
-        assert_eq!(circular["total_issues"], 0);
-        assert!(
-            circular["unused_exports"]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-        );
-        assert_eq!(boundary["kind"], "dead-code");
-        assert_eq!(boundary["total_issues"], 0);
-        assert!(
-            boundary["unused_exports"]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-        );
-    }
-
-    #[test]
     fn detect_duplication_accepts_normalized_mode() {
         let task = detect_duplication(Some(DuplicationOptions {
             mode: Some(" STRICT ".to_string()),
@@ -1055,13 +1130,16 @@ mod tests {
 
     #[test]
     fn detect_duplication_rejects_unknown_mode() {
-        let reason = error_reason(detect_duplication(Some(DuplicationOptions {
+        let Err(error) = detect_duplication(Some(DuplicationOptions {
             mode: Some("strictest".to_string()),
             ..DuplicationOptions::default()
-        })));
+        })) else {
+            panic!("option validation should fail");
+        };
 
+        assert_eq!(error.status, Status::InvalidArg);
         assert_eq!(
-            reason,
+            error.reason,
             "invalid `mode` value `strictest`; expected one of: strict, mild, weak, semantic"
         );
     }
@@ -1128,6 +1206,20 @@ mod tests {
     }
 
     #[test]
+    fn near_miss_enum_value_names_the_literal_the_caller_meant() {
+        let reason = error_reason(compute_complexity(Some(ComplexityOptions {
+            sort: Some("cyclomatc".to_string()),
+            ..ComplexityOptions::default()
+        })));
+
+        assert_eq!(
+            reason,
+            "invalid `sort` value `cyclomatc` (did you mean `cyclomatic`?); \
+             expected one of: cyclomatic, cognitive, lines, severity"
+        );
+    }
+
+    #[test]
     fn compute_complexity_rejects_out_of_range_u16_options() {
         let reason = error_reason(compute_complexity(Some(ComplexityOptions {
             max_cyclomatic: Some(u32::from(u16::MAX) + 1),
@@ -1147,6 +1239,7 @@ mod tests {
             min_occurrences: Some(3),
             threshold: Some(2.5),
             skip_local: Some(true),
+            ignore_symlinks: Some(true),
             cross_language: Some(true),
             ignore_imports: Some(true),
             top: Some(7),
@@ -1161,6 +1254,7 @@ mod tests {
         assert_eq!(options.min_occurrences, Some(3));
         assert_eq!(options.threshold, Some(2.5));
         assert_eq!(options.skip_local, Some(true));
+        assert_eq!(options.ignore_symlinks, Some(true));
         assert_eq!(options.cross_language, Some(true));
         assert_eq!(options.ignore_imports, Some(true));
         assert_eq!(options.top, Some(7));
@@ -1208,40 +1302,6 @@ mod tests {
         );
         assert!(options.analysis.explain);
         assert_eq!(options.top, Some(3));
-    }
-
-    #[test]
-    fn detect_feature_flags_returns_async_task() {
-        let task = detect_feature_flags(Some(FeatureFlagsOptions {
-            top: Some(1),
-            ..FeatureFlagsOptions::default()
-        }));
-
-        assert!(task.is_ok());
-    }
-
-    #[test]
-    fn duplication_options_reject_invalid_mode_and_min_occurrences() {
-        let invalid_mode = api::DuplicationOptions::try_from(DuplicationOptions {
-            mode: Some("exact".to_string()),
-            ..DuplicationOptions::default()
-        })
-        .expect_err("invalid mode should fail");
-
-        assert_eq!(invalid_mode.status, Status::InvalidArg);
-        assert!(invalid_mode.reason.contains("invalid `mode` value `exact`"));
-
-        let too_few_occurrences = api::DuplicationOptions::try_from(DuplicationOptions {
-            min_occurrences: Some(1),
-            ..DuplicationOptions::default()
-        })
-        .expect_err("single occurrence should fail");
-
-        assert!(
-            too_few_occurrences
-                .reason
-                .contains("min_occurrences must be at least 2")
-        );
     }
 
     #[test]
@@ -1305,58 +1365,6 @@ mod tests {
     }
 
     #[test]
-    fn complexity_options_reject_invalid_values_and_out_of_range_thresholds() {
-        let invalid_sort = api::ComplexityOptions::try_from(ComplexityOptions {
-            sort: Some("weighted".to_string()),
-            ..ComplexityOptions::default()
-        })
-        .expect_err("invalid sort should fail");
-
-        assert_eq!(invalid_sort.status, Status::InvalidArg);
-        assert!(
-            invalid_sort
-                .reason
-                .contains("invalid `sort` value `weighted`")
-        );
-
-        let invalid_ownership = api::ComplexityOptions::try_from(ComplexityOptions {
-            ownership_emails: Some("cleartext".to_string()),
-            ..ComplexityOptions::default()
-        })
-        .expect_err("invalid ownership email mode should fail");
-
-        assert!(
-            invalid_ownership
-                .reason
-                .contains("invalid `ownershipEmails` value `cleartext`")
-        );
-
-        let invalid_effort = api::ComplexityOptions::try_from(ComplexityOptions {
-            effort: Some("tiny".to_string()),
-            ..ComplexityOptions::default()
-        })
-        .expect_err("invalid effort should fail");
-
-        assert!(
-            invalid_effort
-                .reason
-                .contains("invalid `effort` value `tiny`")
-        );
-
-        let invalid_threshold = api::ComplexityOptions::try_from(ComplexityOptions {
-            max_cyclomatic: Some(u32::from(u16::MAX) + 1),
-            ..ComplexityOptions::default()
-        })
-        .expect_err("threshold above u16 should fail");
-
-        assert!(
-            invalid_threshold
-                .reason
-                .contains("`maxCyclomatic` must be between 0")
-        );
-    }
-
-    #[test]
     fn programmatic_task_runs_once_and_preserves_compute_errors() {
         let project = tiny_dead_code_project();
         let options = api::DeadCodeOptions {
@@ -1401,25 +1409,72 @@ mod tests {
         assert_eq!(stored.code.as_deref(), Some("FALLOW_TEST_FAILURE"));
     }
 
+    /// `ignoreSymlinks` must reach the engine: the pair that only exists
+    /// because `link.ts` is a symlink to `real.ts` leaves the report.
+    #[cfg(unix)]
     #[test]
-    fn compute_health_uses_programmatic_health_boundary() {
-        let project = tiny_dead_code_project();
-        let options = api::ComplexityOptions::try_from(ComplexityOptions {
-            root: Some(project.path().display().to_string()),
-            no_cache: Some(true),
-            threads: Some(1),
-            score: Some(true),
-            ..ComplexityOptions::default()
-        })
-        .expect("health options should map");
+    fn duplication_ignore_symlinks_reaches_the_engine() {
+        let project = tempfile::tempdir().expect("temp dir");
+        let root = project.path();
+        let block = |name: &str| {
+            (0..4)
+                .map(|index| {
+                    format!(
+                        "export function {name}{index}(a: number, b: number): number {{\n  const x = a * {index} + b;\n  const y = x - {index} * b;\n  if (x > y) {{\n    return x + y + {index};\n  }}\n  return x - y - {index};\n}}\n"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        std::fs::create_dir(root.join("src")).expect("src dir");
+        std::fs::write(root.join("package.json"), r#"{"name":"napi-symlinks"}"#).expect("package");
+        std::fs::write(root.join("src/real.ts"), block("linked")).expect("real");
+        std::os::unix::fs::symlink("real.ts", root.join("src/link.ts")).expect("link");
+        std::fs::write(root.join("src/a.ts"), block("copied")).expect("a");
+        std::fs::write(root.join("src/b.ts"), block("copied")).expect("b");
 
-        let json = api::run_health_with_runner(&options, &api::EngineHealthRunner)
-            .and_then(api::serialize_health_programmatic_json)
-            .expect("health should run through programmatic health boundary");
+        let clone_files = |ignore_symlinks: Option<bool>| -> Vec<Vec<String>> {
+            let options = api::DuplicationOptions::try_from(DuplicationOptions {
+                root: Some(root.to_string_lossy().into_owned()),
+                no_cache: Some(true),
+                threads: Some(1),
+                ignore_symlinks,
+                ..DuplicationOptions::default()
+            })
+            .expect("options should map");
+            let mut task = ProgrammaticTask::new(move || {
+                api::run_duplication(&options)
+                    .map(Box::new)
+                    .map(ProgrammaticOutput::Duplication)
+            });
+            let json = task
+                .compute()
+                .expect("task should succeed")
+                .serialize_json_compat()
+                .expect("typed output should serialize");
+            let mut groups: Vec<Vec<String>> = json["clone_groups"]
+                .as_array()
+                .expect("clone groups array")
+                .iter()
+                .map(|group| {
+                    let mut files: Vec<String> = group["instances"]
+                        .as_array()
+                        .expect("instances array")
+                        .iter()
+                        .map(|instance| instance["file"].as_str().expect("file").to_owned())
+                        .collect();
+                    files.sort();
+                    files
+                })
+                .collect();
+            groups.sort();
+            groups
+        };
+        let real = vec!["src/a.ts".to_owned(), "src/b.ts".to_owned()];
+        let linked = vec!["src/link.ts".to_owned(), "src/real.ts".to_owned()];
 
-        assert_eq!(json["kind"], "health");
-        assert_eq!(json["schema_version"], 11);
-        assert!(json.get("health_score").is_some());
+        assert_eq!(clone_files(None), vec![real.clone(), linked]);
+        assert_eq!(clone_files(Some(true)), vec![real]);
     }
 
     fn tiny_dead_code_project() -> tempfile::TempDir {
@@ -1459,12 +1514,9 @@ mod tests {
     /// (`fallow_types::mcp_manifest::CAPABILITY_PARITY`). A new export that is
     /// not recorded in the table, or a stale table entry, fails here. Mirrors
     /// the include_str source-scan the schemars-alias guards use.
-    #[test]
-    fn napi_exports_match_capability_parity_table() {
-        use std::collections::BTreeSet;
-
+    fn scanned_function_exports() -> std::collections::BTreeSet<String> {
         let source = include_str!("lib.rs");
-        let mut scanned: BTreeSet<String> = BTreeSet::new();
+        let mut scanned = std::collections::BTreeSet::new();
         let mut lines = source.lines();
         while let Some(line) = lines.next() {
             let trimmed = line.trim_start();
@@ -1476,10 +1528,41 @@ mod tests {
                 }
             }
         }
+        scanned
+    }
+
+    /// Drift guard: the root README and the package README name every
+    /// `#[napi(js_name = ...)]` function export.
+    #[test]
+    fn readmes_list_every_napi_export() {
+        let manifest_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        for relative in ["README.md", "../../README.md"] {
+            let path = manifest_dir.join(relative);
+            let readme = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let missing: Vec<String> = scanned_function_exports()
+                .into_iter()
+                .filter(|name| !readme.contains(&format!("`{name}")))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{} does not name these Node exports: {missing:?}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn napi_exports_match_capability_parity_table() {
+        use std::collections::BTreeSet;
+
+        let scanned: BTreeSet<String> = scanned_function_exports();
         assert_eq!(
             scanned.len(),
-            8,
-            "expected eight #[napi(js_name = ...)] function exports, scanned {scanned:?}"
+            9,
+            "expected nine #[napi(js_name = ...)] function exports, scanned {scanned:?}"
         );
 
         let table: BTreeSet<String> = fallow_types::mcp_manifest::CAPABILITY_PARITY

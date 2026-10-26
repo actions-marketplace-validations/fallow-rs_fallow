@@ -14,18 +14,13 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { API } from "typescript/unstable/sync";
+import { BACKEND, createApi } from "../src/backend.mjs";
 
-import { createSemanticResponse, createStatusResponse, parseRequest } from "../src/protocol.mjs";
+import { createSemanticResponse, parseRequest } from "../src/protocol.mjs";
 import { analyzeSemanticQueries, createSemanticSession } from "../src/semantic.mjs";
 import { readAll } from "../src/cli.mjs";
 import { canonicalFileIdentity } from "../src/file-identity.mjs";
-import {
-  ANALYSIS_OPERATION,
-  BACKEND_FAMILY,
-  BACKEND_VERSION,
-  WIRE_PROTOCOL_VERSION,
-} from "../src/generated-protocol.mjs";
+import { ANALYSIS_OPERATION, WIRE_PROTOCOL_VERSION } from "../src/generated-protocol.mjs";
 
 const sidecarRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const sidecarPackage = JSON.parse(readFileSync(path.join(sidecarRoot, "package.json"), "utf8"));
@@ -42,8 +37,8 @@ test("status reports protocol and backend without a project request", () => {
   assert.deepEqual(JSON.parse(result.stdout), {
     package_version: sidecarVersion,
     protocol_version: WIRE_PROTOCOL_VERSION,
-    backend_family: BACKEND_FAMILY,
-    backend_version: BACKEND_VERSION,
+    backend_family: BACKEND.family,
+    backend_version: BACKEND.version,
   });
 });
 
@@ -1743,6 +1738,410 @@ test("protocol v7 confirms complete closed-world absence of static class-member 
   }
 });
 
+test("protocol v7 confirms class members read through shorthand destructuring", () => {
+  const root = makeProject();
+  try {
+    const service = [
+      "export class Service {",
+      "  viaBinding(): void {}",
+      "  viaParameter(): void {}",
+      "  viaNested(): void {}",
+      "  viaLoop(): void {}",
+      "  viaAssignment(): void {}",
+      "  viaRenamedAssignment(): void {}",
+      "  viaDefaultedPattern(): void {}",
+      "  viaArrayPattern(): void {}",
+      "  viaLoopPattern(): void {}",
+      "  viaStringKey(): void {}",
+      "  viaComputedStringKey(): void {}",
+      "  viaAssignmentStringKey(): void {}",
+      "  unused(): void {}",
+      "}",
+      "",
+    ].join("\n");
+    const consumer = [
+      'import { Service } from "./service";',
+      "const service = new Service();",
+      "const { viaBinding } = service;",
+      "viaBinding();",
+      "const run = ({ viaParameter }: Service): void => viaParameter();",
+      "run(service);",
+      "const { inner: { viaNested } } = { inner: service };",
+      "viaNested();",
+      "for (const { viaLoop } of [service]) viaLoop();",
+      "let viaAssignment: () => void;",
+      "({ viaAssignment } = service);",
+      "viaAssignment();",
+      "let renamed: () => void;",
+      "({ viaRenamedAssignment: renamed } = service);",
+      "renamed();",
+      "class Other { viaDefaultedPattern(): void {} }",
+      "let viaDefaultedPattern: () => void;",
+      "({ inner: { viaDefaultedPattern } = new Other() } = { inner: service });",
+      "viaDefaultedPattern();",
+      "let viaArrayPattern: () => void;",
+      "[{ viaArrayPattern }] = [service];",
+      "let viaLoopPattern: () => void;",
+      "for ({ viaLoopPattern } of [service]) viaLoopPattern();",
+      'const { "viaStringKey": viaString } = service;',
+      'const { ["viaComputedStringKey"]: viaComputed } = service;',
+      "let viaAssigned: () => void;",
+      '({ "viaAssignmentStringKey": viaAssigned } = service);',
+      "[viaString, viaComputed, viaAssigned].forEach((run) => run());",
+      "",
+    ].join("\n");
+    write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({ compilerOptions: { strict: true }, include: ["src/**/*.ts"] }),
+    );
+    write(root, "src/service.ts", service);
+    write(root, "src/consumer.ts", consumer);
+    const names = [
+      "viaBinding",
+      "viaParameter",
+      "viaNested",
+      "viaLoop",
+      "viaAssignment",
+      "viaRenamedAssignment",
+      "viaDefaultedPattern",
+      "viaArrayPattern",
+      "viaLoopPattern",
+      "viaStringKey",
+      "viaComputedStringKey",
+      "viaAssignmentStringKey",
+      "unused",
+    ];
+    const queries = names.map((name, id) => ({
+      id,
+      operation: "symbol-use",
+      framework_contracts: [],
+      symbol: symbolIdentity({
+        source: service,
+        marker: `${name}()`,
+        file: "src/service.ts",
+        namespace: "value",
+        declarationKind: "class_method",
+        exportedName: name,
+        owner: "Service",
+      }),
+    }));
+
+    const response = runSidecar(semanticRequest(root, queries));
+    const assertions = Object.fromEntries(
+      response.results.map((result) => [names[result.query_id], result.assertion]),
+    );
+    assert.deepEqual(assertions, {
+      viaBinding: "confirmed-used",
+      viaParameter: "confirmed-used",
+      viaNested: "confirmed-used",
+      viaLoop: "confirmed-used",
+      viaAssignment: "confirmed-used",
+      viaRenamedAssignment: "confirmed-used",
+      viaDefaultedPattern: "no-confirmed-use",
+      viaArrayPattern: "no-confirmed-use",
+      viaLoopPattern: "no-confirmed-use",
+      viaStringKey: "confirmed-used",
+      viaComputedStringKey: "confirmed-used",
+      viaAssignmentStringKey: "confirmed-used",
+      unused: "confirmed-no-static-references",
+    });
+    const bindingUse = response.results.find((result) => result.query_id === 0).evidence[0];
+    assert.equal(bindingUse.path, "src/consumer.ts");
+    assert.equal(bindingUse.line, utf8Position(consumer, "viaBinding }").line);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("protocol v7 confirms exports read through shorthand properties and destructuring", () => {
+  const root = makeProject();
+  try {
+    const source = [
+      "export const shorty = 1;",
+      "export const aliased = 2;",
+      "export const destructured = 3;",
+      "export const renamed = 4;",
+      "export const unused = 5;",
+      "",
+    ].join("\n");
+    write(
+      root,
+      "tsconfig.json",
+      JSON.stringify({ compilerOptions: { strict: true }, include: ["src/**/*.ts"] }),
+    );
+    write(root, "src/values.ts", source);
+    write(
+      root,
+      "src/consumer.ts",
+      [
+        'import { shorty, aliased as local, unused } from "./values";',
+        'import * as values from "./values";',
+        "export const bag = { shorty, local };",
+        "const { destructured } = values;",
+        "const { renamed: other } = values;",
+        "export const read = [destructured, other];",
+        "",
+      ].join("\n"),
+    );
+    const names = ["shorty", "aliased", "destructured", "renamed", "unused"];
+    const queries = names.map((name, id) => ({
+      id,
+      operation: "symbol-use",
+      framework_contracts: [],
+      symbol: symbolIdentity({
+        source,
+        marker: name,
+        file: "src/values.ts",
+        namespace: "value",
+        declarationKind: "export",
+        exportedName: name,
+      }),
+    }));
+
+    const response = runSidecar(semanticRequest(root, queries));
+    const assertions = Object.fromEntries(
+      response.results.map((result) => [names[result.query_id], result.assertion]),
+    );
+    assert.deepEqual(assertions, {
+      shorty: "confirmed-used",
+      aliased: "confirmed-used",
+      destructured: "confirmed-used",
+      renamed: "confirmed-used",
+      unused: "confirmed-no-static-references",
+    });
+    const shortyUse = response.results.find((result) => result.query_id === 0).evidence[0];
+    assert.deepEqual([shortyUse.path, shortyUse.line], ["src/consumer.ts", 3]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Each case reads the export `x` of its own module through a namespace
+// object. A static read credits `x` and keeps the closed-world claim for the
+// unused export `y`. An escaping or computed use makes `y` abstain. An opaque
+// use also hides the read of `x`.
+const NAMESPACE_USE_CASES = [
+  ["assignment-shorthand", "let x = 0;\n({ x } = ns);\nexport const out = x;", "static"],
+  ["assignment-renamed", "let v = 0;\n({ x: v } = ns);\nexport const out = v;", "static"],
+  ["string-key", 'const { "x": v } = ns;\nexport const out = v;', "static"],
+  ["computed-string-key", 'const { ["x"]: v } = ns;\nexport const out = v;', "static"],
+  ["parameter-default", "export function read({ x } = ns) { return x; }", "static"],
+  ["typed-parameter", "export const read = ({ x }: typeof ns) => x;", "static"],
+  ["parenthesized", "const { x } = (ns);\nexport const out = x;", "static"],
+  ["as-expression", "const { x } = ns as typeof ns;\nexport const out = x;", "static"],
+  ["non-null", "const { x } = ns!;\nexport const out = x;", "static"],
+  ["satisfies", "const { x } = ns satisfies object;\nexport const out = x;", "static"],
+  ["asserted-member", "export const out = (ns as typeof ns).x;", "static"],
+  ["import-equals", 'import m = require("./exp");\nexport const out = m.x;', "static", false],
+  ["namespace-export", "export const out = outer.inner.x;", "static", "outer"],
+  ["loop-source", "for (const { x } of [ns]) console.log(x);", "escape"],
+  ["nested-source", "const { inner: { x } } = { inner: ns };\nexport const out = x;", "escape"],
+  ["rest-element", "const { ...r } = ns;\nexport const out = r.x;", "opaque"],
+  ["annotated-source", "const { x }: { x: number } = ns;\nexport const out = x;", "escape"],
+  [
+    "defaulted-source",
+    "let x = 0;\n({ a: { x } = ns } = { a: undefined });\nexport const out = x;",
+    "opaque",
+  ],
+  ["typeof-operator", "export const out = [typeof ns, ns.x];", "escape"],
+  ["star-reexport", "export const out = [outer.x, outer];", "escape", "star"],
+  ["local-alias", "const n2 = ns;\nexport const out = n2.x;", "escape"],
+  ["call-argument", "console.log(ns.x, ns);", "escape"],
+  ["export-specifier", "export { ns };\nexport const out = ns.x;", "escape"],
+  ["default-export", "export default ns;\nexport const out = ns.x;", "escape"],
+  ["shorthand-property", "export const bag = { ns };\nexport const out = ns.x;", "escape"],
+  ["type-query", "export const out = ns.x;\nexport type Keys = keyof typeof ns;", "static"],
+  ["type-alias", "export const out = ns.x;\nexport type Api = typeof ns;", "static"],
+  [
+    "computed-access",
+    "declare const k: keyof typeof ns;\nexport const out = [ns[k], ns.x];",
+    "escape",
+  ],
+  [
+    "computed-key",
+    'declare const k: "x" | "y";\nconst { [k]: v, x } = ns;\nexport const out = [v, x];',
+    "escape",
+  ],
+  ["namespace-export-escape", "console.log(outer.inner.x, outer.inner);", "escape", "outer"],
+  ["outer-escape", "console.log(outer.inner.x, outer);", "escape", "outer"],
+  [
+    "nested-destructure",
+    "const { inner } = outer;\nconsole.log(inner.x, inner);",
+    "escape",
+    "outer",
+  ],
+  [
+    "nested-parameter",
+    "export function read({ inner } = outer) {\n  return [inner.x, inner];\n}",
+    "escape",
+    "outer",
+  ],
+  [
+    "nested-typed-parameter",
+    "export const read = ({ inner }: typeof outer) => [inner.x, inner];",
+    "escape",
+    "outer",
+  ],
+  ["nested-element-access", 'console.log(outer.inner.x, outer["inner"]);', "escape", "outer"],
+  [
+    "renamed-namespace-import",
+    'import { inner as q } from "./barrel";\nconsole.log(q.x, q);',
+    "escape",
+    "named",
+  ],
+  ["namespace-block", "namespace N {\n  import z = ns;\n  console.log(z.x, z);\n}", "escape"],
+  ["dynamic-import-star", 'void import("./barrel");', "opaque", "starOnly"],
+  [
+    "default-namespace-import",
+    'import d from "./barrel";\nconsole.log(d.x, d);',
+    "escape",
+    "defaultBarrel",
+  ],
+  [
+    "keyed-barrel-destructure",
+    "const { z } = outer;\nexport const out = [z, outer.inner.x];",
+    "static",
+    "outer",
+    { "barrel.ts": 'export * as inner from "./exp";\nexport const z = 1;\n' },
+  ],
+  [
+    "keyed-barrel-element",
+    'export const out = [outer["z"], outer.inner.x];',
+    "static",
+    "outer",
+    { "barrel.ts": 'export * as inner from "./exp";\nexport const z = 1;\n' },
+  ],
+  ["dynamic-import-nested", 'void import("./barrel");', "opaque", "named"],
+];
+
+const NAMESPACE_IMPORTS = {
+  ns: 'import * as ns from "./exp";\n',
+  outer: 'import * as outer from "./barrel";\n',
+  star: 'import * as outer from "./barrel";\n',
+  named: "",
+  starOnly: "",
+  defaultBarrel: "",
+  false: "",
+};
+const NAMESPACE_BARRELS = {
+  outer: "export * as inner",
+  star: "export *",
+  named: "export * as inner",
+  starOnly: "export *",
+  defaultBarrel: "export * as default",
+};
+const NAMESPACE_OUTCOMES = {
+  static: ["confirmed-used", "confirmed-no-static-references", null],
+  escape: ["confirmed-used", "no-confirmed-use", "dynamic-behavior"],
+  opaque: ["no-confirmed-use", "no-confirmed-use", "dynamic-behavior"],
+};
+
+// Returns the outcome of `x` and `y` per case: the assertion of `x`, the
+// assertion of `y`, and the reason code of `y`.
+const namespaceUseOutcomes = (cases, compilerOptions, include) => {
+  const root = makeProject();
+  try {
+    const source = "export const x = 1;\nexport const y = 2;\n";
+    write(root, "tsconfig.json", JSON.stringify({ compilerOptions, include }));
+    const queries = cases.flatMap(([name, consumer, , importKind = "ns", files = {}]) => {
+      const dir = `src/${name}`;
+      write(root, `${dir}/exp.ts`, source);
+      const barrel = NAMESPACE_BARRELS[importKind];
+      if (barrel) write(root, `${dir}/barrel.ts`, `${barrel} from "./exp";\n`);
+      write(root, `${dir}/consumer.ts`, `${NAMESPACE_IMPORTS[importKind]}${consumer}\n`);
+      Object.entries(files).forEach(([file, contents]) => write(root, `${dir}/${file}`, contents));
+      return ["x", "y"].map((exportedName) => ({
+        operation: "symbol-use",
+        framework_contracts: [],
+        symbol: symbolIdentity({
+          source,
+          marker: `${exportedName} =`,
+          file: `${dir}/exp.ts`,
+          namespace: "value",
+          declarationKind: "export",
+          exportedName,
+        }),
+      }));
+    });
+
+    const response = runSidecar(
+      semanticRequest(
+        root,
+        queries.map((query, id) => ({ id, ...query })),
+      ),
+    );
+    return Object.fromEntries(
+      cases.map(([name], index) => {
+        const [x, y] = [2 * index, 2 * index + 1].map((id) =>
+          response.results.find((result) => result.query_id === id),
+        );
+        return [name, [x.assertion, y.assertion, y.reason_code ?? null]];
+      }),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+};
+
+const expectedNamespaceOutcomes = (cases) =>
+  Object.fromEntries(cases.map(([name, , kind]) => [name, NAMESPACE_OUTCOMES[kind]]));
+
+test("protocol v7 never claims closed-world absence for exports behind a namespace use", () => {
+  const actual = namespaceUseOutcomes(
+    NAMESPACE_USE_CASES,
+    { strict: true, module: "preserve", moduleResolution: "bundler" },
+    ["src/**/*.ts"],
+  );
+  assert.deepEqual(actual, expectedNamespaceOutcomes(NAMESPACE_USE_CASES));
+});
+
+const COMMONJS_NAMESPACE_USE_CASES = [
+  [
+    "module-exports-require",
+    'import r = require("./r");\nconsole.log(r.x, r);',
+    "escape",
+    false,
+    { "r.js": 'module.exports = require("./exp");\n' },
+  ],
+  [
+    "exports-property-require",
+    "export {};",
+    "escape",
+    false,
+    {
+      "r.js": 'exports.m = require("./exp");\n',
+      "c.js": 'const { m } = require("./r");\nconsole.log(m.x, m);\n',
+    },
+  ],
+  [
+    "require-member",
+    "export {};",
+    "static",
+    false,
+    { "c.js": 'const m = require("./exp");\nconsole.log(m.x);\n' },
+  ],
+  [
+    "nested-require",
+    "export {};",
+    "escape",
+    false,
+    {
+      "c.js":
+        'function load() {\n  const m = require("./exp");\n  console.log(m.x, m);\n}\nload();\n',
+    },
+  ],
+];
+
+test("protocol v7 never claims closed-world absence for exports behind a CommonJS namespace", () => {
+  const actual = namespaceUseOutcomes(
+    COMMONJS_NAMESPACE_USE_CASES,
+    { strict: true, module: "commonjs", allowJs: true, noEmit: true },
+    ["src/**/*.ts", "src/**/*.js"],
+  );
+  assert.deepEqual(actual, expectedNamespaceOutcomes(COMMONJS_NAMESPACE_USE_CASES));
+});
+
 test("protocol v7 preserves required interface, abstract, and inherited contracts", () => {
   const cases = [
     {
@@ -1873,6 +2272,33 @@ test("protocol v7 abstains for optional contracts, decorators, and dynamic membe
         'const key: keyof Worker = Math.random() ? "execute" : "execute";',
         "worker[key]();",
         "export { worker };",
+        "",
+      ].join("\n"),
+      markerOccurrence: 1,
+    },
+    {
+      reason: "dynamic-member-access",
+      source: [
+        "class Worker {",
+        "  execute(): void {}",
+        "}",
+        "declare const key: keyof Worker;",
+        "const { [key]: run } = new Worker();",
+        "export { run };",
+        "",
+      ].join("\n"),
+      markerOccurrence: 1,
+    },
+    {
+      reason: "dynamic-member-access",
+      source: [
+        "class Worker {",
+        "  execute(): void {}",
+        "}",
+        "declare const key: keyof Worker;",
+        "let run: () => void = () => {};",
+        "({ [key]: run } = new Worker());",
+        "export { run };",
         "",
       ].join("\n"),
       markerOccurrence: 1,
@@ -2345,10 +2771,10 @@ test("protocol v7 resolves typeof import for both halves of a declaration merge"
   }
 });
 
-test("protocol v7 abstains when a dynamic import can consume an unresolved export", () => {
+test("protocol v7 credits a dynamic import destructure and abstains for its siblings", () => {
   const root = makeProject();
   try {
-    const source = "export const runtimeValue = 1;\n";
+    const source = "export const runtimeValue = 1;\nexport const siblingValue = 2;\n";
     write(
       root,
       "tsconfig.json",
@@ -2360,25 +2786,29 @@ test("protocol v7 abstains when a dynamic import can consume an unresolved expor
       "src/consumer.ts",
       'void import("./source").then(({ runtimeValue }) => runtimeValue);\n',
     );
-    const identity = symbolIdentity({
-      source,
-      marker: "runtimeValue",
-      file: "src/source.ts",
-      namespace: "value",
-      declarationKind: "export",
-      exportedName: "runtimeValue",
-      localName: "runtimeValue",
-    });
+    const queries = ["runtimeValue", "siblingValue"].map((name, index) => ({
+      id: 70 + index,
+      operation: "symbol-use",
+      symbol: symbolIdentity({
+        source,
+        marker: name,
+        file: "src/source.ts",
+        namespace: "value",
+        declarationKind: "export",
+        exportedName: name,
+      }),
+    }));
 
-    const response = runSidecar(
-      semanticRequest(root, [{ id: 70, operation: "symbol-use", symbol: identity }]),
+    const response = runSidecar(semanticRequest(root, queries));
+    const [read, sibling] = [70, 71].map((id) =>
+      response.results.find((result) => result.query_id === id),
     );
-    const result = response.results[0];
 
-    assert.equal(result.assertion, "no-confirmed-use");
-    assert.equal(result.status, "partial");
-    assert.equal(result.reason_code, "dynamic-behavior");
-    assert.equal(result.data.closed_world_eligible, false);
+    assert.equal(read.assertion, "confirmed-used");
+    assert.equal(sibling.assertion, "no-confirmed-use");
+    assert.equal(sibling.status, "partial");
+    assert.equal(sibling.reason_code, "dynamic-behavior");
+    assert.equal(sibling.data.closed_world_eligible, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2709,6 +3139,47 @@ test("rejects the removed protocol v2 without JSON stdout", () => {
   assert.match(result.stderr, /unsupported protocol_version 2/);
 });
 
+test("rejects unknown arguments without JSON stdout", () => {
+  for (const args of [["--session", "extra"], ["--status", "extra"], ["--bogus"]]) {
+    const result = spawnSync(executable, args, { cwd: sidecarRoot, input: "", encoding: "utf8" });
+
+    assert.equal(result.status, 2, args.join(" "));
+    assert.equal(result.stdout, "", args.join(" "));
+    assert.match(result.stderr, new RegExp(`unknown argument: ${args[0]}`), args.join(" "));
+  }
+});
+
+test("rejects an unsupported operation in a batch request", () => {
+  const result = spawnSync(executable, {
+    cwd: sidecarRoot,
+    input: JSON.stringify({
+      ...semanticRequest(sidecarRoot, [], { projects: [] }),
+      operation: "class-member-uses",
+    }),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /unsupported operation class-member-uses/);
+});
+
+test("rejects an unsupported operation in a session request", () => {
+  const request = {
+    ...semanticRequest(sidecarRoot, [], { projects: [] }),
+    operation: "class-member-uses",
+  };
+  const result = spawnSync(executable, ["--session"], {
+    cwd: sidecarRoot,
+    input: `${JSON.stringify({ type: "analyze", request_id: 1, revision: 1, request })}\n`,
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /unsupported operation class-member-uses/);
+});
+
 test("rejects negative semantic query IDs", () => {
   const result = spawnSync(executable, {
     cwd: sidecarRoot,
@@ -2793,12 +3264,6 @@ test("bounds and normalizes warning text", () => {
   assert.deepEqual(response.warnings.slice(2), ["\uE000", "\u{10000}"]);
 });
 
-test("sidecar version matches the package version", () => {
-  const response = createStatusResponse();
-
-  assert.equal(response.package_version, sidecarVersion);
-});
-
 test("rejects oversized stdin while reading", async () => {
   await assert.rejects(readAll(Readable.from(["12345"]), 4), /4 byte request limit/);
 });
@@ -2809,7 +3274,7 @@ test("returns provenance for an empty semantic request", () => {
   assert.equal(response.protocol_version, 7);
   assert.equal(response.operation, "semantic-queries");
   assert.equal(response.sidecar_version, sidecarVersion);
-  assert.equal(response.backend, "typescript-go");
+  assert.equal(response.backend, BACKEND.family);
   assert.deepEqual(response.selected_tsconfigs, []);
   assert.deepEqual(response.projects, []);
   assert.deepEqual(response.results, []);
@@ -2850,7 +3315,7 @@ test("persistent semantic session invalidates changed source without stale refer
     const snapshots = [];
     const session = createSemanticSession(root, {
       createApi: (cwd) => {
-        const api = new API({ cwd });
+        const api = createApi({ cwd });
         return {
           updateSnapshot: (params) => {
             const snapshot = api.updateSnapshot(params);
@@ -3142,5 +3607,40 @@ test("unknown external framework package provenance abstains", () => {
     assert.equal(response.results[0].data.closed_world_eligible, false);
   } finally {
     rmSync(monorepo, { recursive: true, force: true });
+  }
+});
+
+test("a query for a deleted file does not fail the other queries in the request", () => {
+  const root = makeProject();
+  try {
+    write(root, "tsconfig.json", JSON.stringify({ include: ["src/**/*.ts"] }));
+    write(root, "src/a.ts", "export const a = 1;\n");
+    const symbol = (file) => ({
+      path: file,
+      namespace: "value",
+      declaration_kind: "variable",
+      exported_name: "a",
+      local_name: "a",
+      line: 1,
+      col: 13,
+    });
+    const parsed = parseRequest(
+      semanticRequest(root, [
+        { id: 0, operation: "symbol-use", symbol: symbol("src/a.ts"), framework_contracts: [] },
+        {
+          id: 1,
+          operation: "symbol-use",
+          symbol: symbol("src/deleted.ts"),
+          framework_contracts: [],
+        },
+      ]),
+    );
+    const { results } = analyzeSemanticQueries(parsed);
+    assert.deepEqual(
+      results.map((result) => result.assertion),
+      ["confirmed-no-static-references", "no-confirmed-use"],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

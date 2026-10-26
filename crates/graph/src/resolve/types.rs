@@ -8,6 +8,7 @@ use oxc_resolver::Resolver;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde_json::Value;
 
+use fallow_config::TsconfigOutputMap;
 use fallow_types::discover::FileId;
 
 /// Result of resolving an import specifier.
@@ -142,6 +143,9 @@ pub struct ResolvedProject {
     pub modules: Vec<ResolvedModule>,
     /// Proven test-time replacements whose targets resolve inside the project.
     pub replaced_module_targets: Vec<ResolvedReplacedModuleTarget>,
+    /// Deterministic work counts of the resolution that built this project.
+    /// Zero for a project restored from the graph cache.
+    pub work: super::ResolveWork,
 }
 
 /// One project-internal module replacement resolved from its declaring source file.
@@ -257,7 +261,7 @@ pub struct ResolvedModule {
     pub resolved_imports: Vec<ResolvedImport>,
     /// All dynamic imports with resolved targets.
     pub resolved_dynamic_imports: Vec<ResolvedImport>,
-    /// Dynamic import patterns matched against discovered files.
+    /// Dynamic import patterns and their matched target files.
     pub resolved_dynamic_patterns: Vec<(fallow_types::extract::DynamicImportPattern, Vec<FileId>)>,
     /// Static member accesses (e.g., `Status.Active`).
     pub member_accesses: Arc<[fallow_types::extract::MemberAccess]>,
@@ -292,6 +296,21 @@ pub struct ResolvedModule {
     /// and type-literal aliases. See `fallow_types::extract::TypeMemberTypeEntry`
     /// and issue #1785.
     pub type_member_types: Arc<[fallow_types::extract::TypeMemberTypeEntry]>,
+    /// Unresolved bare specifiers whose package `exports` entry names only
+    /// paths that do not exist, in specifier order. The resolver records the
+    /// paths so that the unresolved-import check can test them against the
+    /// ignore rules of the repository. No edge points at these paths.
+    pub missing_export_targets: Vec<MissingExportTarget>,
+}
+
+/// The missing paths that the `exports` map of a project package names for
+/// one unresolved bare specifier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissingExportTarget {
+    /// The import specifier, for example `store/enums`.
+    pub specifier: String,
+    /// The absolute paths that the matched `exports` entry names.
+    pub paths: Vec<PathBuf>,
 }
 
 impl Default for ResolvedModule {
@@ -316,6 +335,7 @@ impl Default for ResolvedModule {
             exported_factory_returns: Arc::default(),
             exported_factory_return_object_shapes: Arc::default(),
             type_member_types: Arc::default(),
+            missing_export_targets: vec![],
         }
     }
 }
@@ -357,6 +377,9 @@ impl ResolvedModule {
 pub(super) struct ResolveContext<'a> {
     /// The oxc_resolver instance (configured once, shared across threads).
     pub resolver: &'a Resolver,
+    /// Script and JSON extension inference, with explicit asset targets intact.
+    /// Shares the broad resolver's filesystem and PnP cache.
+    pub script_resolver: &'a Resolver,
     /// CSS-only resolver with package.json `sass` and `style` conditions enabled.
     /// Used only for stylesheet package subpaths so JS/TS imports do not
     /// accidentally prefer CSS export branches.
@@ -385,6 +408,10 @@ pub(super) struct ResolveContext<'a> {
     /// Static directory URL mappings from framework config.
     /// Each tuple is `(absolute_source_dir, normalized_url_mount)`.
     pub static_dir_mappings: &'a [(PathBuf, String)],
+    /// Mounts a framework serves for the whole project, reachable from any HTML
+    /// document, unlike `static_dir_mappings`, which stays scoped to the tool
+    /// whose config declared it.
+    pub framework_static_dir_mappings: &'a [(PathBuf, String)],
     /// Project root directory.
     pub root: &'a Path,
     /// Lazy canonical path → FileId fallback for intra-project symlinks.
@@ -428,6 +455,13 @@ impl CanonicalizeCache {
         self.map.insert(path.to_path_buf(), value.clone());
         value
     }
+
+    /// Number of distinct paths this cache canonicalized. Two threads that
+    /// miss the same path at once can both call the filesystem, so this is the
+    /// work the run needs, not an exact syscall count.
+    pub fn distinct_paths(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// Session-local cache for tsconfig helper lookups used during import resolution.
@@ -435,6 +469,7 @@ impl CanonicalizeCache {
 pub(super) struct TsconfigCache {
     json: DashMap<PathBuf, Option<Arc<Value>>, FxBuildHasher>,
     chains: DashMap<PathBuf, Arc<[PathBuf]>, FxBuildHasher>,
+    output_maps: DashMap<PathBuf, Arc<TsconfigOutputMap>, FxBuildHasher>,
 }
 
 impl TsconfigCache {
@@ -466,6 +501,18 @@ impl TsconfigCache {
     /// Store the computed tsconfig chain for a source file.
     pub fn store_chain(&self, from_file: &Path, chain: Arc<[PathBuf]>) {
         self.chains.insert(from_file.to_path_buf(), chain);
+    }
+
+    /// Return the output-to-source map of a package root, building it on
+    /// first miss. Each package root reads its tsconfig files once per run.
+    pub fn output_map(&self, package_root: &Path) -> Arc<TsconfigOutputMap> {
+        if let Some(map) = self.output_maps.get(package_root) {
+            return Arc::clone(&map);
+        }
+        let map = Arc::new(TsconfigOutputMap::from_project(package_root));
+        self.output_maps
+            .insert(package_root.to_path_buf(), Arc::clone(&map));
+        map
     }
 }
 
@@ -509,6 +556,7 @@ impl<'a> CanonicalFallback<'a> {
     /// Look up a canonical path, lazily building the index on first call.
     pub fn get(&self, canonical: &Path) -> Option<FileId> {
         let map = self.map.get_or_init(|| {
+            super::work::note_canonicalize(self.files.len() as u64);
             tracing::debug!(
                 "intra-project symlinks detected, building canonical path index ({} files)",
                 self.files.len()
@@ -690,6 +738,16 @@ mod tests {
 /// prefixes with `src/` (the conventional source directory) to find the tracked
 /// source file.
 pub const OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "esm", "cjs"];
+
+/// Output directory names that map to `src/` only when the target is absent.
+///
+/// Many TypeScript libraries build `src/` into `lib/`, but older packages keep
+/// hand-written source in `lib/`. Thus `lib` maps to `src/` only when the
+/// `lib/` target is absent from the analyzed file set (for example in a fresh
+/// clone before the build, or a gitignored build), and only for package
+/// manifest targets. A `lib/` file in the file set always wins, and generic
+/// relative imports never use this list.
+pub const MISSING_ONLY_OUTPUT_DIRS: &[&str] = &["lib"];
 
 /// Source extensions to try when mapping a built output file back to source.
 pub const SOURCE_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];

@@ -14,25 +14,8 @@ use std::path::Path;
 use fallow_config::{FallowConfig, OutputFormat};
 use fallow_core::graph_cache::{GraphCacheManifest, GraphCacheMode};
 use fallow_types::discover::FileId;
-use fallow_types::source_fingerprint::SourceFingerprint;
 
-use super::common::{create_config_with_cache, fixture_path};
-
-/// Recursively copy a fixture tree into `dst` so the graph cache writes into a
-/// scratch directory and source mutation does not touch the checked-in fixture.
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).expect("create dest dir");
-    for entry in std::fs::read_dir(src).expect("read fixture dir") {
-        let entry = entry.expect("dir entry");
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_tree(&from, &to);
-        } else {
-            std::fs::copy(&from, &to).expect("copy file");
-        }
-    }
-}
+use super::common::{copy_fixture_tree, create_config_with_cache, fixture_path};
 
 /// Run the same fixture cold (clean cache) then warm (cache present) and assert
 /// the full results are byte-identical. The cold run persists `graph-cache.bin`;
@@ -40,7 +23,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 fn assert_cold_warm_identical(fixture: &str) {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path(fixture), &root);
+    copy_fixture_tree(&fixture_path(fixture), &root);
 
     // Cache dir lives OUTSIDE the project root so it is not itself an analyzed
     // source tree; the graph cache writes `graph-cache.bin` here.
@@ -90,11 +73,24 @@ fn current_manifest_with_cached_mode(
     store: &fallow_core::graph_cache::GraphCacheStore,
 ) -> GraphCacheManifest {
     let files = fallow_core::discover::discover_files(config);
-    GraphCacheManifest::from_discovered_files(&config.root, &files, store.manifest.mode, |path| {
-        std::fs::metadata(path).map_or(SourceFingerprint::new(0, 0), |m| {
-            SourceFingerprint::from_metadata(&m)
-        })
+    let hashes = content_hashes_for(&files);
+    GraphCacheManifest::from_discovered_files(&config.root, &files, store.manifest.mode, |file| {
+        hashes.get(file.id.0 as usize).copied().unwrap_or_default()
     })
+}
+
+/// Content hash per `FileId`, mirroring what the analysis path feeds the
+/// manifest. Parsing without a cache is what the production builder gets from
+/// the parse stage it runs anyway.
+fn content_hashes_for(files: &[fallow_types::discover::DiscoveredFile]) -> Vec<u64> {
+    let parsed = fallow_core::extract::parse_all_files(files, None, false);
+    let mut hashes = vec![0u64; files.len()];
+    for module in &parsed.modules {
+        if let Some(slot) = hashes.get_mut(module.file_id.0 as usize) {
+            *slot = module.content_hash;
+        }
+    }
+    hashes
 }
 
 #[test]
@@ -140,7 +136,7 @@ fn basic_project_cold_vs_warm_identical() {
 fn source_change_misses_cache_and_reflects_change() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("barrel-exports"), &root);
+    copy_fixture_tree(&fixture_path("barrel-exports"), &root);
     let cache_dir = temp.path().join("cache");
 
     let config = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -150,8 +146,8 @@ fn source_change_misses_cache_and_reflects_change() {
     let unused_before = before.unused_exports.len();
 
     // Mutate a source file: add a brand-new export that nothing imports. This
-    // changes the file's size, so its SourceFingerprint changes and the
-    // persisted manifest no longer matches the current inputs.
+    // changes the file's content hash, so the persisted manifest no longer
+    // matches the current inputs.
     let target = root.join("src/module-a.ts");
     let original = std::fs::read_to_string(&target).expect("read module-a");
     std::fs::write(
@@ -179,13 +175,114 @@ fn source_change_misses_cache_and_reflects_change() {
     );
 }
 
+/// An edit that keeps the file's byte length and restores its modification
+/// time must still miss the cache.
+///
+/// `(mtime, size)` is the pair the metadata fast paths compared, and both
+/// halves of it are writer-controlled: `touch -r`, a codemod that rewrites a
+/// file and puts the timestamp back, and a `git checkout` of an equal-length
+/// revision all produce this shape. Serving the cached analysis for it is not a
+/// stale timing number, it is a wrong verdict with an auto-fixable action on it:
+/// the warm run reports the previously-unused export as still unused and offers
+/// `remove-export`, while applying that fix deletes a symbol the new source
+/// imports.
+#[test]
+fn equal_length_edit_with_restored_mtime_misses_cache_and_reflects_change() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let root = temp.path().join("project");
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(root.join("src")).expect("create project src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "equal-length-edit", "version": "1.0.0", "main": "src/index.ts" }"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        root.join("src/api.ts"),
+        "export const alpha = (): number => 1;\nexport const bravo = (): number => 2;\n",
+    )
+    .expect("write api module");
+    let entry = root.join("src/index.ts");
+    let before_source =
+        "import { alpha } from \"./api\";\n\nexport const run = (): number => alpha();\n";
+    std::fs::write(&entry, before_source).expect("write entry module");
+
+    let config = create_config_with_cache(root, cache_dir.clone());
+
+    let cold = fallow_core::analyze(&config).expect("cold analysis");
+    assert_eq!(
+        unused_export_names(&cold),
+        vec!["bravo".to_string()],
+        "the fixture must start with exactly one unused export"
+    );
+
+    // `alpha` -> `bravo` keeps the byte length identical; restoring the
+    // timestamps afterwards makes the file indistinguishable from the cached
+    // one by metadata alone.
+    let metadata = std::fs::metadata(&entry).expect("entry metadata");
+    let modified = metadata.modified().expect("entry mtime");
+    let accessed = metadata.accessed().unwrap_or(modified);
+    let after_source = before_source.replace("alpha", "bravo");
+    assert_eq!(after_source.len(), before_source.len());
+    std::fs::write(&entry, &after_source).expect("rewrite entry module");
+    let handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&entry)
+        .expect("open entry for timestamp restore");
+    handle
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(accessed)
+                .set_modified(modified),
+        )
+        .expect("restore entry timestamps");
+    let after_metadata = std::fs::metadata(&entry).expect("entry metadata after rewrite");
+    assert_eq!(
+        after_metadata.len(),
+        metadata.len(),
+        "the rewrite must keep the file size identical"
+    );
+    assert_eq!(
+        after_metadata
+            .modified()
+            .expect("entry mtime after rewrite"),
+        modified,
+        "the rewrite must restore the modification time exactly"
+    );
+
+    let store = fallow_core::graph_cache::GraphCacheStore::load(&cache_dir)
+        .expect("persisted graph cache exists after cold run");
+    let current = current_manifest_with_cached_mode(&config, &store);
+    assert!(
+        !store.manifest.matches_inputs(&current),
+        "an equal-length rewrite with a restored mtime must invalidate the manifest"
+    );
+
+    let warm = fallow_core::analyze(&config).expect("warm analysis");
+    assert_eq!(
+        unused_export_names(&warm),
+        vec!["alpha".to_string()],
+        "the warm run must report the new source's unused export, not the cached one"
+    );
+}
+
+fn unused_export_names(results: &fallow_types::results::AnalysisResults) -> Vec<String> {
+    let mut names: Vec<String> = results
+        .unused_exports
+        .iter()
+        .map(|issue| issue.export.export_name.clone())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 /// A deleted source file must MISS the cache and disappear from the next
 /// analysis result, rather than being served from the old persisted graph.
 #[test]
 fn file_deletion_misses_cache_and_reflects_change() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("basic-project"), &root);
+    copy_fixture_tree(&fixture_path("basic-project"), &root);
     let cache_dir = temp.path().join("cache");
 
     let config = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -227,7 +324,7 @@ fn file_deletion_misses_cache_and_reflects_change() {
 fn file_rename_misses_cache_and_reflects_new_path() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("basic-project"), &root);
+    copy_fixture_tree(&fixture_path("basic-project"), &root);
     let cache_dir = temp.path().join("cache");
 
     let config = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -283,7 +380,7 @@ fn file_rename_misses_cache_and_reflects_new_path() {
 fn production_mode_change_misses_cache_and_reflects_file_set() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("production-mode"), &root);
+    copy_fixture_tree(&fixture_path("production-mode"), &root);
     let cache_dir = temp.path().join("cache");
 
     let non_production = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -330,7 +427,7 @@ fn production_mode_change_misses_cache_and_reflects_file_set() {
 fn ignore_pattern_change_misses_cache_and_reflects_file_set() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("basic-project"), &root);
+    copy_fixture_tree(&fixture_path("basic-project"), &root);
     let cache_dir = temp.path().join("cache");
 
     let without_ignore = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -382,7 +479,7 @@ fn ignore_pattern_change_misses_cache_and_reflects_file_set() {
 fn resolve_condition_change_misses_cache_and_matches_cold_output() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("barrel-exports"), &root);
+    copy_fixture_tree(&fixture_path("barrel-exports"), &root);
     let cache_dir = temp.path().join("cache");
 
     let base = create_config_with_cache(root.clone(), cache_dir.clone());
@@ -423,7 +520,7 @@ fn resolve_condition_change_misses_cache_and_matches_cold_output() {
 fn warm_graph_cache_hit_skips_import_resolution() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("barrel-exports"), &root);
+    copy_fixture_tree(&fixture_path("barrel-exports"), &root);
     let cache_dir = temp.path().join("cache");
 
     let config = create_config_with_cache(root, cache_dir);
@@ -446,8 +543,8 @@ fn warm_graph_cache_hit_skips_import_resolution() {
     );
 }
 
-/// Force the resolver-payload reuse path: the manifest keeps matching
-/// `matches_resolution_inputs` while the persisted graph is unusable, so the
+/// Force the resolver-payload reuse path: the manifest still passes
+/// `classify_resolution_mismatch` while the persisted graph is unusable, so the
 /// graph is rebuilt from the cached `ResolvedProject` alone. Every import field
 /// the graph reads must survive that mirror, so the rebuilt output has to match
 /// the cold output exactly.
@@ -458,7 +555,7 @@ fn warm_graph_cache_hit_skips_import_resolution() {
 fn assert_resolver_cache_hit_matches_cold(fixture: &str) {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path(fixture), &root);
+    copy_fixture_tree(&fixture_path(fixture), &root);
     let cache_dir = temp.path().join("cache");
 
     let config = create_config_with_cache(root, cache_dir.clone());
@@ -484,8 +581,11 @@ fn assert_resolver_cache_hit_matches_cold(fixture: &str) {
         "shifted FileIds must not trust the persisted graph"
     );
     assert!(
-        store.manifest.matches_resolution_inputs(&current),
-        "stable file keys and fingerprints should still allow resolver reuse"
+        store
+            .manifest
+            .classify_resolution_mismatch(&current)
+            .is_none(),
+        "stable file keys and content hashes should still allow resolver reuse"
     );
     store.save(&cache_dir);
 
@@ -526,15 +626,17 @@ fn resolver_cache_hit_preserves_ambient_type_only_star_lane() {
 /// Resolve a real-world benchmark fixture path. These are gitignored symlinks
 /// that may be absent on a fresh checkout, so callers skip when missing.
 fn benchmark_fixture_path(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("benchmarks")
-        .join("fixtures")
-        .join("real-world")
-        .join(name)
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .parent()
+    .unwrap()
+    .parent()
+    .unwrap()
+    .join("benchmarks")
+    .join("fixtures")
+    .join("real-world")
+    .join(name)
 }
 
 /// Run a real-world benchmark fixture cold then warm and assert `total_issues`
@@ -577,43 +679,281 @@ fn benchmark_zod_cold_vs_warm_total_identical() {
     assert_benchmark_cold_warm_total("zod");
 }
 
-/// The manifest must hit on identical inputs and miss when a fingerprint or a
+/// The manifest must hit on identical inputs and miss when file content or a
 /// graph-affecting mode hash changes. This pins `matches_inputs` against the
 /// real `from_discovered_files` shape used by the integration path.
 #[test]
 fn manifest_matches_only_on_identical_inputs() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let root = temp.path().join("project");
-    copy_tree(&fixture_path("namespace-imports"), &root);
+    copy_fixture_tree(&fixture_path("namespace-imports"), &root);
 
     let config = create_config_with_cache(root, temp.path().join("cache"));
     let files = fallow_core::discover::discover_files(&config);
 
-    let fingerprint_provider = |path: &Path| {
-        std::fs::metadata(path).map_or(SourceFingerprint::new(0, 0), |m| {
-            SourceFingerprint::from_metadata(&m)
-        })
+    let hashes = content_hashes_for(&files);
+    let content_hash_provider = |file: &fallow_types::discover::DiscoveredFile| {
+        hashes.get(file.id.0 as usize).copied().unwrap_or_default()
     };
 
     let manifest_a = GraphCacheManifest::from_discovered_files(
         &config.root,
         &files,
         GraphCacheMode::new(1, 2, 3),
-        fingerprint_provider,
+        content_hash_provider,
     );
     let manifest_same = GraphCacheManifest::from_discovered_files(
         &config.root,
         &files,
         GraphCacheMode::new(1, 2, 3),
-        fingerprint_provider,
+        content_hash_provider,
     );
     let manifest_other_mode = GraphCacheManifest::from_discovered_files(
         &config.root,
         &files,
         GraphCacheMode::new(1, 99, 3),
-        fingerprint_provider,
+        content_hash_provider,
     );
 
     assert!(manifest_a.matches_inputs(&manifest_same));
     assert!(!manifest_a.matches_inputs(&manifest_other_mode));
+}
+
+#[test]
+fn a_graph_cache_from_another_root_never_reuses_original_checkout_paths() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let original = temp.path().join("original");
+    let relocated = temp.path().join("relocated");
+    let cache = temp.path().join("cache");
+    std::fs::create_dir_all(original.join("src")).unwrap();
+    std::fs::write(
+        original.join("package.json"),
+        r#"{"name":"relocation","main":"src/index.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        original.join("src/index.ts"),
+        "import { used } from './lib'; console.log(used);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        original.join("src/lib.ts"),
+        "export const used = 1; export const unused = 2;\n",
+    )
+    .unwrap();
+    let original_config = create_config_with_cache(original.clone(), cache.clone());
+    fallow_core::analyze(&original_config).expect("prime original cache");
+    copy_fixture_tree(&original, &relocated);
+    let mut relocated_config = create_config_with_cache(relocated.clone(), cache);
+    let warm = fallow_core::analyze(&relocated_config).expect("relocated warm analysis");
+    relocated_config.no_cache = true;
+    let cold = fallow_core::analyze(&relocated_config).expect("relocated uncached analysis");
+    assert_eq!(format!("{warm:#?}"), format!("{cold:#?}"));
+    assert!(
+        warm.unused_exports
+            .iter()
+            .all(|finding| finding.export.path.starts_with(&relocated))
+    );
+}
+
+/// Write `(relative path, content)` pairs under `root`.
+fn write_project_files(root: &Path, files: &[(&str, &str)]) {
+    for (relative, content) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(&path, content).expect("write project file");
+    }
+}
+
+fn sorted_unused_file_paths(
+    root: &Path,
+    results: &fallow_types::results::AnalysisResults,
+) -> Vec<String> {
+    let mut paths: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|finding| {
+            finding
+                .file
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&finding.file.path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// Run `files` cold with a cache, apply `edits` to non-source files only (so
+/// the source manifest stays the same), then run warm against the same cache.
+/// The warm run must equal a cache-free run on the edited tree. The edit must
+/// also change the cache-free verdict, or the test proves nothing.
+fn assert_resolution_input_edit_misses_cache(files: &[(&str, &str)], edits: &[(&str, &str)]) {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let root = temp.path().join("project");
+    write_project_files(&root, files);
+    let cache_dir = temp.path().join("cache");
+    let config = create_config_with_cache(root.clone(), cache_dir.clone());
+
+    let before = fallow_core::analyze(&config).expect("cold analysis");
+    assert!(
+        cache_dir.join("graph-cache.bin").exists(),
+        "cold run must persist graph-cache.bin"
+    );
+
+    write_project_files(&root, edits);
+
+    let warm = fallow_core::analyze(&config).expect("warm analysis after edit");
+    let mut uncached = create_config_with_cache(root.clone(), temp.path().join("cold-cache"));
+    uncached.no_cache = true;
+    let cold = fallow_core::analyze(&uncached).expect("cache-free analysis after edit");
+
+    let before_unused = sorted_unused_file_paths(&root, &before);
+    let cold_unused = sorted_unused_file_paths(&root, &cold);
+    assert_ne!(
+        before_unused, cold_unused,
+        "the edit must change the cache-free verdict, or this test proves nothing"
+    );
+    assert_eq!(
+        sorted_unused_file_paths(&root, &warm),
+        cold_unused,
+        "a warm run after a resolution-input edit must match a cache-free run"
+    );
+    let cold_json = serde_json::to_value(&cold).expect("serialize cold results");
+    let warm_json = serde_json::to_value(&warm).expect("serialize warm results");
+    assert_eq!(
+        cold_json, warm_json,
+        "warm results after a resolution-input edit must equal cache-free results"
+    );
+}
+
+const DB_IMPORT_SOURCES: &[(&str, &str)] = &[
+    ("src/db-a.ts", "export const db = 'a';\n"),
+    ("src/db-b.ts", "export const db = 'b';\n"),
+];
+
+#[test]
+fn package_json_imports_edit_misses_graph_cache() {
+    let mut files = vec![
+        (
+            "package.json",
+            r##"{"name":"app","main":"src/index.ts","imports":{"#db":"./src/db-a.ts"}}"##,
+        ),
+        (
+            "src/index.ts",
+            "import { db } from '#db';\nconsole.log(db);\n",
+        ),
+    ];
+    files.extend_from_slice(DB_IMPORT_SOURCES);
+    assert_resolution_input_edit_misses_cache(
+        &files,
+        &[(
+            "package.json",
+            r##"{"name":"app","main":"src/index.ts","imports":{"#db":"./src/db-b.ts"}}"##,
+        )],
+    );
+}
+
+#[test]
+fn workspace_name_swap_misses_graph_cache() {
+    assert_resolution_input_edit_misses_cache(
+        &[
+            (
+                "package.json",
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+            ),
+            (
+                "packages/app/package.json",
+                r#"{"name":"@demo/app","main":"src/index.ts","dependencies":{"@demo/lib":"*"}}"#,
+            ),
+            (
+                "packages/app/src/index.ts",
+                "import { value } from '@demo/lib/src/util';\nconsole.log(value);\n",
+            ),
+            ("packages/lib/package.json", r#"{"name":"@demo/lib"}"#),
+            ("packages/lib/src/util.ts", "export const value = 'lib';\n"),
+            ("packages/other/package.json", r#"{"name":"@demo/other"}"#),
+            (
+                "packages/other/src/util.ts",
+                "export const value = 'other';\n",
+            ),
+        ],
+        &[
+            ("packages/lib/package.json", r#"{"name":"@demo/other"}"#),
+            ("packages/other/package.json", r#"{"name":"@demo/lib"}"#),
+        ],
+    );
+}
+
+#[test]
+fn deno_import_map_edit_misses_graph_cache() {
+    let mut files = vec![
+        (
+            "deno.json",
+            r#"{"name":"app","exports":"./main.ts","imports":{"db":"./src/db-a.ts"}}"#,
+        ),
+        ("main.ts", "import { db } from 'db';\nconsole.log(db);\n"),
+    ];
+    files.extend_from_slice(DB_IMPORT_SOURCES);
+    assert_resolution_input_edit_misses_cache(
+        &files,
+        &[(
+            "deno.json",
+            r#"{"name":"app","exports":"./main.ts","imports":{"db":"./src/db-b.ts"}}"#,
+        )],
+    );
+}
+
+#[test]
+fn extended_tsconfig_paths_edit_misses_graph_cache() {
+    let mut files = vec![
+        ("package.json", r#"{"name":"app","main":"src/index.ts"}"#),
+        (
+            "tsconfig.json",
+            r#"{"extends":"./config/tsconfig.base.json"}"#,
+        ),
+        (
+            "config/tsconfig.base.json",
+            r#"{"compilerOptions":{"baseUrl":"..","paths":{"@db":["./src/db-a.ts"]}}}"#,
+        ),
+        (
+            "src/index.ts",
+            "import { db } from '@db';\nconsole.log(db);\n",
+        ),
+    ];
+    files.extend_from_slice(DB_IMPORT_SOURCES);
+    assert_resolution_input_edit_misses_cache(
+        &files,
+        &[(
+            "config/tsconfig.base.json",
+            r#"{"compilerOptions":{"baseUrl":"..","paths":{"@db":["./src/db-b.ts"]}}}"#,
+        )],
+    );
+}
+
+#[test]
+fn nested_tsconfig_paths_edit_misses_graph_cache() {
+    let mut files = vec![
+        ("package.json", r#"{"name":"app","main":"src/index.ts"}"#),
+        (
+            "src/tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@db":["./db-a.ts"]}}}"#,
+        ),
+        (
+            "src/index.ts",
+            "import { db } from '@db';\nconsole.log(db);\n",
+        ),
+    ];
+    files.extend_from_slice(DB_IMPORT_SOURCES);
+    assert_resolution_input_edit_misses_cache(
+        &files,
+        &[(
+            "src/tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@db":["./db-b.ts"]}}}"#,
+        )],
+    );
 }

@@ -1,6 +1,6 @@
 # Type-aware TypeScript analysis
 
-Fallow's default analysis remains fast, syntactic, and independent of Node.js
+Fallow's default analysis is syntactic and independent of Node.js
 or TypeScript. `--type-aware` opts into a bounded TypeScript-Go semantic pass
 after Fallow's normal project analysis. The capability is a stable, optional
 Fallow contract. Its exact-version TypeScript-Go adapter uses an upstream
@@ -43,6 +43,75 @@ JavaScript constants keep the native client, sidecar, corpus, and editor bundle
 on that single contract. Fallow only changes a finding when the checker
 resolves an exact declaration identity. Name-only matches are never enough.
 
+### Experimental tsrs backend
+
+`FALLOW_TYPE_AWARE_BACKEND=tsrs` selects [tsrs](https://github.com/oxc-project/tsrs),
+a Rust port of the TypeScript 7 checker. It serves the same `unstable/sync`
+API. The manifest `backend` object is the default backend, and
+`experimental_backends` lists the opt-in backends, each with its npm package
+and exact version. The native client and the sidecar both read the selection,
+and the client rejects a status or analysis response from a backend family or
+version that the selection does not pin.
+
+An experimental backend refines findings, but its evidence never makes a fix
+eligible: guarded fixes need the corpus evidence of the default backend. The
+audit base-snapshot cache key includes the selection. The corpus runner
+forwards the selection, and it accepts a non-default backend only for
+`prepare`, `focused`, `discover`, `measure`, `evidence` and `verify-ledger`
+with a non-canonical `--out-dir`. The tracked evidence stays on the default
+backend.
+
+`tsrs` is an optional peer dependency of `fallow-type-aware`. Install the
+pinned version where the companion can resolve it:
+
+```bash
+npm install --save-dev tsrs@0.18.0-ts7.1.0-dev.20260929
+FALLOW_TYPE_AWARE_BACKEND=tsrs npx fallow type-aware status
+```
+
+tsrs follows TypeScript 7.1, and the 7.1 API differs from 7.0. The sidecar
+module `src/backend.mjs` keeps the 7.0 contract for the semantic code:
+
+- `updateSnapshot(changes)` derives each snapshot from the newest one, and a
+  disposed snapshot stays alive while it is the newest.
+- 7.0 `fileChanges` become 7.1 `fileNotifications`, and every update sets
+  `ensurePrograms`, so programs reflect the changed files.
+- `getProject(configFileName)` falls back to `getConfiguredProject`.
+- A `readFile` callback returns `serverFS.useOS` to read from disk.
+
+The 7.1 AST also differs: a heritage clause holds a `TypeReference` with
+`typeName` instead of an `ExpressionWithTypeArguments` with `expression`.
+
+TypeScript 7.1.0-beta makes two more changes, and `src/backend.mjs` handles
+both:
+
+- The API moves from `typescript/unstable/sync` to `typescript/sync` (also
+  `ast/is` and `fs`). The sidecar imports the new path first and falls back to
+  `unstable/`, which TypeScript 7.0 and tsrs still use.
+- Compiler options move from `project.compilerOptions` to
+  `project.parsedCommandLine.options`. Read them through
+  `projectCompilerOptions`.
+
+The beta also drops the deprecated `openProject` request field. Use
+`openProjects`.
+
+When the default backend moves to TypeScript 7.1, port the semantic code to
+the 7.1 snapshot API and delete the 7.0 emulation in `src/backend.mjs` in the
+same change.
+
+The sidecar suite runs on both backends:
+
+```bash
+node --test tools/type-aware-sidecar/test/*.test.mjs
+FALLOW_TYPE_AWARE_BACKEND=tsrs node --test tools/type-aware-sidecar/test/*.test.mjs
+```
+
+tsrs has no Windows or macOS x64 binaries, and the backend stays opt-in while
+tsrs is a 0.x release. The VS Code extension bundles only the default backend,
+so the tsrs backend needs an npm or CLI install. Fallow reads the selection
+once per process and rejects an unknown or non-Unicode value before it starts
+the companion.
+
 ## Ownership boundary with tsc and Oxlint
 
 Type-aware Fallow does not emit TypeScript compiler diagnostics or general
@@ -57,6 +126,11 @@ class, how a public export crosses package boundaries, which tests are
 affected, and where public signatures create coupling. The companion returns
 only semantic evidence, completeness, omissions, and stable reason codes. It
 never forwards a compiler diagnostic as a Fallow issue.
+
+`fallow mutation --typecheck` uses the same companion with the one-shot
+`mutant-typecheck` operation. It compares the error diagnostics of a mutated
+file with the original file and returns only the diagnostic codes of new
+errors. See [`mutation-testing.md`](mutation-testing.md).
 
 ## Five semantic capabilities
 
@@ -105,6 +179,11 @@ score:
 fallow health --type-aware --type-coupling --format json --quiet
 ```
 
+A type-coupling result is one report for the whole project, so it can carry up
+to 10,000 evidence items. Symbol, impact, and API-surface results keep the
+limit of 40 items. Above the limit, the report is `partial` with the
+`evidence-limit` reason, and `--type-aware-require complete` fails the run.
+
 Preview and apply class-member cleanup only when Fallow has complete
 closed-world evidence and an exact declaration guard:
 
@@ -131,14 +210,24 @@ Every candidate has one of five outcomes:
   or another known gap prevents a closed-world decision, so Fallow keeps the
   finding
 
-`confirmed-no-static-references` is intentionally not called “proven unused”.
+`confirmed-no-static-references` does not prove that a declaration is unused.
 Reflection, framework registration, external consumers, and runtime behavior
 can still exist beyond the checker-visible world. Existing export and type
 removal actions remain automatically applicable only after a complete negative
-semantic decision. Class-member findings additionally require complete evidence
+semantic decision. Class-member findings also require complete evidence
 from every owning project, no contract or dynamic gap, and a matching
 declaration hash. `fallow fix` reruns the same semantic analysis and verifies
 the declaration hash immediately before editing.
+
+Closed-world eligibility is proved over the program the sidecar could see,
+which is the program the run parsed. It is therefore not evidence that the run
+read every file it discovered, and it does not answer the reachability caveat.
+A class-member finding carrying `reachability_caveats` keeps
+`auto_fixable: false` even after a `confirmed-no-static-references` verdict
+with closed-world eligibility, and `fallow fix` withholds its removal, because
+a member whose only call site lives in a file the size guard skipped is absent
+from the closed world for exactly the reason it is absent from the syntactic
+verdict. Resolve the files named in `workspace_diagnostics[]` and re-run.
 
 The current safety policy abstains for every candidate in a TypeScript project
 when configuration, program, syntax, or bind diagnostics make its structure
@@ -152,11 +241,23 @@ TypeScript's project-wide global diagnostic pass, which eagerly checks the
 whole program without adding confidence to an exact declaration match. Fallow
 scopes a literal dynamic import to its resolved module. A non-literal
 `import(variable)` can target any local module, so every export candidate in
-that owning TypeScript project remains advisory. Fallow also abstains when no
-project can be selected. If an external framework
-declaration cannot be attributed to an exact package, Fallow records
-`framework-contract-provenance` and keeps the candidate. Warnings and stable
-reason codes explain each abstention class.
+that owning TypeScript project remains advisory. A namespace object, such as
+`ns` after `import * as ns`, `import ns = require()`, `export * as ns` or a
+JavaScript `require()`, can read every export of its module. A static member
+read of the object, such as `ns.name`, `ns["name"]`, `ns.Type` or a destructure
+with literal keys, credits the export that it names. A type such as
+`typeof ns` reads no value. Any other use, such as a call argument, an alias,
+an `export { ns }`, a rest element or a computed key, records
+`dynamic-behavior` for every export that the object can reach, re-exports
+included. A literal key that names a nested namespace, such as
+`const { inner } = outer`, records it for the exports of that nested module.
+A dynamic import, such as `import("./barrel")`, does the same for the module
+that it loads. A computed destructure key, such as
+`const { [key]: run } = service`, records `dynamic-member-access` as
+`service[key]` does. Fallow also abstains when no project can be selected.
+If an external framework declaration cannot be attributed to an exact package,
+Fallow records `framework-contract-provenance` and keeps the candidate.
+Warnings and stable reason codes explain each abstention class.
 
 ### Svelte virtual-module exports
 
@@ -199,7 +300,13 @@ or `installed-sibling` (found next to the active executable). Requests, response
 candidate counts, project counts, and execution time are bounded. The child
 process receives a minimal environment. Relative, missing, and project-local
 search-path entries are removed before its Node interpreter is resolved. Its
-complete process group is terminated on timeout.
+complete process group is terminated on timeout. One request may take up to two
+minutes, raised or lowered with `FALLOW_TYPE_AWARE_TIMEOUT_SECS`: a semantic
+query costs a whole-program scan, so a very large TypeScript program can need
+more time than the default allows. When the limit is reached and
+`typeAware.require` is `best-effort`, the run reports the conservative syntactic
+findings and records the reason in `_meta.type_aware.warnings` instead of
+failing; `complete` still fails the run.
 
 ## Output and integration contract
 
@@ -287,6 +394,34 @@ graph algorithms. A failed semantic batch cannot partially mutate Fallow
 results. Cleanup after a failed refinement may remove only candidates that were
 created solely for semantic verification.
 
+## Deferred scope
+
+These items are out of scope for the current implementation. Each item needs
+its own product decision and measured evidence before work starts.
+
+- Program sharing between processes. Each CLI command and each editor session
+  owns its own Program. Separate VS Code or CLI processes do not share a
+  Program. Fallow does not start a global daemon by default. A shared process
+  needs an explicit product and latency decision first.
+- A disk cache for Programs. A Program lives only for one command or one
+  editor session. The companion writes no Program state to disk, so a new run
+  always builds a new Program.
+- LSP sessions for more than one root. The language server binds one semantic
+  session to the first workspace root.
+- Package and workspace rollups for class-method impact. Method impact reports
+  direct consumers, affected files, and targeted tests only.
+- Selectors for computed members, accessors, and individual overloads. The
+  class-method selector abstains for these targets with a stable reason.
+- Framework contracts from decorators, dependency injection containers,
+  manifests, or runtime registration. A contract must name an exact package
+  and heritage symbol. A decorated declaration without such a contract stays
+  an abstention and is never auto-fixable.
+- Idle eviction and a broader memory policy for editor sessions. This work
+  needs measured data from large workspaces first.
+- Cancellation of an in-flight TypeScript checker request. A cancelled owner
+  rejects new requests and does not restart the companion. The protocol has no
+  message that stops a checker request that already runs.
+
 ## Corpus adjudication and release gate
 
 The local corpus ledger uses schema version 2. Project-level feature buckets are
@@ -298,8 +433,14 @@ The corpus uses clean worktrees at exact public refs and does not create or
 reuse fixture-local `node_modules`. TypeScript dependency resolution is pinned
 to the Fallow workspace ancestor, recorded with hashes of its `package-lock.json`
 and installed package manifests and type declarations. Any other ancestor
-dependency root is rejected. Published dependency paths explicitly use the
-Fallow workspace root as their base. Discovery records the
+dependency root is rejected. The real path of the artifact directory and of
+each prepared fixture must be inside the Fallow workspace. A symlinked `target`
+directory, for example from a build cache wrapper, is rejected: replace it with
+a real directory before the run. The supplemental Vitest fixture always uses
+`target/type-aware-corpus`, so `--out-dir` does not avoid this check. A
+workspace without installed dependencies also fails: run `npm ci` first.
+Published dependency paths explicitly use the Fallow workspace root as their
+base. Discovery records the
 manifest, release binary, full sidecar runtime, TypeScript installation,
 platform, fixture commits, and dependency provenance. Partial runs must use a
 separate output directory, so they cannot overwrite canonical publication
@@ -337,6 +478,14 @@ npm run type-aware:corpus -- verify-publication \
   --sidecar-bin tools/type-aware-sidecar/fallow-type-aware.mjs
 ```
 
+No CI job runs the corpus, so the script tests check the age of the tracked
+evidence instead. `benchmarks/type-aware-corpus-freshness.json` sets the
+maximum count of minor releases between the Fallow version that produced
+`benchmarks/type-aware-corpus-evidence.json` and the workspace version. A
+release bump past that lag fails CI. Regenerate the gate, or add a waiver with
+a tracking issue, a last version (`until_version`) and a reason. A waiver on
+fresh evidence also fails, so that it does not stay after the regeneration.
+
 Use `--project` only with a non-canonical `--out-dir` for iteration. The
 publication gate requires the complete manifest, repeated normalized output,
 complete paired measurements, source-current evidence, checked-in review
@@ -355,6 +504,34 @@ The gate reports safe confirmation yield and independently adjudicated truth
 coverage. It does not claim corpus-wide recall: retained candidates without
 independent truth remain `indeterminate` and are excluded from adjudicated
 accuracy metrics.
+
+The summary reports two yields. `confirmation_yield` is the share of all
+candidates that are correctly confirmed as used. The gated
+`checked_confirmation_yield` excludes candidates that the sidecar does not
+resolve because of `blocking-diagnostics`. Blocking diagnostics have two
+causes in the corpus:
+
+- Missing dependencies. The corpus does not install fixture dependencies, so a
+  project that imports a package or type definition outside the Fallow
+  workspace cannot type-check.
+- TypeScript 7 configuration incompatibility, for example
+  `moduleResolution=node10` or `baseUrl`, which TypeScript 7 removed.
+
+These candidates measure the fixture environment, not semantic ability. A ratio that excludes them rises when more
+projects block, so two more gates apply:
+
+- `maximum_blocking_diagnostics_share` bounds the share of blocked candidates.
+- `minimum_checked_candidates` requires a minimum count of checked candidates.
+
+The summary also lists each blocked project with its program configurations
+and the share of candidates without type evidence (abstained or unresolved).
+
+Each project role comes from the intent of the project, not from its current
+output. An `accuracy-core` project has internal class members where syntactic
+analysis has known gaps. A `zero-control` project exposes its class members as
+public API by design, so it must report no candidates. Vue Core is a
+zero-control because each package declares `"./*": "./*"` in `exports`, which
+makes every module a public entry under Node subpath rules.
 
 Feature-bucket value requires two separate candidates that are both manually
 classified as used and correctly confirmed by semantic refinement. The two

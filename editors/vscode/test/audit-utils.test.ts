@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AUDIT_CANDIDATE_HEADER,
+  AUDIT_WORSENED_MIN_CLI_VERSION,
   auditGatingSuffix,
   auditScopeSummary,
   auditVerdictPresentation,
@@ -26,7 +27,7 @@ const baseAuditArgsOptions = {
  * dropped; nothing under test reads them.
  */
 const passAudit: AuditOutput = {
-  schema_version: 10,
+  schema_version: 13,
   version: "2.88.3",
   command: "audit",
   verdict: "pass",
@@ -51,6 +52,7 @@ const passAudit: AuditOutput = {
     styling_introduced: 0,
     styling_inherited: 0,
     duplication_demoted: 0,
+    diff_risk_introduced: 0,
   },
 };
 
@@ -59,7 +61,7 @@ const passAudit: AuditOutput = {
  * (one changed file with a dead-code finding, exit code 1).
  */
 const failAudit: AuditOutput = {
-  schema_version: 10,
+  schema_version: 13,
   version: "2.88.3",
   command: "audit",
   verdict: "fail",
@@ -84,6 +86,7 @@ const failAudit: AuditOutput = {
     styling_introduced: 0,
     styling_inherited: 0,
     duplication_demoted: 0,
+    diff_risk_introduced: 0,
   },
 };
 
@@ -133,6 +136,37 @@ describe("buildAuditArgs", () => {
   it("appends --gate all when the gate is all", () => {
     const { args } = buildAuditArgs({ ...baseAuditArgsOptions, gate: "all" });
     expect(args).toEqual(["audit", "--format", "json", "--quiet", "--gate", "all"]);
+  });
+
+  it("does not append a worsened flag when the mode defers to the project config", () => {
+    expect(buildAuditArgs(baseAuditArgsOptions).args).not.toContain("--worsened");
+  });
+
+  it.each(["warn", "error", "off"] as const)("appends --worsened %s when set", (worsened) => {
+    const { args, skipped } = buildAuditArgs({ ...baseAuditArgsOptions, worsened });
+    expect(args).toEqual(["audit", "--format", "json", "--quiet", "--worsened", worsened]);
+    expect(skipped).toEqual([]);
+  });
+
+  it("appends --worsened for a CLI at the introducing version", () => {
+    const { args } = buildAuditArgs({
+      ...baseAuditArgsOptions,
+      worsened: "error",
+      cliVersion: AUDIT_WORSENED_MIN_CLI_VERSION,
+    });
+    expect(args).toContain("--worsened");
+  });
+
+  it("omits --worsened and reports the skip for a CLI that predates it", () => {
+    const { args, skipped } = buildAuditArgs({
+      ...baseAuditArgsOptions,
+      worsened: "error",
+      cliVersion: "3.34.1",
+    });
+    expect(args).not.toContain("--worsened");
+    expect(skipped).toEqual([
+      { flag: "--worsened", requires: AUDIT_WORSENED_MIN_CLI_VERSION, cliVersion: "3.34.1" },
+    ]);
   });
 
   it("forwards changedSince, workspace, production, and configPath with correct flag spelling", () => {
@@ -243,6 +277,7 @@ describe("gatingCount", () => {
         styling_introduced: 2,
         styling_inherited: 5,
         duplication_demoted: 0,
+        diff_risk_introduced: 0,
       },
     };
     expect(gatingCount(audit)).toBe(6);
@@ -276,6 +311,7 @@ describe("gatingCount", () => {
         styling_introduced: 0,
         styling_inherited: 3,
         duplication_demoted: 0,
+        diff_risk_introduced: 0,
       },
     };
     expect(gatingCount(audit)).toBe(0);
@@ -320,6 +356,32 @@ describe("gatingCount", () => {
   });
 });
 
+describe("gatingCount with diff risk", () => {
+  it("counts diff-risk findings under the new-only gate", () => {
+    const audit: AuditOutput = {
+      ...passAudit,
+      verdict: "warn",
+      attribution: { ...passAudit.attribution, diff_risk_introduced: 2 },
+    };
+    expect(gatingCount(audit)).toBe(2);
+  });
+
+  it("counts diff-risk findings under the all gate", () => {
+    const audit: AuditOutput = {
+      ...failAudit,
+      summary: { ...failAudit.summary, dead_code_issues: 0, dead_code_has_errors: false },
+      attribution: { ...failAudit.attribution, diff_risk_introduced: 1 },
+    };
+    expect(gatingCount(audit)).toBe(1);
+  });
+
+  it("counts zero when an older binary does not emit the field", () => {
+    const { diff_risk_introduced: _omitted, ...attribution } = passAudit.attribution;
+    const audit = { ...passAudit, attribution } as unknown as AuditOutput;
+    expect(gatingCount(audit)).toBe(0);
+  });
+});
+
 describe("auditGatingSuffix", () => {
   it("is empty when nothing is gating", () => {
     expect(auditGatingSuffix(passAudit)).toBe("");
@@ -342,6 +404,7 @@ describe("auditGatingSuffix", () => {
         styling_introduced: 0,
         styling_inherited: 0,
         duplication_demoted: 0,
+        diff_risk_introduced: 0,
       },
     };
     expect(auditGatingSuffix(warnAudit)).toBe(" (3)");
@@ -446,6 +509,16 @@ describe("buildAuditTooltipMarkdown", () => {
     };
     const md = buildAuditTooltipMarkdown(audit);
     expect(md).toContain("1 styling candidate");
+  });
+
+  it("lists a diff-risk-only gating category", () => {
+    const audit: AuditOutput = {
+      ...passAudit,
+      verdict: "warn",
+      attribution: { ...passAudit.attribution, diff_risk_introduced: 2 },
+    };
+    const md = buildAuditTooltipMarkdown(audit);
+    expect(md).toContain("2 diff-risk findings");
   });
 
   it("includes both command links", () => {

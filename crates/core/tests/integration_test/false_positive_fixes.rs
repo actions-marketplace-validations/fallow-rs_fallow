@@ -82,6 +82,66 @@ fn eslint_relative_extends_config_is_not_reported_unused() {
 }
 
 #[test]
+fn extensionless_import_prefers_directory_index_over_non_module_sibling() {
+    for (index, sibling) in [
+        "tsx", "ts", "js", "jsx", "mts", "cts", "mjs", "cjs", "gts", "gjs",
+    ]
+    .into_iter()
+    .flat_map(|index| {
+        [
+            "css", "scss", "vue", "svelte", "astro", "mdx", "graphql", "gql",
+        ]
+        .map(move |sibling| (index, sibling))
+    }) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/Widget")).expect("src dir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "directory-index-sibling", "private": true }"#,
+        )
+        .expect("package json");
+        std::fs::write(
+            root.join("src/index.ts"),
+            "import { Widget } from './Widget';\nconsole.log(Widget());\n",
+        )
+        .expect("entry");
+        std::fs::write(
+            root.join(format!("src/Widget/index.{index}")),
+            "export function Widget() { return 'widget'; }\n\
+             export function UnusedHelper() { return 'unused'; }\n",
+        )
+        .expect("directory index");
+        std::fs::write(root.join(format!("src/Widget.{sibling}")), "{}\n").expect("sibling");
+
+        let config = create_config(root.to_path_buf());
+        let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+        let unused_files: Vec<String> = results
+            .unused_files
+            .iter()
+            .map(|file| file.file.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            !unused_files
+                .iter()
+                .any(|path| path.ends_with(&format!("Widget/index.{index}"))),
+            "./Widget must resolve to Widget/index.{index}, not Widget.{sibling}: {unused_files:?}"
+        );
+        let unused_exports: Vec<&str> = results
+            .unused_exports
+            .iter()
+            .map(|e| e.export.export_name.as_str())
+            .collect();
+        assert_eq!(
+            unused_exports,
+            ["UnusedHelper"],
+            "only UnusedHelper is unused in Widget/index.{index} with a Widget.{sibling} sibling"
+        );
+    }
+}
+
+#[test]
 fn type_only_bidirectional_import_not_reported_as_cycle() {
     let root = fixture_path("type-only-cycle");
     let config = create_config(root);
@@ -3209,4 +3269,59 @@ fn unused_dev_dependencies(results: &fallow_core::results::AnalysisResults) -> V
         .iter()
         .map(|dep| dep.dep.package_name.clone())
         .collect()
+}
+
+#[test]
+fn wildcard_subpath_export_target_matches_nested_directories() {
+    let root = fixture_path("wildcard-subpath-export-nested");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_files: Vec<String> = unused_file_paths(&results)
+        .into_iter()
+        .map(|path| relative_to_fixture(&root, &path))
+        .collect();
+    let unused_exports: Vec<(String, String)> = results
+        .unused_exports
+        .iter()
+        .map(|export| {
+            (
+                relative_to_fixture(&root, &export.export.path.to_string_lossy()),
+                export.export.export_name.clone(),
+            )
+        })
+        .collect();
+
+    assert!(
+        !unused_files.contains(&"packages/ui/src/a/b/orphan.ts".to_string()),
+        "a `*` in an exports target matches files in nested directories: {unused_files:?}"
+    );
+    assert!(
+        !unused_exports
+            .iter()
+            .any(|(file, _)| file == "packages/lib/src/nested/deep.ts"),
+        "a nested file that matches `./src/*.ts` is a public entry point: {unused_exports:?}"
+    );
+    assert!(
+        unused_files.contains(&"packages/lib/src/nested/helper.js".to_string()),
+        "a file that does not end with the target suffix stays out of the entry set: {unused_files:?}"
+    );
+    assert_eq!(
+        unused_files,
+        vec!["packages/lib/src/nested/helper.js".to_string()],
+        "only the file outside the export target is unused: {unused_files:?}"
+    );
+    assert!(
+        unused_exports.is_empty(),
+        "every export is public through a wildcard subpath: {unused_exports:?}"
+    );
+}
+
+fn relative_to_fixture(root: &std::path::Path, path: &str) -> String {
+    let normalized_root = root.to_string_lossy().replace('\\', "/");
+    let normalized = path.replace('\\', "/");
+    match normalized.strip_prefix(&normalized_root) {
+        Some(rest) => rest.trim_start_matches('/').to_string(),
+        None => normalized,
+    }
 }

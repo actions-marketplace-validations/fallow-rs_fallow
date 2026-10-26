@@ -1,3 +1,7 @@
+# Legacy renderer for fallow before 3.4.2. The action runs this file only when
+# the binary has no `fallow report`. Do not add new issue kinds: the binaries
+# that use this file do not emit them. Newer binaries render natively.
+
 # Job-summary renderer only. Sticky PR comments use the typed Rust renderer
 # behind --format pr-comment-github and fallow ci post-pr-comment.
 
@@ -13,16 +17,16 @@ def file_link(path; start; end_line):
   if (repo | length) > 0 and (sha | length) > 0 then
     "[`\($display):\(start)-\(end_line)`](https://github.com/\(repo)/blob/\(sha)/\(prefix)\(path)#L\(start)-L\(end_line))"
   else "`\($display):\(start)-\(end_line)`" end;
-def dead_code_docs: "https://docs.fallow.tools/explanations/dead-code";
+def dead_code_docs: "https://fallow.tools/docs/explanations/dead-code/";
 def docs(anchor): dead_code_docs + "#" + anchor;
-def health_docs: "https://docs.fallow.tools/explanations/health";
-def dupes_docs: "https://docs.fallow.tools/explanations/duplication";
+def health_docs: "https://fallow.tools/docs/explanations/health/";
+def dupes_docs: "https://fallow.tools/docs/explanations/duplication/";
 def clone_rank:
   (.spread // 0) as $spread |
   ([1000000000, 1047319732, 1075000000, 1094639463, 1109873014, 1122319732, 1132843281, 1141959195, 1150000000][([$spread, 8] | min)]) as $weight |
   ((.instances // []) | sort_by([(.file // ""), (.start_line // 0)]) | first // {}) as $first |
   [-((.token_count // 0) * ((.instances // []) | length) * $weight), -$spread, -(.token_count // 0), -((.instances // []) | length), -(.line_count // 0), ($first.file // ""), ($first.start_line // 0)];
-def suppression_docs: "https://docs.fallow.tools/configuration/suppression";
+def suppression_docs: "https://fallow.tools/docs/configuration/suppression/";
 def metric_delta(name):
   (.health.health_trend.metrics // []) | map(select(.name == name)) | first // null;
 def exceeded_priority:
@@ -57,7 +61,16 @@ def prod_hot_path_label($n):
   (if prod_hot_paths_touched then "hot path\(if $n == 1 then "" else "s" end) touched" else "hot path\(if $n == 1 then "" else "s" end)" end);
 
 (count(.check; "total_issues")) as $check |
-((.dupes.clone_groups // []) | length) as $dupes |
+# Visible groups plus what a presentation cap withheld, NOT `stats.clone_groups`.
+# The two differ for two unrelated reasons and only one of them belongs here:
+# a filtered combined run (`--changed-since`, a diff filter) leaves `stats`
+# describing the unfiltered corpus while `clone_groups[]` holds the actionable
+# set, and gating on `stats` there fails a run with nothing to show (issue
+# #1250); a presentation cap such as `--top` truncates the array while `stats`
+# stays right. `clone_groups_omitted` counts only the second, and no combined
+# envelope carries it today because the bare command takes no `--top`, so this
+# is byte-identical now and stays correct if that ever changes.
+(((.dupes.clone_groups // []) | length) + (.dupes.clone_groups_omitted // 0)) as $dupes |
 (count(.health.summary; "functions_above_threshold")) as $complex |
 (($complex) + (prod_failing_findings | length)) as $health |
 (prod_failing_findings | length) as $prod_failing |
@@ -151,17 +164,20 @@ else
       (if ((.check.invalid_client_exports // []) | length) > 0 then "| [Invalid client exports](\(docs("invalid-client-exports"))) | \(.check.invalid_client_exports | length) |" else null end),
       (if ((.check.mixed_client_server_barrels // []) | length) > 0 then "| [Mixed client/server barrels](\(docs("mixed-client-server-barrels"))) | \(.check.mixed_client_server_barrels | length) |" else null end),
       (if ((.check.misplaced_directives // []) | length) > 0 then "| [Misplaced directives](\(docs("misplaced-directives"))) | \(.check.misplaced_directives | length) |" else null end),
-      (if ((.check.unused_server_actions // []) | length) > 0 then "| [Unused server actions](\(docs("unused-server-action"))) | \(.check.unused_server_actions | length) |" else null end),
+      (if ((.check.unused_server_actions // []) | length) > 0 then "| [Unused server actions](\(docs("unused-server-actions"))) | \(.check.unused_server_actions | length) |" else null end),
       (if ((.check.route_collisions // []) | length) > 0 then "| [Route collisions](\(docs("route-collisions"))) | \(.check.route_collisions | length) |" else null end),
       (if ((.check.dynamic_segment_name_conflicts // []) | length) > 0 then "| [Dynamic segment conflicts](\(docs("dynamic-segment-name-conflicts"))) | \(.check.dynamic_segment_name_conflicts | length) |" else null end),
-      (if ((.check.unrendered_components // []) | length) > 0 then "| [Unrendered components](\(docs("unrendered-component"))) | \(.check.unrendered_components | length) |" else null end),
-      (if ((.check.unused_component_props // []) | length) > 0 then "| [Unused component props](\(docs("unused-component-prop"))) | \(.check.unused_component_props | length) |" else null end),
-      (if ((.check.unused_component_emits // []) | length) > 0 then "| [Unused component emits](\(docs("unused-component-emit"))) | \(.check.unused_component_emits | length) |" else null end),
-      (if ((.check.unused_component_inputs // []) | length) > 0 then "| [Unused component inputs](\(docs("unused-component-input"))) | \(.check.unused_component_inputs | length) |" else null end),
-      (if ((.check.unused_component_outputs // []) | length) > 0 then "| [Unused component outputs](\(docs("unused-component-output"))) | \(.check.unused_component_outputs | length) |" else null end),
-      (if ((.check.unused_svelte_events // []) | length) > 0 then "| [Unused Svelte events](\(docs("unused-svelte-event"))) | \(.check.unused_svelte_events | length) |" else null end),
-      (if ((.check.unprovided_injects // []) | length) > 0 then "| [Unprovided injects](\(docs("unprovided-inject"))) | \(.check.unprovided_injects | length) |" else null end),
-      (if ((.check.unused_load_data_keys // []) | length) > 0 then "| [Unused load data keys](\(docs("unused-load-data-key"))) | \(.check.unused_load_data_keys | length) |" else null end),
+      (if ((.check.unrendered_components // []) | length) > 0 then "| [Unrendered components](\(docs("unrendered-components"))) | \(.check.unrendered_components | length) |" else null end),
+      (if ((.check.unused_component_props // []) | length) > 0 then "| [Unused component props](\(docs("unused-component-props"))) | \(.check.unused_component_props | length) |" else null end),
+      (if ((.check.unused_component_emits // []) | length) > 0 then "| [Unused component emits](\(docs("unused-component-emits"))) | \(.check.unused_component_emits | length) |" else null end),
+      (if ((.check.unused_component_inputs // []) | length) > 0 then "| [Unused component inputs](\(docs("unused-component-inputs"))) | \(.check.unused_component_inputs | length) |" else null end),
+      (if ((.check.unused_component_outputs // []) | length) > 0 then "| [Unused component outputs](\(docs("unused-component-outputs"))) | \(.check.unused_component_outputs | length) |" else null end),
+      (if ((.check.unused_svelte_events // []) | length) > 0 then "| [Unused Svelte events](\(docs("unused-svelte-events"))) | \(.check.unused_svelte_events | length) |" else null end),
+      (if ((.check.unused_effect_layers // []) | length) > 0 then "| [Unused Effect layers](\(docs("unused-effect-layers"))) | \(.check.unused_effect_layers | length) |" else null end),
+      (if ((.check.unused_tagged_errors // []) | length) > 0 then "| [Unused tagged errors](\(docs("unused-tagged-errors"))) | \(.check.unused_tagged_errors | length) |" else null end),
+      (if ((.check.unproduced_catch_tags // []) | length) > 0 then "| [Unproduced catch tags](\(docs("unproduced-catch-tags"))) | \(.check.unproduced_catch_tags | length) |" else null end),
+      (if ((.check.unprovided_injects // []) | length) > 0 then "| [Unprovided injects](\(docs("unprovided-injects"))) | \(.check.unprovided_injects | length) |" else null end),
+      (if ((.check.unused_load_data_keys // []) | length) > 0 then "| [Unused load data keys](\(docs("unused-load-data-keys"))) | \(.check.unused_load_data_keys | length) |" else null end),
       (if (.check.type_only_dependencies | length) > 0 then "| [Type-only dependencies](\(docs("type-only-dependencies"))) | \(.check.type_only_dependencies | length) |" else null end),
       (if (.check.test_only_dependencies | length) > 0 then "| [Test-only dependencies](\(docs("test-only-dependencies"))) | \(.check.test_only_dependencies | length) |" else null end),
       (if ((.check.dev_dependencies_in_production // []) | length) > 0 then "| [Dev dependencies used in production](\(docs("dev-dependencies-in-production"))) | \(.check.dev_dependencies_in_production | length) |" else null end),
@@ -242,7 +258,7 @@ else
     "> [!TIP]\n" +
     "> Run `fallow fix --dry-run` to preview auto-fixes.\n" +
     (if (.check.unused_exports // []) | length > 0 then
-      "> Add [`/** @public */`](https://docs.fallow.tools/configuration/suppression) above exports to preserve them.\n"
+      "> Add [`/** @public */`](https://fallow.tools/docs/configuration/suppression/) above exports to preserve them.\n"
     else "" end)
   else "" end)
 end

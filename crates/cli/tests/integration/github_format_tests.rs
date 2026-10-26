@@ -1,0 +1,2113 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests use unwrap and expect to keep fixture setup concise"
+)]
+
+//! Golden tests for the GitHub-native text formats (`github-annotations`,
+//! `github-summary`), pinning the per-envelope-kind renderers against
+//! hand-built `--format json` envelopes. The regression traps the design
+//! spike and panel called out each get a named test: budget notice,
+//! severity-sort over path order, path-prefix rebasing, escaping of
+//! comma/colon/percent/CRLF, `kind_known == false` stale suppressions,
+//! notice-level security candidates, and report-from round-trip parity.
+
+use std::collections::BTreeSet;
+
+use fallow_cli::report::github::{PackageManager, PathRebase, RenderOptions};
+use fallow_cli::report::github_annotations::{EnvelopeKind, render_annotations};
+use fallow_cli::report::github_summary::{LinkContext, render_summary};
+use fallow_types::issue_meta::{ISSUE_RESULT_META, IssueResultMeta};
+use serde_json::{Value, json};
+
+fn plain_options() -> RenderOptions {
+    RenderOptions {
+        rebase: PathRebase::None,
+        pm: PackageManager::Npm,
+    }
+}
+
+#[test]
+fn consumer_contract_audit_dead_code_cap_keeps_new_errors_visible() {
+    let inherited: Vec<Value> = (0..11)
+        .map(|index| {
+            json!({
+                "path": format!("a/inherited_{index:02}.ts"),
+                "introduced": false, "effective_severity": "error"
+            })
+        })
+        .collect();
+    let mut env = json!({
+        "kind": "audit", "verdict": "fail", "attribution": { "gate": "new-only" },
+        "dead_code": { "unused_files": inherited, "unused_exports": [{
+            "path": "z/new.ts", "line": 42, "export_name": "newUnused",
+            "introduced": true, "effective_severity": "error"
+        }] }
+    });
+    let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(summary.contains("`newUnused` | new | error |"), "{summary}");
+    assert!(summary.contains("inherited_00.ts"), "{summary}");
+    assert!(!summary.contains("inherited_10.ts"), "{summary}");
+    env["attribution"]["gate"] = json!("all");
+    let all = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(all.contains("inherited_00.ts"), "{all}");
+    assert!(
+        !all.contains("newUnused"),
+        "all-scope errors retain deterministic location order: {all}"
+    );
+}
+
+#[test]
+fn consumer_contract_audit_complexity_cap_keeps_new_errors_visible() {
+    let mut findings: Vec<Value> = (0..16)
+        .map(|index| {
+            json!({
+                "path": format!("a/inherited_{index:02}.ts"), "line": 1, "name": "oldComplex",
+                "introduced": false, "effective_severity": "error", "severity": "critical"
+            })
+        })
+        .collect();
+    findings.push(json!({
+        "path": "z/new.ts", "line": 12, "name": "newComplex", "introduced": true,
+        "effective_severity": "error", "severity": "moderate"
+    }));
+    let env = json!({ "kind": "audit", "verdict": "fail", "attribution": { "gate": "new-only" },
+        "complexity": { "findings": findings } });
+    let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(
+        summary.contains("`newComplex` | new | error | moderate |"),
+        "{summary}"
+    );
+    assert!(summary.contains("inherited_00.ts"), "{summary}");
+    assert!(!summary.contains("inherited_15.ts"), "{summary}");
+}
+
+#[test]
+fn consumer_contract_audit_rule_severity_is_distinct_from_complexity_band() {
+    for gate in ["new-only", "all"] {
+        let env = json!({ "kind": "audit", "attribution": { "gate": gate }, "complexity": {
+            "findings": [
+                { "path": "a/warn.ts", "name": "warningBand", "severity": "critical", "effective_severity": "warn", "introduced": true },
+                { "path": "z/error.ts", "name": "errorBand", "severity": "moderate", "effective_severity": "error", "introduced": true }
+            ]
+        } });
+        let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+        assert!(
+            summary.contains("`warningBand` | new | warn | critical |"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("`errorBand` | new | error | moderate |"),
+            "{summary}"
+        );
+        assert!(
+            summary.find("errorBand") < summary.find("warningBand"),
+            "{summary}"
+        );
+    }
+}
+
+#[test]
+fn consumer_contract_audit_duplication_cap_keeps_new_groups_visible() {
+    let mut groups: Vec<Value> = (0..11)
+        .map(|index| {
+            json!({
+                "introduced": false, "line_count": 10, "token_count": 80,
+                "instances": [
+                    { "file": format!("a/inherited_{index:02}.ts"), "start_line": 1, "end_line": 10 },
+                    { "file": format!("b/copy_{index:02}.ts"), "start_line": 1, "end_line": 10 }
+                ]
+            })
+        })
+        .collect();
+    groups.push(
+        json!({ "introduced": true, "line_count": 10, "token_count": 80,
+        "instances": [
+            { "file": "z/newDuplicate.ts", "start_line": 24, "end_line": 33 },
+            { "file": "z/otherDuplicate.ts", "start_line": 24, "end_line": 33 }
+        ] }),
+    );
+    let env = json!({ "kind": "audit", "attribution": { "gate": "new-only" },
+        "duplication": { "clone_groups": groups } });
+    let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(summary.contains("z/newDuplicate.ts:24"), "{summary}");
+    assert!(summary.contains("inherited_00.ts"), "{summary}");
+    assert!(!summary.contains("inherited_10.ts"), "{summary}");
+}
+
+#[test]
+fn consumer_contract_audit_styling_details_keep_new_errors_visible() {
+    let mut findings: Vec<Value> = (0..16)
+        .map(|index| {
+            json!({
+                "path": format!("a/inherited_{index:02}.css"), "line": 1, "code": "css-token-drift",
+                "value": "old", "introduced": false, "effective_severity": "error"
+            })
+        })
+        .collect();
+    findings.push(
+        json!({ "path": "z/button.tsx", "line": 7, "code": "css-token-drift",
+        "value": "w-[13px]", "introduced": true, "effective_severity": "error" }),
+    );
+    let env = json!({ "kind": "audit", "verdict": "fail", "attribution": { "gate": "new-only" },
+        "complexity": { "styling_findings": findings } });
+    let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(summary.contains("### Styling"), "{summary}");
+    assert!(
+        summary.contains("`z/button.tsx:7` | `w-[13px]` | new | error |"),
+        "{summary}"
+    );
+    assert!(summary.contains("inherited_00.css"), "{summary}");
+    assert!(!summary.contains("inherited_15.css"), "{summary}");
+}
+
+#[test]
+fn consumer_contract_audit_legacy_attribution_is_unknown() {
+    let env = json!({ "kind": "audit", "summary": { "dead_code_issues": 1 },
+        "dead_code": { "unused_exports": [{ "path": "src/old.ts", "export_name": "legacyExport" }] } });
+    let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(
+        summary.contains("`legacyExport` | unknown | unknown |"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("| Dead code | 1 | unknown | unknown |"),
+        "{summary}"
+    );
+    assert!(summary.contains("Audit gate: unknown"), "{summary}");
+    assert!(!summary.contains("Audit gate: new-only"), "{summary}");
+}
+
+#[test]
+fn consumer_contract_audit_diff_risk_cap_keeps_errors_visible() {
+    let mut findings: Vec<Value> = (0..16)
+        .map(|index| {
+            json!({
+                "path": format!("a/advisory_{index:02}.ts"), "line": 1,
+                "rule": "added-dependency", "severity": "warn", "introduced": true,
+                "evidence": "new dependency"
+            })
+        })
+        .collect();
+    findings.push(json!({ "path": "z/breaking.ts", "line": 3,
+        "rule": "removed-export", "severity": "error", "introduced": true,
+        "evidence": "breaking-api-removal" }));
+    for gate in ["new-only", "all"] {
+        let env = json!({ "kind": "audit", "attribution": { "gate": gate },
+            "diff_risk": { "findings": findings } });
+        let summary = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+        assert!(summary.contains("breaking-api-removal"), "{summary}");
+        assert!(summary.contains("advisory_00.ts"), "{summary}");
+        assert!(!summary.contains("advisory_15.ts"), "{summary}");
+    }
+}
+
+#[test]
+fn consumer_contract_audit_annotations_prioritize_new_equal_errors() {
+    let mut exports: Vec<Value> = (0..12)
+        .map(|index| {
+            json!({
+                "path": format!("a/inherited_{index:02}.ts"), "line": 1, "export_name": "old",
+                "introduced": false, "effective_severity": "error"
+            })
+        })
+        .collect();
+    exports.push(
+        json!({ "path": "z/new.ts", "line": 42, "export_name": "newUnused",
+        "introduced": true, "effective_severity": "error" }),
+    );
+    exports.push(
+        json!({ "path": "0/warn.ts", "line": 1, "export_name": "warning",
+        "introduced": true, "effective_severity": "warn" }),
+    );
+    let mut env = json!({ "kind": "audit", "attribution": { "gate": "new-only" },
+        "dead_code": { "unused_exports": exports } });
+    let annotations = render_annotations(EnvelopeKind::Audit, &env, &plain_options());
+    assert!(
+        annotations
+            .lines()
+            .next()
+            .expect("annotation")
+            .contains("z/new.ts"),
+        "{annotations}"
+    );
+    assert!(annotations.contains("a/inherited_00.ts"), "{annotations}");
+    assert!(annotations.contains("0/warn.ts"), "{annotations}");
+    assert!(
+        annotations.find("a/inherited_00.ts") < annotations.find("0/warn.ts"),
+        "{annotations}"
+    );
+    env["attribution"]["gate"] = json!("all");
+    let all = render_annotations(EnvelopeKind::Audit, &env, &plain_options());
+    assert!(
+        all.lines()
+            .next()
+            .expect("annotation")
+            .contains("a/inherited_00.ts"),
+        "{all}"
+    );
+    let check = render_annotations(EnvelopeKind::DeadCode, &env["dead_code"], &plain_options());
+    assert!(
+        check
+            .lines()
+            .next()
+            .expect("annotation")
+            .contains("a/inherited_00.ts"),
+        "{check}"
+    );
+}
+
+#[test]
+fn consumer_contract_audit_annotations_keep_unlocated_and_parent_provenance() {
+    for finding in [
+        json!({ "unused_files": [{ "path": "z/new.ts", "introduced": true, "effective_severity": "error" }] }),
+        json!({ "unused_dependencies": [{ "path": "z/package.json", "line": 0, "package_name": "unused", "introduced": true, "effective_severity": "error" }] }),
+        json!({ "circular_dependencies": [{ "files": ["z/new.ts", "z/other.ts"], "line": 0, "introduced": true, "effective_severity": "error" }] }),
+        json!({ "re_export_cycles": [{ "files": ["z/new.ts", "z/other.ts"], "kind": "cycle", "introduced": true, "effective_severity": "error" }] }),
+        json!({ "package_cycles": [{ "packages": ["@app/a", "@app/b"], "introduced": true, "effective_severity": "error", "edges": [{ "path": "z/new.ts", "line": 3, "from_package": "@app/a", "to_package": "@app/b" }] }] }),
+        json!({ "unlisted_dependencies": [{ "package_name": "missing", "introduced": true, "effective_severity": "error", "imported_from": [{ "path": "z/new.ts", "line": 3 }] }] }),
+        json!({ "duplicate_exports": [{ "export_name": "shared", "introduced": true, "effective_severity": "error", "locations": [{ "path": "z/new.ts", "line": 3 }] }] }),
+    ] {
+        let mut dead_code = finding;
+        dead_code["unused_exports"] = json!([{ "path": "a/inherited.ts", "line": 1,
+            "export_name": "old", "introduced": false, "effective_severity": "error" }]);
+        let env = json!({ "kind": "audit", "attribution": { "gate": "new-only" }, "dead_code": dead_code });
+        let annotations = render_annotations(EnvelopeKind::Audit, &env, &plain_options());
+        assert!(
+            annotations
+                .lines()
+                .next()
+                .expect("annotation")
+                .contains("file=z/"),
+            "{annotations}"
+        );
+        assert!(annotations.contains("a/inherited.ts"), "{annotations}");
+    }
+}
+
+#[test]
+fn consumer_contract_audit_annotations_include_styling_once() {
+    let health = json!({ "styling_findings": [
+        { "path": "z/button.tsx", "line": 7, "code": "css-token-drift", "value": "w-[13px]", "introduced": true, "effective_severity": "error" },
+        { "path": "a/old.css", "line": 2, "code": "css-token-drift", "value": "old", "introduced": false, "effective_severity": "warn" }
+    ], "findings": [{ "path": "src/complex.ts", "line": 4, "name": "complex", "severity": "high", "effective_severity": "error" }] });
+    let env =
+        json!({ "kind": "audit", "attribution": { "gate": "new-only" }, "complexity": health });
+    let annotations = render_annotations(EnvelopeKind::Audit, &env, &plain_options());
+    assert!(
+        annotations
+            .lines()
+            .next()
+            .expect("annotation")
+            .contains("z/button.tsx,line=7"),
+        "{annotations}"
+    );
+    assert!(annotations.contains("css-token-drift"), "{annotations}");
+    assert!(annotations.contains("w-[13px]"), "{annotations}");
+    assert!(
+        annotations.contains("::warning file=a/old.css"),
+        "{annotations}"
+    );
+    assert_eq!(
+        annotations.matches("file=src/complex.ts").count(),
+        1,
+        "{annotations}"
+    );
+    let standalone = render_annotations(EnvelopeKind::Health, &health, &plain_options());
+    assert!(standalone.contains("file=src/complex.ts"), "{standalone}");
+    assert!(!standalone.contains("css-token-drift"), "{standalone}");
+}
+
+fn check_envelope() -> Value {
+    json!({
+        "kind": "dead-code",
+        "schema_version": 7,
+        "total_issues": 12,
+        "elapsed_ms": 321,
+        "unused_files": [
+            { "path": "src/a,b.ts" },
+            { "path": "src/München.ts" }
+        ],
+        "unused_exports": [
+            { "path": "src/api/client.ts", "line": 42, "col": 9, "export_name": "unusedFn", "is_re_export": false, "is_type_only": false },
+            { "path": "src/api/types.ts", "line": 7, "col": 0, "export_name": "LegacyShape", "is_re_export": true, "is_type_only": true }
+        ],
+        "unused_dependencies": [
+            { "path": "package.json", "line": 12, "package_name": "left-pad", "used_in_workspaces": [] },
+            { "path": "packages/app/package.json", "line": 0, "package_name": "lodash", "used_in_workspaces": ["web", "docs"] }
+        ],
+        "unlisted_dependencies": [
+            {
+                "package_name": "chalk",
+                "imported_from": [
+                    { "path": "src/cli.ts", "line": 3, "col": 21 },
+                    { "path": "src/log.ts", "line": 1, "col": 19 }
+                ]
+            }
+        ],
+        "duplicate_exports": [
+            {
+                "export_name": "format",
+                "locations": [
+                    { "path": "src/format.ts", "line": 1, "col": 0 },
+                    { "path": "src/utils/format.ts", "line": 8, "col": 0 }
+                ]
+            }
+        ],
+        "circular_dependencies": [
+            { "files": ["src/a.ts", "src/b.ts"], "line": 0, "col": 0, "length": 2 }
+        ],
+        "re_export_cycles": [
+            { "files": ["src/index.ts"], "kind": "self-loop" }
+        ],
+        "boundary_violations": [
+            { "from_path": "src/ui/button.ts", "to_path": "src/db/pool.ts", "from_zone": "ui", "to_zone": "db", "line": 4, "col": 0 }
+        ],
+        "policy_violations": [
+            { "path": "src/legacy/eval.ts", "line": 9, "col": 2, "matched": "eval", "pack": "security", "rule_id": "no-eval", "severity": "error", "message": "eval is 100% banned\r\nsee: policy" },
+            { "path": "src/telemetry.ts", "line": 2, "col": 0, "matched": "track", "pack": "hygiene", "rule_id": "no-track", "severity": "warn" }
+        ],
+        "stale_suppressions": [
+            { "path": "src/kept.ts", "line": 11, "col": 0, "origin": { "type": "jsdoc_tag", "export_name": "keptExport" } },
+            { "path": "src/typo.ts", "line": 5, "col": 0, "origin": { "type": "comment", "kind_known": false, "issue_kind": "not-a-kind", "is_file_level": false } },
+            { "path": "src/old.ts", "line": 1, "col": 0, "origin": { "type": "comment", "kind_known": true, "issue_kind": "unused-export", "is_file_level": true } }
+        ],
+        "unresolved_catalog_references": [
+            { "path": "packages/web/package.json", "line": 14, "entry_name": "react", "catalog_name": "default", "available_in_catalogs": [] }
+        ]
+    })
+}
+
+fn dupes_envelope() -> Value {
+    json!({
+        "kind": "dupes",
+        "elapsed_ms": 87,
+        "stats": {
+            "total_files": 40,
+            "files_with_clones": 3,
+            "clone_groups": 2,
+            "clone_instances": 5,
+            "duplicated_lines": 62,
+            "total_lines": 4100,
+            "duplication_percentage": 1.512
+        },
+        "clone_groups": [
+            {
+                "line_count": 18,
+                "token_count": 140,
+                "instances": [
+                    { "file": "packages/app/src/services/api/client.ts", "start_line": 10, "end_line": 27, "start_col": 0 },
+                    { "file": "packages/app/src/services/api/admin.ts", "start_line": 44, "end_line": 61, "start_col": 2 },
+                    { "file": "shared.ts", "start_line": 5, "end_line": 22, "start_col": 0 }
+                ]
+            },
+            {
+                "line_count": 6,
+                "token_count": 55,
+                "instances": [
+                    { "file": "src/one.ts", "start_line": 1, "end_line": 6, "start_col": 0 },
+                    { "file": "src/two.ts", "start_line": 9, "end_line": 14, "start_col": 4 }
+                ]
+            }
+        ]
+    })
+}
+
+fn health_envelope() -> Value {
+    json!({
+        "kind": "health",
+        "elapsed_ms": 954,
+        "health_score": { "grade": "C", "score": 71.25 },
+        "health_trend": {
+            "compared_to": { "grade": "B", "score": 80.0 },
+            "metrics": [
+                { "name": "score", "delta": -8.75, "current": 71.25, "label": "Score" },
+                { "name": "dead_export_pct", "delta": 2.5, "current": 6.0, "label": "Dead exports" },
+                { "name": "avg_cyclomatic", "delta": -0.4, "current": 3.6, "label": "Avg cyclomatic" }
+            ]
+        },
+        "summary": {
+            "files_analyzed": 210,
+            "functions_analyzed": 1400,
+            "functions_above_threshold": 3,
+            "max_cyclomatic_threshold": 20,
+            "max_cognitive_threshold": 15,
+            "max_crap_threshold": 30
+        },
+        "findings": [
+            { "path": "src/z-last.ts", "line": 3, "col": 0, "name": "criticalMess", "severity": "critical", "exceeded": "all", "cyclomatic": 33, "cognitive": 41, "crap": 156.5, "line_count": 120 },
+            { "path": "src/a-first.ts", "line": 9, "col": 4, "name": "moderateBranch", "severity": "moderate", "exceeded": "cyclomatic", "cyclomatic": 22, "cognitive": 9, "crap": null, "line_count": 40 },
+            { "path": "src/mid.ts", "line": 5, "col": 2, "name": "highCog", "severity": "high", "exceeded": "cognitive", "cyclomatic": 8, "cognitive": 19, "crap": null, "line_count": 33 }
+        ],
+        "runtime_coverage": {
+            "findings": [
+                {
+                    "path": "src/cold.ts", "line": 12, "function": "neverCalled", "verdict": "safe_to_delete",
+                    "invocations": 0, "confidence": "high",
+                    "evidence": { "static_status": "unused", "test_coverage": "none", "v8_tracking": "tracked" },
+                    "actions": [ { "description": "Delete this function; production never called it in 90 days." } ]
+                },
+                {
+                    "path": "src/unknown.ts", "line": 30, "function": "maybeUsed", "verdict": "coverage_unavailable",
+                    "invocations": null, "confidence": "low",
+                    "evidence": { "static_status": "used", "test_coverage": "partial", "v8_tracking": "untracked", "untracked_reason": "bundled" },
+                    "actions": []
+                }
+            ],
+            "hot_paths": [
+                { "path": "src/hot.ts", "line": 2, "function": "handleRequest", "invocations": 91234, "percentile": 99 }
+            ],
+            "summary": { "functions_tracked": 900, "functions_hit": 700, "functions_unhit": 150, "functions_untracked": 50 }
+        },
+        "targets": [
+            {
+                "path": "src/refactor-me.ts", "effort": "medium", "priority": "P1", "confidence": "high",
+                "recommendation": "Split the request handler into parsing and dispatch.",
+                "factors": [
+                    { "metric": "churn", "detail": "12 commits in 30 days" },
+                    { "metric": "complexity", "value": 27 }
+                ]
+            }
+        ]
+    })
+}
+
+fn audit_envelope() -> Value {
+    json!({
+        "kind": "audit",
+        "verdict": "warn",
+        "elapsed_ms": 640,
+        "changed_files_count": 4,
+        "summary": { "dead_code_issues": 3, "complexity_findings": 1, "duplication_clone_groups": 1 },
+        "attribution": {
+            "gate": "new-only",
+            "dead_code_introduced": 2, "dead_code_inherited": 1,
+            "complexity_introduced": 1, "complexity_inherited": 0,
+            "duplication_introduced": 0, "duplication_inherited": 1
+        },
+        "dead_code": {
+            "unused_exports": [
+                { "path": "src/api/client.ts", "line": 42, "export_name": "unusedFn", "introduced": true },
+                { "path": "/abs/deep/nested/src/api/types.ts", "line": 7, "export_name": "Old", "introduced": false }
+            ],
+            "unused_server_actions": [
+                { "path": "app/actions.ts", "line": 3, "action_name": "submitForm", "introduced": true }
+            ]
+        },
+        "complexity": {
+            "findings": [
+                { "path": "src/gnarly.ts", "line": 88, "name": "bigSwitch", "severity": "high", "cyclomatic": 24, "cognitive": 18, "crap": 42.5, "coverage_tier": "partial", "introduced": true }
+            ],
+            "summary": { "coverage_model": "istanbul", "istanbul_matched": 12, "istanbul_total": 40, "istanbul_files_matched": 5, "istanbul_files_total": 5 }
+        },
+        "duplication": {
+            "clone_groups": [
+                {
+                    "line_count": 9, "token_count": 80, "introduced": false,
+                    "instances": [
+                        { "file": "src/one.ts", "start_line": 4, "end_line": 12 },
+                        { "file": "src/two.ts", "start_line": 20, "end_line": 28 }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+fn security_envelope() -> Value {
+    json!({
+        "kind": "security",
+        "elapsed_ms": 233,
+        "summary": { "security_findings": 2 },
+        "security_findings": [
+            {
+                "kind": "tainted-sink", "severity": "high",
+                "path": "src/routes/exec.ts", "line": 17, "col": 8,
+                "evidence": "Non-literal command passed to child_process.exec().",
+                "candidate": { "sink": { "callee": "child_process.exec" } }
+            },
+            {
+                "kind": "client-server-leak", "severity": "medium",
+                "path": "src/pages/settings,page.tsx", "line": 4, "col": 0,
+                "evidence": "\"use client\" cone reaches process.env.SECRET_KEY: 100% certain.",
+                "candidate": { "sink": {} }
+            }
+        ],
+        "gate": { "mode": "new", "verdict": "fail", "new_count": 2 }
+    })
+}
+
+fn fix_envelope() -> Value {
+    json!({
+        "dry_run": true,
+        "total_fixed": 0,
+        "skipped": 0,
+        "skipped_content_changed": 1,
+        "skipped_mixed_line_endings": 0,
+        "skipped_low_confidence_exports": 2,
+        "fixes": [
+            { "type": "remove_export", "path": "src/api/client.ts", "line": 42, "name": "unusedFn", "applied": false },
+            { "type": "remove_export", "path": "src/api/types.ts", "line": 7, "name": "LegacyShape", "applied": false },
+            { "type": "remove_dependency", "package": "left-pad", "location": "dependencies", "file": "package.json", "applied": false },
+            { "type": "skipped", "path": "src/raced.ts", "skipped": true, "skip_reason": "content_changed" }
+        ]
+    })
+}
+
+fn combined_envelope() -> Value {
+    json!({
+        "kind": "combined",
+        "elapsed_ms": 1500,
+        "check": {
+            "total_issues": 3,
+            "unused_files": [ { "path": "src/dead.ts" } ],
+            "unused_exports": [
+                { "path": "src/api/client.ts", "line": 42, "col": 9, "export_name": "unusedFn", "is_re_export": false, "is_type_only": false }
+            ],
+            "unused_dependencies": [
+                { "path": "package.json", "line": 12, "package_name": "left-pad", "used_in_workspaces": [] }
+            ]
+        },
+        "dupes": {
+            "stats": {
+                "total_files": 40, "files_with_clones": 2, "clone_groups": 1,
+                "clone_instances": 2, "duplicated_lines": 18, "total_lines": 2000,
+                "duplication_percentage": 0.9
+            },
+            "clone_groups": [
+                {
+                    "line_count": 9, "token_count": 80,
+                    "instances": [
+                        { "file": "packages/app/src/services/api/client.ts", "start_line": 10, "end_line": 18, "start_col": 0 },
+                        { "file": "src/two.ts", "start_line": 20, "end_line": 28, "start_col": 0 }
+                    ]
+                }
+            ]
+        },
+        "health": {
+            "health_score": { "grade": "B", "score": 82.0 },
+            "summary": {
+                "files_analyzed": 210, "functions_analyzed": 1400, "functions_above_threshold": 2,
+                "max_cyclomatic_threshold": 20, "max_cognitive_threshold": 15, "max_crap_threshold": 30
+            },
+            "findings": [
+                { "path": "deep/nested/dir/src/a.ts", "line": 9, "col": 4, "name": "tieBreakFirst", "severity": "moderate", "exceeded": "cyclomatic", "cyclomatic": 22, "cognitive": 9, "crap": null, "line_count": 40 },
+                { "path": "src/z.ts", "line": 3, "col": 0, "name": "worstCrap", "severity": "critical", "exceeded": "all", "cyclomatic": 33, "cognitive": 41, "crap": 156.5, "line_count": 120 }
+            ],
+            "runtime_coverage": {
+                "verdict": "hot-path-touched",
+                "findings": [
+                    {
+                        "path": "src/cold.ts", "line": 12, "function": "neverCalled", "verdict": "safe_to_delete",
+                        "invocations": 0, "confidence": "high",
+                        "evidence": { "static_status": "unused", "test_coverage": "none", "v8_tracking": "tracked" },
+                        "actions": []
+                    }
+                ],
+                "hot_paths": [
+                    { "path": "src/hot.ts", "line": 2, "function": "handleRequest", "invocations": 91234, "percentile": 99 }
+                ]
+            },
+            "vital_signs": { "maintainability_avg": 74.36, "avg_cyclomatic": 3.4 },
+            "file_scores": [
+                { "maintainability_index": 61.0 },
+                { "maintainability_index": 70.0 }
+            ]
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// github-annotations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn github_annotations_check_snapshot() {
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &plain_options());
+    insta::assert_snapshot!("github_annotations_check", rendered);
+}
+
+#[test]
+fn github_annotations_dupes_snapshot() {
+    let rendered = render_annotations(EnvelopeKind::Dupes, &dupes_envelope(), &plain_options());
+    insta::assert_snapshot!("github_annotations_dupes", rendered);
+}
+
+#[test]
+fn github_annotations_health_snapshot() {
+    let rendered = render_annotations(EnvelopeKind::Health, &health_envelope(), &plain_options());
+    insta::assert_snapshot!("github_annotations_health", rendered);
+}
+
+/// An override-affected finding must be annotated against the ceiling it was
+/// measured with, not the run's global summary ceiling (issue #2163). The
+/// frozen legacy renderer `action/jq/annotations-health.jq` is held to the same
+/// assertion by `action/tests/run.sh`.
+#[test]
+fn annotations_use_the_finding_effective_threshold() {
+    let mut envelope = health_envelope();
+    envelope["findings"] = json!([
+        {
+            "path": "src/Board.astro", "line": 6, "col": 3, "name": "<template>",
+            "severity": "critical", "exceeded": "crap", "cyclomatic": 11,
+            "cognitive": 4, "crap": 132.0, "line_count": 20,
+            "threshold_source": "override",
+            "effective_thresholds": {
+                "max_cyclomatic": 20, "max_cognitive": 15,
+                "max_crap": 100.0, "max_unit_size": 60
+            }
+        }
+    ]);
+
+    let rendered = render_annotations(EnvelopeKind::Health, &envelope, &plain_options());
+
+    assert_eq!(
+        rendered.matches("(threshold: 100)").count(),
+        2,
+        "{rendered}"
+    );
+    assert!(!rendered.contains("(threshold: 30)"), "{rendered}");
+}
+
+/// A statically-unused function that only test files still reference must say
+/// so in the annotation, otherwise a reviewer reads a bare "unused" and deletes
+/// code the test suite depends on (issue #2594).
+#[test]
+fn annotations_mark_a_test_only_reference() {
+    let mut envelope = health_envelope();
+    envelope["runtime_coverage"]["findings"] = json!([
+        {
+            "path": "src/helpers.ts", "line": 4, "function": "resetForTests",
+            "verdict": "review_required", "invocations": 0, "confidence": "high",
+            "evidence": {
+                "static_status": "unused", "test_coverage": "not_covered",
+                "test_only_reference": true, "v8_tracking": "tracked"
+            },
+            "actions": [ { "description": "Only tests reference this export; delete the test usage together with the function or keep it." } ]
+        }
+    ]);
+
+    let rendered = render_annotations(EnvelopeKind::Health, &envelope, &plain_options());
+
+    assert!(
+        rendered.contains("Static: unused (referenced only from tests)"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn github_annotations_audit_snapshot() {
+    let rendered = render_annotations(EnvelopeKind::Audit, &audit_envelope(), &plain_options());
+    insta::assert_snapshot!("github_annotations_audit", rendered);
+}
+
+#[test]
+fn github_annotations_security_snapshot() {
+    let rendered = render_annotations(
+        EnvelopeKind::Security,
+        &security_envelope(),
+        &plain_options(),
+    );
+    insta::assert_snapshot!("github_annotations_security", rendered);
+}
+
+#[test]
+fn github_annotations_combined_snapshot() {
+    let rendered = render_annotations(
+        EnvelopeKind::Combined,
+        &combined_envelope(),
+        &plain_options(),
+    );
+    insta::assert_snapshot!("github_annotations_combined", rendered);
+}
+
+#[test]
+fn annotations_severity_sort_beats_path_order() {
+    let rendered = render_annotations(EnvelopeKind::Health, &health_envelope(), &plain_options());
+    let lines: Vec<&str> = rendered.lines().collect();
+    // Errors first (critical/high complexity), even though their paths sort
+    // after the moderate finding's `src/a-first.ts`.
+    assert!(
+        lines[0].starts_with("::error file=src/mid.ts"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("::error file=src/z-last.ts"),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[2].starts_with("::warning file=src/a-first.ts"),
+        "{}",
+        lines[2]
+    );
+    // Notices (refactoring targets, coverage_unavailable) after warnings.
+    let first_notice = lines
+        .iter()
+        .position(|line| line.starts_with("::notice"))
+        .expect("notices present");
+    assert!(
+        lines[..first_notice]
+            .iter()
+            .all(|line| !line.starts_with("::notice")),
+        "no notice may precede a warning"
+    );
+}
+
+#[test]
+fn annotations_end_with_budget_notice() {
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &plain_options());
+    let last = rendered.lines().last().expect("non-empty");
+    let total = rendered.lines().count() - 1;
+    assert_eq!(
+        last,
+        format!(
+            "::notice::fallow emitted {total} annotations; GitHub shows at most 10 per type per step"
+        )
+    );
+}
+
+#[test]
+fn annotations_single_finding_notice_uses_singular_noun() {
+    let rendered = render_annotations(
+        EnvelopeKind::DeadCode,
+        &json!({
+            "kind": "dead-code",
+            "total_issues": 1,
+            "unused_files": [{ "path": "src/orphan.ts" }]
+        }),
+        &plain_options(),
+    );
+    let last = rendered.lines().last().expect("non-empty");
+    assert_eq!(
+        last,
+        "::notice::fallow emitted 1 annotation; GitHub shows at most 10 per type per step"
+    );
+}
+
+#[test]
+fn annotations_empty_run_renders_nothing() {
+    let rendered = render_annotations(
+        EnvelopeKind::DeadCode,
+        &json!({ "kind": "dead-code", "total_issues": 0 }),
+        &plain_options(),
+    );
+    assert_eq!(rendered, "");
+}
+
+#[test]
+fn annotations_rebase_prefixes_every_file_property() {
+    let options = RenderOptions {
+        rebase: PathRebase::Prefix("packages/app".to_owned()),
+        pm: PackageManager::Npm,
+    };
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &options);
+    for line in rendered.lines() {
+        if let Some(rest) = line.split_once(" file=").map(|(_, rest)| rest) {
+            assert!(
+                rest.starts_with("packages/app/"),
+                "unrebased file property: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn annotations_escape_comma_colon_percent_crlf() {
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &plain_options());
+    // Comma in a path escapes in the file= property.
+    assert!(rendered.contains("file=src/a%2Cb.ts"), "{rendered}");
+    // Non-ASCII passes through as UTF-8.
+    assert!(rendered.contains("file=src/München.ts"), "{rendered}");
+    // Percent and CRLF in a policy message body escape strictly.
+    assert!(
+        rendered.contains("eval is 100%25 banned%0D%0Asee: policy"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn annotations_package_manager_drives_fix_commands() {
+    let options = RenderOptions {
+        rebase: PathRebase::None,
+        pm: PackageManager::Bun,
+    };
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &options);
+    assert!(rendered.contains("Run: bun remove left-pad"), "{rendered}");
+    assert!(rendered.contains("Run: bun add chalk"), "{rendered}");
+    // Workspace-used dependency keeps the move advice instead of a command.
+    assert!(
+        rendered.contains("Move this dependency to the consuming workspace package.json."),
+        "{rendered}"
+    );
+}
+
+fn root_dependency_declared_in_workspace_envelope() -> Value {
+    json!({
+        "kind": "dead-code",
+        "schema_version": 7,
+        "total_issues": 1,
+        "elapsed_ms": 12,
+        "unused_dependencies": [
+            {
+                "path": "package.json",
+                "line": 7,
+                "package_name": "left-pad",
+                "declared_and_imported_in": ["packages/app", "packages/web"]
+            }
+        ]
+    })
+}
+
+#[test]
+fn annotations_name_the_workspaces_that_declare_and_import_a_root_dependency() {
+    let rendered = render_annotations(
+        EnvelopeKind::DeadCode,
+        &root_dependency_declared_in_workspace_envelope(),
+        &plain_options(),
+    );
+    assert!(
+        rendered.contains("Declared and imported in other workspaces: packages/app, packages/web"),
+        "{rendered}"
+    );
+    // The workspace declarations keep the package installed, so the root
+    // declaration can go.
+    assert!(
+        rendered.contains("Run: npm uninstall left-pad"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn summary_names_the_workspaces_that_declare_and_import_a_root_dependency() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &root_dependency_declared_in_workspace_envelope(),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered
+            .contains("| `left-pad` | declared and imported in `packages/app`, `packages/web` |"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn annotations_security_candidates_render_at_notice_level() {
+    let rendered = render_annotations(
+        EnvelopeKind::Security,
+        &security_envelope(),
+        &plain_options(),
+    );
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert!(
+        lines[..lines.len() - 1]
+            .iter()
+            .all(|line| line.starts_with("::notice ")),
+        "security candidates must all be notices: {rendered}"
+    );
+}
+
+#[test]
+fn annotations_stale_suppression_unknown_kind_branch() {
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &plain_options());
+    assert!(
+        rendered.contains(
+            "title=Unknown suppression kind::'not-a-kind' is not a recognized fallow issue kind."
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("title=Stale @expected-unused::"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "title=Stale suppression::This 'fallow-ignore-file' comment for 'unused-export'"
+        ),
+        "{rendered}"
+    );
+}
+
+/// The analyze-once contract: rendering an envelope that went through a JSON
+/// serialize/parse round trip (what `--format json -o file` + `fallow report
+/// --from file` does) is byte-identical to rendering the in-memory envelope.
+#[test]
+fn report_from_round_trip_parity() {
+    for (kind, envelope) in [
+        (EnvelopeKind::DeadCode, check_envelope()),
+        (EnvelopeKind::Dupes, dupes_envelope()),
+        (EnvelopeKind::Health, health_envelope()),
+        (EnvelopeKind::Audit, audit_envelope()),
+        (EnvelopeKind::Security, security_envelope()),
+        (EnvelopeKind::Combined, combined_envelope()),
+        (EnvelopeKind::Fix, fix_envelope()),
+    ] {
+        let direct = render_annotations(kind, &envelope, &plain_options());
+        let serialized = serde_json::to_string_pretty(&envelope).expect("serialize");
+        let reparsed: Value = serde_json::from_str(&serialized).expect("parse");
+        let from_file = render_annotations(kind, &reparsed, &plain_options());
+        assert_eq!(direct, from_file, "round-trip drift for {kind:?}");
+
+        let links = LinkContext::default();
+        let direct_summary = render_summary(kind, &envelope, &links);
+        let from_file_summary = render_summary(kind, &reparsed, &links);
+        assert_eq!(
+            direct_summary, from_file_summary,
+            "summary round-trip drift for {kind:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// github-summary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn github_summary_check_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &check_envelope(),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_check", rendered);
+}
+
+#[test]
+fn github_summary_check_clean_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &json!({ "kind": "dead-code", "total_issues": 0, "elapsed_ms": 45 }),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_check_clean", rendered);
+}
+
+#[test]
+fn github_summary_single_issue_uses_singular_noun() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &json!({
+            "kind": "dead-code",
+            "total_issues": 1,
+            "elapsed_ms": 45,
+            "unused_files": [{ "path": "src/orphan.ts" }]
+        }),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered.contains("> **1 issue** found"),
+        "headline should use the singular noun: {rendered}"
+    );
+}
+
+#[test]
+fn github_summary_dupes_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::Dupes,
+        &dupes_envelope(),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_dupes", rendered);
+}
+
+#[test]
+fn github_summary_dupes_ranks_families_by_their_best_group() {
+    let rendered = render_summary(
+        EnvelopeKind::Dupes,
+        &json!({
+            "kind": "dupes",
+            "elapsed_ms": 5,
+            "stats": {
+                "total_files": 4, "files_with_clones": 4, "clone_groups": 2,
+                "clone_instances": 4, "duplicated_lines": 20, "total_lines": 100,
+                "duplication_percentage": 20.0
+            },
+            "clone_groups": [],
+            "clone_families": [
+                {
+                    "files": ["a-local.ts", "b-local.ts"],
+                    "total_duplicated_lines": 10,
+                    "groups": [{
+                        "line_count": 10, "token_count": 110, "spread": 0,
+                        "instances": [
+                            { "file": "a-local.ts", "start_line": 1, "end_line": 10 },
+                            { "file": "b-local.ts", "start_line": 1, "end_line": 10 }
+                        ]
+                    }],
+                    "suggestions": []
+                },
+                {
+                    "files": ["z-distant-a.ts", "z-distant-b.ts"],
+                    "total_duplicated_lines": 10,
+                    "groups": [
+                        {
+                            "line_count": 2, "token_count": 5, "spread": 0,
+                            "instances": [
+                                { "file": "ignored-first-a.ts", "start_line": 1, "end_line": 2 },
+                                { "file": "ignored-first-b.ts", "start_line": 1, "end_line": 2 }
+                            ]
+                        },
+                        {
+                            "line_count": 10, "token_count": 100, "spread": 8,
+                            "instances": [
+                                { "file": "z-distant-a.ts", "start_line": 1, "end_line": 10 },
+                                { "file": "z-distant-b.ts", "start_line": 1, "end_line": 10 }
+                            ]
+                        }
+                    ],
+                    "suggestions": []
+                }
+            ]
+        }),
+        &LinkContext::default(),
+    );
+    let distant = rendered.find("z-distant-a.ts").expect("distant family");
+    let local = rendered.find("a-local.ts").expect("local family");
+    assert!(
+        distant < local,
+        "spread-aware family must render first: {rendered}"
+    );
+    assert!(
+        rendered.contains("\n  - `z-distant-a.ts:1-10`"),
+        "family details must show the best-ranked group: {rendered}"
+    );
+}
+
+/// Clone-family identifier cells render as code spans: file names with
+/// underscores and suggestion prose with parentheses must reach the summary
+/// without markdown escape backslashes.
+#[test]
+fn github_summary_dupes_family_renders_identifiers_as_code_spans() {
+    let rendered = render_summary(
+        EnvelopeKind::Dupes,
+        &json!({
+            "kind": "dupes",
+            "elapsed_ms": 5,
+            "stats": {
+                "total_files": 4, "files_with_clones": 2, "clone_groups": 1,
+                "clone_instances": 2, "duplicated_lines": 9, "total_lines": 100,
+                "duplication_percentage": 9.0
+            },
+            "clone_groups": [{
+                "line_count": 9, "token_count": 80,
+                "instances": [
+                    { "file": "src/auth_service_helper.ts", "start_line": 1, "end_line": 9 },
+                    { "file": "src/auth_service_backup.ts", "start_line": 4, "end_line": 12 }
+                ]
+            }],
+            "clone_families": [{
+                "files": ["src/auth_service_helper.ts", "src/auth_service_backup.ts"],
+                "total_duplicated_lines": 9,
+                "groups": [{
+                    "line_count": 9, "token_count": 80,
+                    "instances": [
+                        { "file": "src/auth_service_helper.ts", "start_line": 1, "end_line": 9 }
+                    ]
+                }],
+                "suggestions": [{
+                    "description": "Extract 1 shared clone group (9 lines) from auth_service_helper.ts, auth_service_backup.ts into src",
+                    "estimated_savings": 9
+                }]
+            }]
+        }),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered.contains("**`src/auth_service_helper.ts`, `src/auth_service_backup.ts`**"),
+        "family header must code-span each file: {rendered}"
+    );
+    assert!(
+        rendered.contains("(9 lines)"),
+        "suggestion parentheses must render unescaped: {rendered}"
+    );
+    assert!(
+        !rendered.contains("\\_") && !rendered.contains("\\(") && !rendered.contains("\\)"),
+        "no markdown escape backslashes may reach identifiers or prose: {rendered}"
+    );
+}
+
+/// The audit duplication Files column renders each path as a code span, so
+/// underscores survive verbatim and pipes cannot terminate the cell.
+#[test]
+fn github_summary_audit_dupes_files_column_uses_code_spans() {
+    let mut env = audit_envelope();
+    env["duplication"]["clone_groups"][0]["instances"] = json!([
+        { "file": "src/auth_service_helper.ts", "start_line": 4, "end_line": 12 },
+        { "file": "src/we|ird_helper.ts", "start_line": 20, "end_line": 28 }
+    ]);
+    let rendered = render_summary(EnvelopeKind::Audit, &env, &LinkContext::default());
+    assert!(
+        rendered.contains("`src/auth_service_helper.ts`"),
+        "files cell must code-span the path: {rendered}"
+    );
+    assert!(
+        !rendered.contains("auth\\_service\\_helper"),
+        "underscores must not be backslash-escaped: {rendered}"
+    );
+    assert!(
+        rendered.contains("`src/we\\|ird_helper.ts`"),
+        "pipes must stay escaped inside the code span: {rendered}"
+    );
+}
+
+#[test]
+fn github_summary_health_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::Health,
+        &health_envelope(),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_health", rendered);
+}
+
+/// A coverage file covers the files its test run touched, so matching a
+/// fraction of a project's functions is ordinary. The signal that a path is
+/// wrong is files in the coverage file that no analyzed file matched, and the
+/// note points at `--coverage-root` for that case alone.
+#[test]
+fn audit_summary_names_the_coverage_root_only_when_the_join_failed() {
+    let with_join_failure = |matched: u64, total: u64| {
+        let mut envelope = audit_envelope();
+        envelope["complexity"]["summary"] = serde_json::json!({
+            "coverage_model": "istanbul",
+            "istanbul_matched": 12,
+            "istanbul_total": 40,
+            "istanbul_files_matched": matched,
+            "istanbul_files_total": total,
+        });
+        render_summary(EnvelopeKind::Audit, &envelope, &LinkContext::default())
+    };
+
+    let joined = with_join_failure(5, 5);
+    assert!(joined.contains("Matched 12/40 functions."), "{joined}");
+    assert!(!joined.contains("--coverage-root"), "{joined}");
+
+    let unjoined = with_join_failure(0, 5);
+    assert!(unjoined.contains("--coverage-root"), "{unjoined}");
+    assert!(
+        unjoined.contains("5 files that none of the analyzed files matched"),
+        "{unjoined}"
+    );
+
+    let partial = with_join_failure(2, 5);
+    assert!(partial.contains("from 2 of 5 files"), "{partial}");
+}
+
+#[test]
+fn github_summary_audit_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::Audit,
+        &audit_envelope(),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_audit", rendered);
+}
+
+#[test]
+fn github_summary_security_snapshot() {
+    let rendered = render_summary(
+        EnvelopeKind::Security,
+        &security_envelope(),
+        &LinkContext::default(),
+    );
+    insta::assert_snapshot!("github_summary_security", rendered);
+}
+
+#[test]
+fn github_summary_fix_snapshot() {
+    let rendered = fallow_cli::report::github_summary::render_fix_summary(&fix_envelope());
+    insta::assert_snapshot!("github_summary_fix", rendered);
+}
+
+/// `report --from <fix-results.json> --format github-summary` routes the
+/// kind-less fix envelope through `EnvelopeKind::Fix`, which must reach the
+/// same renderer as the live `fallow fix` command (`render_fix_summary`) and
+/// carry `summary-fix.jq`'s sections.
+#[test]
+fn render_summary_fix_mirrors_render_fix_summary() {
+    let env = fix_envelope();
+    let via_dispatch = render_summary(EnvelopeKind::Fix, &env, &LinkContext::default());
+    let direct = fallow_cli::report::github_summary::render_fix_summary(&env);
+    assert_eq!(
+        via_dispatch, direct,
+        "EnvelopeKind::Fix must reach render_fix_summary"
+    );
+    // The summary-fix.jq sections: heading, headline, count table, details.
+    assert!(
+        via_dispatch.starts_with("## Fallow - Auto-fix"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("**Dry run**: would apply **3 fixes**"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("skipped 1 file(s) that changed since analysis"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains(
+            "kept exports in 2 file(s) where consumers may be hidden from static analysis"
+        ),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("| Export removals | 2 |"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("| Dependency removals | 1 |"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("<summary>View details</summary>"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("- `src/api/client.ts:42` - `unusedFn`"),
+        "{via_dispatch}"
+    );
+    assert!(
+        via_dispatch.contains("- `left-pad` from `dependencies` in `package.json`"),
+        "{via_dispatch}"
+    );
+}
+
+/// A single fix uses the singular noun in the headline (`1 fix`, not
+/// `1 fixes`). One fix is the common PR case.
+#[test]
+fn fix_summary_single_fix_uses_singular_noun() {
+    let env = json!({
+        "dry_run": true,
+        "total_fixed": 0,
+        "skipped": 0,
+        "skipped_content_changed": 0,
+        "skipped_mixed_line_endings": 0,
+        "skipped_low_confidence_exports": 0,
+        "fixes": [
+            { "type": "remove_export", "path": "src/lib.ts", "line": 2, "name": "dead", "applied": false }
+        ]
+    });
+    let rendered = fallow_cli::report::github_summary::render_fix_summary(&env);
+    assert!(
+        rendered.contains("would apply **1 fix**"),
+        "single fix should read '1 fix', got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("1 fixes"),
+        "must not use the plural noun for one fix: {rendered}"
+    );
+}
+
+/// A withheld `remove_dependency` entry keeps its `type` so a caller can see
+/// which finding was declined. The CI summary must not read that as a write
+/// that happened: listing it under "Dependencies removed" would tell a
+/// reviewer the package left `package.json` when it is still there.
+#[test]
+fn fix_summary_does_not_report_a_withheld_dependency_as_removed() {
+    let env = json!({
+        "dry_run": false,
+        "total_fixed": 0,
+        "skipped": 0,
+        "skipped_content_changed": 0,
+        "skipped_mixed_line_endings": 0,
+        "skipped_low_confidence_exports": 0,
+        "skipped_low_confidence_dependencies": 1,
+        "fixes": [
+            {
+                "type": "remove_dependency",
+                "package": "lodash",
+                "location": "dependencies",
+                "file": "package.json",
+                "applied": false,
+                "skipped": true,
+                "skip_reason": "low_confidence_incomplete_analysis",
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ]
+    });
+    let rendered = fallow_cli::report::github_summary::render_fix_summary(&env);
+
+    assert!(
+        !rendered.contains("`lodash`"),
+        "a withheld package must not be listed as removed: {rendered}"
+    );
+    assert!(
+        rendered.contains("kept 1 declared package(s)"),
+        "the withholding has to be stated instead: {rendered}"
+    );
+}
+
+/// The bundled action no-ops annotations for the fix command, so the native
+/// `EnvelopeKind::Fix` annotation renderer must emit nothing.
+#[test]
+fn render_annotations_fix_is_empty() {
+    let rendered = render_annotations(EnvelopeKind::Fix, &fix_envelope(), &plain_options());
+    assert_eq!(rendered, "", "fix annotations must be empty: {rendered}");
+}
+
+#[test]
+fn github_summary_combined_snapshot() {
+    // Populated link context exercises the blob-URL branch of the dupes file
+    // links, including the repo-root prefix slot.
+    let links = LinkContext {
+        prefix: "packages/app/".to_owned(),
+        repo: "acme/monorepo".to_owned(),
+        sha: "0123abc".to_owned(),
+    };
+    let rendered = render_summary(EnvelopeKind::Combined, &combined_envelope(), &links);
+    insta::assert_snapshot!("github_summary_combined", rendered);
+}
+
+/// Backticks and pipes in envelope strings must not break out of their table
+/// cell: a suppression comment token is arbitrary source text, so an unknown
+/// `issue_kind` is the canonical markdown-injection vector into
+/// `GITHUB_STEP_SUMMARY`.
+#[test]
+fn github_summary_escapes_hostile_stale_suppression_kind() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &json!({
+            "kind": "dead-code",
+            "total_issues": 1,
+            "elapsed_ms": 5,
+            "stale_suppressions": [{
+                "path": "src/a.ts",
+                "line": 3,
+                "origin": { "type": "comment", "kind_known": false, "issue_kind": "x`|![evil](u)" }
+            }]
+        }),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered.contains("unknown kind ``x`\\|![evil](u)``"),
+        "hostile kind must stay one escaped code span: {rendered}"
+    );
+    assert!(
+        !rendered.contains("![evil](u) |"),
+        "pipe must not terminate the description cell: {rendered}"
+    );
+}
+
+/// Paths and export names with pipes/backticks stay inside a single escaped
+/// code span per cell instead of splitting or closing the row.
+#[test]
+fn github_summary_escapes_pipes_and_backticks_in_check_cells() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &json!({
+            "kind": "dead-code",
+            "total_issues": 2,
+            "elapsed_ms": 5,
+            "unused_exports": [{
+                "path": "src/we|ird.ts",
+                "line": 1,
+                "export_name": "bad`name",
+                "is_re_export": false
+            }],
+            "circular_dependencies": [{
+                "files": ["src/a|b.ts", "src/c.ts"],
+                "length": 2
+            }]
+        }),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered.contains("| `src/we\\|ird.ts` | 1 | ``bad`name`` |"),
+        "export row must escape both hostile cells: {rendered}"
+    );
+    assert!(
+        rendered.contains("src/a\\|b.ts"),
+        "cycle cell must escape pipes in file names: {rendered}"
+    );
+    assert!(
+        !rendered.contains("src/we|ird.ts"),
+        "raw pipe must not survive inside a data row: {rendered}"
+    );
+}
+
+/// CRLF in envelope strings must not leave a bare CR (a CommonMark line
+/// ending) inside a table row.
+#[test]
+fn github_summary_stale_description_survives_crlf_kind() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &json!({
+            "kind": "dead-code",
+            "total_issues": 1,
+            "elapsed_ms": 5,
+            "circular_dependencies": [{
+                "files": ["src/a\r\nb.ts", "src/c.ts"],
+                "length": 2
+            }]
+        }),
+        &LinkContext::default(),
+    );
+    assert!(
+        rendered.contains("src/a b.ts"),
+        "CRLF must collapse to one space: {rendered}"
+    );
+    assert!(
+        !rendered.contains('\r'),
+        "no carriage return may reach the summary: {rendered}"
+    );
+}
+
+#[test]
+fn summary_has_no_em_dashes() {
+    // Repo style rule: the renderer templates must never emit em dashes,
+    // including where the ported jq layer used them.
+    for (kind, envelope) in [
+        (EnvelopeKind::DeadCode, check_envelope()),
+        (EnvelopeKind::Dupes, dupes_envelope()),
+        (EnvelopeKind::Health, health_envelope()),
+        (EnvelopeKind::Audit, audit_envelope()),
+        (EnvelopeKind::Security, security_envelope()),
+        (EnvelopeKind::Combined, combined_envelope()),
+        (EnvelopeKind::Fix, fix_envelope()),
+    ] {
+        let summary = render_summary(kind, &envelope, &LinkContext::default());
+        assert!(!summary.contains('\u{2014}'), "em dash in {kind:?} summary");
+        let annotations = render_annotations(kind, &envelope, &plain_options());
+        assert!(
+            !annotations.contains('\u{2014}'),
+            "em dash in {kind:?} annotations"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-IssueKind drift guard (advisor plan 027 Phase A)
+//
+// The bundled action's shell drift guard (`action/tests/issuekind-drift-guard.sh`,
+// `assert_issuekind_summary_coverage`) asserts that every counted dead-code
+// IssueKind's serialized `result_key` reaches the GitHub summary + annotation
+// surfaces. Those surfaces render natively since v3.4.2, but no Rust test held
+// the same line: a new `counts_in_total` IssueKind could land in
+// `ISSUE_RESULT_META` and silently miss `render_summary` / `render_annotations`.
+// These tests iterate the registry (the `counts_in_total == true` rows the shell
+// guard gates) and assert each kind renders in BOTH github-summary and
+// github-annotations.
+// ---------------------------------------------------------------------------
+
+/// The counted dead-code result rows: exactly the set the shell guard gates
+/// (`counts_in_total == true`). Prop-drilling participates when explicitly
+/// enforced. Thin-wrapper and duplicate-prop-shape remain advisory and are
+/// excluded from native CI reports.
+fn counted_dead_code_metas() -> impl Iterator<Item = &'static IssueResultMeta> {
+    ISSUE_RESULT_META.iter().filter(|meta| meta.counts_in_total)
+}
+
+/// Number of counted dead-code IssueKinds the GitHub surfaces must carry. This
+/// mirrors the shell drift guard's gated set size (verified equal by running
+/// `action/tests/issuekind-drift-guard.sh`); bump it in lockstep when a counted
+/// IssueKind lands so the Rust guard and the shell guard keep agreeing.
+const COUNTED_DEAD_CODE_KINDS: usize = 49;
+
+/// Sentinel path embedded per kind so an annotation for that kind is uniquely
+/// identifiable in the rendered stream. `snt/` + the unique `result_key` +
+/// `.ts` carries no workflow-command reserved character, so it renders verbatim
+/// in the annotation `file=` property.
+fn kind_sentinel(result_key: &str) -> String {
+    format!("snt/{result_key}.ts")
+}
+
+/// One finding for `result_key`, shaped so the annotation renderer emits the
+/// kind's sentinel path in `file=`. Most kinds read a top-level `path`; the
+/// handful that anchor on a nested location carry the sentinel there instead.
+fn dead_code_finding(result_key: &str) -> Value {
+    let path = kind_sentinel(result_key);
+    match result_key {
+        "prop_drilling_chains" => json!({
+            "prop": "user", "depth": 3, "effective_severity": "error",
+            "hops": [{"file": path, "line": 1, "component": "Page"}],
+        }),
+        "unlisted_dependencies" => json!({
+            "package_name": "pkg",
+            "imported_from": [{ "path": path, "line": 1, "col": 0 }],
+        }),
+        "duplicate_exports" => json!({
+            "export_name": "dup",
+            "locations": [{ "path": path, "line": 1, "col": 0 }],
+        }),
+        "circular_dependencies" => json!({ "files": [path], "line": 0, "col": 0, "length": 1 }),
+        "re_export_cycles" => json!({ "files": [path], "kind": "cycle" }),
+        "package_cycles" => json!({
+            "packages": ["a", "b"],
+            "length": 2,
+            "edges": [{
+                "from_package": "a", "to_package": "b", "path": path,
+                "target_path": "src/to.ts", "line": 1, "col": 0, "type_only": false,
+            }],
+        }),
+        "boundary_violations" => json!({
+            "from_path": path, "to_path": "src/to.ts",
+            "from_zone": "ui", "to_zone": "db", "line": 1, "col": 0,
+        }),
+        _ => json!({ "path": path, "line": 1, "col": 0 }),
+    }
+}
+
+/// A dead-code envelope carrying exactly one finding of every counted kind.
+fn every_dead_code_kind_envelope() -> Value {
+    let mut env = serde_json::Map::new();
+    env.insert("kind".to_owned(), json!("dead-code"));
+    let mut total = 0u64;
+    for meta in counted_dead_code_metas() {
+        env.insert(
+            meta.result_key.to_owned(),
+            json!([dead_code_finding(meta.result_key)]),
+        );
+        total += 1;
+    }
+    env.insert("total_issues".to_owned(), json!(total));
+    env.insert("elapsed_ms".to_owned(), json!(1));
+    Value::Object(env)
+}
+
+/// Trip-wire that keeps the two coverage tests honest: the fixture must carry
+/// one finding array per counted `result_key`, no more, no fewer. A new counted
+/// IssueKind that is not added here fails this before the coverage tests even
+/// run, and the count pins agreement with the shell guard's gated set.
+#[test]
+fn fixture_tracks_the_counted_registry_exactly() {
+    let env = every_dead_code_kind_envelope();
+    let obj = env.as_object().expect("object envelope");
+    let registry: BTreeSet<&str> = counted_dead_code_metas()
+        .map(|meta| meta.result_key)
+        .collect();
+    let fixture: BTreeSet<&str> = obj
+        .iter()
+        .filter(|(_, value)| value.is_array())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        fixture, registry,
+        "fixture drifted from the counted ISSUE_RESULT_META set"
+    );
+    assert_eq!(
+        registry.len(),
+        COUNTED_DEAD_CODE_KINDS,
+        "counted dead-code kind count changed; update COUNTED_DEAD_CODE_KINDS and re-run action/tests/run.sh to keep the Rust guards and the filter-changed.jq shell guard in sync"
+    );
+}
+
+/// Every counted dead-code IssueKind must surface a category row in
+/// github-summary. The frozen legacy `summary-check.jq` has no such guard.
+#[test]
+fn summary_covers_every_counted_dead_code_kind() {
+    let env = every_dead_code_kind_envelope();
+    let rendered = render_summary(EnvelopeKind::DeadCode, &env, &LinkContext::default());
+    for meta in counted_dead_code_metas() {
+        let marker = format!("[{}](", meta.summary_label);
+        assert!(
+            rendered.contains(&marker),
+            "github-summary omits the dead-code category row for `{}` (label {:?}): a counted IssueKind is not wired into render_summary",
+            meta.result_key,
+            meta.summary_label,
+        );
+    }
+}
+
+/// Every counted dead-code IssueKind must surface an annotation in
+/// github-annotations. The frozen legacy `annotations-check.jq` has no such
+/// guard.
+#[test]
+fn annotations_cover_every_counted_dead_code_kind() {
+    let env = every_dead_code_kind_envelope();
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &env, &plain_options());
+    for meta in counted_dead_code_metas() {
+        let marker = kind_sentinel(meta.result_key);
+        assert!(
+            rendered.contains(&marker),
+            "github-annotations omits an annotation for `{}`: a counted IssueKind is not wired into render_annotations",
+            meta.result_key,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A verdict resting on a file the run never fully read must not reach a
+// machine-actionable CI surface looking confident.
+// ---------------------------------------------------------------------------
+
+/// A dead-code envelope where every caveated array carries one caveated
+/// finding, shaped exactly as `--format json` serializes it.
+fn caveated_check_envelope() -> Value {
+    json!({
+        "kind": "dead-code",
+        "schema_version": 7,
+        "total_issues": 3,
+        "elapsed_ms": 12,
+        "unused_files": [
+            { "path": "src/lib.ts", "reachability_caveats": ["incomplete-import-graph"] }
+        ],
+        "unused_exports": [
+            {
+                "path": "src/api.ts",
+                "line": 3,
+                "col": 0,
+                "export_name": "needed",
+                "is_re_export": false,
+                "is_type_only": false,
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ],
+        "unused_types": [
+            {
+                "path": "src/api.ts",
+                "line": 9,
+                "col": 0,
+                "export_name": "LegacyShape",
+                "is_re_export": false,
+                "is_type_only": true,
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ],
+        "unused_enum_members": [
+            {
+                "path": "src/api.ts",
+                "line": 14,
+                "col": 2,
+                "parent_name": "Mode",
+                "member_name": "Legacy",
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ],
+        "unused_class_members": [
+            {
+                "path": "src/api.ts",
+                "line": 20,
+                "col": 2,
+                "parent_name": "Widget",
+                "member_name": "render",
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ],
+        "unused_store_members": [
+            {
+                "path": "src/api.ts",
+                "line": 26,
+                "col": 2,
+                "parent_name": "useCart",
+                "member_name": "subtotal",
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ],
+        "unused_dependencies": [
+            {
+                "path": "package.json",
+                "line": 12,
+                "package_name": "left-pad",
+                "used_in_workspaces": [],
+                "reachability_caveats": ["incomplete-import-graph"]
+            }
+        ]
+    })
+}
+
+/// The job summary is where a reviewer decides what to delete, so the row that
+/// names a caveated finding has to carry the qualifier. It rides inside an
+/// existing cell so no table changes shape.
+#[test]
+fn github_summary_rows_name_the_reachability_caveat() {
+    let rendered = render_summary(
+        EnvelopeKind::DeadCode,
+        &caveated_check_envelope(),
+        &LinkContext::default(),
+    );
+
+    assert!(
+        rendered.contains("| `src/lib.ts` *(caveat: incomplete import graph)* |"),
+        "unused-file row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("`needed` *(caveat: incomplete import graph)* |"),
+        "unused-export row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("| `left-pad` *(caveat: incomplete import graph)* |"),
+        "unused-dependency row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("`LegacyShape` *(caveat: incomplete import graph)* |"),
+        "unused-type row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("`Legacy` *(caveat: incomplete import graph)* |"),
+        "unused-enum-member row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("`render` *(caveat: incomplete import graph)* |"),
+        "unused-class-member row must hedge: {rendered}"
+    );
+    assert!(
+        rendered.contains("`subtotal` *(caveat: incomplete import graph)* |"),
+        "unused-store-member row must hedge: {rendered}"
+    );
+}
+
+/// An annotation is the surface that spells out the mutation ("remove the
+/// export keyword", "Run: npm uninstall"), so it must not read as confident
+/// while the evidence behind it is incomplete.
+#[test]
+fn github_annotations_name_the_reachability_caveat() {
+    let rendered = render_annotations(
+        EnvelopeKind::DeadCode,
+        &caveated_check_envelope(),
+        &plain_options(),
+    );
+
+    assert_eq!(
+        rendered.matches("Caveat: incomplete import graph").count(),
+        7,
+        "every caveated annotation hedges: {rendered}"
+    );
+}
+
+/// A run that read every file it discovered must render exactly as it did
+/// before the hedge existed, so an integrator diffing reports sees no churn
+/// from a mechanism that did not fire.
+#[test]
+fn a_clean_run_adds_no_caveat_text_to_either_github_format() {
+    let summary = render_summary(
+        EnvelopeKind::DeadCode,
+        &check_envelope(),
+        &LinkContext::default(),
+    );
+    let annotations =
+        render_annotations(EnvelopeKind::DeadCode, &check_envelope(), &plain_options());
+
+    assert!(!summary.contains("caveat"), "{summary}");
+    assert!(!annotations.contains("Caveat"), "{annotations}");
+}
+
+/// The dupes summary headline counts the measured corpus, so the details block
+/// beneath it must not present its own capped listing as that corpus. `--top`
+/// withholds families before the envelope is built and the block caps again at
+/// 15, and a reader needs the total of both.
+#[test]
+fn github_summary_dupes_details_name_what_the_listing_omits() {
+    let mut env = dupes_envelope();
+    env["stats"]["clone_families"] = json!(9);
+    env["clone_families"] = json!([
+        { "files": ["src/a.ts"], "instances": 2, "line_count": 6, "token_count": 55, "similarity": 1.0 }
+    ]);
+    env["clone_families_shown"] = json!(1);
+    env["clone_families_omitted"] = json!(8);
+
+    let rendered = render_summary(EnvelopeKind::Dupes, &env, &LinkContext::default());
+
+    assert!(
+        rendered.contains("**Clone Families (9)**"),
+        "the details heading must count the corpus, not the listing: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "*... and 8 more families, 8 of them withheld by a display limit before this report*"
+        ),
+        "the omission has to be named: {rendered}"
+    );
+}
+
+/// The same for the group listing the block falls back to when a run produced
+/// no families. The withholding is measured against what the block actually
+/// rendered, not against its cap, so a `--top` that left fewer rows than the
+/// cap is still reported in full.
+#[test]
+fn github_summary_dupes_group_listing_names_what_top_withheld() {
+    let mut env = dupes_envelope();
+    env["stats"]["clone_groups"] = json!(30);
+    env["clone_groups_shown"] = json!(2);
+    env["clone_groups_omitted"] = json!(28);
+
+    let rendered = render_summary(EnvelopeKind::Dupes, &env, &LinkContext::default());
+
+    assert!(
+        rendered.contains(
+            "*... and 28 more groups, 28 of them withheld by a display limit before this report*"
+        ),
+        "the corpus total minus the rendered rows has to be named: {rendered}"
+    );
+}
+
+/// The block's own display limit counts too, on a run `--top` never touched:
+/// 16 families in the envelope, 15 rendered, one named as withheld.
+#[test]
+fn github_summary_dupes_details_name_the_blocks_own_display_limit() {
+    let mut env = dupes_envelope();
+    let families: Vec<Value> = (0..16)
+        .map(|n| {
+            json!({
+                "files": [format!("src/a{n}.ts")],
+                "instances": 2,
+                "line_count": 6,
+                "token_count": 55,
+                "similarity": 1.0
+            })
+        })
+        .collect();
+    env["stats"]["clone_families"] = json!(16);
+    env["clone_families"] = json!(families);
+    env["clone_families_shown"] = json!(16);
+    env["clone_families_omitted"] = json!(0);
+
+    let rendered = render_summary(EnvelopeKind::Dupes, &env, &LinkContext::default());
+
+    assert!(rendered.contains("**Clone Families (16)**"), "{rendered}");
+    assert!(
+        rendered.contains("*... and 1 more families*"),
+        "the block's own cap has to be named as well: {rendered}"
+    );
+}
+
+/// An untruncated duplication run keeps the listing silent, so the default
+/// summary stays byte-identical.
+#[test]
+fn github_summary_dupes_details_stay_silent_when_nothing_was_omitted() {
+    let rendered = render_summary(
+        EnvelopeKind::Dupes,
+        &dupes_envelope(),
+        &LinkContext::default(),
+    );
+
+    assert!(!rendered.contains("... and"), "{rendered}");
+}
+
+/// The caveat token set is open, so a value this build does not recognise is
+/// still a caveat: dropping it would turn a finding whose evidence is
+/// incomplete back into a confident one. Two caveats on one finding join into
+/// a single qualifier rather than repeating the sentence.
+#[test]
+fn github_annotations_render_unrecognised_and_multiple_caveat_tokens() {
+    let mut env = check_envelope();
+    env["unused_files"][0]["reachability_caveats"] = json!(["some-future-caveat"]);
+    env["unused_dependencies"][0]["reachability_caveats"] =
+        json!(["incomplete-file-analysis", "incomplete-import-graph"]);
+
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &env, &plain_options());
+
+    assert!(
+        rendered.contains("Caveat: some future caveat."),
+        "an unrecognised token is rendered, not dropped: {rendered}"
+    );
+    assert!(
+        rendered.contains("Caveat: incomplete file analysis, incomplete import graph."),
+        "both caveats join into one qualifier, in wire order: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("Caveat: ").count(),
+        2,
+        "the qualifier reaches exactly the caveated findings: {rendered}"
+    );
+}
+
+/// Every withholding counter has to reach the fix headline. A run whose only
+/// outcome is a withheld enum member still leaves entries in `fixes`, which the
+/// action's gate counts, so a summary that skips the counter reports the run as
+/// clean under a job that reports fixable issues.
+#[test]
+fn fix_summary_names_the_withheld_enum_members() {
+    let env = json!({
+        "dry_run": false,
+        "total_fixed": 0,
+        "skipped": 0,
+        "skipped_content_changed": 0,
+        "skipped_mixed_line_endings": 0,
+        "skipped_low_confidence_exports": 0,
+        "skipped_low_confidence_dependencies": 0,
+        "skipped_low_confidence_members": 1,
+        "fixes": [
+            { "type": "remove_enum_member", "path": "src/kind.ts", "line": 4, "skipped": true, "skip_reason": "low_confidence_reachability_caveat" }
+        ]
+    });
+
+    let rendered = fallow_cli::report::github_summary::render_fix_summary(&env);
+
+    assert!(
+        !rendered.contains("No fixable issues found"),
+        "a withheld member is not a clean run: {rendered}"
+    );
+    assert!(
+        rendered.contains("kept 1 unused enum member(s)"),
+        "{rendered}"
+    );
+}
+
+/// Issue #1250 in the presence of a presentation cap. A filtered combined run
+/// leaves `stats` describing the unfiltered corpus while `clone_groups[]` holds
+/// the actionable set, so an empty array still counts zero; a cap that withheld
+/// entries reports them through `clone_groups_omitted`, which does count.
+#[test]
+fn combined_summary_counts_visible_groups_plus_what_a_cap_withheld() {
+    let mut filtered = combined_envelope();
+    filtered["check"]["total_issues"] = json!(0);
+    filtered["check"]["unused_files"] = json!([]);
+    filtered["check"]["unused_exports"] = json!([]);
+    filtered["check"]["unused_dependencies"] = json!([]);
+    filtered["dupes"]["clone_groups"] = json!([]);
+    filtered["dupes"]["clone_families"] = json!([]);
+    filtered["dupes"]["stats"]["clone_groups"] = json!(2);
+    filtered["health"]["summary"]["functions_above_threshold"] = json!(0);
+
+    let rendered = render_summary(EnvelopeKind::Combined, &filtered, &LinkContext::default());
+    assert!(
+        rendered.contains("No duplication"),
+        "nonzero stats with nothing actionable to inspect must still read clean: {rendered}"
+    );
+
+    let mut capped = combined_envelope();
+    capped["dupes"]["clone_groups_omitted"] = json!(4);
+    let capped_counts = render_summary(EnvelopeKind::Combined, &capped, &LinkContext::default());
+    assert!(
+        capped_counts.contains("**5** clone groups"),
+        "one listed group plus four withheld by a cap is five: {capped_counts}"
+    );
+}
+
+/// An unknown `effective_severity` value reads as absent, so each kind keeps
+/// the level older versions used: `::error` for catalog references and
+/// misconfigured overrides, `::warning` for the others.
+#[test]
+fn an_unknown_effective_severity_keeps_the_legacy_level() {
+    let envelope = json!({
+        "kind": "dead-code",
+        "schema_version": 7,
+        "total_issues": 3,
+        "unused_exports": [
+            { "path": "src/a.ts", "line": 1, "col": 0, "export_name": "a", "is_re_export": false, "is_type_only": false, "effective_severity": "info" }
+        ],
+        "unresolved_catalog_references": [
+            { "path": "packages/app/package.json", "line": 4, "entry_name": "react", "catalog_name": "react17", "available_in_catalogs": [], "effective_severity": "info" }
+        ],
+        "misconfigured_dependency_overrides": [
+            { "path": "pnpm-workspace.yaml", "line": 7, "raw_key": "", "raw_value": "^1", "reason": "unparsable-key", "effective_severity": "info" }
+        ]
+    });
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &envelope, &plain_options());
+    let level = |title: &str| -> String {
+        rendered
+            .lines()
+            .find(|line| line.contains(&format!("title={title}::")))
+            .unwrap_or_else(|| panic!("no {title} annotation in:\n{rendered}"))
+            .trim_start_matches("::")
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(level("Unused export"), "warning");
+    assert_eq!(level("Unresolved catalog reference"), "error");
+    assert_eq!(level("Misconfigured dependency override"), "error");
+}
+
+/// A package cycle whose package group has more cycles than the CLI lists
+/// must say so in the annotation and in the audit summary row.
+#[test]
+fn truncated_package_cycle_group_is_visible_in_github_formats() {
+    let cycle = |group_truncated: bool| {
+        json!({
+            "packages": ["a", "b"],
+            "package_roots": ["packages/a", "packages/b"],
+            "length": 2,
+            "edges": [{
+                "from_package": "a", "to_package": "b", "path": "packages/a/x.ts",
+                "target_path": "packages/b/y.ts", "line": 1, "col": 0, "type_only": false,
+            }],
+            "group_truncated": group_truncated,
+            "introduced": true,
+        })
+    };
+    let note = "this package group has more cycles than listed";
+
+    let check = json!({
+        "kind": "dead-code",
+        "total_issues": 2,
+        "package_cycles": [cycle(true), cycle(false)],
+    });
+    let rendered = render_annotations(EnvelopeKind::DeadCode, &check, &plain_options());
+    assert_eq!(rendered.matches(note).count(), 1, "{rendered}");
+    let summary = render_summary(EnvelopeKind::DeadCode, &check, &LinkContext::default());
+    assert_eq!(summary.matches(note).count(), 1, "{summary}");
+
+    let audit = json!({
+        "kind": "audit",
+        "verdict": "warn",
+        "summary": { "dead_code_issues": 2, "complexity_findings": 0, "duplication_clone_groups": 0 },
+        "dead_code": { "package_cycles": [cycle(true), cycle(false)] },
+    });
+    let summary = render_summary(EnvelopeKind::Audit, &audit, &LinkContext::default());
+    assert_eq!(summary.matches(note).count(), 1, "{summary}");
+}
+
+/// An audit whose verdict comes only from diff-risk findings.
+fn audit_diff_risk_envelope() -> Value {
+    json!({
+        "kind": "audit",
+        "verdict": "fail",
+        "elapsed_ms": 12,
+        "changed_files_count": 1,
+        "summary": { "dead_code_issues": 0, "complexity_findings": 0, "duplication_clone_groups": 0 },
+        "attribution": { "gate": "new-only", "diff_risk_introduced": 2 },
+        "diff_risk": {
+            "findings": [
+                {
+                    "rule": "weakened-tests", "kind": "skip-only",
+                    "path": "src/a.test.ts", "line": 4,
+                    "message": "The change skips a test.", "evidence": "it.skip",
+                    "severity": "error", "introduced": true, "actions": []
+                },
+                {
+                    "rule": "added-dependency",
+                    "path": "package.json",
+                    "message": "The change adds a dependency.", "evidence": "left-pad",
+                    "severity": "warn", "introduced": true, "actions": []
+                }
+            ]
+        }
+    })
+}
+
+/// A diff-risk finding changes the audit verdict, so the annotation stream
+/// must show it at the level of its severity.
+#[test]
+fn annotations_render_audit_diff_risk_findings_at_their_severity() {
+    let rendered = render_annotations(
+        EnvelopeKind::Audit,
+        &audit_diff_risk_envelope(),
+        &plain_options(),
+    );
+    assert!(
+        rendered.contains(
+            "::error file=src/a.test.ts,line=4,title=fallow/weakened-tests::The change skips a test. (it.skip)"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "::warning file=package.json,title=fallow/added-dependency::The change adds a dependency. (left-pad)"
+        ),
+        "{rendered}"
+    );
+}
+
+/// The job summary must name the findings that set the verdict.
+#[test]
+fn audit_summary_lists_diff_risk_findings() {
+    let rendered = render_summary(
+        EnvelopeKind::Audit,
+        &audit_diff_risk_envelope(),
+        &LinkContext::default(),
+    );
+    assert!(rendered.contains("### Diff Risk"), "{rendered}");
+    assert!(
+        rendered.contains("| `weakened-tests` | `src/a.test.ts:4` | `it.skip` | error |"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("| `added-dependency` | `package.json` | `left-pad` | warn |"),
+        "{rendered}"
+    );
+}

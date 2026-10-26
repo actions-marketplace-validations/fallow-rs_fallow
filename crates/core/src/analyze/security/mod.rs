@@ -2,7 +2,8 @@
 //!
 //! These are CANDIDATES for downstream agent verification, NOT verified
 //! vulnerabilities. The graph-structural `client-server-leak` rule has two
-//! sink predicates over the SAME `"use client"` transitive static-import cone:
+//! sink predicates over the SAME `"use client"` transitive import cone (static
+//! and dynamic):
 //!
 //! 1. The cone reaches a module that reads a non-public env secret
 //!    (`category: None`, the original finding).
@@ -13,13 +14,19 @@
 //!    server-only marker here: a Server Action module imported from a
 //!    `"use client"` file is the framework's sanctioned mutation pattern (the
 //!    bundler swaps the import for an action reference), so only its server-only
-//!    IMPORTS count, and those still surface through re-export chains. The sink
-//!    predicate is MODULE-LEVEL: it does not tell action exports apart from
-//!    value exports, so a `"use server"` module that imports server-only code
-//!    is still reported even when every export is an async action (the shape
-//!    the bundler exonerates). The remediation text carries the deciding
-//!    question (does a non-action export leak the import into the client
-//!    bundle) because fallow has no export-shape signal to gate on.
+//!    IMPORTS count, and those still surface through re-export chains.
+//!
+//! Server Action boundary: a `"use server"` module whose value exports are all
+//! async functions (`ModuleInfo::is_server_action_module`) stops the cone. The
+//! bundler replaces the import with action references, so neither the module
+//! nor its imports enter the client bundle (issue #2941). A `"use server"`
+//! module with a non-action value export stays in the cone, because that
+//! export does ship to the client. The remediation text for such a sink asks
+//! whether the non-action export leaks the import into the client bundle.
+//!
+//! Type-only edges: an import that names only type exports of the target
+//! (`import { Props } from "./x"` where `x` has `export interface Props`) is
+//! erased at build time and is not a cone edge, the same as `import type`.
 //!
 //! fallow emits the structural import-hop trace; it does not prove the path is
 //! exploitable.
@@ -71,6 +78,11 @@ pub use fallow_security::{CalleePattern, Matcher};
 pub fn catalogue_matchers() -> &'static [Matcher] {
     fallow_security::catalogue().matchers()
 }
+
+// The provenance predicate lives in `fallow-security` so that the mutation
+// plan applies the same import check as the detectors.
+#[cfg(test)]
+use fallow_security::import_source_matches;
 
 /// The inline suppression kind token for the client-server-leak rule.
 const SUPPRESS_KIND: &str = "security-client-server-leak";
@@ -227,7 +239,8 @@ fn compute_server_only_source_set(
     server_only
 }
 
-/// For each `"use client"` file, BFS its transitive static-import cone. Two
+/// For each `"use client"` file, BFS its transitive import cone (static and
+/// dynamic). Two
 /// distinct sink predicates run over the SAME cone:
 ///
 /// - reaching a module that reads a non-public env secret emits the secret-leak
@@ -248,10 +261,12 @@ struct ClientConeResult {
     had_unresolved_edge: bool,
 }
 
-/// BFS the static import cone of a `"use client"` file, draining the FULL cone
-/// (no early break) so the dynamic-import blind-spot count reflects every edge,
-/// not just the path to the first finding. Type-only and `next/dynamic
-/// ssr:false`-only edges are excluded (neither can leak into the client bundle).
+/// BFS the import cone (static and dynamic) of a `"use client"` file, draining
+/// the FULL cone (no early break) so the dynamic-import blind-spot count
+/// reflects every edge, not just the path to the first finding. A plain
+/// `import()` edge stays in the cone, because its chunk still ships to the
+/// client. Type-only and `next/dynamic ssr:false`-only edges are excluded
+/// (neither can leak into the client bundle).
 fn walk_client_cone(scan: &LeakScanInput<'_>, client_id: FileId) -> ClientConeResult {
     let mut visited: FxHashSet<FileId> = FxHashSet::default();
     visited.insert(client_id);
@@ -318,6 +333,16 @@ fn enqueue_client_cone_edges(
         if all_client_only {
             // Reached only via next/dynamic ssr:false: the sanctioned
             // client-only escape hatch, not a leak edge.
+            continue;
+        }
+        if scan
+            .modules_by_id
+            .get(&target)
+            .is_some_and(|m| m.is_server_action_module)
+        {
+            // An all-action "use server" module: the bundler replaces the
+            // import with action references, so the module and its imports
+            // stay on the server.
             continue;
         }
         if visited.insert(target) {
@@ -596,8 +621,8 @@ fn build_leak_finding(
 }
 
 /// Build a finding for the SERVER-ONLY sink: a `"use client"` file whose
-/// transitive static-import cone reaches a server-only module (one importing a
-/// server-only package or API). Same rule, same suppress
+/// transitive import cone (static and dynamic) reaches a server-only module
+/// (one importing a server-only package or API). Same rule, same suppress
 /// kind, same `SecurityFinding` shape as the secret leak; distinguished by
 /// `category: Some("server-only-import")` so consumers can tell the two apart.
 /// The terminal trace hop carries the `Sink` role (the server-only module is the
@@ -628,11 +653,11 @@ fn build_server_only_finding(
          node:fs / node:child_process; see the sink hop in the trace). Candidate for \
          verification: confirm whether this server-only code is meant to run on the client. \
          If it is pulled in only through next/dynamic(..., { ssr: false }), it is the \
-         sanctioned client-only escape hatch and is a false positive. If the sink is a \
-         Server Action module, decide by export shape: only a non-action export (a \
-         top-level const, a re-export, or a default value) carries the server-only \
-         import into the client bundle; if every export is an async action, the bundler \
-         replaces the import with an action reference and it is a false positive."
+         sanctioned client-only escape hatch and is a false positive. fallow already \
+         excludes a Server Action module whose value exports are all async functions. \
+         If the sink is a Server Action module, it has a non-action export (a top-level \
+         const, a re-export, or a default value), and that export carries the \
+         server-only import into the client bundle."
         .to_owned();
 
     let candidate = client_leak_candidate(
@@ -745,5 +770,19 @@ mod tests {
         assert!(!is_public_env_var("SESSION_SECRET"));
         // A var that merely contains a public token mid-name is still a secret.
         assert!(!is_public_env_var("MY_NEXT_PUBLIC_FAKE"));
+    }
+
+    #[test]
+    fn import_source_matches_node_prefix() {
+        assert!(import_source_matches("node:child_process", "child_process"));
+        assert!(import_source_matches("child_process", "node:child_process"));
+        assert!(!import_source_matches("child_process", "node:vm"));
+    }
+
+    #[test]
+    fn import_source_matches_package_subpath() {
+        assert!(import_source_matches("mysql2/promise", "mysql2"));
+        assert!(import_source_matches("@scope/pkg/subpath", "@scope/pkg"));
+        assert!(!import_source_matches("mysql2-promise", "mysql2"));
     }
 }

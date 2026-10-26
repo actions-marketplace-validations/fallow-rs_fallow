@@ -11,7 +11,8 @@ import {
 const DUPLICATE_CODE = "code-duplication";
 const STATUS_ITEM_ID = "fallow.diagnosticMutes";
 const CODE_ACTION_KIND = vscode.CodeActionKind.QuickFix.append("fallow.mute");
-const FALLOW_LANGUAGES = [
+/** Languages whose Fallow diagnostics get client-side code actions. */
+export const FALLOW_LANGUAGES = [
   "javascript",
   "javascriptreact",
   "typescript",
@@ -150,7 +151,7 @@ const showManageQuickPick = async (filter: DiagnosticFilter): Promise<void> => {
       // Reflect the genuine per-category mute state, NOT `isMutedAll()`. When
       // hide-all is on, auto-checking every category made unchecking the global
       // "All Findings" row re-mute each category individually on accept (the
-      // `else` branch applies `setMutedCategories(selected)`), so the user who
+      // `else` branch applies `applyMuteSelection(false, selected)`), so the user who
       // unchecked it to reveal findings stayed fully hidden. mute-all is a
       // separate flag the filter tracks independently, so per-category rows show
       // their own state and unchecking the global row reveals what is actually

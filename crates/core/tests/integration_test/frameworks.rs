@@ -988,6 +988,40 @@ fn vite_array_aliases_from_config_resolve_internal_modules() {
     );
 }
 
+/// An alias replacement can call a same-file path helper with one literal
+/// argument. The helper body is a path expression that the parser reads.
+#[test]
+fn vite_alias_replacement_through_local_path_helper_resolves() {
+    let root = fixture_path("vite-alias-helper-replacement");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unlisted_names: Vec<&str> = results
+        .unlisted_dependencies
+        .iter()
+        .map(|u| u.dep.package_name.as_str())
+        .collect();
+    for alias in ["local-widget", "local-format"] {
+        assert!(
+            !unlisted_names.contains(&alias),
+            "alias {alias} must not be an unlisted dependency: {unlisted_names:?}"
+        );
+    }
+
+    let unused_file_paths: Vec<String> = results
+        .unused_files
+        .iter()
+        .filter_map(|f| f.file.path.strip_prefix(&root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for file in ["src/widget.ts", "src/format.ts"] {
+        assert!(
+            !unused_file_paths.contains(&file.to_string()),
+            "{file} must be reachable through the alias: {unused_file_paths:?}"
+        );
+    }
+}
+
 #[test]
 fn webpack_aliases_from_config_resolve_internal_modules() {
     let root = fixture_path("webpack-alias-project");
@@ -1267,6 +1301,58 @@ fn nuxt_default_scan_keeps_nested_plugin_index_but_not_nested_helpers() {
         assert!(
             !unused_file_names.contains(&expected_used.to_string()),
             "{expected_used} should stay reachable via Nuxt default scanning: {unused_file_names:?}"
+        );
+    }
+}
+
+#[test]
+fn nuxt_convention_dirs_credit_only_the_files_nuxt_scans() {
+    let root = fixture_path("nuxt-convention-dir-depth");
+    let config = create_config(root.clone());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| {
+            f.file
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&f.file.path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+
+    for expected_unused in [
+        "plugins/foo/helper.ts",
+        "plugins/foo/deep/index.ts",
+        "middleware/admin/guard.ts",
+        "modules/kit/internal/helper.ts",
+        "layers/base/plugins/nested/helper.ts",
+        "layers/base/middleware/nested/guard.ts",
+    ] {
+        assert!(
+            unused.contains(&expected_unused.to_string()),
+            "{expected_unused} is not a Nuxt convention file, so it is unused: {unused:?}"
+        );
+    }
+
+    for expected_used in [
+        "plugins/bar.ts",
+        "plugins/foo/index.ts",
+        "plugins/foo/explicit.ts",
+        "middleware/auth.ts",
+        "middleware/admin/index.ts",
+        "modules/local.ts",
+        "modules/kit/index.ts",
+        "modules/kit/runtime/plugin.ts",
+        "layers/base/plugins/layer.ts",
+        "layers/base/middleware/layer-auth.ts",
+    ] {
+        assert!(
+            !unused.contains(&expected_used.to_string()),
+            "{expected_used} is scanned or registered by Nuxt: {unused:?}"
         );
     }
 }

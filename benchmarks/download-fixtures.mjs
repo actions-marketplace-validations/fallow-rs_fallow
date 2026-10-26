@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "fixtures", "real-world");
+const INSTALL_LOG_TAIL_LINES = 20;
 
 const FIXTURES = [
   // Small projects (< 300 source files)
@@ -51,12 +52,28 @@ function countSourceFiles(dir) {
   return count;
 }
 
+// `--only preact,zod` downloads a subset. The PGO jobs use it to fetch only
+// the training and held-out fixtures.
+const selectFixtures = (args) => {
+  const index = args.indexOf("--only");
+  if (index === -1) return FIXTURES;
+  const names = (args[index + 1] ?? "").split(",").filter(Boolean);
+  const unknown = names.filter((name) => !FIXTURES.some((fixture) => fixture.name === name));
+  if (names.length === 0 || unknown.length > 0) {
+    console.error(`--only needs known fixture names. Unknown: ${unknown.join(", ") || "(none)"}`);
+    process.exit(2);
+  }
+  return FIXTURES.filter((fixture) => names.includes(fixture.name));
+};
+
+const selected = selectFixtures(process.argv.slice(2));
+
 if (!existsSync(fixturesDir)) mkdirSync(fixturesDir, { recursive: true });
 
 console.log("Downloading real-world projects for benchmarking...\n");
 let allOk = true;
 
-for (const fixture of FIXTURES) {
+for (const fixture of selected) {
   const dest = join(fixturesDir, fixture.name);
   if (existsSync(dest)) {
     console.log(`  ${fixture.name}: already exists, skipping`);
@@ -86,6 +103,12 @@ for (const fixture of FIXTURES) {
     console.log(`  ${fixture.name}: ready (${countSourceFiles(dest)} source files)`);
   } catch (err) {
     console.error(`  ${fixture.name}: FAILED - ${err.message}`);
+    // pnpm writes install errors to stdout, so print the tail of both streams.
+    const output = [err.stdout, err.stderr]
+      .map((stream) => stream?.toString().trim())
+      .filter(Boolean)
+      .join("\n");
+    if (output) console.error(output.split("\n").slice(-INSTALL_LOG_TAIL_LINES).join("\n"));
     allOk = false;
   }
 }

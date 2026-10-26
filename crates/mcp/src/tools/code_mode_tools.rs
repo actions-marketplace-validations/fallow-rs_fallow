@@ -1,24 +1,29 @@
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+
 use crate::params::{
-    AnalyzeParams, AuditParams, CheckChangedParams, CheckRuntimeCoverageParams, CombinedParams,
-    ExplainParams, FeatureFlagsParams, FindDupesParams, HealthParams, ImpactClosureParams,
-    ImpactParams, ListBoundariesParams, ProjectInfoParams, SecurityCandidatesParams,
-    TraceCloneParams, TraceDependencyParams, TraceExportParams, TraceFileParams,
+    AnalyzeParams, ArchitectureParams, AuditParams, CheckChangedParams, CheckRuntimeCoverageParams,
+    CombinedParams, ExplainParams, FeatureFlagsParams, FindDupesParams, HealthParams,
+    ImpactClosureParams, ImpactParams, ListBoundariesParams, ProjectInfoParams,
+    SecurityCandidatesParams, TraceCloneParams, TraceDependencyParams, TraceExportParams,
+    TraceFileParams,
 };
 
 use fallow_api::{
     AnalysisOptions, CombinedOptions, ComplexityOptions, CoverageInputs, DuplicationMode,
-    DuplicationOptions, RootEnvelopeMode, run_combined, serialize_combined_programmatic_json,
+    DuplicationOptions, run_combined, serialize_combined_programmatic_json,
     serialize_explain_programmatic_json,
 };
 
 use super::super::{
-    analyze::run_analyze_api_value,
+    VALID_DUPES_MODES,
     api_runtime::{
-        changed_since_from_param, env_diff_file, non_empty_path, programmatic_error_body,
-        resolve_typed_coverage_inputs, workspace_patterns_from_param,
+        EnvScope, non_empty_path, non_empty_string, programmatic_error_body,
+        resolve_typed_coverage_inputs, shared_analysis_options, shared_params, typed_api_value,
+        workspace_patterns_from_param,
     },
-    audit::run_audit_api_value,
-    build_analyze_args, build_audit_args, build_check_changed_args,
+    build_analyze_args, build_architecture_args, build_audit_args, build_check_changed_args,
     build_check_runtime_coverage_args, build_explain_args, build_feature_flags_args,
     build_find_dupes_args, build_get_blast_radius_args, build_get_cleanup_candidates_args,
     build_get_hot_paths_args, build_get_importance_args, build_health_args, build_impact_args,
@@ -26,12 +31,10 @@ use super::super::{
     build_security_candidates_args, build_trace_clone_args, build_trace_dependency_args,
     build_trace_export_args, build_trace_file_args,
     check_changed::run_check_changed_api_value,
-    dupes::run_find_dupes_api_value,
     flags::run_feature_flags_api_value,
-    health::run_health_api_value,
     list_boundaries::run_list_boundaries_api_value,
     project_info::run_project_info_api_value,
-    push_global, push_remote_extends,
+    push_global, push_production, push_remote_extends,
     trace::{
         run_trace_clone_api_value, run_trace_dependency_api_value, run_trace_export_api_value,
         run_trace_file_api_value,
@@ -62,9 +65,89 @@ pub(super) enum CodeModeTool {
     GetBlastRadius,
     GetImportance,
     GetCleanupCandidates,
+    CheckArchitecture,
 }
 
 impl CodeModeTool {
+    /// Every variant, in `name()` order. Drift tests bind this list to the
+    /// shared manifest in both directions, so a variant missing here (or a
+    /// manifest row whose `code_mode_alias` is missing) fails the suite.
+    #[cfg(test)]
+    pub(super) const ALL: &'static [Self] = &[
+        Self::Analyze,
+        Self::Combined,
+        Self::CheckChanged,
+        Self::SecurityCandidates,
+        Self::FindDupes,
+        Self::ProjectInfo,
+        Self::TraceExport,
+        Self::TraceFile,
+        Self::ImpactClosure,
+        Self::TraceDependency,
+        Self::TraceClone,
+        Self::CheckHealth,
+        Self::Audit,
+        Self::FallowExplain,
+        Self::ListBoundaries,
+        Self::FeatureFlags,
+        Self::Impact,
+        Self::CheckRuntimeCoverage,
+        Self::GetHotPaths,
+        Self::GetBlastRadius,
+        Self::GetImportance,
+        Self::GetCleanupCandidates,
+        Self::CheckArchitecture,
+    ];
+
+    /// Position of the variant in [`Self::ALL`]. A new variant makes this
+    /// match non-exhaustive, which is the compile-time nudge to extend `ALL`
+    /// as well; `all_lists_every_variant_in_order` proves the two agree.
+    #[cfg(test)]
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Analyze => 0,
+            Self::Combined => 1,
+            Self::CheckChanged => 2,
+            Self::SecurityCandidates => 3,
+            Self::FindDupes => 4,
+            Self::ProjectInfo => 5,
+            Self::TraceExport => 6,
+            Self::TraceFile => 7,
+            Self::ImpactClosure => 8,
+            Self::TraceDependency => 9,
+            Self::TraceClone => 10,
+            Self::CheckHealth => 11,
+            Self::Audit => 12,
+            Self::FallowExplain => 13,
+            Self::ListBoundaries => 14,
+            Self::FeatureFlags => 15,
+            Self::Impact => 16,
+            Self::CheckRuntimeCoverage => 17,
+            Self::GetHotPaths => 18,
+            Self::GetBlastRadius => 19,
+            Self::GetImportance => 20,
+            Self::GetCleanupCandidates => 21,
+            Self::CheckArchitecture => 22,
+        }
+    }
+
+    /// Refusal for a tool name the sandbox does not expose. The allowlist is
+    /// in hand at the refusal, so a near miss names the tool the caller meant
+    /// instead of making it re-read the manifest.
+    fn unknown_code_mode_tool_message(name: &str) -> String {
+        let allowlist = fallow_types::mcp_manifest::code_mode_allowlist();
+        let names: Vec<&str> = allowlist
+            .iter()
+            .flat_map(|(alias, wire)| [*alias, *wire])
+            .collect();
+        fallow_api::closest_match(name, names).map_or_else(
+            || format!("unsupported code mode fallow tool '{name}'"),
+            |nearest| {
+                format!("unsupported code mode fallow tool '{name}'; did you mean '{nearest}'?")
+            },
+        )
+    }
+
     pub(super) fn from_name(name: &str) -> Result<Self, String> {
         match name {
             "analyze" => Ok(Self::Analyze),
@@ -73,6 +156,10 @@ impl CodeModeTool {
             "security_candidates" => Ok(Self::SecurityCandidates),
             "find_similar_code" | "inspect_similar_code" => Err(
                 "similar-code is not exposed through Code Mode's 30-second window; use the standalone MCP find_similar_code or inspect_similar_code tool, which has a dedicated 15-minute timeout"
+                    .to_string(),
+            ),
+            "mutation_plan" | "mutation_inspect" => Err(
+                "mutation testing is not exposed through Code Mode; use the standalone MCP mutation_plan or mutation_inspect tool"
                     .to_string(),
             ),
             "find_dupes" => Ok(Self::FindDupes),
@@ -93,11 +180,12 @@ impl CodeModeTool {
             "get_blast_radius" => Ok(Self::GetBlastRadius),
             "get_importance" => Ok(Self::GetImportance),
             "get_cleanup_candidates" => Ok(Self::GetCleanupCandidates),
+            "check_architecture" => Ok(Self::CheckArchitecture),
             "fix_preview" | "fix_apply" => Err(
                 "code mode does not expose fix tools; use standalone MCP tools for previews"
                     .to_string(),
             ),
-            _ => Err(format!("unsupported code mode fallow tool '{name}'")),
+            _ => Err(Self::unknown_code_mode_tool_message(name)),
         }
     }
 
@@ -125,63 +213,164 @@ impl CodeModeTool {
             Self::GetBlastRadius => "get_blast_radius",
             Self::GetImportance => "get_importance",
             Self::GetCleanupCandidates => "get_cleanup_candidates",
+            Self::CheckArchitecture => "check_architecture",
         }
     }
 
-    fn is_api_backed(self) -> bool {
-        API_BACKED_CODE_MODE_TOOLS.contains(&self)
-    }
-
-    pub(super) fn is_code_mode_api_backed(self) -> bool {
-        self.is_api_backed()
-            && !matches!(
-                self,
-                Self::Analyze | Self::FindDupes | Self::CheckHealth | Self::Audit
-            )
+    /// Which of Code Mode's two execution paths this host call takes.
+    pub(super) fn backing(self) -> CodeModeBacking {
+        if api_route(self).is_some() {
+            CodeModeBacking::Api
+        } else {
+            CodeModeBacking::Subprocess
+        }
     }
 }
 
-pub(super) const CODE_MODE_ALIASES: &[(&str, &str)] = &[
-    ("analyze", "analyze"),
-    ("combined", "combined"),
-    ("checkChanged", "check_changed"),
-    ("securityCandidates", "security_candidates"),
-    ("findDupes", "find_dupes"),
-    ("projectInfo", "project_info"),
-    ("traceExport", "trace_export"),
-    ("traceFile", "trace_file"),
-    ("impactClosure", "impact_closure"),
-    ("traceDependency", "trace_dependency"),
-    ("traceClone", "trace_clone"),
-    ("checkHealth", "check_health"),
-    ("audit", "audit"),
-    ("explain", "fallow_explain"),
-    ("listBoundaries", "list_boundaries"),
-    ("featureFlags", "feature_flags"),
-    ("impact", "impact"),
-    ("checkRuntimeCoverage", "check_runtime_coverage"),
-    ("getHotPaths", "get_hot_paths"),
-    ("getBlastRadius", "get_blast_radius"),
-    ("getImportance", "get_importance"),
-    ("getCleanupCandidates", "get_cleanup_candidates"),
-];
+/// How Code Mode executes one host call.
+///
+/// Standalone MCP tools always prefer `fallow-api`. Code Mode is stricter,
+/// because `timeout_ms` has to mean something inside a sandbox capped at 30
+/// seconds, and `fallow-api` cancellation is cooperative: the deadline asks an
+/// in-process analysis to stop, and it stops at its next stage boundary rather
+/// than immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CodeModeBacking {
+    /// Runs in this process through `fallow-api`. The deadline both answers the
+    /// caller and sets the call's cancellation token.
+    ///
+    /// What that buys differs per route, and the difference is the reason this
+    /// backing is not a promise of promptness:
+    ///
+    /// - `combined`, `checkChanged`, `featureFlags`, and the four trace routes
+    ///   carry the token into the engine session. They stop inside the per-file
+    ///   parse loop and at each pipeline stage boundary.
+    /// - `projectInfo` and `listBoundaries` parse nothing. Config load and file
+    ///   discovery are the whole call, so the token is read on either side of
+    ///   that and nowhere within it.
+    /// - `explain` reads a static table and never looks at the token.
+    ///
+    /// Even on the first group the stop is cooperative and unbounded: a token
+    /// set inside duplication detection or the dead-code detectors is not seen
+    /// until that stage ends, which on a large repository is seconds. This is
+    /// why the abandoned-call accounting still exists rather than being
+    /// replaced by cancellation.
+    Api,
+    /// Runs as a child `fallow` process that is killed when `timeout_ms`
+    /// expires. Either `fallow-api` has no programmatic route for the tool, or
+    /// the route exists and Code Mode trades its speed for a stop that is
+    /// bounded rather than cooperative.
+    Subprocess,
+}
 
-const API_BACKED_CODE_MODE_TOOLS: &[CodeModeTool] = &[
-    CodeModeTool::Analyze,
-    CodeModeTool::Combined,
-    CodeModeTool::CheckChanged,
-    CodeModeTool::FindDupes,
-    CodeModeTool::ProjectInfo,
-    CodeModeTool::TraceExport,
-    CodeModeTool::TraceFile,
-    CodeModeTool::TraceDependency,
-    CodeModeTool::TraceClone,
-    CodeModeTool::CheckHealth,
-    CodeModeTool::Audit,
-    CodeModeTool::FallowExplain,
-    CodeModeTool::ListBoundaries,
-    CodeModeTool::FeatureFlags,
-];
+/// The in-process route for a host call, or `None` when the call belongs to a
+/// child process.
+///
+/// This match is the only place a tool's backing is decided:
+/// [`CodeModeTool::backing`] reads it and [`run_api_tool`] runs it, so neither
+/// can claim a route the other does not have and no dispatch arm can go
+/// unreachable.
+fn api_route(tool: CodeModeTool) -> Option<ApiRoute> {
+    match tool {
+        CodeModeTool::Combined => Some(|params, cancellation| {
+            let params: CombinedParams = parse_params(params)?;
+            run_combined_api_value(&params, cancellation)
+        }),
+        CodeModeTool::CheckChanged => Some(|params, cancellation| {
+            let params: CheckChangedParams = parse_params(params)?;
+            run_check_changed_api_value(&params, cancellation)
+        }),
+        CodeModeTool::ProjectInfo => Some(|params, cancellation| {
+            let params: ProjectInfoParams = parse_params(params)?;
+            run_project_info_api_value(&params, cancellation)
+        }),
+        CodeModeTool::TraceExport => Some(|params, cancellation| {
+            let params: TraceExportParams = parse_params(params)?;
+            run_trace_export_api_value(&params, cancellation)
+        }),
+        CodeModeTool::TraceFile => Some(|params, cancellation| {
+            let params: TraceFileParams = parse_params(params)?;
+            run_trace_file_api_value(&params, cancellation).map(Some)
+        }),
+        CodeModeTool::TraceDependency => Some(|params, cancellation| {
+            let params: TraceDependencyParams = parse_params(params)?;
+            run_trace_dependency_api_value(&params, cancellation).map(Some)
+        }),
+        CodeModeTool::TraceClone => Some(|params, cancellation| {
+            let params: TraceCloneParams = parse_params(params)?;
+            run_trace_clone_api_value(&params, cancellation).map(Some)
+        }),
+        CodeModeTool::FallowExplain => Some(|params, _cancellation| {
+            let params: ExplainParams = parse_params(params)?;
+            serialize_explain_programmatic_json(&params.issue_type, None)
+                .map(Some)
+                .map_err(|error| error.message)
+        }),
+        CodeModeTool::FeatureFlags => Some(|params, cancellation| {
+            let params: FeatureFlagsParams = parse_params(params)?;
+            run_feature_flags_api_value(&params, cancellation)
+        }),
+        CodeModeTool::ListBoundaries => Some(|params, cancellation| {
+            let params: ListBoundariesParams = parse_params(params)?;
+            run_list_boundaries_api_value(&params, cancellation)
+        }),
+        // `fallow-api` can run the first four and `check_architecture` (their
+        // standalone MCP tools do).
+        // They stay on the subprocess because killing the child is the only
+        // stop with an upper bound: cooperative cancellation unwinds at the
+        // next stage boundary, and a detector or graph pass on a large
+        // repository is not a bound `timeout_ms` can promise. `check_health`
+        // additionally builds its own session below the API options, and
+        // `audit` runs a second analysis in a temporary base worktree whose
+        // cleanup under cancellation is unexamined. The rest have no
+        // `fallow-api` route at all.
+        CodeModeTool::Analyze
+        | CodeModeTool::CheckArchitecture
+        | CodeModeTool::FindDupes
+        | CodeModeTool::CheckHealth
+        | CodeModeTool::Audit
+        | CodeModeTool::SecurityCandidates
+        | CodeModeTool::ImpactClosure
+        | CodeModeTool::Impact
+        | CodeModeTool::CheckRuntimeCoverage
+        | CodeModeTool::GetHotPaths
+        | CodeModeTool::GetBlastRadius
+        | CodeModeTool::GetImportance
+        | CodeModeTool::GetCleanupCandidates => None,
+    }
+}
+
+/// An in-process host call: params and a cancellation token in, serialized
+/// fallow JSON out.
+///
+/// The token is a parameter rather than a captured value because `ApiRoute` is
+/// a bare `fn` pointer. Setting it asks the analysis behind the call to stop at
+/// its next stage boundary and return a `FALLOW_CANCELLED` error.
+type ApiRoute =
+    fn(serde_json::Value, Option<Arc<AtomicBool>>) -> Result<Option<serde_json::Value>, String>;
+
+/// The sandbox host API, as `(camelCase alias, wire tool name)` pairs,
+/// projected from `fallow_types::mcp_manifest` so the allowlist has exactly
+/// one source of truth. Adding a tool to Code Mode means setting
+/// `code_mode_alias` on its manifest row, never editing a list here.
+pub(super) static CODE_MODE_ALIASES: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(fallow_types::mcp_manifest::code_mode_allowlist);
+
+/// Host-call aliases whose backing is [`CodeModeBacking::Subprocess`], so
+/// `timeout_ms` kills them instead of asking them to stop. The `code_execute`
+/// description names exactly this set, and a server test binds that prose to
+/// this projection.
+#[cfg(test)]
+pub fn code_mode_subprocess_aliases() -> Vec<&'static str> {
+    CODE_MODE_ALIASES
+        .iter()
+        .filter(|(_, name)| {
+            CodeModeTool::from_name(name)
+                .is_ok_and(|tool| tool.backing() == CodeModeBacking::Subprocess)
+        })
+        .map(|(alias, _)| *alias)
+        .collect()
+}
 
 pub(super) fn merge_default_root(
     params_json: &str,
@@ -207,123 +396,9 @@ pub(super) fn merge_default_root(
 pub(super) fn run_api_tool(
     tool: CodeModeTool,
     params: serde_json::Value,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<Option<serde_json::Value>, String> {
-    if !tool.is_api_backed() {
-        return Ok(None);
-    }
-
-    match tool {
-        CodeModeTool::Analyze
-        | CodeModeTool::Combined
-        | CodeModeTool::CheckChanged
-        | CodeModeTool::FindDupes
-        | CodeModeTool::ProjectInfo => run_analysis_api_tool(tool, params),
-        CodeModeTool::TraceExport
-        | CodeModeTool::TraceFile
-        | CodeModeTool::TraceDependency
-        | CodeModeTool::TraceClone => run_trace_api_tool(tool, params),
-        CodeModeTool::CheckHealth
-        | CodeModeTool::Audit
-        | CodeModeTool::FallowExplain
-        | CodeModeTool::FeatureFlags
-        | CodeModeTool::ListBoundaries => run_report_api_tool(tool, params),
-        CodeModeTool::SecurityCandidates
-        | CodeModeTool::ImpactClosure
-        | CodeModeTool::Impact
-        | CodeModeTool::CheckRuntimeCoverage
-        | CodeModeTool::GetHotPaths
-        | CodeModeTool::GetBlastRadius
-        | CodeModeTool::GetImportance
-        | CodeModeTool::GetCleanupCandidates => unreachable!(
-            "{} is not API-backed and should have returned before dispatch",
-            tool.name()
-        ),
-    }
-}
-
-fn run_analysis_api_tool(
-    tool: CodeModeTool,
-    params: serde_json::Value,
-) -> Result<Option<serde_json::Value>, String> {
-    match tool {
-        CodeModeTool::Analyze => {
-            let params: AnalyzeParams = parse_params(params)?;
-            run_analyze_api_value(&params)
-        }
-        CodeModeTool::Combined => {
-            let params: CombinedParams = parse_params(params)?;
-            run_combined_api_value(&params)
-        }
-        CodeModeTool::CheckChanged => {
-            let params: CheckChangedParams = parse_params(params)?;
-            run_check_changed_api_value(&params)
-        }
-        CodeModeTool::FindDupes => {
-            let params: FindDupesParams = parse_params(params)?;
-            run_find_dupes_api_value(&params)
-        }
-        CodeModeTool::ProjectInfo => {
-            let params: ProjectInfoParams = parse_params(params)?;
-            run_project_info_api_value(&params)
-        }
-        _ => unreachable!("analysis API helper called with {}", tool.name()),
-    }
-}
-
-fn run_trace_api_tool(
-    tool: CodeModeTool,
-    params: serde_json::Value,
-) -> Result<Option<serde_json::Value>, String> {
-    match tool {
-        CodeModeTool::TraceExport => {
-            let params: TraceExportParams = parse_params(params)?;
-            run_trace_export_api_value(&params).map(Some)
-        }
-        CodeModeTool::TraceFile => {
-            let params: TraceFileParams = parse_params(params)?;
-            run_trace_file_api_value(&params).map(Some)
-        }
-        CodeModeTool::TraceDependency => {
-            let params: TraceDependencyParams = parse_params(params)?;
-            run_trace_dependency_api_value(&params).map(Some)
-        }
-        CodeModeTool::TraceClone => {
-            let params: TraceCloneParams = parse_params(params)?;
-            run_trace_clone_api_value(&params).map(Some)
-        }
-        _ => unreachable!("trace API helper called with {}", tool.name()),
-    }
-}
-
-fn run_report_api_tool(
-    tool: CodeModeTool,
-    params: serde_json::Value,
-) -> Result<Option<serde_json::Value>, String> {
-    match tool {
-        CodeModeTool::CheckHealth => {
-            let params: HealthParams = parse_params(params)?;
-            run_health_api_value(&params)
-        }
-        CodeModeTool::Audit => {
-            let params: AuditParams = parse_params(params)?;
-            run_audit_api_value(&params)
-        }
-        CodeModeTool::FallowExplain => {
-            let params: ExplainParams = parse_params(params)?;
-            serialize_explain_programmatic_json(&params.issue_type, RootEnvelopeMode::Tagged, None)
-                .map(Some)
-                .map_err(|error| error.message)
-        }
-        CodeModeTool::FeatureFlags => {
-            let params: FeatureFlagsParams = parse_params(params)?;
-            run_feature_flags_api_value(&params)
-        }
-        CodeModeTool::ListBoundaries => {
-            let params: ListBoundariesParams = parse_params(params)?;
-            run_list_boundaries_api_value(&params)
-        }
-        _ => unreachable!("report API helper called with {}", tool.name()),
-    }
+    api_route(tool).map_or(Ok(None), |route| route(params, cancellation))
 }
 
 pub(super) fn build_tool_args(
@@ -332,6 +407,7 @@ pub(super) fn build_tool_args(
 ) -> Result<Vec<String>, String> {
     match tool {
         CodeModeTool::Analyze
+        | CodeModeTool::CheckArchitecture
         | CodeModeTool::Combined
         | CodeModeTool::CheckChanged
         | CodeModeTool::SecurityCandidates
@@ -364,6 +440,10 @@ fn build_project_tool_args(
         CodeModeTool::Analyze => {
             let params: AnalyzeParams = parse_params(params)?;
             build_analyze_args(&params)
+        }
+        CodeModeTool::CheckArchitecture => {
+            let params: ArchitectureParams = parse_params(params)?;
+            Ok(build_architecture_args(&params))
         }
         CodeModeTool::Combined => {
             let params: CombinedParams = parse_params(params)?;
@@ -480,29 +560,25 @@ fn build_runtime_coverage_tool_args(
     }
 }
 
-fn run_combined_api_value(params: &CombinedParams) -> Result<Option<serde_json::Value>, String> {
-    let options = combined_options_from_params(params)?;
-    let value = run_combined(&options)
-        .and_then(serialize_combined_programmatic_json)
-        .map_err(|err| programmatic_error_body(&err))?;
-
-    Ok(Some(value))
+fn run_combined_api_value(
+    params: &CombinedParams,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let options = combined_options_from_params(params, cancellation)?;
+    typed_api_value(run_combined(&options).and_then(serialize_combined_programmatic_json))
 }
 
-fn combined_options_from_params(params: &CombinedParams) -> Result<CombinedOptions, String> {
+fn combined_options_from_params(
+    params: &CombinedParams,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<CombinedOptions, String> {
     let analysis = AnalysisOptions {
-        root: non_empty_path(params.root.as_deref()),
-        config_path: non_empty_path(params.config.as_deref()),
-        allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
-        no_cache: params.no_cache.unwrap_or(false),
-        threads: params.threads,
         production: params.production.unwrap_or(false),
         production_override: params.production,
-        changed_since: changed_since_from_param(params.changed_since.as_deref()),
-        diff_file: env_diff_file(),
+        changed_since: non_empty_string(params.changed_since.as_deref()),
         workspace: workspace_patterns_from_param(params.workspace.as_deref()),
         explain: true,
-        ..AnalysisOptions::default()
+        ..shared_analysis_options(shared_params!(params), EnvScope::Ambient, cancellation)
     };
     let coverage = resolve_typed_coverage_inputs(
         &analysis,
@@ -517,6 +593,7 @@ fn combined_options_from_params(params: &CombinedParams) -> Result<CombinedOptio
     Ok(CombinedOptions {
         analysis,
         include_entry_exports: params.include_entry_exports.unwrap_or(false),
+        show_cascade: params.show_cascade.unwrap_or(false),
         duplication_options: DuplicationOptions {
             mode: combined_duplication_mode(params.dupes_mode.as_deref())?,
             near: params.dupes_near,
@@ -525,6 +602,7 @@ fn combined_options_from_params(params: &CombinedParams) -> Result<CombinedOptio
             min_occurrences: params.dupes_min_occurrences.map(|value| value as usize),
             threshold: params.dupes_threshold,
             skip_local: params.dupes_skip_local,
+            ignore_symlinks: params.dupes_ignore_symlinks,
             cross_language: params.dupes_cross_language,
             ignore_imports: params.dupes_ignore_imports,
             ..DuplicationOptions::default()
@@ -554,7 +632,8 @@ fn combined_duplication_mode(value: Option<&str>) -> Result<Option<DuplicationMo
         Some("weak") => Ok(Some(DuplicationMode::Weak)),
         Some("semantic") => Ok(Some(DuplicationMode::Semantic)),
         Some(value) => Err(format!(
-            "Invalid dupes_mode '{value}'. Valid values: strict, mild, weak, semantic"
+            "Invalid dupes_mode '{value}'. Valid values: {}",
+            VALID_DUPES_MODES.join(", ")
         )),
     }
 }
@@ -574,9 +653,7 @@ fn build_combined_args(params: &CombinedParams) -> Vec<String> {
         params.threads,
     );
     push_remote_extends(&mut args, params.allow_remote_extends);
-    if params.production == Some(true) {
-        args.push("--production".to_string());
-    }
+    push_production(&mut args, params.production);
     push_opt_arg(&mut args, "--workspace", params.workspace.as_deref());
     push_opt_arg(
         &mut args,
@@ -585,6 +662,9 @@ fn build_combined_args(params: &CombinedParams) -> Vec<String> {
     );
     if params.include_entry_exports == Some(true) {
         args.push("--include-entry-exports".to_string());
+    }
+    if params.show_cascade == Some(true) {
+        args.push("--show-cascade".to_string());
     }
     push_combined_duplication_args(&mut args, params);
     if params.score == Some(true) {
@@ -636,6 +716,11 @@ fn push_combined_duplication_args(args: &mut Vec<String>, params: &CombinedParam
     if params.dupes_cross_language == Some(true) {
         args.push("--dupes-cross-language".to_string());
     }
+    match params.dupes_ignore_symlinks {
+        Some(true) => args.push("--dupes-ignore-symlinks".to_string()),
+        Some(false) => args.push("--dupes-no-ignore-symlinks".to_string()),
+        None => {}
+    }
     match params.dupes_ignore_imports {
         Some(true) => args.push("--dupes-ignore-imports".to_string()),
         Some(false) => args.push("--dupes-no-ignore-imports".to_string()),
@@ -658,60 +743,177 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use fallow_types::mcp_manifest::{MCP_TOOLS, code_mode_allowlist};
+
     use super::*;
 
+    /// The allowlist is in hand at the refusal, so a one-edit typo must name
+    /// the tool the snippet meant instead of sending the agent back to the
+    /// manifest.
     #[test]
-    fn api_backed_code_mode_tools_are_explicitly_registered() {
-        let names = API_BACKED_CODE_MODE_TOOLS
+    fn unknown_tool_name_suggests_the_nearest_allowlisted_tool() {
+        let error = CodeModeTool::from_name("check_helth").expect_err("unknown tool");
+        assert!(error.contains("did you mean 'check_health'?"), "{error}");
+    }
+
+    #[test]
+    fn unrelated_tool_name_gets_no_suggestion() {
+        let error = CodeModeTool::from_name("teleport").expect_err("unknown tool");
+        assert!(!error.contains("did you mean"), "{error}");
+    }
+
+    #[test]
+    fn all_lists_every_variant_in_order() {
+        for (index, tool) in CodeModeTool::ALL.iter().enumerate() {
+            assert_eq!(
+                tool.ordinal(),
+                index,
+                "CodeModeTool::ALL disagrees with ordinal() at slot {index}; both must list \
+                 every variant in the same order"
+            );
+        }
+    }
+
+    /// The drift gate finding 5 was missing: `MCP_TOOLS` and the sandbox's
+    /// dispatch enum must describe the same allowlist, so a tool cannot be
+    /// added to (or dropped from) one surface while the other keeps its old
+    /// answer.
+    #[test]
+    fn enum_variants_match_the_manifest_allowlist_both_directions() {
+        let manifest: BTreeSet<&str> = code_mode_allowlist()
             .iter()
+            .map(|(_, name)| *name)
+            .collect();
+        let variants: BTreeSet<&str> = CodeModeTool::ALL.iter().map(|tool| tool.name()).collect();
+        assert_eq!(
+            manifest, variants,
+            "the Code Mode allowlist in fallow_types::mcp_manifest (code_mode_alias plus \
+             CODE_MODE_ONLY_TOOLS) must equal the CodeModeTool variants exactly"
+        );
+    }
+
+    #[test]
+    fn manifest_tools_dispatch_exactly_when_they_carry_an_alias() {
+        for tool in MCP_TOOLS {
+            assert_eq!(
+                CodeModeTool::from_name(tool.name).is_ok(),
+                tool.code_mode_alias.is_some(),
+                "Code Mode dispatch for {} disagrees with its manifest code_mode_alias",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_project_the_manifest_and_resolve_to_their_tool() {
+        assert_eq!(*CODE_MODE_ALIASES, code_mode_allowlist());
+        for &(alias, name) in CODE_MODE_ALIASES.as_slice() {
+            let tool = CodeModeTool::from_name(name)
+                .unwrap_or_else(|err| panic!("alias {alias} maps to unknown tool {name}: {err}"));
+            assert_eq!(tool.name(), name, "alias {alias} does not round-trip");
+        }
+    }
+
+    /// Code Mode's two rejections are routing hints agents read, not
+    /// accidents: the sandbox is read-only, and similar-code's cold-inference
+    /// window does not fit the 30-second cap. Deriving the allowlist from the
+    /// manifest must not flatten them into the generic unsupported-tool error.
+    #[test]
+    fn deliberate_rejections_keep_their_routing_hints() {
+        for name in ["fix_preview", "fix_apply"] {
+            let err = CodeModeTool::from_name(name).expect_err("fix tools stay out of Code Mode");
+            assert!(
+                err.contains("code mode does not expose fix tools"),
+                "error was: {err}"
+            );
+        }
+        for name in ["mutation_plan", "mutation_inspect"] {
+            let err = CodeModeTool::from_name(name).expect_err("mutation stays out of Code Mode");
+            assert!(
+                err.contains("standalone MCP mutation_plan or mutation_inspect"),
+                "error was: {err}"
+            );
+        }
+        for name in ["find_similar_code", "inspect_similar_code"] {
+            let err =
+                CodeModeTool::from_name(name).expect_err("similar-code stays out of Code Mode");
+            assert!(
+                err.contains("standalone MCP find_similar_code or inspect_similar_code"),
+                "error was: {err}"
+            );
+            assert!(
+                err.contains("dedicated 15-minute timeout"),
+                "error was: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn subprocess_aliases_are_every_host_call_a_timeout_can_kill() {
+        let mut aliases = code_mode_subprocess_aliases();
+        aliases.sort_unstable();
+        assert_eq!(
+            aliases,
+            [
+                "analyze",
+                "audit",
+                "checkArchitecture",
+                "checkHealth",
+                "checkRuntimeCoverage",
+                "findDupes",
+                "getBlastRadius",
+                "getCleanupCandidates",
+                "getHotPaths",
+                "getImportance",
+                "impact",
+                "impactClosure",
+                "securityCandidates",
+            ]
+        );
+    }
+
+    #[test]
+    fn in_process_host_calls_are_explicitly_registered() {
+        let names = CodeModeTool::ALL
+            .iter()
+            .filter(|tool| tool.backing() == CodeModeBacking::Api)
             .map(|tool| tool.name())
             .collect::<Vec<_>>();
 
         assert_eq!(
             names,
             vec![
-                "analyze",
                 "combined",
                 "check_changed",
-                "find_dupes",
                 "project_info",
                 "trace_export",
                 "trace_file",
                 "trace_dependency",
                 "trace_clone",
-                "check_health",
-                "audit",
                 "fallow_explain",
                 "list_boundaries",
                 "feature_flags",
             ]
         );
-
-        for tool in API_BACKED_CODE_MODE_TOOLS {
-            assert!(
-                tool.is_api_backed(),
-                "{} should use fallow-api",
-                tool.name()
-            );
-        }
     }
 
+    /// `fallow-api` can run these four, and their standalone MCP tools do.
+    /// Code Mode does not, because it has to be able to stop them.
     #[test]
-    fn heavy_code_mode_tools_keep_cancellable_cli_path() {
+    fn whole_project_analyses_keep_the_killable_subprocess_path() {
         for tool in [
             CodeModeTool::Analyze,
+            CodeModeTool::CheckArchitecture,
             CodeModeTool::FindDupes,
             CodeModeTool::CheckHealth,
             CodeModeTool::Audit,
         ] {
-            assert!(
-                tool.is_api_backed(),
-                "{} should still be API-backed for standalone MCP tools",
-                tool.name()
-            );
-            assert!(
-                !tool.is_code_mode_api_backed(),
-                "{} should use Code Mode's cancellable subprocess path",
+            assert_eq!(
+                tool.backing(),
+                CodeModeBacking::Subprocess,
+                "{} must stay killable in Code Mode",
                 tool.name()
             );
         }
@@ -719,8 +921,8 @@ mod tests {
 
     #[test]
     fn combined_params_default_to_cli_combined_health_sections() {
-        let options =
-            combined_options_from_params(&CombinedParams::default()).expect("combined options");
+        let options = combined_options_from_params(&CombinedParams::default(), None)
+            .expect("combined options");
 
         assert!(options.health_options.complexity);
         assert!(options.health_options.file_scores);
@@ -731,11 +933,14 @@ mod tests {
 
     #[test]
     fn combined_params_forward_explicit_coverage_inputs() {
-        let options = combined_options_from_params(&CombinedParams {
-            coverage: Some("artifacts/coverage-final.json".to_string()),
-            coverage_root: Some("/ci/workspace".to_string()),
-            ..CombinedParams::default()
-        })
+        let options = combined_options_from_params(
+            &CombinedParams {
+                coverage: Some("artifacts/coverage-final.json".to_string()),
+                coverage_root: Some("/ci/workspace".to_string()),
+                ..CombinedParams::default()
+            },
+            None,
+        )
         .expect("combined options");
 
         assert_eq!(
@@ -748,17 +953,71 @@ mod tests {
         );
     }
 
+    /// Bare `fallow` runs type-aware analysis when the config turns it on.
+    /// The in-process route declines the call, so Code Mode runs the
+    /// subprocess.
+    #[test]
+    fn combined_declines_config_type_aware_analysis() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"fixture","main":"index.ts"}"#,
+        )
+        .expect("write package");
+        std::fs::write(project.path().join("index.ts"), "export const a = 1;\n")
+            .expect("write source");
+        crate::tools::api_runtime::write_type_aware_config(
+            project.path(),
+            r#"{"typeAware":{"enabled":true}}"#,
+        );
+        let params = CombinedParams {
+            root: Some(project.path().display().to_string()),
+            no_cache: Some(true),
+            ..CombinedParams::default()
+        };
+        assert_eq!(run_combined_api_value(&params, None), Ok(None));
+    }
+
     #[test]
     fn combined_forwards_near_detection() {
         let params = CombinedParams {
             dupes_near: Some(true),
             ..CombinedParams::default()
         };
-        let options = combined_options_from_params(&params).expect("combined options");
+        let options = combined_options_from_params(&params, None).expect("combined options");
         let args = build_combined_args(&params);
 
         assert_eq!(options.duplication_options.near, Some(true));
         assert!(args.contains(&"--dupes-near".to_string()));
+    }
+
+    #[test]
+    fn combined_forwards_ignore_symlinks_in_both_directions() {
+        for (value, flag, other) in [
+            (
+                true,
+                "--dupes-ignore-symlinks",
+                "--dupes-no-ignore-symlinks",
+            ),
+            (
+                false,
+                "--dupes-no-ignore-symlinks",
+                "--dupes-ignore-symlinks",
+            ),
+        ] {
+            let params = CombinedParams {
+                dupes_ignore_symlinks: Some(value),
+                ..CombinedParams::default()
+            };
+            let options = combined_options_from_params(&params, None).expect("combined options");
+            let args = build_combined_args(&params);
+
+            assert_eq!(options.duplication_options.ignore_symlinks, Some(value));
+            assert!(args.contains(&flag.to_string()), "{args:?}");
+            assert!(!args.contains(&other.to_string()), "{args:?}");
+        }
+        let args = build_combined_args(&CombinedParams::default());
+        assert!(!args.iter().any(|arg| arg.contains("ignore-symlinks")));
     }
 
     #[test]
@@ -848,26 +1107,113 @@ mod tests {
         }
     }
 
+    /// The modelled backing and the dispatcher cannot disagree: every
+    /// subprocess-backed tool must decline in-process execution rather than
+    /// reach a route that does not exist.
     #[test]
-    fn cli_only_code_mode_tools_are_not_api_backed() {
-        for tool in [
-            CodeModeTool::SecurityCandidates,
-            CodeModeTool::Impact,
-            CodeModeTool::CheckRuntimeCoverage,
-            CodeModeTool::GetHotPaths,
-            CodeModeTool::GetBlastRadius,
-            CodeModeTool::GetImportance,
-            CodeModeTool::GetCleanupCandidates,
-        ] {
-            assert!(
-                !tool.is_api_backed(),
-                "{} should use CLI fallback",
+    fn subprocess_backed_tools_decline_in_process_dispatch() {
+        for tool in CodeModeTool::ALL
+            .iter()
+            .filter(|tool| tool.backing() == CodeModeBacking::Subprocess)
+        {
+            assert_eq!(
+                run_api_tool(*tool, serde_json::json!({}), None).expect("fallback decision"),
+                None,
+                "{} must fall back to its subprocess",
                 tool.name()
             );
-            assert_eq!(
-                run_api_tool(tool, serde_json::json!({})).expect("fallback decision"),
-                None
+        }
+    }
+
+    fn cancellation_fixture() -> tempfile::TempDir {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::create_dir(root.join("src")).expect("src dir");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"cancellation","main":"src/index.ts"}"#,
+        )
+        .expect("package.json");
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export const entry = 1;\nconsole.log(entry);\n",
+        )
+        .expect("entry");
+        std::fs::write(root.join("src/orphan.ts"), "export const orphan = 1;\n").expect("orphan");
+        project
+    }
+
+    /// Params that reach each route's analysis rather than being refused for a
+    /// missing or invalid argument first.
+    fn cancellation_params(tool: CodeModeTool, root: &str) -> serde_json::Value {
+        match tool {
+            CodeModeTool::CheckChanged => serde_json::json!({ "root": root, "since": "HEAD" }),
+            CodeModeTool::TraceExport => {
+                serde_json::json!({ "root": root, "file": "src/orphan.ts", "export_name": "orphan" })
+            }
+            CodeModeTool::TraceFile => {
+                serde_json::json!({ "root": root, "file": "src/orphan.ts" })
+            }
+            CodeModeTool::TraceDependency => {
+                serde_json::json!({ "root": root, "package_name": "left-pad" })
+            }
+            CodeModeTool::TraceClone => {
+                serde_json::json!({ "root": root, "file": "src/orphan.ts", "line": 1 })
+            }
+            _ => serde_json::json!({ "root": root }),
+        }
+    }
+
+    /// A Code Mode deadline is only a stop signal for routes that read the
+    /// token it sets. Every Api-backed tool must report `FALLOW_CANCELLED`
+    /// rather than a report, so a route wired to accept a token but never read
+    /// one fails here instead of quietly running to completion.
+    ///
+    /// `explain` is the single exemption: it reads a static issue-type table
+    /// and never opens a project.
+    #[test]
+    fn api_backed_tools_stop_for_a_token_that_is_already_set() {
+        let project = cancellation_fixture();
+        let root = project.path().to_string_lossy().to_string();
+
+        for tool in CodeModeTool::ALL
+            .iter()
+            .filter(|tool| tool.backing() == CodeModeBacking::Api)
+        {
+            if matches!(tool, CodeModeTool::FallowExplain) {
+                continue;
+            }
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let error = run_api_tool(*tool, cancellation_params(*tool, &root), Some(cancelled))
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{} returned a result for a cancelled call", tool.name())
+                });
+            assert!(
+                error.contains("FALLOW_CANCELLED"),
+                "{} did not stop for a token that was already set: {error}",
+                tool.name()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod route_parity_tests {
+    use super::*;
+
+    /// Both routes of the `combined` host call express the same shared settings.
+    #[test]
+    fn typed_and_cli_routes_agree_on_shared_settings() {
+        super::super::super::route_parity::assert_routes_agree(
+            "combined",
+            &serde_json::json!({ "coverage": "coverage-final.json", "coverage_root": "/parity/ci" }),
+            |params: CombinedParams| build_combined_args(&params),
+            |params: CombinedParams| {
+                combined_options_from_params(&params, None)
+                    .expect("options")
+                    .analysis
+            },
+        );
     }
 }

@@ -16,7 +16,10 @@ use crate::graph::ModuleGraph;
 use crate::resolve::ResolvedModule;
 use crate::suppress::SuppressionContext;
 
-use super::{find_policy_violations as find_policy_violations_raw, rules_applying_to_path};
+use super::{
+    PolicyAnalysisInput, compile_rules, compile_scope_globs,
+    find_policy_violations as find_policy_violations_raw,
+};
 
 fn rule(id: &str, kind: RulePackRuleKind) -> RulePackRule {
     RulePackRule {
@@ -26,6 +29,8 @@ fn rule(id: &str, kind: RulePackRuleKind) -> RulePackRule {
         specifiers: Vec::new(),
         effects: Vec::new(),
         exports: Vec::new(),
+        allowed_files: Vec::new(),
+        proof_kinds: Vec::new(),
         ignore_type_only: false,
         files: Vec::new(),
         exclude: Vec::new(),
@@ -73,41 +78,49 @@ fn pack(rules: Vec<RulePackRule>) -> RulePackDef {
     }
 }
 
+/// Rule ids whose compiled file and zone scope applies to `rel_path`.
+fn applying_rule_ids(config: &ResolvedConfig, rel_path: &str) -> Vec<String> {
+    let zone = config.boundaries.classify_zone(rel_path);
+    compile_rules(config)
+        .iter()
+        .filter(|rule| rule.applies_to(rel_path, zone))
+        .map(|rule| rule.rule.id.clone())
+        .collect()
+}
+
 #[test]
-fn rules_applying_to_path_honors_rule_file_scope() {
+fn compiled_rules_honor_rule_file_scope() {
     let mut scoped = banned_call("no-domain-process", &["child_process.*"]);
     scoped.files = vec!["src/domain/**".to_string()];
     scoped.exclude = vec!["src/domain/generated/**".to_string()];
     let global = banned_import("no-moment", &["moment"]);
-    let packs = vec![pack(vec![scoped, global])];
-    let boundaries = fallow_config::ResolvedBoundaryConfig::default();
-
-    let matching = rules_applying_to_path(&packs, &boundaries, "src/domain/user.ts");
-    assert_eq!(
-        matching
-            .iter()
-            .map(|(_, rule)| rule.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["no-domain-process", "no-moment"]
+    let config = make_config(
+        PathBuf::from("/project"),
+        vec![pack(vec![scoped, global])],
+        Severity::Error,
     );
 
-    let excluded = rules_applying_to_path(&packs, &boundaries, "src/domain/generated/user.ts");
     assert_eq!(
-        excluded
-            .iter()
-            .map(|(_, rule)| rule.id.as_str())
-            .collect::<Vec<_>>(),
+        applying_rule_ids(&config, "src/domain/user.ts"),
+        vec!["no-domain-process", "no-moment"]
+    );
+    assert_eq!(
+        applying_rule_ids(&config, "src/domain/generated/user.ts"),
         vec!["no-moment"]
     );
 }
 
 #[test]
-fn rules_applying_to_path_honors_rule_zone_scope() {
+fn compiled_rules_honor_rule_zone_scope() {
     let mut domain_only = banned_effect("pure-domain", &[EffectKind::Network]);
     domain_only.zones = vec!["domain".to_owned()];
     let global = banned_import("no-moment", &["moment"]);
-    let packs = vec![pack(vec![domain_only, global])];
-    let boundaries = fallow_config::BoundaryConfig {
+    let mut config = make_config(
+        PathBuf::from("/project"),
+        vec![pack(vec![domain_only, global])],
+        Severity::Error,
+    );
+    config.boundaries = fallow_config::BoundaryConfig {
         zones: vec![
             fallow_config::BoundaryZone {
                 name: "domain".to_owned(),
@@ -126,20 +139,12 @@ fn rules_applying_to_path_honors_rule_zone_scope() {
     }
     .resolve();
 
-    let domain = rules_applying_to_path(&packs, &boundaries, "src/domain/user.ts");
     assert_eq!(
-        domain
-            .iter()
-            .map(|(_, rule)| rule.id.as_str())
-            .collect::<Vec<_>>(),
+        applying_rule_ids(&config, "src/domain/user.ts"),
         vec!["pure-domain", "no-moment"]
     );
-
-    let app = rules_applying_to_path(&packs, &boundaries, "src/app/page.ts");
     assert_eq!(
-        app.iter()
-            .map(|(_, rule)| rule.id.as_str())
-            .collect::<Vec<_>>(),
+        applying_rule_ids(&config, "src/app/page.ts"),
         vec!["no-moment"]
     );
 }
@@ -200,6 +205,7 @@ fn build_graph(root: &std::path::Path, file_names: &[&str]) -> ModuleGraph {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         })
         .collect();
 
@@ -232,6 +238,8 @@ fn export(name: ExportName, is_type_only: bool, span_start: u32) -> ExportInfo {
         span: oxc_span::Span::new(span_start, span_start + 1),
         members: Vec::new(),
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     }
 }
 
@@ -266,14 +274,15 @@ fn find_policy_violations(
     suppressions: &SuppressionContext<'_>,
     line_offsets_by_file: &super::super::LineOffsetsMap<'_>,
 ) -> Vec<fallow_types::results::PolicyViolation> {
-    find_policy_violations_raw(
+    find_policy_violations_raw(PolicyAnalysisInput {
         graph,
         modules,
+        resolved_modules: &[],
         config,
-        &FxHashSet::default(),
+        declared_deps: &FxHashSet::default(),
         suppressions,
         line_offsets_by_file,
-    )
+    })
 }
 
 #[test]
@@ -421,25 +430,27 @@ fn banned_effect_honors_catalogue_enabler() {
     let suppressions = SuppressionContext::empty();
     let line_offsets = FxHashMap::default();
 
-    let without_electron = find_policy_violations_raw(
-        &graph,
-        &modules,
-        &config,
-        &FxHashSet::default(),
-        &suppressions,
-        &line_offsets,
-    );
+    let without_electron = find_policy_violations_raw(PolicyAnalysisInput {
+        graph: &graph,
+        modules: &modules,
+        resolved_modules: &[],
+        config: &config,
+        declared_deps: &FxHashSet::default(),
+        suppressions: &suppressions,
+        line_offsets_by_file: &line_offsets,
+    });
     assert!(without_electron.is_empty());
 
     let declared_deps = FxHashSet::from_iter(["electron".to_string()]);
-    let with_electron = find_policy_violations_raw(
-        &graph,
-        &modules,
-        &config,
-        &declared_deps,
-        &suppressions,
-        &line_offsets,
-    );
+    let with_electron = find_policy_violations_raw(PolicyAnalysisInput {
+        graph: &graph,
+        modules: &modules,
+        resolved_modules: &[],
+        config: &config,
+        declared_deps: &declared_deps,
+        suppressions: &suppressions,
+        line_offsets_by_file: &line_offsets,
+    });
     assert_eq!(with_electron.len(), 1);
     assert_eq!(with_electron[0].matched, "dom: BrowserWindow");
 }
@@ -1099,4 +1110,12 @@ fn message_is_carried_onto_findings() {
         violations[0].message.as_deref(),
         Some("Use the logger facade.")
     );
+}
+
+#[test]
+fn scope_glob_single_star_stays_within_one_segment() {
+    let matchers = compile_scope_globs(&["src/*.ts".to_string()]);
+    let matches = |path: &str| matchers.iter().any(|m| m.is_match(path));
+    assert!(matches("src/a.ts"));
+    assert!(!matches("src/nested/a.ts"));
 }

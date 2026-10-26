@@ -29,7 +29,7 @@ use super::{LineOffsetsMap, byte_offset_to_line_col};
 use crate::discover::FileId;
 use crate::graph::{ModuleGraph, ModuleNode};
 use crate::suppress::SuppressionContext;
-use fallow_security::{CalleePattern, Matcher, catalogue};
+use fallow_security::{CalleePattern, Matcher, ProvenanceBindings, catalogue};
 
 /// The inline suppression kind token for the tainted-sink catalogue rule. ONE
 /// token covers every catalogue category.
@@ -108,59 +108,6 @@ pub(super) fn build_actions() -> Vec<IssueAction> {
     })]
 }
 
-/// Whether the matcher's import provenance is satisfied by the module.
-///
-/// `None` provenance is always satisfied. Otherwise the module must import a
-/// source matching the spec (tolerant of the `node:` prefix on either side).
-/// For binding-sensitive rows, the binding's `local_name` must also be the
-/// leading identifier of the callee path, matching the `child_process.fork()`
-/// provenance precedent.
-fn provenance_satisfied(matcher: &Matcher, module: &ModuleInfo, callee_path: &str) -> bool {
-    let Some(spec) = &matcher.import_provenance else {
-        return true;
-    };
-    let leading_ident = callee_path.split('.').next().unwrap_or(callee_path);
-    let want_binding_trace = matches!(
-        matcher.id.as_str(),
-        "command-injection"
-            | "permissive-cors"
-            | "electron-unsafe-webpreferences"
-            | "insecure-temp-file"
-            | "jwt-alg-none"
-            | "jwt-verify-missing-algorithms"
-            | "tls-validation-disabled"
-            | "mysql-multiple-statements"
-            | "world-writable-permission"
-    ) || (matcher.id == "weak-crypto" && matcher.is_literal_aware());
-    module.imports.iter().any(|imp| {
-        let source_matches = import_source_matches(&imp.source, spec);
-        if !source_matches {
-            return false;
-        }
-        if want_binding_trace {
-            imp.local_name == leading_ident
-        } else {
-            true
-        }
-    })
-}
-
-/// Compare an import source against a provenance spec, tolerant of the `node:`
-/// prefix on either side (`node:child_process` matches `child_process`) and
-/// package subpath imports (`mysql2/promise` matches `mysql2`).
-fn import_source_matches(source: &str, spec: &str) -> bool {
-    fn strip_node_prefix(value: &str) -> &str {
-        value.strip_prefix("node:").unwrap_or(value)
-    }
-
-    let source = strip_node_prefix(source);
-    let spec = strip_node_prefix(spec);
-    source == spec
-        || source
-            .strip_prefix(spec)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
 /// Compiled glob set over [`PRODUCTION_EXCLUDE_PATTERNS`](crate::discover::PRODUCTION_EXCLUDE_PATTERNS),
 /// built once. Used to skip security candidates anchored in test / spec / story
 /// / build-config files, matching the production-mode exclusion semantics
@@ -209,7 +156,7 @@ fn source_tainted_locals<'b>(
     let cat = catalogue();
     let mut out: FxHashMap<&'b str, (&'static str, &'static str, u32)> = FxHashMap::default();
     for b in bindings {
-        // `matching_source_for_deps` borrows from the `'static` catalogue, so
+        // `matching_source_for_deps_with_receivers` borrows from the `'static` catalogue, so
         // the (id, title) pair outlives the per-module computation. The id is
         // the stable machine source kind (`http-request-input`); the title is
         // the human phrase woven into the evidence string. The third element is
@@ -670,7 +617,7 @@ fn match_tainted_sink<'a>(
     let source_id = source.map(|(id, title, _)| (id, title));
     let matcher = run.active.iter().copied().find(|m| {
         matcher_admits_sink(m, sink, source_id)
-            && provenance_satisfied(m, module, &sink.callee_path)
+            && m.provenance_satisfied(module, &sink.callee_path, ProvenanceBindings::Imports)
     })?;
 
     Some((matcher, source))
@@ -752,20 +699,6 @@ mod tests {
         let f = CategoryFilter::new(None, Some(vec!["sql-injection".to_string()]));
         assert!(f.admits("dangerous-html"));
         assert!(!f.admits("sql-injection"));
-    }
-
-    #[test]
-    fn import_source_matches_node_prefix() {
-        assert!(import_source_matches("node:child_process", "child_process"));
-        assert!(import_source_matches("child_process", "node:child_process"));
-        assert!(!import_source_matches("child_process", "node:vm"));
-    }
-
-    #[test]
-    fn import_source_matches_package_subpath() {
-        assert!(import_source_matches("mysql2/promise", "mysql2"));
-        assert!(import_source_matches("@scope/pkg/subpath", "@scope/pkg"));
-        assert!(!import_source_matches("mysql2-promise", "mysql2"));
     }
 
     fn binding(local: &str, source_path: &str) -> TaintedBinding {

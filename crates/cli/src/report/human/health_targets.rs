@@ -2,9 +2,9 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use super::{MAX_FLAT_ITEMS, relative_path, split_dir_filename};
-
-const DOCS_HEALTH: &str = "https://docs.fallow.tools/explanations/health";
+use super::health::DOCS_HEALTH;
+use super::{MAX_FLAT_ITEMS, push_docs_footer, split_dir_filename};
+use crate::report::format_display_path;
 
 fn render_direct_import_symbol(symbol: &fallow_output::DirectCallerSymbolEvidence) -> String {
     let imported = if symbol.imported == "side-effect" {
@@ -38,13 +38,11 @@ pub(super) fn render_refactoring_targets(
         lines.push(String::new());
     }
     push_refactoring_targets_overflow(lines, report.targets.len());
-    lines.push(format!(
-        "  {}",
-        format!(
-            "Prioritized refactoring recommendations based on complexity, churn, and coupling signals: {DOCS_HEALTH}#refactoring-targets"
-        )
-        .dimmed()
-    ));
+    push_docs_footer(
+        lines,
+        "Prioritized refactoring recommendations based on complexity, churn, and coupling signals",
+        &format!("{DOCS_HEALTH}#refactoring-targets"),
+    );
     lines.push(String::new());
 }
 
@@ -98,7 +96,7 @@ fn push_refactoring_target_row(
     target: &fallow_output::RefactoringTarget,
     root: &Path,
 ) {
-    let file_str = relative_path(&target.path, root).display().to_string();
+    let file_str = format_display_path(&target.path, root);
     let (dir, filename) = split_dir_filename(&file_str);
     lines.push(format!(
         "  {}  {}    {}{}",
@@ -183,7 +181,7 @@ fn render_target_evidence(
             .direct_callers
             .iter()
             .map(|caller| {
-                let path = relative_path(&caller.path, root).display().to_string();
+                let path = format_display_path(&caller.path, root);
                 if caller.symbols.is_empty() {
                     path
                 } else {
@@ -209,7 +207,7 @@ fn render_target_evidence(
             .clone_siblings
             .iter()
             .map(|sibling| {
-                let path = relative_path(&sibling.path, root).display().to_string();
+                let path = format_display_path(&sibling.path, root);
                 format!(
                     "{}:{}-{} {}",
                     path, sibling.start_line, sibling.end_line, sibling.fingerprint

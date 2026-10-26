@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in fallow, please report it responsibly via [GitHub's private vulnerability reporting](https://github.com/fallow-rs/fallow/security/advisories/new) instead of opening a public issue.
+If you discover a security vulnerability in fallow, please report it responsibly via [GitHub's private vulnerability reporting](https://github.com/fallow-rs/fallow/security/advisories/new) instead of opening a public issue. If you cannot use GitHub, send the report by email to [security@fallow.tools](mailto:security@fallow.tools).
 
 You should receive a response within 48 hours. Please include:
 
@@ -10,15 +10,42 @@ You should receive a response within 48 hours. Please include:
 - Steps to reproduce it
 - Any relevant version or configuration information
 
+## Supported versions
+
+Only the latest minor release of fallow receives security fixes. A fix ships as a patch release of that minor. When a new minor release ships, the previous minor no longer receives security fixes. To get a fix, upgrade to the latest release.
+
+## Code scanning policy
+
+CodeQL analyzes every pull request and every push to `main`. The `Analyze` checks are required on `main`, so a pull request cannot merge while CodeQL reports a new high or critical finding.
+
+- High and critical findings block the merge. The author fixes them before the pull request merges.
+- Medium findings are fixed, or dismissed with a written reason, within 30 days.
+- Low findings are fixed or dismissed during routine maintenance.
+- A dismissal always states the reason in the alert, for example "false positive" or "used in tests only".
+
+## Vulnerability exploitability (VEX)
+
+The file [`.vex/openvex.json`](.vex/openvex.json) is an OpenVEX document. It states that fallow is not affected by each advisory that the repository ignores in its `osv-scanner.toml` files, with the reason for each. Run `node scripts/generate-vex.mjs` to regenerate it after you change an ignore entry. The `osv-scanner ignores` workflow runs `node scripts/check-osv-ignores.mjs` on each push to `main` and every week. A release waits for it to pass. It fails when an ignore entry matches no advisory in the lockfile next to it, for example after a dependency bump fixed the advisory. The `deny.toml` file ignores no advisories.
+
+## Software bill of materials
+
+Each release publishes one CycloneDX SBOM per target platform on the GitHub Release, named `fallow-<target>.cdx.json`.
+
 ## Scope
 
-fallow is a static analysis tool that reads source files and `package.json`. It does not execute user code or modify files (except `fallow fix`, which only edits files in the analyzed project). Ordinary analysis makes no config network requests. A host must explicitly trust remote config inheritance with `--allow-remote-extends` or the typed `ConfigLoadOptions` API before fallow fetches an `https://` extends target. The "does not execute user code" property is enforced, not just documented: the analysis crates (`fallow-core`, `fallow-extract`, `fallow-graph`) pin `#![cfg_attr(not(test), deny(clippy::disallowed_methods))]` against `std::process::Command::new`, so the only external program the analysis path can spawn is `git` (for `--changed-since`, churn history, and repository-state queries), invoked solely from `fallow-engine`'s churn module with a scrubbed environment (`git_env::clear_ambient_git_env`). A `package.json` lifecycle script is read as data and never run; a regression test (`safe_analysis`) asserts a `postinstall` sentinel never fires during analysis.
+fallow analyzes source files and `package.json` without running project code. Analysis can write caches and requested reports; `fallow fix` edits files only in the analyzed project. Ordinary analysis makes no config network requests. A host must explicitly trust remote config inheritance with `--allow-remote-extends` or the typed `ConfigLoadOptions` API before fallow fetches an `https://` extends target.
+
+The analysis crates (`fallow-core`, `fallow-extract`, `fallow-graph`) use `#![cfg_attr(not(test), deny(clippy::disallowed_methods))]` to prohibit `std::process::Command::new`. Git operations run from `fallow-engine` with a scrubbed environment (`git_env::clear_ambient_git_env`). These operations use `git` for `--changed-since`, churn history, and repository-state queries. Optional type-aware and similar-code analysis launches companion programs through the API layer.
+
+A `package.json` lifecycle script is read as data and never run. The regression test `safe_analysis` asserts that a `postinstall` sentinel never fires during analysis.
 
 ## Threat model
 
 The primary security boundary is the project root passed via `--root` (or the discovered config's directory). fallow walks files under that root and reads `package.json`, source files, lockfiles, and CI configs found within it.
 
 Config-sourced glob patterns (`entry`, `ignorePatterns`, `dynamicallyLoaded`, `duplicates.ignore`, `health.ignore`, `overrides[].files`, `ignoreExports[].file`, `ignoreCatalogReferences[].consumer`, `boundaries.zones[].{patterns, root, autoDiscover}`) are validated against absolute paths, `..` traversal segments, and invalid glob syntax at config load time. The same validation applies to every glob-bearing field on inline `framework[]` plugin definitions and on external plugin files discovered from `.fallow/plugins/`, root-level `fallow-plugin-*.{toml,json,jsonc}`, or paths listed in the `plugins:` config field, including patterns nested inside `detection` combinators (`all`, `any`). Invalid patterns cause `fallow` to exit with code 2 before walking the filesystem, so a malicious `.fallowrc.json` or plugin file shipped in a PR cannot smuggle absolute or traversal globs into a CI run. See issue [#463](https://github.com/fallow-rs/fallow/issues/463) for the original report.
+
+Workspace globs from `package.json` `workspaces`, `pnpm-workspace.yaml` `packages`, `deno.json` `workspace`, and the fallow config `workspaces.patterns` get a similar check. An entry that is absolute, or whose `..` segments lead above the project root, is skipped before fallow reads the disk, so fallow does not expand it outside the root. npm, pnpm, and yarn accept a `../` workspace entry, so such an entry does not cause exit code 2. A `workspace-glob-outside-root` diagnostic names the entry and the file that declares it, never a path outside the root. A `..` that stays inside the root, as in `packages/../libs/*`, is kept. A symlinked directory inside the root that points outside is never added as a workspace, because each workspace directory must canonicalize to a path under the root.
 
 Remote config inheritance is disabled by default, including for repository-controlled configs discovered during analysis. Trusted CLI callers can opt in per invocation with `--allow-remote-extends`. Rust embedders use `ConfigLoadOptions { allow_remote_extends: true }`, and API, NAPI, and LSP hosts expose the same per-call policy. There is intentionally no environment-only or process-global opt-in. HTTPS-only transport, the response-size limit, and `FALLOW_EXTENDS_TIMEOUT_SECS` still apply after opt-in. Sealed configs reject remote URL and `npm:` inheritance regardless of the host policy.
 
@@ -38,9 +65,17 @@ The Cargo dependency graph is gated by `cargo-deny` (`deny.toml`, run in CI):
 
 Dependency updates flow through Dependabot with a 7-day cooldown and non-major-only auto-merge, so a freshly-published (possibly compromised) version is not pulled into a build the day it lands.
 
+The advisory gates above catch only known issues. [Socket](https://socket.dev) closes the gap for new malicious releases. Its GitHub App checks every pull request that changes an npm or Cargo manifest or lockfile for malware, install scripts, typosquats, and unexpected network or shell access. Its pull request check is required on `main`, so a Dependabot update does not auto-merge while Socket reports a blocking alert. `socket.yml` excludes test fixtures and example projects, because those manifests are analysis inputs and not fallow dependencies.
+
+### Publication path
+
+Registries are published from `.github/workflows/release.yml` over OIDC trusted publishing; no long-lived npm or crates.io token exists in the repository. Every credential-bearing job runs in the `release` GitHub environment, whose deployment branch policy admits `main` only, so a copy of the workflow dispatched from another ref is refused before it starts.
+
+The `fallow` npm root is the one package the workflow cannot make installable. Its trusted publisher grants stage publish only: CI runs `npm stage publish`, npm holds the tarball privately, and the maintainer approves the stage with npm two-factor authentication from their own machine after comparing the staged bytes with the tarball the run built. A direct `npm publish` of `fallow` over OIDC is refused by npm. Because `fallow` pins its `@fallow-cli/*` platform packages and `fallow-type-aware` to the exact release version, a new version of those reaches users only through a root the maintainer approved. The maintainer-side rules live in `docs/development/release-security.md`.
+
 Every fallow release publishes signed standalone CLI, LSP, and MCP binaries through GitHub Releases. The `@fallow-cli/*` npm platform packages and the bundled `fallow-rs/fallow@v3` GitHub Action instead use one signed per-platform multicall `fallow` binary, which the npm package exposes through the `fallow`, `fallow-lsp`, and `fallow-mcp` launchers. At release time the `build` job in `.github/workflows/release.yml` signs all four build artifacts with the workflow's Ed25519 private key (`ED25519_BINARY_SIGNING_PRIVATE_KEY` repo secret), uploads the standalone signatures alongside their GitHub Release binaries, and publishes npm tarballs with `npm publish --provenance --ignore-scripts`. The same workflow embeds the multicall binary's SHA-256 digest in the platform package's `package.json` under `fallowDigests`, so npm and Action verification runs locally without a network round-trip.
 
-The matching public key is `34 bytes of SPKI DER header + 32 raw bytes of Ed25519 public key`. The 32-byte raw key is hardcoded into every consumer (the VS Code extension at `editors/vscode/src/download.ts`, the npm wrapper at `npm/fallow/scripts/verify-binary.js`) so the Ed25519 layer of verification works fully offline and cannot be silently downgraded by network-path tampering. The SHA-256 layer reads the embedded `fallowDigests` field from the platform package's `package.json`; platform packages predating v2.78.1 (which introduced the field, see issue #597) cannot be lazily verified and surface an actionable `npm install fallow@latest` error.
+The matching public key is `12 bytes of SPKI DER header + 32 raw bytes of Ed25519 public key`. The 32-byte raw key is hardcoded into every consumer (the VS Code extension at `editors/vscode/src/download.ts`, the npm wrapper at `npm/fallow/scripts/verify-binary.js`) so the Ed25519 layer of verification works fully offline and cannot be silently downgraded by network-path tampering. The SHA-256 layer reads the embedded `fallowDigests` field from the platform package's `package.json`; platform packages predating v2.78.1 (which introduced the field, see issue #597) cannot be lazily verified and surface an actionable `npm install fallow@latest` error.
 
 On the npm wrapper specifically, verification runs at first-invocation of `fallow`, `fallow-lsp`, or `fallow-mcp` rather than during `npm install`'s postinstall hook. A small JSON sentinel file is written next to the platform binary (or under `$XDG_CACHE_HOME/fallow/sentinels/` if the platform pkg dir is read-only, e.g. yarn PnP, Docker baked layers) so subsequent invocations skip verification on a cache hit. The sentinel is bound to both the resolved platform-package directory AND a SHA-256 of the multicall binary's bytes. The directory binding prevents cross-install sentinel reuse in the shared fallback cache (two installs of the same package version on the same host cannot ride each other's verified state). The byte binding catches a tampered binary that happens to preserve the recorded mtime, since the cache hit re-reads the binary and compares its SHA-256 against the sentinel before trusting it. This change preserves the cryptographic property bit-for-bit while removing the dependency on npm install scripts ahead of [npm RFC 868](https://github.com/npm/rfcs/pull/868) (`npm/cli#9360`) Phase 2, which will block postinstall hooks unless consumers explicitly add fallow to their `package.json#allowScripts`. The GitHub Action installer runs its own independent verification step that does not depend on the npm wrapper's first-run path.
 
@@ -62,7 +97,7 @@ You can copy this value out-of-band (a release blog post, this file at a tag you
 | `fallow-rs/fallow@v3` GitHub Action installer | After `npm install -g --ignore-scripts fallow@<spec>` | Same as above, but the verifier code is loaded from the checked-out Action tree rather than the installed package so a tampered installer cannot self-validate | Aborts the action step with a `::error::` annotation |
 | `npm install fallow` (`postinstall`) | **REMOVED 2026-Q2.** Previously aborted the install on verification failure. Removed for [npm RFC 868](https://github.com/npm/rfcs/pull/868) (`npm/cli#9360`) readiness: Phase 2 of the RFC will block postinstall hooks by default unless consumers add fallow to their `package.json#allowScripts`, which would silently no-op the install-time check. The cryptographic property is preserved bit-for-bit by the lazy first-run path (row above). | n/a (no longer runs) |
 
-The lazy first-run model is stronger than the npm-tarball-shasum-only baseline used by most Rust/Go npm wrappers (esbuild verifies SHA-256 only on its HTTP fallback path; biome, oxlint, rolldown, turbo, rspack, swc, and tailwindcss-oxide ship no in-package binary verification). fallow's Ed25519 signature check uses a key the project controls; provenance attestations from `npm publish --provenance` and the npm registry shasum are complementary signals, not the trust root.
+Fallow's Ed25519 signature check uses a key the project controls; provenance attestations from `npm publish --provenance` and the npm registry shasum are complementary signals, not the trust root.
 
 ### Signed-binary epoch: versions before 2.77.0
 
@@ -114,31 +149,33 @@ Do NOT set this flag in regular CI configurations or on machines that are expect
 
 ### Reporting binary tampering
 
-If `npm install fallow` or the `fallow-rs/fallow` action ever aborts with `binary verification failed` on a fresh, unmodified install, do not ignore it. Report it via the [private vulnerability reporting link](https://github.com/fallow-rs/fallow/security/advisories/new) above and include the full error message and the platform package version. False positives on this path are rare; a sustained failure on a clean install is treated as a P0 supply-chain incident.
+If the first run after `npm install fallow` or the `fallow-rs/fallow` action aborts with `binary verification failed` on a fresh, unmodified install, report it via the [private vulnerability reporting link](https://github.com/fallow-rs/fallow/security/advisories/new) above and include the full error message and the platform package version. False positives on this path are rare; a sustained failure on a clean install is treated as a P0 supply-chain incident.
 
 ### Signing-key rotation and compromise response
 
 The binary-signing keypair is asymmetric and split across two surfaces:
 
-- **Private key:** the `ED25519_BINARY_SIGNING_PRIVATE_KEY` repository secret. Only the `build` job in `.github/workflows/release.yml` reads it, to sign each platform binary at release time.
+- **Private key:** the `ED25519_BINARY_SIGNING_PRIVATE_KEY` Actions secret. Only the `build` job in `.github/workflows/release.yml` reads it, to sign each platform binary at release time; that job runs in the `release` environment.
 - **Public key:** the raw 32 bytes are hardcoded into every consumer that verifies a binary, `editors/vscode/src/download.ts` and `npm/fallow/scripts/verify-binary.js`, and the hex fingerprint is documented in the "Build-time trust boundary" section above. Repository policy tests assert that both consumer copies, the fingerprint, and the documented base64 form agree. Before signing, the release build also compares the public repository variable with that committed key. Treat all copies as one unit on any key change.
 
-**Why rotation is a clean per-version cutover (no grace window needed).** Each released consumer pins exactly one public key (the one it was built with) and only ever fetches the binary for its own version (the npm wrapper resolves the matching `@fallow-cli/*` platform package; the VS Code extension and the Action download the binary for the version they ship). So version N's consumer verifies version N's binary against version N's key, and an already-installed version N-1 keeps verifying its own N-1 binary against the old key. A key rotation therefore takes effect on upgrade, with nothing to dual-sign and no mixed-key window to manage.
+**Key selection on upgrade.** The npm wrapper resolves its matching `@fallow-cli/*` platform package, and the VS Code extension downloads the binary for its bundled version. Each verifies with the public key embedded in that release. Existing installations retain their embedded key until they upgrade.
+
+The GitHub Action selects the CLI version independently of the Action ref. It uses the explicit version input, the project dependency, or the latest release, in that order. Its installer verifies the selected binary with the public key bundled in the Action checkout. A rotation must account for workflows that select a CLI signed with a different key from their pinned Action.
 
 **Scheduled / maintainer-change rotation.** Do it as one ordinary release:
 
 1. Generate a new Ed25519 keypair offline.
-2. Replace the `ED25519_BINARY_SIGNING_PRIVATE_KEY` repo secret (read from stdin, never `--body -`; see the release-workflow rules).
+2. Replace the `ED25519_BINARY_SIGNING_PRIVATE_KEY` secret in the `release` environment (read from stdin, never `--body -`; see the release-workflow rules), and delete any repository-level copy in the same pass.
 3. Update the hardcoded raw public key in BOTH `editors/vscode/src/download.ts` and `npm/fallow/scripts/verify-binary.js`, and update the hex fingerprint block in this file, in the same commit.
 4. Ship a normal release through `/fallow-release`. The new release's binaries are signed with the new key and its consumers verify against it.
 5. Confirm a fresh `npm install fallow@<new>` and a clean VS Code extension download both verify without error.
 
 **Compromise response (private key suspected leaked).** The danger is that whoever holds the leaked key can sign a malicious binary that any consumer still pinned to the matching public key would accept. Move fast:
 
-1. Rotate immediately via a patch release using the steps above. This is the load-bearing action: once the new release ships, upgrading consumers no longer trust the compromised key.
+1. Rotate immediately via a patch release using the steps above. After users upgrade to the new release, their verifiers no longer trust the compromised key.
 2. File a GitHub Security Advisory ([new advisory](https://github.com/fallow-rs/fallow/security/advisories/new)) describing the exposure window and the fixed version.
 3. Consider deprecating (`npm deprecate`) the versions published during the exposure window so installs steer to the rotated release. Do NOT force-rewrite their git tags (tag tombstones are permanent); the rotation is forward-only.
-4. Rotate any other secret that shared the exposure path (a leaked Actions secret rarely leaks alone): `NPM_TOKEN`, `CARGO_REGISTRY_TOKEN`, `VSCE_PAT`, `OVSX_PAT`.
+4. Rotate any other secret that shared the exposure path (a leaked Actions secret rarely leaks alone): `VSCE_PAT`, `OVSX_PAT`, and any bootstrap `NPM_TOKEN` that happened to exist at the time. npm and crates.io publish over OIDC, so there is no registry token to rotate; review the trusted publisher configurations instead.
 
 ## Agent-instruction surface
 
@@ -148,3 +185,9 @@ AI coding agents read instruction files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules
 - **Local agent surface (advisory):** a Claude Code `SessionStart` hook scans the agent-instruction allowlist, including untracked and gitignored files that never reach a pull request. Hidden code points are reported; on the un-reviewed (untracked) files only, shell-exec injection shapes (`curl | sh`, `base64 -d | sh`, `eval`, `node -e`) are flagged as advisory warnings.
 
 This is defense-in-depth, not a trust boundary: it raises the cost of agent-context poisoning and surfaces the most common shapes, but a determined attacker who can write these files can also edit the hook. Agent-instruction files are untrusted by default; never run a pasted remediation without reading the patch, the URLs, and the package names first.
+
+## Acknowledgments
+
+Thanks to the people who reported vulnerabilities in fallow:
+
+- presendapp (https://github.com/presendapp) reported that the MCP setup snippet `npx fallow-mcp` could resolve to an unclaimed npm package name (GHSA-pp5v-xh6f-qgfx). Fixed in 3.32.0: the snippet now names the `fallow` package, and `fallow-mcp` is reserved on npm.

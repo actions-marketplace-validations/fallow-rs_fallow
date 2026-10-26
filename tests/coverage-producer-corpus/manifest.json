@@ -2,10 +2,10 @@
   "$schema": "fallow-coverage-producer-conformance/v1",
   "recorded": {
     "node_pin": "v24.18.0",
-    "platform": "darwin-arm64",
+    "platform": "linux-x64",
     "coverage_root": "/fallow/corpus",
     "producers_lock_file": "producers/package-lock.json",
-    "producers_lock_sha256": "e673a88ff57403ae9f720c211556e3703f03d00cf3b13cd811bc95b8c703959c"
+    "producers_lock_sha256": "90e3386b3aca872dd25657e28a7515606276ff00bd6af99c366abe9e479b8aab"
   },
   "invariants": [
     {
@@ -44,6 +44,11 @@
       "mechanism": "A record spelled `get area` / `set area` answers to the bare property name Fallow extracts."
     },
     {
+      "id": "tally_statements_by_owner",
+      "rust_fn": "crates/engine/src/health/scoring.rs::tally_statements_by_owner",
+      "mechanism": "A statement counts for the innermost fnMap record that encloses it, so a nested function body is never charged to the function that contains it as well."
+    },
+    {
       "id": "clamp_negative_positions",
       "rust_fn": "crates/engine/src/health/scoring.rs::parse_coverage_map_tolerantly",
       "mechanism": "A producer that records a negative coordinate for a position it could not place must not reject the whole map, which would silently drop every unit in the file to its static estimate."
@@ -73,7 +78,7 @@
     {
       "id": "ast-v8-to-istanbul",
       "package": "ast-v8-to-istanbul",
-      "version": "1.0.5",
+      "version": "1.0.7",
       "profile": "default",
       "driver": "producers/drivers/ast-v8-to-istanbul.mjs",
       "consumers": "vitest default v8 provider",
@@ -83,7 +88,7 @@
     {
       "id": "oxc-coverage-instrument",
       "package": "oxc-coverage-instrument",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "profile": "default",
       "driver": "producers/drivers/oxc-coverage-instrument.mjs",
       "consumers": "oxc-coverage-instrument vitest integration",
@@ -93,7 +98,7 @@
     {
       "id": "oxc-coverage-instrument-istanbul",
       "package": "oxc-coverage-instrument",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "profile": "compat:istanbul",
       "driver": "producers/drivers/oxc-coverage-instrument-istanbul.mjs",
       "consumers": "oxc-coverage-instrument callers asking for Istanbul-shaped output",

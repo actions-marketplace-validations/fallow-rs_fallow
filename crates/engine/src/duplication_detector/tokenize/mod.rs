@@ -36,6 +36,16 @@ pub fn tokenize_file(path: &Path, source: &str, skip_imports: bool) -> FileToken
     tokenize_file_inner(path, source, false, skip_imports)
 }
 
+/// Tokenize a fragment that the parser cannot read on its own.
+///
+/// The token stream serves content identity only. It ignores whitespace and
+/// comments, like the parser-based stream does. Identifiers are lowercase, so
+/// two fragments that differ only in identifier case share a fingerprint.
+#[must_use]
+pub(crate) fn tokenize_unparsed_fragment(fragment: &str) -> Vec<SourceToken> {
+    lexical::tokenize_lexical_region(fragment, 0, false)
+}
+
 /// Tokenize a source file with optional type stripping for cross-language detection.
 #[must_use]
 pub(crate) fn tokenize_file_cross_language(
@@ -57,20 +67,29 @@ fn tokenize_file_inner(
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    if is_sfc_file(path) {
-        return tokenize_sfc(source, strip_types, skip_imports);
-    }
-    if ext == "astro" {
-        return tokenize_astro(source, strip_types, skip_imports, extract_astro_frontmatter);
-    }
-    if ext == "mdx" {
-        return tokenize_mdx(source, strip_types, skip_imports);
-    }
-    if matches!(ext, "css" | "scss" | "sass" | "less") {
-        return tokenize_style_source(source);
-    }
-
-    tokenize_js_ts(path, source, strip_types, skip_imports)
+    fallow_extract::parse_bounded(source, || {
+        if is_sfc_file(path) {
+            return tokenize_sfc(source, strip_types, skip_imports);
+        }
+        if ext == "astro" {
+            return tokenize_astro(source, strip_types, skip_imports, extract_astro_frontmatter);
+        }
+        if ext == "mdx" {
+            return tokenize_mdx(source, strip_types, skip_imports);
+        }
+        if matches!(ext, "css" | "scss" | "sass" | "less") {
+            return tokenize_style_source(source);
+        }
+        tokenize_js_ts(path, source, strip_types, skip_imports)
+    })
+    .unwrap_or_else(|| FileTokens {
+        tokens: Vec::new(),
+        function_spans: Vec::new(),
+        atomic_invocation_spans: Vec::new(),
+        literal_argument_spans: Vec::new(),
+        source: source.to_string(),
+        line_count: source.lines().count().max(1),
+    })
 }
 
 /// Tokenize Vue/Svelte SFC `<script>` blocks.
@@ -113,12 +132,14 @@ fn tokenize_sfc(source: &str, strip_types: bool, skip_imports: bool) -> FileToke
         }
     }
 
-    let (all_tokens, function_spans, atomic_invocation_spans) = merge_sections(sections);
+    let (all_tokens, function_spans, atomic_invocation_spans, literal_argument_spans) =
+        merge_sections(sections);
 
     FileTokens {
         tokens: all_tokens,
         function_spans,
         atomic_invocation_spans,
+        literal_argument_spans,
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }
@@ -154,11 +175,13 @@ fn tokenize_astro(
                 region.byte_offset,
             ));
         }
-        let (tokens, function_spans, atomic_invocation_spans) = merge_sections(sections);
+        let (tokens, function_spans, atomic_invocation_spans, literal_argument_spans) =
+            merge_sections(sections);
         return FileTokens {
             tokens,
             function_spans,
             atomic_invocation_spans,
+            literal_argument_spans,
             source: source.to_string(),
             line_count: source.lines().count().max(1),
         };
@@ -178,11 +201,13 @@ fn tokenize_astro(
             region.byte_offset,
         ));
     }
-    let (tokens, function_spans, atomic_invocation_spans) = merge_sections(sections);
+    let (tokens, function_spans, atomic_invocation_spans, literal_argument_spans) =
+        merge_sections(sections);
     FileTokens {
         tokens,
         function_spans,
         atomic_invocation_spans,
+        literal_argument_spans,
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }
@@ -206,11 +231,15 @@ fn tokenize_mdx(source: &str, strip_types: bool, skip_imports: bool) -> FileToke
         for span in &mut extractor.atomic_invocation_spans {
             *span = statements.remap_span(*span);
         }
+        for span in &mut extractor.literal_argument_spans {
+            *span = statements.remap_span(*span);
+        }
 
         return FileTokens {
             tokens: extractor.tokens,
             function_spans: extractor.function_spans,
             atomic_invocation_spans: extractor.atomic_invocation_spans,
+            literal_argument_spans: extractor.literal_argument_spans,
             source: source.to_string(),
             line_count: source.lines().count().max(1),
         };
@@ -224,6 +253,7 @@ fn empty_tokens(source: &str) -> FileTokens {
         tokens: Vec::new(),
         function_spans: Vec::new(),
         atomic_invocation_spans: Vec::new(),
+        literal_argument_spans: Vec::new(),
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }
@@ -237,6 +267,7 @@ fn tokenize_style_source(source: &str) -> FileTokens {
         tokens,
         function_spans: Vec::new(),
         atomic_invocation_spans: Vec::new(),
+        literal_argument_spans: Vec::new(),
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }
@@ -248,6 +279,7 @@ struct TokenSection {
     tokens: Vec<SourceToken>,
     function_spans: Vec<Span>,
     atomic_invocation_spans: Vec<Span>,
+    literal_argument_spans: Vec<Span>,
 }
 
 fn tokenize_js_section(
@@ -274,6 +306,9 @@ fn tokenize_js_section(
     for span in &mut extractor.atomic_invocation_spans {
         *span = Span::new(span.start + offset, span.end + offset);
     }
+    for span in &mut extractor.literal_argument_spans {
+        *span = Span::new(span.start + offset, span.end + offset);
+    }
 
     TokenSection {
         name,
@@ -281,6 +316,7 @@ fn tokenize_js_section(
         tokens: extractor.tokens,
         function_spans: extractor.function_spans,
         atomic_invocation_spans: extractor.atomic_invocation_spans,
+        literal_argument_spans: extractor.literal_argument_spans,
     }
 }
 
@@ -294,25 +330,35 @@ fn tokenize_lexical_section(name: &'static str, source: &str, byte_offset: usize
         tokens: lexical::tokenize_lexical_region(source, byte_offset, css),
         function_spans: Vec::new(),
         atomic_invocation_spans: Vec::new(),
+        literal_argument_spans: Vec::new(),
     }
 }
 
-fn merge_sections(mut sections: Vec<TokenSection>) -> (Vec<SourceToken>, Vec<Span>, Vec<Span>) {
+type MergedSections = (Vec<SourceToken>, Vec<Span>, Vec<Span>, Vec<Span>);
+
+fn merge_sections(mut sections: Vec<TokenSection>) -> MergedSections {
     sections.retain(|section| !section.tokens.is_empty());
     sections.sort_by_key(|section| section.start);
 
     let mut tokens = Vec::new();
     let mut function_spans = Vec::new();
     let mut atomic_invocation_spans = Vec::new();
+    let mut literal_argument_spans = Vec::new();
 
     for section in sections {
         tokens.push(lexical::boundary_token(section.name, section.start));
         tokens.extend(section.tokens);
         function_spans.extend(section.function_spans);
         atomic_invocation_spans.extend(section.atomic_invocation_spans);
+        literal_argument_spans.extend(section.literal_argument_spans);
     }
 
-    (tokens, function_spans, atomic_invocation_spans)
+    (
+        tokens,
+        function_spans,
+        atomic_invocation_spans,
+        literal_argument_spans,
+    )
 }
 
 /// Tokenize a standard JS/TS file, with JSX fallback for parse errors.
@@ -351,6 +397,7 @@ fn tokenize_js_ts(path: &Path, source: &str, strip_types: bool, skip_imports: bo
         tokens: extractor.tokens,
         function_spans: extractor.function_spans,
         atomic_invocation_spans: extractor.atomic_invocation_spans,
+        literal_argument_spans: extractor.literal_argument_spans,
         source: source.to_string(),
         line_count: source.lines().count().max(1),
     }

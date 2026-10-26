@@ -19,12 +19,12 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use ureq::tls::{PemItem, RootCerts, TlsConfig};
 
-/// Default fallow cloud API base URL.
+/// Default Fallow Cloud API base URL.
 pub const DEFAULT_API_URL: &str = "https://api.fallow.cloud";
 
 pub use crate::exit_codes::NETWORK_EXIT_CODE;
 
-/// Environment variable pointing at a PEM trust bundle for fallow cloud calls.
+/// Environment variable pointing at a PEM trust bundle for Fallow Cloud calls.
 pub const CA_BUNDLE_ENV: &str = "FALLOW_CA_BUNDLE";
 
 /// Maximum Retry-After sleep accepted from the server.
@@ -107,8 +107,13 @@ impl fmt::Display for ApiClientError {
 impl std::error::Error for ApiClientError {}
 
 fn tls_config_from_env() -> Result<Option<TlsConfig>, ApiClientError> {
-    let Some(path) = std::env::var(CA_BUNDLE_ENV)
-        .ok()
+    tls_config_from_path(std::env::var(CA_BUNDLE_ENV).ok().as_deref())
+}
+
+/// [`tls_config_from_env`] over an injected value, so bundle parsing and its
+/// error reporting are testable without mutating the process environment.
+fn tls_config_from_path(raw: Option<&str>) -> Result<Option<TlsConfig>, ApiClientError> {
+    let Some(path) = raw
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
     else {
@@ -143,14 +148,19 @@ fn tls_config_from_env() -> Result<Option<TlsConfig>, ApiClientError> {
 /// Honors `FALLOW_API_URL` for staging/local development. Trailing slashes on
 /// the base are trimmed so `/v1/...` paths never double-slash.
 pub fn api_url(path: &str) -> String {
-    let base = std::env::var("FALLOW_API_URL")
-        .ok()
+    api_url_with_base(std::env::var("FALLOW_API_URL").ok().as_deref(), path)
+}
+
+/// [`api_url`] over an injected base, so the override and default precedence is
+/// testable without mutating the process environment.
+fn api_url_with_base(base: Option<&str>, path: &str) -> String {
+    let base = base
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+        .unwrap_or(DEFAULT_API_URL);
     format!("{}{path}", base.trim_end_matches('/'))
 }
 
-/// Structured error payload returned by fallow cloud on non-2xx responses.
+/// Structured error payload returned by Fallow Cloud on non-2xx responses.
 #[derive(Debug, Deserialize, Default)]
 pub struct ErrorEnvelope {
     /// Machine-readable code (e.g. `rate_limit_exceeded`, `payload_too_large`).
@@ -267,14 +277,33 @@ fn clamp_retry_delay(delay: Duration) -> Duration {
     delay.min(Duration::from_secs(RETRY_MAX_WAIT_SECONDS))
 }
 
+/// Backend error code for a stored license JWT the cloud considers too far
+/// past expiry to refresh. `fallow license refresh` retries such a response
+/// with a full-access API key before giving up.
+pub const TOKEN_STALE_CODE: &str = "token_stale";
+
+/// The recovery path for `fallow license refresh` when the stored license JWT
+/// cannot be exchanged for a fresh one. Declared as a macro so it can be
+/// `concat!`-ed into the `&'static str` hints below and still be referenced as
+/// a plain value through [`LICENSE_API_KEY_RECOVERY`].
+macro_rules! license_api_key_recovery {
+    () => {
+        "set FALLOW_API_KEY to a full-access key and run `fallow license refresh` again (generate one at https://fallow.cloud/settings#api-keys)"
+    };
+}
+
+/// See [`license_api_key_recovery`].
+pub const LICENSE_API_KEY_RECOVERY: &str = license_api_key_recovery!();
+
 /// Map a backend error-code + operation pair to an actionable user-facing
 /// hint. Returns `None` for unknown codes; callers fall back to the generic
 /// "HTTP N: body" shape produced by [`http_status_message`].
 pub fn actionable_error_hint(operation: &str, code: &str) -> Option<&'static str> {
     match (operation, code) {
-        ("refresh", "token_stale") => Some(
-            "your stored license is too stale to refresh. Reactivate with: fallow license activate --trial --email <addr>",
-        ),
+        ("refresh", "token_stale") => Some(concat!(
+            "your stored license is too stale to refresh: ",
+            license_api_key_recovery!()
+        )),
         ("refresh", "invalid_token") => Some(
             "your stored license token is missing required claims. Reactivate with: fallow license activate --trial --email <addr>",
         ),
@@ -430,23 +459,50 @@ const fn is_token_byte(byte: u8) -> bool {
     matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'=')
 }
 
-/// Format a non-2xx response into a user-facing error string.
+/// A non-2xx fallow-cloud response, split into the machine-readable backend
+/// code and the user-facing message rendered from it.
+///
+/// The body can only be read once, so callers that need to branch on the code
+/// (for example the license-refresh credential fallback) take both halves from
+/// a single [`http_status_failure`] call.
+#[derive(Debug)]
+pub struct HttpFailure {
+    /// Backend `code` from the error envelope, when the body carried one.
+    pub code: Option<String>,
+    /// User-facing message, identical to what [`http_status_message`] renders.
+    pub message: String,
+}
+
+/// Read a non-2xx response into its backend code plus a user-facing message.
 ///
 /// Tries to parse the body as an [`ErrorEnvelope`]. When the envelope has a
 /// known `code` for the given `operation`, the mapped hint is returned with
 /// the HTTP status and code appended. Otherwise the backend's `message`
 /// (or raw body) is appended to a generic "HTTP N" line.
-pub fn http_status_message(response: &mut impl ResponseBodyReader, operation: &str) -> String {
+pub fn http_status_failure(response: &mut impl ResponseBodyReader, operation: &str) -> HttpFailure {
     let status = response.status();
     let body = response.read_to_string().unwrap_or_default();
     let envelope = parse_error_envelope(&body);
-    if let Some(code) = envelope.code()
-        && let Some(hint) = actionable_error_hint(operation, code)
-    {
-        return format!("{hint} (HTTP {status}, code {code})");
-    }
-    let body_suffix = response_message_suffix(&body, &envelope);
-    format!("{operation} request failed with HTTP {status}{body_suffix}")
+    let code = envelope.code().map(str::to_owned);
+    let hint = code
+        .as_deref()
+        .and_then(|code| actionable_error_hint(operation, code).map(|hint| (hint, code)));
+    let message = match hint {
+        Some((hint, code)) => format!("{hint} (HTTP {status}, code {code})"),
+        None => {
+            let body_suffix = response_message_suffix(&body, &envelope);
+            format!("{operation} request failed with HTTP {status}{body_suffix}")
+        }
+    };
+    HttpFailure { code, message }
+}
+
+/// Format a non-2xx response into a user-facing error string.
+///
+/// Thin wrapper over [`http_status_failure`] for callers that do not branch on
+/// the backend code.
+pub fn http_status_message(response: &mut impl ResponseBodyReader, operation: &str) -> String {
+    http_status_failure(response, operation).message
 }
 
 #[cfg(test)]
@@ -473,17 +529,43 @@ mod tests {
     }
 
     #[test]
-    fn refresh_token_stale_hint_points_to_reactivation() {
+    fn refresh_token_stale_hint_points_to_the_api_key_route() {
         let mut response = StubResponse {
             status: 401,
             body: r#"{"error":true,"message":"token stale","code":"token_stale"}"#.to_owned(),
         };
         let message = http_status_message(&mut response, "refresh");
         assert!(
-            message.contains("Reactivate with: fallow license activate --trial"),
-            "expected reactivation hint, got: {message}"
+            message.contains(LICENSE_API_KEY_RECOVERY),
+            "expected the API-key recovery route, got: {message}"
+        );
+        assert!(
+            !message.contains("--trial"),
+            "a stale token cannot be recovered through the trial flow, got: {message}"
         );
         assert!(message.contains("token_stale"));
+    }
+
+    #[test]
+    fn http_status_failure_exposes_the_backend_code_with_the_message() {
+        let mut response = StubResponse {
+            status: 401,
+            body: r#"{"error":true,"code":"token_stale"}"#.to_owned(),
+        };
+        let failure = http_status_failure(&mut response, "refresh");
+        assert_eq!(failure.code.as_deref(), Some(TOKEN_STALE_CODE));
+        assert!(failure.message.contains(LICENSE_API_KEY_RECOVERY));
+    }
+
+    #[test]
+    fn http_status_failure_reports_no_code_when_the_body_carries_none() {
+        let mut response = StubResponse {
+            status: 500,
+            body: "upstream exploded".to_owned(),
+        };
+        let failure = http_status_failure(&mut response, "refresh");
+        assert!(failure.code.is_none());
+        assert!(failure.message.contains("HTTP 500"));
     }
 
     #[test]
@@ -610,27 +692,12 @@ mod tests {
     }
 
     #[test]
-    #[expect(unsafe_code, reason = "env var mutation requires unsafe")]
     fn ca_bundle_read_errors_are_reported_as_client_setup_errors() {
-        let prior = std::env::var(CA_BUNDLE_ENV).ok();
-        // SAFETY: This test owns the CA_BUNDLE_ENV mutation and restores the
-        // previous value before returning.
-        unsafe {
-            std::env::set_var(CA_BUNDLE_ENV, "/definitely/missing/fallow-ca.pem");
-        }
-        let err = try_api_agent().expect_err("missing bundle should fail");
+        let err = tls_config_from_path(Some("/definitely/missing/fallow-ca.pem"))
+            .expect_err("missing bundle should fail");
         let message = err.to_string();
         assert!(message.contains(CA_BUNDLE_ENV));
         assert!(message.contains("failed to read PEM bundle"));
-        // SAFETY: Restore the process environment to the value captured before
-        // the test mutation.
-        unsafe {
-            if let Some(value) = prior {
-                std::env::set_var(CA_BUNDLE_ENV, value);
-            } else {
-                std::env::remove_var(CA_BUNDLE_ENV);
-            }
-        }
     }
 
     #[test]
@@ -703,6 +770,7 @@ mod tests {
     #[test]
     fn token_leak_authenticated_ureq_paths_stay_sanitized() {
         const CLOUD_CLIENT: &str = include_str!("coverage/cloud_client.rs");
+        const CLOUD_TRANSPORT: &str = include_str!("coverage/cloud_transport.rs");
         const UPLOAD_INVENTORY: &str = include_str!("coverage/upload_inventory.rs");
         const UPLOAD_SOURCE_MAPS: &str = include_str!("coverage/upload_source_maps.rs");
         const LICENSE: &str = include_str!("license/mod.rs");
@@ -710,13 +778,18 @@ mod tests {
 
         assert_eq!(
             count_occurrences(CLOUD_CLIENT, ".header(\"Authorization\""),
-            1,
-            "update this guard when cloud runtime-context auth paths change"
+            0,
+            "cloud reads must authenticate through coverage/cloud_transport.rs"
+        );
+        assert_eq!(
+            count_occurrences(CLOUD_TRANSPORT, ".header(\"Authorization\""),
+            2,
+            "update this guard when cloud read auth paths change"
         );
         assert_contains(
-            CLOUD_CLIENT,
-            "sanitize_network_error(&format!(\"{err}\"))",
-            "cloud runtime-context transport errors must be sanitized",
+            CLOUD_TRANSPORT,
+            "sanitize_network_error(&err.to_string())",
+            "cloud read transport errors must be sanitized",
         );
 
         assert_eq!(
@@ -773,9 +846,22 @@ mod tests {
     fn token_leak_credential_debug_impls_stay_redacted() {
         const ANALYZE: &str = include_str!("coverage/analyze.rs");
         const CLOUD_CLIENT: &str = include_str!("coverage/cloud_client.rs");
+        const CLOUD_TRANSPORT: &str = include_str!("coverage/cloud_transport.rs");
+        const CLOUD_READS: &str = include_str!("coverage/cloud_reads.rs");
         const UPLOAD_INVENTORY: &str = include_str!("coverage/upload_inventory.rs");
         const LICENSE: &str = include_str!("license/mod.rs");
 
+        assert_manual_debug_mask(CLOUD_TRANSPORT, "CloudAuth", r#".field("api_key", &"***")"#);
+        assert_manual_debug_mask(
+            CLOUD_READS,
+            "ReviewPacketArgs",
+            r#".field("api_key", &self.api_key.as_ref().map(|_| "***"))"#,
+        );
+        assert_manual_debug_mask(
+            CLOUD_READS,
+            "DeploymentChangesArgs",
+            r#".field("api_key", &self.api_key.as_ref().map(|_| "***"))"#,
+        );
         assert_manual_debug_mask(
             ANALYZE,
             "AnalyzeArgs",
@@ -791,6 +877,11 @@ mod tests {
             LICENSE,
             "ActivateArgs",
             r#".field("raw_jwt", &self.raw_jwt.as_ref().map(|_| "***"))"#,
+        );
+        assert_manual_debug_mask(
+            LICENSE,
+            "RefreshArgs",
+            r#".field("api_key", &self.api_key.as_ref().map(|_| "***"))"#,
         );
     }
 
@@ -819,37 +910,18 @@ mod tests {
     }
 
     #[test]
-    #[expect(unsafe_code, reason = "env var mutation requires unsafe")]
     fn api_url_respects_env_override_and_default() {
-        let prior = std::env::var("FALLOW_API_URL").ok();
-
-        // SAFETY: This test owns the FALLOW_API_URL mutation while validating
-        // default URL behavior.
-        unsafe {
-            std::env::remove_var("FALLOW_API_URL");
-        }
         assert_eq!(
-            api_url("/v1/coverage/repo/inventory"),
+            api_url_with_base(None, "/v1/coverage/repo/inventory"),
             "https://api.fallow.cloud/v1/coverage/repo/inventory",
         );
-
-        // SAFETY: Set a scoped override for this test case only.
-        unsafe {
-            std::env::set_var("FALLOW_API_URL", "http://127.0.0.1:3000/");
-        }
         assert_eq!(
-            api_url("/v1/coverage/a/inventory"),
+            api_url_with_base(Some("   "), "/v1/coverage/repo/inventory"),
+            "https://api.fallow.cloud/v1/coverage/repo/inventory",
+        );
+        assert_eq!(
+            api_url_with_base(Some("http://127.0.0.1:3000/"), "/v1/coverage/a/inventory"),
             "http://127.0.0.1:3000/v1/coverage/a/inventory",
         );
-
-        // SAFETY: Restore the process environment to the value captured before
-        // the test mutation.
-        unsafe {
-            if let Some(value) = prior {
-                std::env::set_var("FALLOW_API_URL", value);
-            } else {
-                std::env::remove_var("FALLOW_API_URL");
-            }
-        }
     }
 }

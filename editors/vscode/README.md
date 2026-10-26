@@ -1,18 +1,20 @@
 # Fallow for VS Code
 
-Codebase intelligence for TypeScript and JavaScript. Real-time diagnostics for unused code, duplication, circular dependencies, complexity hotspots, architecture drift, and design-system styling, with optional runtime evidence via Fallow Runtime. Powered by [fallow](https://docs.fallow.tools).
+Codebase intelligence for TypeScript and JavaScript. Real-time diagnostics for unused code, duplication, circular dependencies, complexity hotspots, architecture drift, and design-system styling, with optional production coverage via Fallow Cloud. Powered by [fallow](https://fallow.tools/docs/).
 
 ## Features
 
 - **Real-time diagnostics** via the fallow LSP server: unused files, exports, types, dependencies, enum/class members, unresolved imports, unlisted deps, duplicate exports, circular dependencies, and code duplication
+- **Component health hints** (opt-in): when you turn on the `prop-drilling`, `thin-wrapper` or `duplicate-prop-shape` rule in your Fallow config, each finding shows as a hint on the component and in the sidebar tree. The hints do not add to the issue count.
+- **Config pattern checks**: an `ignoreDependencies` glob or an `ignoreFindings` pattern that matched nothing gets an information diagnostic on its entry in the config file (`.fallowrc.json`, `.fallowrc.jsonc`, `fallow.toml`, or the file in the `extends` chain that declares the list)
 - **Quick-fix code actions**: remove unused exports, delete unused files
 - **Refactor code actions**: extract duplicate code into a shared function
-- **Code Lens**: reference counts above each export declaration with click-to-navigate (opens Peek References panel)
+- **Code Lens**: the number of importing files above each used export declaration, with click-to-navigate (opens Peek References panel)
 - **Hover information**: export usage status, unused status, and duplicate block locations
 - **Tree views**: browse unused code by issue type and duplicates by clone family in the sidebar
-- **Health view**: project health score and grade, complexity findings (click to open `file:line`), plus churn-and-complexity hotspot candidates and refactoring candidates (framed as heuristics to verify, not facts). Runs a separate, lazy `fallow health` analysis only when the view is first opened, so it never slows the editor or the other views.
-- **Security Candidates view** (opt-in): surfaces local `client-server-leak` and tainted-sink CWE findings from `fallow security` as UNVERIFIED candidates for you or an AI agent to verify, never confirmed vulnerabilities. Off by default; enabling it runs a separate `fallow security` scan only when the view is opened, so it never slows the editor or the other views.
-- **Runtime Coverage view**: point Fallow at a local runtime-coverage capture to see hot paths and cleanup candidates (safe-to-delete and review-required), framed as candidates to verify, not facts. Local-only and offline (cloud/continuous monitoring is never invoked). Requires the fallow-cov sidecar (and a runtime-coverage license or trial when a license is present): run `fallow coverage setup` first. Loads only when you point it at a capture, so it never slows the editor or the other views.
+- **Health view**: project health score and grade, complexity findings (click to open `file:line`), plus churn-and-complexity hotspot candidates and refactoring candidates (framed as heuristics to verify, not facts). Runs a separate `fallow health` analysis when the view is first opened.
+- **Security Candidates view** (opt-in): surfaces local `client-server-leak` and tainted-sink CWE findings from `fallow security` as UNVERIFIED candidates for you or an AI agent to verify, never confirmed vulnerabilities. Off by default. When enabled, it runs a separate `fallow security` scan when the view is opened.
+- **Runtime Coverage view**: point Fallow at a local runtime-coverage capture to see hot paths and cleanup candidates (safe-to-delete and review-required), framed as candidates to verify, not facts. Local-only and offline (cloud/continuous monitoring is never invoked). Requires the fallow-cov sidecar (and a runtime-coverage license or trial when a license is present): run `fallow coverage setup` first. Loads only when you point it at a capture.
 - **Status bar**: see total issue count and duplication percentage at a glance, with an optional health score/grade segment (e.g. `health: B (82)`)
 - **Audit verdict status bar** (on by default): run `Fallow: Audit Changed Files` to get a pass/warn/fail verdict for your current change set, shown in a dedicated status-bar item with a gating-candidate count and a per-category tooltip breakdown. Opt into re-running it on every JS/TS save with `fallow.audit.runOnSave`. The verdict is the CLI's own gate result; findings are static candidates to verify.
 - **License management**: activate, refresh, or deactivate a Fallow license without leaving the editor, with an optional status-bar indicator showing your tier and expiry. The activation token travels only via the CLI's stdin (never the command line), and the indicator probes status passively, so it never blocks startup.
@@ -31,7 +33,7 @@ code --install-extension fallow-rs.fallow-vscode
 
 ### Manual
 
-1. Install the `fallow` npm package or the standalone `fallow` / `fallow-lsp` binaries (see [fallow installation](https://docs.fallow.tools/installation))
+1. Install the `fallow` npm package or the standalone `fallow` / `fallow-lsp` binaries (see [fallow installation](https://fallow.tools/docs/installation/))
 2. Install the extension VSIX file: `code --install-extension fallow-vscode-*.vsix`
 
 ## Commands
@@ -58,6 +60,10 @@ code --install-extension fallow-rs.fallow-vscode
 | `Fallow: Show License Status` | Show the active license tier, seats, features, and days remaining |
 | `Fallow: Refresh License` | Fetch a fresh license token from `api.fallow.cloud` and persist it locally |
 | `Fallow: Deactivate License` | Remove the local license file |
+
+### Copying a finding id
+
+A dead-code squiggle has a **Quick Fix** "Copy Fallow finding id". It copies the stable `finding_id` of the finding (for example `dc1:unused-export:0123456789abcdef`) to the clipboard. The id is the same as the `finding_id` field in `fallow dead-code --format json`, so you can find the same finding in a report. The id does not change when code above the finding moves. A security candidate squiggle has the same Quick Fix. Its id is the `finding_id` field in `fallow security --format json` (16 hex digits). A security id contains the line and column, so it changes when code above the finding moves.
 
 ### Muting Fallow's editor squiggles
 
@@ -86,21 +92,25 @@ Mute state is stored in the workspace, so it survives reload but does not bleed 
 | `fallow.duplication.skipLocal` | `false` | Only report duplicate code that appears across different directories. |
 | `fallow.duplication.crossLanguage` | `false` | Compare TypeScript and JavaScript files after stripping TypeScript type annotations. |
 | `fallow.duplication.ignoreImports` | `false` | Exclude import declarations from duplicate-code detection. |
+| `fallow.duplication.ignoreSymlinks` | `false` | Omit clone instances whose path is a symlink or lies under a symlinked directory. When unset, the project config decides. |
 | `fallow.health.enabled` | `true` | Show the Fallow Health view (score and grade, complexity findings, hotspot candidates, refactoring candidates). When off, the Health view stays empty and no extra analysis runs. |
-| `fallow.health.hotspots` | `true` | Include git churn hotspots in the Health view. Hotspot analysis walks git history; disable on very large repositories to keep the Health refresh fast. Has no effect outside a git repository. |
+| `fallow.health.hotspots` | `true` | Show git churn hotspots in the Health view. Refactoring targets still use git history when this is disabled. Hotspots require a git repository. |
 | `fallow.health.topFindings` | `20` | Maximum number of complexity findings shown in the Health view (passed to `fallow health --top`). |
 | `fallow.health.statusBar` | `true` | Show the project health score and grade in the Fallow status bar item. |
 | `fallow.health.inlineComplexity` | `false` | Show LSP code lenses above functions that exceed Fallow Health cyclomatic or cognitive thresholds. Off by default to keep editor chrome unchanged. |
-| `fallow.security.enabled` | `false` | Show the Security Candidates view and surface local `client-server-leak` and tainted-sink CWE findings from `fallow security`. Off by default. Findings are UNVERIFIED candidates to verify, never confirmed vulnerabilities. When enabled, the scan runs only when the view is opened, so it never slows the main sidebar. |
+| `fallow.security.enabled` | `false` | Show the Security Candidates view and surface local `client-server-leak` and tainted-sink CWE findings from `fallow security`. Off by default. Findings are UNVERIFIED candidates to verify, never confirmed vulnerabilities. When enabled, the scan runs only when the view is opened. |
 | `fallow.coverage.capturePath` | `""` | Path to a local runtime-coverage capture (a file or directory) for the Runtime Coverage view. Relative paths resolve from the workspace root. Local-only and offline. Requires the fallow-cov sidecar (run `fallow coverage setup` first). Empty prompts you to pick a capture on first load. |
 | `fallow.coverage.top` | `0` | Show only the top N hot paths and findings in the Runtime Coverage view (mirrors the CLI's `--top`). `0` (the default) means no limit. |
 | `fallow.license.showStatusBar` | `true` | Show a Fallow license indicator in the status bar. Disable to remove the indicator and skip the license status probe on activation. |
 | `fallow.license.refreshOnStartup` | `false` | Probe license status once when the extension activates. Off by default so the editor never shells out to fallow on startup unless you opt in; the indicator otherwise updates only when you run a Fallow license command. |
 | `fallow.production` | `false` | Production mode: exclude test/dev files, only production scripts. |
+| `fallow.packageBaselines` | `true` | Apply the per-package refs of `workspaces.changedSince` from the Fallow config. Turn off to analyze every workspace package in full scope, mirroring the CLI's `--no-package-baselines`. `fallow.changedSince` takes precedence when set. Needs Fallow 3.31.0 or newer. |
 | `fallow.changedSince` | `""` | Git ref (tag, branch, or SHA) to scope the Problems panel and sidebar to files changed since that ref, mirroring the CLI's `--changed-since`. Run **Fallow: Set Baseline at HEAD** in a single-folder workspace to create and configure `fallow-baseline` safely. |
 | `fallow.audit.gate` | `"new-only"` | Which findings affect the audit verdict. `new-only` fails only on findings introduced by the current change set (runs an extra base-snapshot pass); `all` fails on every finding in changed files. Mirrors `fallow audit --gate`. |
+| `fallow.audit.worsened` | `"auto"` | How an inherited complexity finding that got worse affects the audit verdict. `auto` uses `audit.worsened` from the project config. `warn` makes the verdict at least warn, `error` counts the finding like an introduced finding, and `off` reports only growth of an exceeded metric as worsened. Mirrors `fallow audit --worsened`. Needs Fallow 3.34.2 or newer. An older CLI ignores the setting and writes a note to the output channel. |
 | `fallow.audit.statusBar.enabled` | `true` | Show the audit verdict (pass/warn/fail) for the current change set in the status bar. Toggling takes effect immediately, no window reload needed. |
 | `fallow.audit.runOnSave` | `false` | Re-run the audit verdict automatically when a JS/TS file is saved. Off by default to avoid added latency; the **Fallow: Audit Changed Files** command and the status-bar item run it on demand. |
+| `fallow.typeAware.timeoutSeconds` | `0` | Wall clock in seconds allowed for one semantic request when `fallow.typeAware.enabled` is on, forwarded to the CLI as `FALLOW_TYPE_AWARE_TIMEOUT_SECS`. A semantic query scans the whole TypeScript program, so a very large program can need more than the 120-second default. `0` keeps the CLI default and any value already set in the environment. |
 | `fallow.trace.server` | `"off"` | LSP trace level: `off`, `messages`, or `verbose`. |
 
 ## Binary resolution

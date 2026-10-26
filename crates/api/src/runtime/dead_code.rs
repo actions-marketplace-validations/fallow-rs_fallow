@@ -3,32 +3,35 @@ use std::time::Instant;
 
 use fallow_config::ProductionAnalysis;
 use fallow_engine::{
+    change_scope::ChangeScope,
     dead_code::DeadCodeAnalysisArtifacts,
     project_config::{ProjectConfig, ProjectConfigOptions},
     session::AnalysisSession,
 };
 use fallow_output::{
-    CHECK_SCHEMA_VERSION, CheckOutputInput, DeadCodeNextStepsInput, DiffIndex, build_check_output,
+    CheckEnvelope, CheckOutputInput, DeadCodeNextStepsInput, architecture_meta, build_check_output,
     build_dead_code_next_steps, check_meta,
 };
 use fallow_types::output_format::OutputFormat;
 use fallow_types::path_util::is_absolute_path_any_platform;
-use fallow_types::results::{AnalysisResults, TraceHopRole};
+use fallow_types::results::AnalysisResults;
 use rustc_hash::FxHashSet;
 
 use crate::{
-    AnalysisOptions, BoundaryViolationsProgrammaticOutput, CircularDependenciesProgrammaticOutput,
-    DeadCodeFilters, DeadCodeOptions, DeadCodeProgrammaticOutput, ProgrammaticError,
+    AnalysisOptions, ArchitectureOptions, ArchitectureProgrammaticOutput,
+    BoundaryViolationsProgrammaticOutput, CircularDependenciesProgrammaticOutput, DeadCodeFilters,
+    DeadCodeOptions, DeadCodeProgrammaticOutput, ProgrammaticError,
     analysis_context::{
-        ProgrammaticAnalysisContext, changed_files_for_run,
-        resolve_programmatic_analysis_context_deferred_workspace, workspace_roots_for_session,
+        ProgrammaticAnalysisContext, changed_files_for_run, resolve_programmatic_analysis_context,
+        workspace_roots_for_session,
     },
     next_steps::{
-        default_workspace_ref_for_workspaces, setup_pointer_applicable, suggestions_enabled,
+        audit_changed_applicable, default_workspace_ref_for_workspaces, setup_pointer_applicable,
+        suggestions_enabled,
     },
 };
 
-use super::{ProgrammaticResult, root_envelope_mode};
+use super::ProgrammaticResult;
 
 pub(super) struct DeadCodeProgrammaticRunWithArtifacts {
     pub output: DeadCodeProgrammaticOutput,
@@ -41,10 +44,209 @@ pub(super) struct DeadCodeProgrammaticRunWithArtifacts {
 ///
 /// Returns a structured programmatic error for unsupported options, invalid
 /// options, config load failures, analysis failures, or git changed-file
-/// failures.
+/// failures. When the environment or `typeAware.enabled` turns on type-aware
+/// analysis that the options leave off, it returns
+/// [`super::TYPE_AWARE_CONFIG_UNSUPPORTED`].
 pub fn run_dead_code(options: &DeadCodeOptions) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
-    resolved.install(|| run_dead_code_inner(options, &resolved, |_| {}))
+    run_dead_code_with_baseline(options, None)
+}
+
+/// Run dead-code analysis and hide the findings of a saved dead-code baseline.
+///
+/// The baseline is the file that `fallow dead-code --save-baseline` writes. It
+/// is applied by the same engine function as `fallow dead-code --baseline`, so
+/// both hide the same findings. A file that another command saved suppresses
+/// nothing, as on the CLI.
+///
+/// # Errors
+///
+/// Returns the errors of [`run_dead_code`], and a structured error when the
+/// baseline cannot be read, is not valid, or was saved with an incompatible
+/// analysis identity.
+pub fn run_dead_code_with_baseline(
+    options: &DeadCodeOptions,
+    baseline: Option<&Path>,
+) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    reject_config_type_aware(options, &resolved)?;
+    run_dead_code_in_context(options, baseline, &resolved)
+}
+
+/// `fallow dead-code` turns type-aware analysis on from the environment and
+/// `typeAware.enabled`. The typed route runs it only on request, see
+/// [`super::TYPE_AWARE_CONFIG_UNSUPPORTED`].
+fn reject_config_type_aware(
+    options: &DeadCodeOptions,
+    resolved: &ProgrammaticAnalysisContext,
+) -> ProgrammaticResult<()> {
+    super::type_aware_config::reject_config_type_aware(
+        &options.analysis.type_aware,
+        resolved,
+        super::type_aware_config::TypeAwareCommand::Analysis,
+    )
+}
+
+/// Run dead-code analysis in a context that the caller resolved. Audit uses
+/// this to hand the change scope of every section to itself.
+pub(super) fn run_dead_code_in_context(
+    options: &DeadCodeOptions,
+    baseline: Option<&Path>,
+    resolved: &ProgrammaticAnalysisContext,
+) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
+    resolved.install(|| {
+        let start = Instant::now();
+        resolved.ensure_not_cancelled("config load and file discovery")?;
+        let finding_ids = parse_finding_ids(options)?;
+        let session = load_dead_code_session(options, resolved)?;
+        resolve_package_map_before_analysis(resolved, &session)?;
+        let (mut results, finished) =
+            analyze_dead_code_results(options, resolved, &session, finding_ids)?;
+        let FinishedDeadCode {
+            type_aware_meta,
+            mut finding_id_trace,
+            change_reason,
+            package_baselines,
+        } = finished;
+        if let Some(trace) = finding_id_trace.as_mut() {
+            trace.start_stage(&mut results);
+        }
+        let install_state = match baseline {
+            Some(baseline) => apply_baseline(
+                &mut results,
+                baseline,
+                session.root(),
+                type_aware_meta.as_ref(),
+            )?,
+            None => None,
+        };
+        let finding_id_query = finding_id_trace.map(|mut trace| {
+            trace.end_stage(&mut results);
+            trace.finish(
+                &mut results,
+                session.config(),
+                finding_id_run_reasons(
+                    options,
+                    resolved,
+                    &session,
+                    RunScope {
+                        change_reason,
+                        baseline: baseline.is_some(),
+                    },
+                ),
+            )
+        });
+        let mut output = build_dead_code_programmatic_output(
+            options,
+            resolved,
+            &session,
+            DeadCodeReport {
+                results,
+                type_aware_meta,
+                package_baselines,
+            },
+            start,
+            CheckEnvelope::DeadCode,
+        );
+        output.output.finding_id_query = finding_id_query;
+        output.output.workspace_diagnostics.extend(install_state);
+        Ok(output)
+    })
+}
+
+/// Validate `finding_ids`. A malformed id is an error, so a typo never reads
+/// as "the finding is gone".
+fn parse_finding_ids(
+    options: &DeadCodeOptions,
+) -> ProgrammaticResult<Option<fallow_engine::dead_code::FindingIdFilter>> {
+    fallow_engine::dead_code::FindingIdFilter::parse(&options.finding_ids).map_err(|message| {
+        ProgrammaticError::new(message, 2)
+            .with_code("FALLOW_INVALID_FINDING_ID")
+            .with_context("findingIds")
+    })
+}
+
+/// Refuse `finding_ids` on the analyses that narrow the result to one issue
+/// family: a missing id there says nothing about the other families.
+fn reject_finding_ids(options: &DeadCodeOptions) -> ProgrammaticResult<()> {
+    if options.finding_ids.is_empty() {
+        return Ok(());
+    }
+    Err(
+        ProgrammaticError::new("findingIds is supported only by the dead-code analysis", 2)
+            .with_code("FALLOW_UNSUPPORTED_OPTION")
+            .with_context("findingIds"),
+    )
+}
+
+/// The run facts that finding-id reasons read beyond the options.
+#[derive(Clone, Copy)]
+struct RunScope {
+    /// The change channel that narrowed the run: a global ref or the package
+    /// map.
+    change_reason: Option<fallow_output::ScopeReason>,
+    /// A saved baseline hid findings.
+    baseline: bool,
+}
+
+/// The options of this run that can hide a finding without a fix. Mirrors the
+/// CLI list: the scope channels, the issue-type filters, production mode and
+/// the baseline.
+fn finding_id_run_reasons(
+    options: &DeadCodeOptions,
+    resolved: &ProgrammaticAnalysisContext,
+    session: &AnalysisSession,
+    run: RunScope,
+) -> Vec<fallow_output::FindingIdQueryReason> {
+    use fallow_output::FindingIdQueryReason as Reason;
+
+    [
+        (resolved.diff.is_some(), Reason::Diff),
+        (
+            run.change_reason == Some(fallow_output::ScopeReason::ChangedSince)
+                || options.analysis.ambient_changed_since.is_some(),
+            Reason::ChangedSince,
+        ),
+        (
+            run.change_reason == Some(fallow_output::ScopeReason::PackageBaselines),
+            Reason::PackageBaselines,
+        ),
+        (resolved.workspace().is_some(), Reason::Workspace),
+        (
+            resolved.changed_workspaces().is_some(),
+            Reason::ChangedWorkspaces,
+        ),
+        (!options.files.is_empty(), Reason::File),
+        (options.filters.any_active(), Reason::IssueTypeFilter),
+        (session.config().production, Reason::Production),
+        (
+            session.config().include_entry_exports,
+            Reason::IncludeEntryExports,
+        ),
+        (run.baseline, Reason::Baseline),
+    ]
+    .into_iter()
+    .filter_map(|(active, reason)| active.then_some(reason))
+    .collect()
+}
+
+/// Turn an engine failure into a programmatic error, keeping a cancelled run
+/// distinguishable from a failed one.
+///
+/// The engine's cancellation message already names the pipeline boundary the
+/// run stopped at, so it is carried through rather than replaced.
+pub(super) fn map_engine_error(
+    err: &fallow_engine::EngineError,
+    failure_message: &str,
+    failure_code: &'static str,
+    context: &'static str,
+) -> ProgrammaticError {
+    if err.is_cancelled() {
+        return crate::analysis_context::cancelled_error_message(err.message())
+            .with_context(context);
+    }
+    ProgrammaticError::new(format!("{failure_message}: {err}"), 2)
+        .with_code(failure_code)
+        .with_context(context)
 }
 
 /// Run circular-dependency analysis and return typed API output before JSON.
@@ -55,9 +257,48 @@ pub fn run_dead_code(options: &DeadCodeOptions) -> ProgrammaticResult<DeadCodePr
 pub fn run_circular_dependencies(
     options: &DeadCodeOptions,
 ) -> ProgrammaticResult<CircularDependenciesProgrammaticOutput> {
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    reject_finding_ids(options)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    reject_config_type_aware(options, &resolved)?;
     resolved.install(|| {
         run_dead_code_inner(options, &resolved, keep_circular_dependencies).map(Into::into)
+    })
+}
+
+/// Run the analysis of `fallow architecture` and return typed API output
+/// before JSON: import cycles, boundary violations and rule-pack policy
+/// violations.
+///
+/// The selectors keep one kind each, and no selector keeps all of them, as on
+/// the CLI. The output is the dead-code envelope with the `architecture`
+/// schema version, the architecture `_meta` and next steps that name
+/// `fallow architecture`.
+///
+/// # Errors
+///
+/// Returns the same structured errors as [`run_dead_code`].
+pub fn run_architecture(
+    options: &ArchitectureOptions,
+) -> ProgrammaticResult<ArchitectureProgrammaticOutput> {
+    let dead_code = options.dead_code_options();
+    let resolved = resolve_programmatic_analysis_context(&dead_code.analysis)?;
+    resolved.install(|| {
+        let start = Instant::now();
+        resolved.ensure_not_cancelled("config load and file discovery")?;
+        let session = load_dead_code_session(&dead_code, &resolved)?;
+        resolve_package_map_before_analysis(&resolved, &session)?;
+        run_dead_code_with_changed_files(
+            &dead_code,
+            &resolved,
+            &session,
+            SessionRun {
+                changed_files: None,
+                start,
+                envelope: CheckEnvelope::Architecture,
+            },
+            |_| {},
+        )
+        .map(Into::into)
     })
 }
 
@@ -69,7 +310,9 @@ pub fn run_circular_dependencies(
 pub fn run_boundary_violations(
     options: &DeadCodeOptions,
 ) -> ProgrammaticResult<BoundaryViolationsProgrammaticOutput> {
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    reject_finding_ids(options)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    reject_config_type_aware(options, &resolved)?;
     resolved.install(|| {
         run_dead_code_inner(options, &resolved, keep_boundary_violations).map(Into::into)
     })
@@ -81,7 +324,9 @@ fn run_dead_code_inner(
     post_filter: impl FnOnce(&mut AnalysisResults),
 ) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
     let start = Instant::now();
+    resolved.ensure_not_cancelled("config load and file discovery")?;
     let session = load_dead_code_session(options, resolved)?;
+    resolve_package_map_before_analysis(resolved, &session)?;
     run_dead_code_with_session(options, resolved, &session, None, post_filter, start)
 }
 
@@ -93,33 +338,157 @@ pub(super) fn run_dead_code_with_session(
     post_filter: impl FnOnce(&mut AnalysisResults),
     start: Instant,
 ) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
-    let analysis = session.analyze_dead_code().map_err(|err| {
-        ProgrammaticError::new(format!("dead-code analysis failed: {err}"), 2)
-            .with_code("FALLOW_DEAD_CODE_FAILED")
-            .with_context("dead-code")
-    })?;
-    let mut results = analysis.results;
-    let unfiltered_unused_files = results.unused_files.clone();
-
-    apply_dead_code_scope(options, resolved, session, changed_files, &mut results)?;
-    apply_dead_code_filters(&options.filters, &mut results);
-    post_filter(&mut results);
-    let type_aware_meta = refine_with_unfiltered_unused_files(
-        &options.analysis.type_aware,
-        &options.filters,
+    run_dead_code_with_changed_files(
+        options,
+        resolved,
         session,
-        &mut results,
-        unfiltered_unused_files,
-    )?;
+        SessionRun {
+            changed_files,
+            start,
+            envelope: CheckEnvelope::DeadCode,
+        },
+        post_filter,
+    )
+}
 
+/// The run facts of one session run that are not options: the changed-file
+/// set, the start time, and the member of the dead-code family that writes
+/// the output.
+#[derive(Clone, Copy)]
+struct SessionRun<'a> {
+    changed_files: Option<&'a FxHashSet<std::path::PathBuf>>,
+    start: Instant,
+    envelope: CheckEnvelope,
+}
+
+fn run_dead_code_with_changed_files(
+    options: &DeadCodeOptions,
+    resolved: &ProgrammaticAnalysisContext,
+    session: &AnalysisSession,
+    run: SessionRun<'_>,
+    post_filter: impl FnOnce(&mut AnalysisResults),
+) -> ProgrammaticResult<DeadCodeProgrammaticOutput> {
+    let SessionRun {
+        changed_files,
+        start,
+        envelope,
+    } = run;
+    resolved.ensure_not_cancelled("dead-code analysis")?;
+    let mut results = analyze_session_dead_code(session)?;
+    let unfiltered_unused_files = results.unused_files.clone();
+    let finished = finish_dead_code_results(
+        DeadCodeReportInputs {
+            options,
+            resolved,
+            session,
+            changed_files,
+            unfiltered_unused_files,
+            finding_ids: None,
+        },
+        &mut results,
+        post_filter,
+    )?;
     Ok(build_dead_code_programmatic_output(
         options,
         resolved,
         session,
-        results,
-        type_aware_meta,
+        finished.into_report(results),
         start,
+        envelope,
     ))
+}
+
+/// The reported dead-code findings of one session run and what the reporting
+/// tail learned about them.
+fn analyze_dead_code_results(
+    options: &DeadCodeOptions,
+    resolved: &ProgrammaticAnalysisContext,
+    session: &AnalysisSession,
+    finding_ids: Option<fallow_engine::dead_code::FindingIdFilter>,
+) -> ProgrammaticResult<(AnalysisResults, FinishedDeadCode)> {
+    resolved.ensure_not_cancelled("dead-code analysis")?;
+    let mut results = analyze_session_dead_code(session)?;
+    let unfiltered_unused_files = results.unused_files.clone();
+
+    let finished = finish_dead_code_results(
+        DeadCodeReportInputs {
+            options,
+            resolved,
+            session,
+            changed_files: None,
+            unfiltered_unused_files,
+            finding_ids,
+        },
+        &mut results,
+        |_| {},
+    )?;
+    Ok((results, finished))
+}
+
+fn analyze_session_dead_code(session: &AnalysisSession) -> ProgrammaticResult<AnalysisResults> {
+    session
+        .analyze_dead_code()
+        .map(|analysis| analysis.results)
+        .map_err(|err| {
+            map_engine_error(
+                &err,
+                "dead-code analysis failed",
+                "FALLOW_DEAD_CODE_FAILED",
+                "dead-code",
+            )
+        })
+}
+
+/// Hide the findings of a saved dead-code baseline, as `--baseline` does.
+///
+/// Returns the `baseline-install-state-mismatch` diagnostic when the baseline
+/// was saved in another install state than this run.
+fn apply_baseline(
+    results: &mut AnalysisResults,
+    baseline: &Path,
+    root: &Path,
+    type_aware_meta: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> ProgrammaticResult<Option<fallow_types::workspace::WorkspaceDiagnostic>> {
+    use fallow_engine::baseline::{DeadCodeBaselineError, apply_dead_code_baseline};
+
+    let path = if is_absolute_path_any_platform(baseline) {
+        baseline.to_path_buf()
+    } else {
+        root.join(baseline)
+    };
+    let content = std::fs::read_to_string(&path).map_err(|err| {
+        ProgrammaticError::new(
+            format!("failed to read baseline {}: {err}", path.display()),
+            2,
+        )
+        .with_code("FALLOW_BASELINE_READ_FAILED")
+        .with_context("baseline")
+    })?;
+    let identity = type_aware_meta
+        .and_then(|meta| meta.identity.clone())
+        .unwrap_or_default();
+    let run_state = fallow_config::node_modules_state(root);
+    apply_dead_code_baseline(results, &content, root, &identity, false)
+        .map(|_| {
+            fallow_engine::baseline::install_state_diagnostic(root, &path, &content, run_state)
+        })
+        .map_err(|err| match err {
+            DeadCodeBaselineError::Parse(message) => ProgrammaticError::new(
+                format!("failed to parse baseline {}: {message}", path.display()),
+                2,
+            )
+            .with_code("FALLOW_BASELINE_INVALID")
+            .with_context("baseline"),
+            DeadCodeBaselineError::IncompatibleIdentity(fields) => ProgrammaticError::new(
+                format!(
+                    "baseline analysis identity is incompatible in: {}. Save it again with the same analysis options",
+                    fields.join(", ")
+                ),
+                2,
+            )
+            .with_code("FALLOW_BASELINE_IDENTITY_INCOMPATIBLE")
+            .with_context("baseline"),
+        })
 }
 
 pub(super) fn run_dead_code_with_session_artifacts(
@@ -130,39 +499,34 @@ pub(super) fn run_dead_code_with_session_artifacts(
     post_filter: impl FnOnce(&mut AnalysisResults),
     start: Instant,
 ) -> ProgrammaticResult<DeadCodeProgrammaticRunWithArtifacts> {
+    resolved.ensure_not_cancelled("dead-code analysis")?;
     let mut artifacts = session
         .analyze_dead_code_with_artifacts(true, true)
         .map_err(|err| {
-            ProgrammaticError::new(format!("dead-code analysis failed: {err}"), 2)
-                .with_code("FALLOW_DEAD_CODE_FAILED")
-                .with_context("dead-code")
+            map_engine_error(
+                &err,
+                "dead-code analysis failed",
+                "FALLOW_DEAD_CODE_FAILED",
+                "dead-code",
+            )
         })?;
     let unfiltered_unused_files = artifacts.results.unused_files.clone();
 
-    apply_dead_code_scope(
-        options,
-        resolved,
-        session,
-        changed_files,
+    let finished = finish_dead_code_results(
+        DeadCodeReportInputs {
+            options,
+            resolved,
+            session,
+            changed_files,
+            unfiltered_unused_files,
+            finding_ids: None,
+        },
         &mut artifacts.results,
-    )?;
-    apply_dead_code_filters(&options.filters, &mut artifacts.results);
-    post_filter(&mut artifacts.results);
-    let type_aware_meta = refine_with_unfiltered_unused_files(
-        &options.analysis.type_aware,
-        &options.filters,
-        session,
-        &mut artifacts.results,
-        unfiltered_unused_files,
+        post_filter,
     )?;
 
     Ok(build_dead_code_run_with_artifacts(
-        options,
-        resolved,
-        session,
-        artifacts,
-        type_aware_meta,
-        start,
+        options, resolved, session, artifacts, finished, start,
     ))
 }
 
@@ -175,30 +539,126 @@ pub(super) fn run_dead_code_from_artifacts(
     start: Instant,
 ) -> ProgrammaticResult<DeadCodeProgrammaticRunWithArtifacts> {
     let unfiltered_unused_files = artifacts.results.unused_files.clone();
-    apply_dead_code_scope(
+    let finished = finish_dead_code_results(
+        DeadCodeReportInputs {
+            options,
+            resolved,
+            session,
+            changed_files,
+            unfiltered_unused_files,
+            finding_ids: None,
+        },
+        &mut artifacts.results,
+        |_| {},
+    )?;
+
+    Ok(build_dead_code_run_with_artifacts(
+        options, resolved, session, artifacts, finished, start,
+    ))
+}
+
+/// Inputs the reporting tail needs from whichever entry point produced the
+/// analysis.
+struct DeadCodeReportInputs<'a> {
+    options: &'a DeadCodeOptions,
+    resolved: &'a ProgrammaticAnalysisContext,
+    session: &'a AnalysisSession,
+    changed_files: Option<&'a FxHashSet<std::path::PathBuf>>,
+    /// Unused files as the engine reported them, before scope narrowing, which
+    /// type-aware refinement needs to reason about the whole project.
+    unfiltered_unused_files: Vec<fallow_types::output_dead_code::UnusedFileFinding>,
+    /// The requested finding ids, when the caller asked for some. The trace
+    /// starts on the full result set, before the scope.
+    finding_ids: Option<fallow_engine::dead_code::FindingIdFilter>,
+}
+
+/// What the reporting tail learned about one run.
+struct FinishedDeadCode {
+    type_aware_meta: Option<fallow_types::envelope::TypeAwareMeta>,
+    finding_id_trace: Option<fallow_engine::dead_code::FindingIdTrace>,
+    /// The change channel that narrowed the run.
+    change_reason: Option<fallow_output::ScopeReason>,
+    /// The package baselines that narrowed the run.
+    package_baselines: Vec<fallow_output::PackageBaselineStatus>,
+}
+
+impl FinishedDeadCode {
+    fn into_report(self, results: AnalysisResults) -> DeadCodeReport {
+        DeadCodeReport {
+            results,
+            type_aware_meta: self.type_aware_meta,
+            package_baselines: self.package_baselines,
+        }
+    }
+}
+
+/// The findings of one run and the envelope facts that travel with them.
+struct DeadCodeReport {
+    results: AnalysisResults,
+    type_aware_meta: Option<fallow_types::envelope::TypeAwareMeta>,
+    package_baselines: Vec<fallow_output::PackageBaselineStatus>,
+}
+
+/// Shared reporting tail for every programmatic dead-code entry point: scope,
+/// issue-type filters, effective rule severities, the caller's family filter,
+/// and type-aware refinement.
+///
+/// The severity pass belongs here rather than at each entry point. Spelling
+/// the sequence out per entry point is what let the programmatic runtime
+/// report findings for rules a project had turned off while the CLI and the
+/// editor did not. The change scope is resolved here once for the same reason.
+fn finish_dead_code_results(
+    inputs: DeadCodeReportInputs<'_>,
+    results: &mut AnalysisResults,
+    post_filter: impl FnOnce(&mut AnalysisResults),
+) -> ProgrammaticResult<FinishedDeadCode> {
+    let DeadCodeReportInputs {
         options,
         resolved,
         session,
         changed_files,
-        &mut artifacts.results,
-    )?;
-    apply_dead_code_filters(&options.filters, &mut artifacts.results);
+        unfiltered_unused_files,
+        finding_ids,
+    } = inputs;
+    let mut finding_id_trace =
+        finding_ids.map(|filter| fallow_engine::dead_code::FindingIdTrace::start(filter, results));
+    let resolved_changed_files = if changed_files.is_some() {
+        None
+    } else {
+        changed_files_for_run(resolved)?
+    };
+    let global_files = changed_files.or(resolved_changed_files.as_ref());
+    if global_files.is_some() {
+        resolved
+            .measure_changed_since_scope(session.files().iter().map(|file| file.path.as_path()));
+    }
+    let change_scope =
+        resolved.change_scope(global_files, session.config(), session.workspaces())?;
+    apply_dead_code_scope(options, resolved, session, &change_scope, results)?;
+    apply_dead_code_filters(&options.filters, results);
+    fallow_engine::dead_code::apply_rule_severities(results, session.config());
+    post_filter(results);
+    if let Some(trace) = finding_id_trace.as_mut() {
+        trace.end_stage(results);
+    }
     let type_aware_meta = refine_with_unfiltered_unused_files(
         &options.analysis.type_aware,
         &options.filters,
         session,
-        &mut artifacts.results,
+        results,
         unfiltered_unused_files,
     )?;
-
-    Ok(build_dead_code_run_with_artifacts(
-        options,
-        resolved,
-        session,
-        artifacts,
+    if type_aware_meta.is_some() {
+        // Refinement can add findings, such as private-type leaks, anywhere in
+        // the project. The scope narrows the final result, so it runs again.
+        apply_dead_code_scope(options, resolved, session, &change_scope, results)?;
+    }
+    Ok(FinishedDeadCode {
         type_aware_meta,
-        start,
-    ))
+        finding_id_trace,
+        change_reason: change_scope.scope_reason(),
+        package_baselines: change_scope.package_baselines(),
+    })
 }
 
 fn refine_with_unfiltered_unused_files(
@@ -213,6 +673,13 @@ fn refine_with_unfiltered_unused_files(
     let outcome =
         crate::type_aware::refine_programmatic_dead_code(options, filters, session, results);
     results.unused_files = reported_unused_files;
+    if options.requested() {
+        // Reconciliation can add findings, so rule severities are resolved
+        // again over the refined set. The pass removes findings and writes
+        // each gate severity again, so repeating it is idempotent. Mirrors
+        // EditorAnalysisSession.
+        fallow_engine::dead_code::apply_rule_severities(results, session.config());
+    }
     outcome
 }
 
@@ -221,16 +688,16 @@ fn build_dead_code_run_with_artifacts(
     resolved: &ProgrammaticAnalysisContext,
     session: &AnalysisSession,
     artifacts: DeadCodeAnalysisArtifacts,
-    type_aware_meta: Option<fallow_types::envelope::TypeAwareMeta>,
+    finished: FinishedDeadCode,
     start: Instant,
 ) -> DeadCodeProgrammaticRunWithArtifacts {
     let output = build_dead_code_programmatic_output(
         options,
         resolved,
         session,
-        artifacts.results.clone(),
-        type_aware_meta,
+        finished.into_report(artifacts.results.clone()),
         start,
+        CheckEnvelope::DeadCode,
     );
     DeadCodeProgrammaticRunWithArtifacts { output, artifacts }
 }
@@ -239,10 +706,15 @@ fn build_dead_code_programmatic_output(
     options: &DeadCodeOptions,
     resolved: &ProgrammaticAnalysisContext,
     session: &AnalysisSession,
-    results: AnalysisResults,
-    type_aware_meta: Option<fallow_types::envelope::TypeAwareMeta>,
+    report: DeadCodeReport,
     start: Instant,
+    envelope: CheckEnvelope,
 ) -> DeadCodeProgrammaticOutput {
+    let DeadCodeReport {
+        results,
+        type_aware_meta,
+        package_baselines,
+    } = report;
     let root = session.root();
     let next_steps = build_dead_code_next_steps(DeadCodeNextStepsInput {
         suggestions_enabled: suggestions_enabled(),
@@ -251,30 +723,49 @@ fn build_dead_code_programmatic_output(
         offer_setup: setup_pointer_applicable(root),
         impact_digest: None,
         workspace_ref: default_workspace_ref_for_workspaces(root, session.workspaces()).as_deref(),
-        audit_changed: fallow_engine::churn::is_git_repo(root),
+        audit_changed: audit_changed_applicable(root),
         has_external_plugins: !fallow_config::discover_external_plugins(root, &[]).is_empty(),
+        // The programmatic runtime loads no baseline, so there is never one to
+        // re-check.
+        baseline_recheck: None,
+        command: envelope.command(),
     });
     let config_fixable =
         fallow_config::is_config_fixable(&resolved.root, resolved.config_path.as_ref());
-    let mut meta = options.analysis.explain.then(check_meta);
+    let mut meta = options.analysis.explain.then(|| match envelope {
+        CheckEnvelope::DeadCode => check_meta(),
+        CheckEnvelope::Architecture => architecture_meta(),
+    });
     if let Some(type_aware) = type_aware_meta {
         meta.get_or_insert_with(Default::default).type_aware = Some(type_aware);
     }
-    let output = build_check_output(CheckOutputInput {
-        schema_version: CHECK_SCHEMA_VERSION,
+    // A `files` run drops dependency findings, like a filter without the
+    // dependency issue types. The CLI applies the same rule.
+    let reports_dependencies =
+        options.filters.reports_dependency_findings() && options.files.is_empty();
+    let workspace_diagnostics = fallow_types::workspace::merge_workspace_diagnostics(
+        session.current_workspace_diagnostics(),
+        fallow_engine::dead_code::config_pattern_diagnostics(
+            session.config(),
+            reports_dependencies,
+        ),
+    );
+    let mut output = build_check_output(CheckOutputInput {
+        schema_version: envelope.schema_version(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         elapsed: start.elapsed(),
         results,
         config_fixable,
         meta,
-        workspace_diagnostics: session.current_workspace_diagnostics(),
+        workspace_diagnostics,
         next_steps,
     });
+    output.request_outcomes = resolved.request_outcomes();
+    output.package_baselines = package_baselines;
     DeadCodeProgrammaticOutput {
         output,
         root: session.root().to_path_buf(),
         config_fixable,
-        envelope_mode: root_envelope_mode(),
         telemetry_analysis_run_id: None,
     }
 }
@@ -322,13 +813,46 @@ pub(super) fn load_dead_code_session(
             .with_context("analysis.configPath")
     })?;
     let project_config = configure_project_for_dead_code(project_config, options);
-    Ok(AnalysisSession::from_config(project_config))
+    Ok(attach_cancellation(
+        AnalysisSession::from_config(project_config),
+        resolved,
+    ))
+}
+
+/// Resolve the package map before the analysis starts, so a malformed map
+/// fails fast. The call context keeps the result for the scope step.
+///
+/// Only the entry points that apply the change scope call this. Their changed
+/// files come from the call's own ref, so the request here matches the one
+/// the scope step makes. Trace and decision-surface sessions never read the map.
+pub(super) fn resolve_package_map_before_analysis(
+    resolved: &ProgrammaticAnalysisContext,
+    session: &AnalysisSession,
+) -> ProgrammaticResult<()> {
+    resolved
+        .change_scope(None, session.config(), session.workspaces())
+        .map(drop)
+}
+
+/// Hand the caller's cancellation token to the engine session.
+///
+/// Without this the session runs to completion no matter what the API layer
+/// checks between its own stages.
+pub(super) fn attach_cancellation(
+    session: AnalysisSession,
+    resolved: &ProgrammaticAnalysisContext,
+) -> AnalysisSession {
+    match resolved.cancellation() {
+        Some(cancellation) => session.with_cancellation(std::sync::Arc::clone(cancellation)),
+        None => session,
+    }
 }
 
 pub(super) fn default_dead_code_options_for_context(
     resolved: &ProgrammaticAnalysisContext,
 ) -> DeadCodeOptions {
     DeadCodeOptions {
+        finding_ids: Vec::new(),
         analysis: AnalysisOptions {
             root: Some(resolved.root().to_path_buf()),
             config_path: resolved.config_path().clone(),
@@ -344,6 +868,7 @@ pub(super) fn default_dead_code_options_for_context(
         filters: DeadCodeFilters::default(),
         files: Vec::new(),
         include_entry_exports: false,
+        show_cascade: false,
     }
 }
 
@@ -354,16 +879,53 @@ fn configure_project_for_dead_code(
     if options.include_entry_exports {
         project_config.config.include_entry_exports = true;
     }
+    if options.show_cascade {
+        project_config.config.show_cascade = true;
+    }
     activate_explicit_dead_code_opt_ins(&options.filters, &mut project_config.config.rules);
+    apply_explicit_type_aware_choice(options, &mut project_config.config);
     project_config
+}
+
+/// Write an explicit `type_aware` choice into the resolved config, as the
+/// `--type-aware` and `--no-type-aware` flags do. Detection reads
+/// `typeAware.enabled` itself: it holds framework class-member rules back for
+/// semantic verification, and a syntactic run must credit them instead.
+/// A type-aware run turns the opt-in `private-type-leaks` rule on, as the CLI
+/// does, unless a filter is active or the config sets the rule.
+fn apply_explicit_type_aware_choice(
+    options: &DeadCodeOptions,
+    config: &mut fallow_config::ResolvedConfig,
+) {
+    let Some(enabled) = options.analysis.type_aware.enabled else {
+        return;
+    };
+    config.type_aware.enabled = enabled;
+    if enabled
+        && !options.filters.any_active()
+        && config.rules.private_type_leaks == fallow_config::Severity::Off
+        && !config.rules.private_type_leaks_configured
+    {
+        config.rules.private_type_leaks = fallow_config::Severity::Warn;
+    }
 }
 
 fn activate_explicit_dead_code_opt_ins(
     filters: &DeadCodeFilters,
     rules: &mut fallow_config::RulesConfig,
 ) {
+    if filters.absent_component_props
+        && rules.absent_component_props == fallow_config::Severity::Off
+    {
+        rules.absent_component_props = fallow_config::Severity::Warn;
+    }
     if filters.private_type_leaks && rules.private_type_leaks == fallow_config::Severity::Off {
         rules.private_type_leaks = fallow_config::Severity::Warn;
+    }
+    if filters.deprecated_exports_in_use
+        && rules.deprecated_exports_in_use == fallow_config::Severity::Off
+    {
+        rules.deprecated_exports_in_use = fallow_config::Severity::Warn;
     }
 }
 
@@ -371,209 +933,42 @@ fn apply_dead_code_scope(
     options: &DeadCodeOptions,
     resolved: &ProgrammaticAnalysisContext,
     session: &AnalysisSession,
-    changed_files: Option<&FxHashSet<std::path::PathBuf>>,
+    change_scope: &ChangeScope,
     results: &mut AnalysisResults,
 ) -> ProgrammaticResult<()> {
     let workspace_roots = workspace_roots_for_session(resolved, session.workspaces())?;
-    if let Some(workspace_roots) = workspace_roots.as_ref() {
-        fallow_engine::dead_code::filter_to_workspaces(results, workspace_roots);
-    }
-    let resolved_changed_files = if changed_files.is_some() {
-        None
-    } else {
-        changed_files_for_run(resolved)?
-    };
-    if let Some(changed_files) = changed_files.or(resolved_changed_files.as_ref()) {
-        fallow_engine::dead_code::filter_by_changed_files(results, changed_files);
-    }
-    if let Some(diff) = resolved.diff.as_ref() {
-        filter_dead_code_by_diff(results, diff, session.root());
-    }
-    apply_dead_code_file_filter(options, session.root(), results);
+    let files = file_scope(options, session.root());
+    fallow_engine::dead_code::apply_scope(
+        results,
+        &fallow_engine::dead_code::DeadCodeScope {
+            workspace_roots: workspace_roots.as_deref(),
+            changes: Some(change_scope),
+            diff: resolved.diff.as_ref().map(|diff| (diff, session.root())),
+            files: files.as_ref(),
+        },
+        session.config(),
+    );
     Ok(())
 }
 
-fn filter_dead_code_by_diff(results: &mut AnalysisResults, diff: &DiffIndex, root: &Path) {
-    let touches_file = |path: &Path| -> bool {
-        diff.key_for(path, root)
-            .is_none_or(|rel| diff.touches_file(&rel))
-    };
-    let line_in_diff = |path: &Path, line: u32| -> bool {
-        diff.key_for(path, root)
-            .is_none_or(|rel| diff.line_is_added(&rel, u64::from(line)))
-    };
-
-    filter_dead_code_source_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_security_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_dependency_findings(results, &line_in_diff);
-    filter_dead_code_graph_findings(results, &touches_file, &line_in_diff);
-    filter_dead_code_framework_findings(results, &line_in_diff);
-}
-
-fn filter_dead_code_source_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results
-        .unused_files
-        .retain(|finding| touches_file(&finding.file.path));
-    results
-        .unused_exports
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .unused_types
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .private_type_leaks
-        .retain(|finding| line_in_diff(&finding.leak.path, finding.leak.line));
-    results
-        .unused_enum_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unused_class_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unused_store_members
-        .retain(|finding| line_in_diff(&finding.member.path, finding.member.line));
-    results
-        .unprovided_injects
-        .retain(|finding| line_in_diff(&finding.inject.path, finding.inject.line));
-    results
-        .unrendered_components
-        .retain(|finding| line_in_diff(&finding.component.path, finding.component.line));
-    results
-        .unused_component_props
-        .retain(|finding| line_in_diff(&finding.prop.path, finding.prop.line));
-    results
-        .unused_component_emits
-        .retain(|finding| line_in_diff(&finding.emit.path, finding.emit.line));
-    results
-        .unused_component_inputs
-        .retain(|finding| line_in_diff(&finding.input.path, finding.input.line));
-    results
-        .unused_component_outputs
-        .retain(|finding| line_in_diff(&finding.output.path, finding.output.line));
-    results
-        .unused_svelte_events
-        .retain(|finding| line_in_diff(&finding.event.path, finding.event.line));
-    results
-        .unused_server_actions
-        .retain(|finding| line_in_diff(&finding.action.path, finding.action.line));
-    results
-        .unused_load_data_keys
-        .retain(|finding| line_in_diff(&finding.key.path, finding.key.line));
-    results
-        .unresolved_imports
-        .retain(|finding| line_in_diff(&finding.import.path, finding.import.line));
-}
-
-fn filter_dead_code_security_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.security_findings.retain(|finding| {
-        line_in_diff(&finding.path, finding.line)
-            || finding.trace.iter().any(|hop| {
-                line_in_diff(&hop.path, hop.line)
-                    || (matches!(hop.role, TraceHopRole::SecretSource) && touches_file(&hop.path))
-            })
-            || finding.reachability.as_ref().is_some_and(|reachability| {
-                reachability
-                    .untrusted_source_trace
-                    .iter()
-                    .any(|hop| line_in_diff(&hop.path, hop.line))
-            })
-    });
-    results
-        .security_unresolved_callee_diagnostics
-        .retain(|finding| line_in_diff(&finding.path, finding.line));
-}
-
-fn filter_dead_code_dependency_findings(
-    results: &mut AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    for finding in &mut results.unlisted_dependencies {
-        finding
-            .dep
-            .imported_from
-            .retain(|source| line_in_diff(&source.path, source.line));
-    }
-    results
-        .unlisted_dependencies
-        .retain(|finding| !finding.dep.imported_from.is_empty());
-}
-
-fn filter_dead_code_graph_findings(
-    results: &mut AnalysisResults,
-    touches_file: &dyn Fn(&Path) -> bool,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results.duplicate_exports.retain(|finding| {
-        finding
-            .export
-            .locations
-            .iter()
-            .any(|location| line_in_diff(&location.path, location.line))
-    });
-    results
-        .circular_dependencies
-        .retain(|cycle| cycle.cycle.files.iter().any(|path| touches_file(path)));
-    results
-        .re_export_cycles
-        .retain(|cycle| cycle.cycle.files.iter().any(|path| touches_file(path)));
-    results
-        .boundary_violations
-        .retain(|finding| line_in_diff(&finding.violation.from_path, finding.violation.line));
-    results
-        .stale_suppressions
-        .retain(|finding| line_in_diff(&finding.path, finding.line));
-}
-
-fn filter_dead_code_framework_findings(
-    results: &mut AnalysisResults,
-    line_in_diff: &dyn Fn(&Path, u32) -> bool,
-) {
-    results
-        .invalid_client_exports
-        .retain(|finding| line_in_diff(&finding.export.path, finding.export.line));
-    results
-        .mixed_client_server_barrels
-        .retain(|finding| line_in_diff(&finding.barrel.path, finding.barrel.line));
-    results
-        .misplaced_directives
-        .retain(|finding| line_in_diff(&finding.directive_site.path, finding.directive_site.line));
-    results
-        .route_collisions
-        .retain(|finding| line_in_diff(&finding.collision.path, finding.collision.line));
-    results
-        .dynamic_segment_name_conflicts
-        .retain(|finding| line_in_diff(&finding.conflict.path, finding.conflict.line));
-}
-
-fn apply_dead_code_file_filter(
-    options: &DeadCodeOptions,
-    root: &Path,
-    results: &mut AnalysisResults,
-) {
+/// The `files` option resolved against the root, or `None` when it is empty.
+fn file_scope(options: &DeadCodeOptions, root: &Path) -> Option<FxHashSet<std::path::PathBuf>> {
     if options.files.is_empty() {
-        return;
+        return None;
     }
-    let file_set = options
-        .files
-        .iter()
-        .map(|path| {
-            if is_absolute_path_any_platform(path) {
-                path.clone()
-            } else {
-                root.join(path)
-            }
-        })
-        .collect::<FxHashSet<_>>();
-    fallow_engine::dead_code::filter_by_changed_files(results, &file_set);
-    clear_dead_code_dependency_findings(results);
+    Some(
+        options
+            .files
+            .iter()
+            .map(|path| {
+                if is_absolute_path_any_platform(path) {
+                    path.clone()
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect(),
+    )
 }
 
 fn apply_dead_code_filters(filters: &DeadCodeFilters, results: &mut AnalysisResults) {
@@ -593,16 +988,21 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
         || filters.unused_deps
         || filters.unused_types
         || filters.private_type_leaks
+        || filters.deprecated_exports_in_use
         || filters.unused_enum_members
         || filters.unused_class_members
         || filters.unused_store_members
         || filters.unprovided_injects
         || filters.unrendered_components
         || filters.unused_component_props
+        || filters.absent_component_props
         || filters.unused_component_emits
         || filters.unused_component_inputs
         || filters.unused_component_outputs
         || filters.unused_svelte_events
+        || filters.unused_effect_layers
+        || filters.unused_tagged_errors
+        || filters.unproduced_catch_tags
         || filters.unused_server_actions
         || filters.unused_load_data_keys
         || filters.unresolved_imports
@@ -610,6 +1010,7 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
         || filters.duplicate_exports
         || filters.circular_deps
         || filters.re_export_cycles
+        || filters.package_cycles
         || filters.boundary_violations
         || filters.policy_violations
         || filters.stale_suppressions
@@ -623,6 +1024,7 @@ fn dead_code_filters_active(filters: &DeadCodeFilters) -> bool {
 fn apply_dead_code_core_filters(filters: &DeadCodeFilters, results: &mut AnalysisResults) {
     if !filters.unused_files {
         results.unused_files.clear();
+        results.cascade.suppressed_unused_files.clear();
     }
     if !filters.unused_exports {
         results.unused_exports.clear();
@@ -632,6 +1034,9 @@ fn apply_dead_code_core_filters(filters: &DeadCodeFilters, results: &mut Analysi
     }
     if !filters.private_type_leaks {
         results.private_type_leaks.clear();
+    }
+    if !filters.deprecated_exports_in_use {
+        results.deprecated_exports_in_use.clear();
     }
     if !filters.unused_deps {
         clear_dead_code_dependency_findings(results);
@@ -666,6 +1071,9 @@ fn apply_dead_code_component_filters(filters: &DeadCodeFilters, results: &mut An
     if !filters.unrendered_components {
         results.unrendered_components.clear();
     }
+    if !filters.absent_component_props {
+        results.absent_component_props.clear();
+    }
     if !filters.unused_component_props {
         results.unused_component_props.clear();
     }
@@ -680,6 +1088,15 @@ fn apply_dead_code_component_filters(filters: &DeadCodeFilters, results: &mut An
     }
     if !filters.unused_svelte_events {
         results.unused_svelte_events.clear();
+    }
+    if !filters.unused_effect_layers {
+        results.unused_effect_layers.clear();
+    }
+    if !filters.unused_tagged_errors {
+        results.unused_tagged_errors.clear();
+    }
+    if !filters.unproduced_catch_tags {
+        results.unproduced_catch_tags.clear();
     }
     if !filters.unused_server_actions {
         results.unused_server_actions.clear();
@@ -701,6 +1118,9 @@ fn apply_dead_code_graph_filters(filters: &DeadCodeFilters, results: &mut Analys
     }
     if !filters.re_export_cycles {
         results.re_export_cycles.clear();
+    }
+    if !filters.package_cycles {
+        results.package_cycles.clear();
     }
     if !filters.boundary_violations {
         results.boundary_violations.clear();

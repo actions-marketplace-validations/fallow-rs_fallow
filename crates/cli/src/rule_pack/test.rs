@@ -51,7 +51,12 @@ fn analyze_rule_pack(
     let analysis = fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
         .and_then(|session| session.analyze_dead_code())
         .map_err(|error| crate::error::emit_error(error.message(), 2, output))?;
-    let findings = analysis.results.policy_violations;
+    let mut findings = analysis.results.policy_violations;
+    for finding in &mut findings {
+        if let Ok(relative) = finding.violation.path.strip_prefix(&config.root) {
+            finding.violation.path = relative.to_path_buf();
+        }
+    }
     let summaries = build_rule_summaries(config, &findings);
     Ok((summaries, findings))
 }
@@ -229,7 +234,7 @@ fn emit_human(
         }) {
             println!(
                 "  {}:{}:{}  matched \"{}\"",
-                display_path(root, &finding.violation.path),
+                fallow_types::path_util::display_relative(root, &finding.violation.path),
                 finding.violation.line,
                 finding.violation.col,
                 finding.violation.matched
@@ -264,6 +269,7 @@ fn rule_kind(kind: RulePackRuleKind) -> &'static str {
         RulePackRuleKind::BannedImport => "banned-import",
         RulePackRuleKind::BannedEffect => "banned-effect",
         RulePackRuleKind::BannedExport => "banned-export",
+        RulePackRuleKind::GdpProofProducer => "gdp-proof-producer",
     }
 }
 
@@ -274,13 +280,6 @@ fn pack_arg_to_config_path(root: &std::path::Path, pack: &std::path::Path) -> St
         pack
     };
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn display_path(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn default_threads() -> usize {

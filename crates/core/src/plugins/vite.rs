@@ -26,7 +26,10 @@ fn additional_data_entry_pattern(
     {
         return None;
     }
-    Some(normalized.to_string())
+    // Sass resolves `@use "src/styles/tokens"` to `_tokens.scss`, `tokens.scss`
+    // or a directory index. An entry pattern is a glob, so it must name the
+    // file that Sass loads, not the specifier text.
+    Some(local_style_candidate(root, normalized).unwrap_or_else(|| normalized.to_string()))
 }
 
 fn additional_data_package_name(
@@ -47,17 +50,16 @@ fn is_additional_data_package_import(
     if raw.starts_with('.') || raw.starts_with('/') || raw.contains(':') {
         return false;
     }
-    if local_style_candidate_exists(root, normalized) {
-        return false;
-    }
-    true
+    local_style_candidate(root, normalized).is_none()
 }
 
-fn local_style_candidate_exists(root: &std::path::Path, normalized: &str) -> bool {
+/// The root-relative path of the local style file that a preprocessor loads
+/// for `normalized`: the exact file, then `<name>.<ext>`, the `_<name>.<ext>`
+/// partial, and the `<name>/_index.<ext>` and `<name>/index.<ext>` indexes.
+fn local_style_candidate(root: &std::path::Path, normalized: &str) -> Option<String> {
     let path = std::path::Path::new(normalized);
-    let exact = root.join(path);
-    if exact.is_file() {
-        return true;
+    if root.join(path).is_file() {
+        return Some(normalized.to_string());
     }
 
     let has_style_ext = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
@@ -67,24 +69,28 @@ fn local_style_candidate_exists(root: &std::path::Path, normalized: &str) -> boo
         )
     });
     if has_style_ext {
-        return false;
+        return None;
     }
 
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
+    let file_name = path.file_name().and_then(|name| name.to_str())?;
+    let parent = normalized
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty());
     let with_parent =
-        |name: &str| parent.map_or_else(|| root.join(name), |parent| root.join(parent).join(name));
+        |name: &str| parent.map_or_else(|| name.to_string(), |p| format!("{p}/{name}"));
 
-    ["scss", "sass", "css", "less", "stylus"].iter().any(|ext| {
-        with_parent(&format!("{file_name}.{ext}")).is_file()
-            || with_parent(&format!("_{file_name}.{ext}")).is_file()
-            || root.join(path).join(format!("_index.{ext}")).is_file()
-            || root.join(path).join(format!("index.{ext}")).is_file()
-    })
+    ["scss", "sass", "css", "less", "stylus"]
+        .iter()
+        .flat_map(|ext| {
+            [
+                with_parent(&format!("{file_name}.{ext}")),
+                with_parent(&format!("_{file_name}.{ext}")),
+                format!("{normalized}/_index.{ext}"),
+                format!("{normalized}/index.{ext}"),
+            ]
+        })
+        .find(|candidate| root.join(candidate).is_file())
 }
 
 /// Credit the CSS implementation package named under one of the CSS keys.
@@ -111,19 +117,135 @@ fn add_css_implementation_dependency(
     }
 }
 
+/// Credit the Sass settings file that `vite-plugin-vuetify` loads from
+/// `styles.configFile`. No module imports that file, so it is an entry.
+fn add_vuetify_config_file(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &std::path::Path,
+    root: &std::path::Path,
+) {
+    let Some(raw) = config_parser::extract_vite_plugin_call_option_path(
+        source,
+        config_path,
+        "vite-plugin-vuetify",
+        &["styles", "configFile"],
+    ) else {
+        return;
+    };
+    // The plugin resolves the file against the Vite root: the `root` option
+    // when the config sets it, otherwise the config directory.
+    let base = vite_root(source, config_path, root).map_or_else(
+        || config_path.to_path_buf(),
+        |dir| root.join(dir).join("vite.config"),
+    );
+    if let Some(normalized) = config_parser::normalize_config_path(&raw, &base, root) {
+        result.push_entry_pattern(normalized);
+    }
+}
+
+/// The root-relative directory that the Vite `root` option names, if the
+/// config sets it.
+fn vite_root(
+    source: &str,
+    config_path: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<String> {
+    let raw = config_parser::extract_config_path(source, config_path, &["root"])?;
+    let vite_root = config_parser::normalize_filesystem_config_path(&raw, config_path, root)?;
+    Some(vite_root.trim_end_matches('/').to_string())
+}
+
+/// Vite entries that sit under its root directory.
+const ROOT_ENTRY_PATTERNS: &[&str] = &[
+    "src/main.{ts,tsx,js,jsx}",
+    "src/index.{ts,tsx,js,jsx}",
+    "index.html",
+];
+
+/// Re-base the default entries under the directory that the `root` option names.
+///
+/// Vite resolves `root` as a filesystem path and reads `index.html` from it.
+/// The static entry patterns stay at the config directory, so this adds only
+/// the entries under a root other than that directory.
+fn add_root_entry_patterns(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &std::path::Path,
+    root: &std::path::Path,
+) {
+    let Some(vite_root) = vite_root(source, config_path, root) else {
+        return;
+    };
+    let vite_root = vite_root.as_str();
+    let config_dir = config_path
+        .parent()
+        .and_then(|dir| dir.strip_prefix(root).ok())
+        .map(config_parser::path_to_config_string)
+        .unwrap_or_default();
+    if vite_root.is_empty() || vite_root == config_dir {
+        return;
+    }
+    result.extend_entry_patterns(
+        ROOT_ENTRY_PATTERNS
+            .iter()
+            .map(|pattern| format!("{vite_root}/{pattern}")),
+    );
+}
+
+/// Vite config file names. A package with one build per target names each
+/// config `vite.config.<target>.ts` and runs it with `vite build -c`.
+const CONFIG_PATTERNS: &[&str] = &[
+    "vite.config.{ts,js,mts,mjs}",
+    "vite.config.*.{ts,js,mts,mjs}",
+];
+
+/// The dependency lists of a Vite config, as key paths below the config root.
+const DEPENDENCY_LIST_KEYS: &[&[&str]] = &[
+    &["optimizeDeps", "include"],
+    &["optimizeDeps", "exclude"],
+    &["ssr", "external"],
+    &["ssr", "noExternal"],
+];
+
+/// Credit the packages in the `optimizeDeps` and `ssr` lists of a Vite config.
+///
+/// `prefix` is the key path of the Vite config object inside the file: empty
+/// for `vite.config.*`, and `["vite"]` for the `vite` block of a `VitePress`
+/// config. An `optimizeDeps` entry can name a nested dependency as
+/// `'parent > child'`. Vite resolves `child` from `parent`, so the entry
+/// credits `parent`.
+pub(super) fn credit_dependency_lists(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &std::path::Path,
+    prefix: &[&str],
+) {
+    for keys in DEPENDENCY_LIST_KEYS {
+        let path: Vec<&str> = prefix.iter().chain(keys.iter()).copied().collect();
+        for spec in config_parser::extract_config_string_array(source, config_path, &path) {
+            let parent = spec.split('>').next().unwrap_or(&spec).trim();
+            if !parent.is_empty() {
+                result
+                    .referenced_dependencies
+                    .push(crate::resolve::extract_package_name(parent));
+            }
+        }
+    }
+}
+
 define_plugin!(
     struct VitePlugin => "vite",
     enablers: &["vite", "rolldown-vite"],
-    entry_patterns: &[
-        "src/main.{ts,tsx,js,jsx}",
-        "src/index.{ts,tsx,js,jsx}",
-        "index.html",
-    ],
-    config_patterns: &["vite.config.{ts,js,mts,mjs}"],
-    always_used: &["vite.config.{ts,js,mts,mjs}"],
+    entry_patterns: ROOT_ENTRY_PATTERNS,
+    config_patterns: CONFIG_PATTERNS,
+    always_used: CONFIG_PATTERNS,
     tooling_dependencies: &["vite", "@vitejs/plugin-react", "@vitejs/plugin-vue"],
     virtual_module_prefixes: &["virtual:"],
-    used_exports: [("vite.config.{ts,js,mts,mjs}", CONFIG_EXPORTS)],
+    used_exports: [
+        ("vite.config.{ts,js,mts,mjs}", CONFIG_EXPORTS),
+        ("vite.config.*.{ts,js,mts,mjs}", CONFIG_EXPORTS)
+    ],
     resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
 
@@ -133,7 +255,7 @@ define_plugin!(
             result.referenced_dependencies.push(dep);
         }
         result.referenced_dependencies.extend(
-            config_parser::extract_vite_react_babel_dependencies(source, config_path),
+            config_parser::extract_vite_plugin_option_dependencies(source, config_path),
         );
 
         result.referenced_dependencies.extend(super::react_compiler::extract_dependencies(
@@ -141,6 +263,15 @@ define_plugin!(
             config_path,
             &[&["plugins"]],
         ));
+
+        super::module_federation::apply_bundler_plugin_options(
+            &mut result,
+            source,
+            config_path,
+            root,
+            super::module_federation::FederationBase::default(),
+            "vite",
+        );
 
         for (find, replacement) in
             config_parser::extract_config_path_aliases(source, config_path, &["resolve", "alias"])
@@ -154,59 +285,29 @@ define_plugin!(
 
         super::test_alias::apply_test_block_aliases(&mut result, source, config_path, root);
 
+        add_root_entry_patterns(&mut result, source, config_path, root);
+
         let rollup_input = config_parser::extract_config_string_or_array(
             source,
             config_path,
             &["build", "rollupOptions", "input"],
         );
-        result.extend_entry_patterns(rollup_input);
+        result.extend_entry_patterns_and_dependencies(rollup_input, root);
 
         let lib_entry = config_parser::extract_config_string_or_array(
             source,
             config_path,
             &["build", "lib", "entry"],
         );
-        result.extend_entry_patterns(lib_entry);
+        // Vite resolves `lib.entry` against its root with `path.resolve`, so the
+        // value is a path only and never names a package.
+        result.extend_entry_paths(lib_entry);
 
-        let optimize_include = config_parser::extract_config_string_array(
-            source,
-            config_path,
-            &["optimizeDeps", "include"],
-        );
-        for dep in &optimize_include {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(dep));
-        }
-
-        let optimize_exclude = config_parser::extract_config_string_array(
-            source,
-            config_path,
-            &["optimizeDeps", "exclude"],
-        );
-        for dep in &optimize_exclude {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(dep));
-        }
-
-        let ssr_external =
-            config_parser::extract_config_string_array(source, config_path, &["ssr", "external"]);
-        for dep in &ssr_external {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(dep));
-        }
-
-        let ssr_no_external =
-            config_parser::extract_config_string_array(source, config_path, &["ssr", "noExternal"]);
-        for dep in &ssr_no_external {
-            result
-                .referenced_dependencies
-                .push(crate::resolve::extract_package_name(dep));
-        }
+        credit_dependency_lists(&mut result, source, config_path, &[]);
 
         add_css_implementation_dependency(&mut result, source, config_path);
+
+        add_vuetify_config_file(&mut result, source, config_path, root);
 
         for preprocessor in ["scss", "sass", "less", "stylus"] {
             let body = config_parser::extract_config_string_or_array(
@@ -281,6 +382,125 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_credits_the_parent_of_a_nested_optimize_deps_entry() {
+        let deps = resolve_vite_deps(
+            r"
+            export default {
+                optimizeDeps: {
+                    include: ['mermaid > @braintree/sanitize-url', '@scope/ui > dayjs'],
+                },
+            };
+            ",
+        );
+        assert!(deps.contains(&"mermaid".to_string()), "{deps:?}");
+        assert!(deps.contains(&"@scope/ui".to_string()), "{deps:?}");
+        assert!(
+            !deps.iter().any(|dep| dep.contains('>') || dep == "dayjs"),
+            "{deps:?}"
+        );
+    }
+
+    fn resolve_vite_deps(source: &str) -> Vec<String> {
+        VitePlugin
+            .resolve_config(Path::new("vite.config.ts"), source, Path::new("/project"))
+            .referenced_dependencies
+    }
+
+    #[test]
+    fn resolve_config_credits_react_swc_plugin_tuple_heads() {
+        let deps = resolve_vite_deps(
+            r#"
+            import { defineConfig } from "vite";
+            import react from "@vitejs/plugin-react-swc";
+
+            export default defineConfig(({ mode }) => {
+                return {
+                    plugins: [
+                        react({
+                            plugins: [
+                                ["@lingui/swc-plugin", {}],
+                                ["@acme/swc-plugin/wasm", {}],
+                                ["./local-plugin.wasm", {}],
+                                "plain-string-entry",
+                            ],
+                        }),
+                    ],
+                };
+            });
+        "#,
+        );
+        assert!(deps.contains(&"@lingui/swc-plugin".to_string()), "{deps:?}");
+        assert!(deps.contains(&"@acme/swc-plugin".to_string()), "{deps:?}");
+        assert!(
+            !deps.iter().any(|dep| dep.contains("local-plugin")),
+            "a relative SWC plugin path is not a package: {deps:?}"
+        );
+        assert!(
+            !deps.contains(&"plain-string-entry".to_string()),
+            "SWC reads only [name, options] tuples: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_credits_wyw_babel_options_inside_a_wrapper_call() {
+        let deps = resolve_vite_deps(
+            r#"
+            import { defineConfig } from "vite";
+            import wyw from "@wyw-in-js/vite";
+            import { wrap } from "./wrap";
+
+            export default defineConfig({
+                plugins: [
+                    wrap(
+                        wyw({
+                            babelOptions: {
+                                presets: ["@babel/preset-typescript"],
+                                plugins: ["@babel/plugin-transform-export-namespace-from"],
+                            },
+                        }),
+                    ),
+                ],
+            });
+        "#,
+        );
+        assert!(
+            deps.contains(&"@babel/preset-typescript".to_string()),
+            "{deps:?}"
+        );
+        assert!(
+            deps.contains(&"@babel/plugin-transform-export-namespace-from".to_string()),
+            "{deps:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_ignores_plugin_options_of_an_unknown_plugin() {
+        let deps = resolve_vite_deps(
+            r#"
+            import { defineConfig } from "vite";
+            import other from "vite-plugin-other";
+
+            export default defineConfig({
+                plugins: [
+                    other({
+                        plugins: [["swc-plugin-not-read", {}]],
+                        babelOptions: { presets: ["babel-preset-not-read"] },
+                    }),
+                ],
+            });
+        "#,
+        );
+        assert!(
+            !deps.contains(&"swc-plugin-not-read".to_string()),
+            "{deps:?}"
+        );
+        assert!(
+            !deps.contains(&"babel-preset-not-read".to_string()),
+            "{deps:?}"
+        );
+    }
+
+    #[test]
     fn resolve_config_credits_react_babel_plugin_dependencies() {
         let source = r#"
             import { defineConfig } from "vite";
@@ -327,6 +547,86 @@ mod tests {
                     }
                 }
             });
+        "#;
+        let plugin = VitePlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/vite.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![("@".to_string(), "src".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_config_reads_alias_replacement_through_local_path_helper() {
+        let source = r"
+            import { defineConfig } from 'vite';
+            import { fileURLToPath, URL } from 'node:url';
+            import path from 'node:path';
+
+            const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+            function fromRoot(p) { return path.resolve(__dirname, p); }
+
+            export default defineConfig({
+                resolve: {
+                    alias: [
+                        { find: 'local-a', replacement: here('src/a.ts') },
+                        { find: 'local-b', replacement: fromRoot('lib/b.ts') },
+                    ]
+                }
+            });
+        ";
+        let plugin = VitePlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/vite.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(
+            result.path_aliases,
+            vec![
+                ("local-a".to_string(), "src/a.ts".to_string()),
+                ("local-b".to_string(), "lib/b.ts".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_skips_alias_helper_with_two_parameters_or_a_condition() {
+        let source = r"
+            const two = (base, p) => path.resolve(base, p);
+            const pick = (p) => (process.env.X ? p : './other');
+            export default {
+                resolve: {
+                    alias: {
+                        'two-a': two(__dirname, 'src/a.ts'),
+                        'pick-b': pick('./src/b.ts'),
+                    }
+                }
+            };
+        ";
+        let plugin = VitePlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/vite.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert!(result.path_aliases.is_empty(), "{:?}", result.path_aliases);
+    }
+
+    /// Issue #2806: Vite reads a leading `/` as relative to the project root.
+    #[test]
+    fn resolve_config_reads_a_leading_slash_alias_as_root_relative() {
+        let source = r#"
+            export default {
+                resolve: { alias: { "@": "/src" } },
+            };
         "#;
         let plugin = VitePlugin;
         let result = plugin.resolve_config(
@@ -503,6 +803,95 @@ mod tests {
             "build.lib.entry path-helper call should be extracted: {:?}",
             result.entry_patterns
         );
+    }
+
+    fn entry_pattern_strings(result: &PluginResult) -> Vec<&str> {
+        result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn resolve_config_evaluates_a_local_path_helper_call() {
+        let source = r"
+            import { fileURLToPath } from 'node:url';
+            import { resolve } from 'node:path';
+
+            const fromHere = (rel: string) => fileURLToPath(new URL(rel, import.meta.url));
+            function fromDir(rel) {
+                return resolve(__dirname, rel);
+            }
+            const viaPathname = function (rel) { return new URL(rel, import.meta.url).pathname; };
+
+            export default {
+                resolve: { alias: { 'some-mod': fromHere('./src/stub.ts') } },
+                build: {
+                    rollupOptions: {
+                        input: {
+                            main: fromHere('./src/main.ts'),
+                            second: fromDir('src/second.ts'),
+                            third: viaPathname('./src/third.ts'),
+                        },
+                    },
+                },
+            };
+        ";
+        let result = VitePlugin.resolve_config(
+            std::path::Path::new("/project/vite.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        let patterns = entry_pattern_strings(&result);
+        for expected in ["src/main.ts", "src/second.ts", "src/third.ts"] {
+            assert!(
+                patterns.contains(&expected),
+                "local helper call {expected} should be an entry: {patterns:?}"
+            );
+        }
+        assert_eq!(
+            result.path_aliases,
+            vec![("some-mod".to_string(), "src/stub.ts".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_config_ignores_a_local_helper_with_an_unsupported_body() {
+        let source = r"
+            const base = 'src';
+            const fromBase = (rel) => `${base}/${rel}`;
+            const twoArgs = (dir, rel) => dir + rel;
+            const nested = (rel) => fromBase(rel);
+
+            export default {
+                resolve: { alias: { 'some-mod': fromBase('stub.ts') } },
+                build: {
+                    rollupOptions: {
+                        input: {
+                            a: fromBase('a.ts'),
+                            b: twoArgs('src', '/b.ts'),
+                            c: nested('c.ts'),
+                        },
+                    },
+                },
+            };
+        ";
+        let result = VitePlugin.resolve_config(
+            std::path::Path::new("/project/vite.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        let patterns = entry_pattern_strings(&result);
+        for unexpected in ["a.ts", "src/a.ts", "src/b.ts", "c.ts", "src/c.ts"] {
+            assert!(
+                !patterns.contains(&unexpected),
+                "an unsupported helper body must yield nothing, found {unexpected}: {patterns:?}"
+            );
+        }
+        assert!(result.path_aliases.is_empty(), "{:?}", result.path_aliases);
     }
 
     #[test]
@@ -712,6 +1101,75 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_vuetify_styles_config_file_is_an_entry() {
+        let source = r"
+            import { defineConfig } from 'vite';
+            import vuetify from 'vite-plugin-vuetify';
+
+            export default defineConfig({
+                plugins: [vuetify({ styles: { configFile: './src/styles/settings.scss' } })],
+            });
+        ";
+        let result = VitePlugin.resolve_config(
+            Path::new("/project/web/vite.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            entry_pattern_strings(&result).contains(&"web/src/styles/settings.scss"),
+            "{:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn resolve_config_vuetify_config_file_is_read_against_the_vite_root() {
+        let source = r"
+            import path from 'path';
+            import { defineConfig } from 'vite';
+            import vuetify from 'vite-plugin-vuetify';
+
+            export default defineConfig(({ command }) => ({
+                root: path.resolve(__dirname, 'src'),
+                plugins: [vuetify({ styles: { configFile: 'settings.scss' } })],
+            }));
+        ";
+        let result = VitePlugin.resolve_config(
+            Path::new("/project/dev/vite.config.mjs"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            entry_pattern_strings(&result).contains(&"dev/src/settings.scss"),
+            "{:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn resolve_config_ignores_config_file_of_a_local_vuetify_function() {
+        let source = r"
+            import { defineConfig } from 'vite';
+
+            const vuetify = (options) => ({ name: 'local', options });
+
+            export default defineConfig({
+                plugins: [vuetify({ styles: { configFile: 'src/styles/settings.scss' } })],
+            });
+        ";
+        let result = VitePlugin.resolve_config(
+            Path::new("/project/vite.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            !entry_pattern_strings(&result).contains(&"src/styles/settings.scss"),
+            "{:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
     fn resolve_config_additional_data_keeps_existing_local_style_entries() {
         let tmp = tempfile::tempdir().expect("create temp dir");
         std::fs::create_dir_all(tmp.path().join("src/styles")).expect("create styles dir");
@@ -736,8 +1194,9 @@ mod tests {
             result
                 .entry_patterns
                 .iter()
-                .any(|rule| rule.pattern == "src/styles/tokens"),
-            "existing local style references should remain entry patterns"
+                .any(|rule| rule.pattern == "src/styles/_tokens.scss"),
+            "a local style reference should credit the partial that Sass loads: {:?}",
+            result.entry_patterns
         );
         assert!(
             !result.referenced_dependencies.contains(&"src".to_string()),
@@ -807,5 +1266,198 @@ mod tests {
                 .contains(&"lightningcss".to_string()),
             "only the two selector keys make the package load-bearing"
         );
+    }
+
+    #[test]
+    fn resolve_config_reads_inline_module_federation_options() {
+        let source = r#"
+            import { federation } from "@module-federation/vite";
+
+            export default defineConfig({
+                plugins: [
+                    federation({
+                        name: "host",
+                        exposes: { "./Button": "./src/Button.tsx" },
+                        remotes: { checkout: "checkout@https://example.test/remoteEntry.js" },
+                    }),
+                ],
+            });
+        "#;
+        let result = VitePlugin.resolve_config(
+            Path::new("/project/vite.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|rule| rule.pattern == "src/Button.tsx")
+        );
+        assert_eq!(result.provided_dependencies.len(), 1);
+        assert!(result.provided_dependencies[0].covers_specifier("checkout/Button"));
+    }
+
+    /// `build.rollupOptions.input` reads a bare value through both channels,
+    /// while `build.lib.entry` is a path that vite resolves against its root,
+    /// so it never credits a package (issue #2753).
+    #[test]
+    fn a_bare_rollup_input_credits_the_package_and_lib_entry_stays_a_path() {
+        let source = r#"
+            export default {
+                build: {
+                    rollupOptions: { input: "my-lib/client" },
+                    lib: { entry: "src/lib" },
+                },
+            };
+        "#;
+        let result =
+            VitePlugin.resolve_config(Path::new("vite.config.ts"), source, Path::new("/project"));
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"my-lib".to_string()),
+            "got {:?}",
+            result.referenced_dependencies
+        );
+        assert!(
+            !result.referenced_dependencies.contains(&"src".to_string()),
+            "lib.entry is a path only, got {:?}",
+            result.referenced_dependencies
+        );
+        let patterns: Vec<&str> = result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        assert!(patterns.contains(&"my-lib/client"), "got {patterns:?}");
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| pattern.starts_with("src/lib.{")),
+            "an extensionless lib entry resolves to the file, got {patterns:?}"
+        );
+    }
+
+    fn any_pattern_matches(patterns: &[&str], name: &str) -> bool {
+        patterns.iter().any(|pattern| {
+            globset::Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(name))
+        })
+    }
+
+    /// A package with one vite build per target names each config
+    /// `vite.config.<target>.ts` and runs it with `vite build -c`.
+    #[test]
+    fn named_vite_config_variants_are_config_files() {
+        let plugin = VitePlugin;
+        let used_export_patterns: Vec<&str> = plugin
+            .used_exports()
+            .iter()
+            .map(|(pattern, _)| *pattern)
+            .collect();
+        for name in [
+            "vite.config.ts",
+            "vite.config.node.ts",
+            "vite.config.define.mts",
+            "vite.config.browser.js",
+            "vite.config.utils.mjs",
+        ] {
+            assert!(
+                any_pattern_matches(plugin.config_patterns(), name),
+                "{name}"
+            );
+            assert!(any_pattern_matches(plugin.always_used(), name), "{name}");
+            assert!(any_pattern_matches(&used_export_patterns, name), "{name}");
+        }
+        for name in [
+            "vitest.config.ts",
+            "vite.configs.ts",
+            "vite.config.node.json",
+            "vite-env.d.ts",
+        ] {
+            assert!(
+                !any_pattern_matches(plugin.config_patterns(), name),
+                "{name}"
+            );
+            assert!(!any_pattern_matches(plugin.always_used(), name), "{name}");
+        }
+    }
+
+    fn entry_patterns_for(source: &str) -> Vec<String> {
+        VitePlugin
+            .resolve_config(
+                Path::new("/project/vite.config.ts"),
+                source,
+                Path::new("/project"),
+            )
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.clone())
+            .collect()
+    }
+
+    const REBASED_WEB_ENTRIES: &[&str] = &[
+        "web/index.html",
+        "web/src/main.{ts,tsx,js,jsx}",
+        "web/src/index.{ts,tsx,js,jsx}",
+    ];
+
+    #[test]
+    fn resolve_config_root_rebases_the_default_entries() {
+        for source in [
+            r#"export default { root: "./web" };"#,
+            r#"export default { root: "web/" };"#,
+            r#"
+                import { resolve } from "node:path";
+                export default { root: resolve(__dirname, "web") };
+            "#,
+            r#"
+                import { fileURLToPath, URL } from "node:url";
+                export default { root: fileURLToPath(new URL("./web", import.meta.url)) };
+            "#,
+        ] {
+            let patterns = entry_patterns_for(source);
+            for expected in REBASED_WEB_ENTRIES {
+                assert!(
+                    patterns.iter().any(|pattern| pattern == expected),
+                    "root should re-base the entry {expected}: {patterns:?} for {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_config_root_is_read_relative_to_the_config_directory() {
+        let result = VitePlugin.resolve_config(
+            Path::new("/project/config/vite.config.ts"),
+            r#"export default { root: "../web" };"#,
+            Path::new("/project"),
+        );
+        assert!(
+            result
+                .entry_patterns
+                .iter()
+                .any(|rule| rule.pattern == "web/index.html"),
+            "got {:?}",
+            result.entry_patterns
+        );
+    }
+
+    #[test]
+    fn resolve_config_without_a_nested_root_adds_no_rebased_entries() {
+        for source in [
+            "export default { build: { outDir: \"dist\" } };",
+            r#"export default { root: "." };"#,
+            r#"export default { root: "./" };"#,
+        ] {
+            let patterns = entry_patterns_for(source);
+            assert!(
+                !patterns
+                    .iter()
+                    .any(|pattern| pattern.ends_with("index.html")),
+                "no root means no extra entry: {patterns:?} for {source}"
+            );
+        }
     }
 }

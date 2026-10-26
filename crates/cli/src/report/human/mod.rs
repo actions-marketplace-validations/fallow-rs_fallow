@@ -6,7 +6,7 @@ mod health_hotspots;
 mod health_runtime;
 mod health_targets;
 mod perf;
-mod traces;
+pub(super) mod traces;
 pub(super) mod walkthrough;
 
 pub(super) use check::*;
@@ -23,13 +23,13 @@ use colored::Colorize;
 use fallow_types::issue_meta::{issue_meta_by_kind, issue_meta_for_contract_token};
 use fallow_types::suppress::{IssueKind, issue_kind_to_kebab};
 
-use super::{Level, plural, relative_path, split_dir_filename};
+use super::{Level, format_display_path, plural, relative_path, split_dir_filename};
 
 /// Maximum items shown per flat section (unused files, deps, etc.).
 pub(super) const MAX_FLAT_ITEMS: usize = 10;
 
 /// Format a path with dimmed directory and bold filename.
-pub(super) fn format_path(path_str: &str) -> String {
+pub fn format_path(path_str: &str) -> String {
     let (dir, filename) = split_dir_filename(path_str);
     format!("{}{}", dir.dimmed(), filename.bold())
 }
@@ -62,8 +62,21 @@ pub(super) fn print_explain_tip_if_tty(has_findings: bool, quiet: bool) {
     }
 }
 
+/// The final status line of a run that has findings.
+///
+/// The mark follows the gate result. A run that fails shows the red failure
+/// mark. A run that passes, because all of its findings are at rule severity
+/// `warn`, shows the yellow warning mark.
+pub fn findings_status_line(text: &str, run_fails: bool) -> String {
+    if run_fails {
+        format!("\u{2717} {text}").red().bold().to_string()
+    } else {
+        format!("\u{26a0} {text}").yellow().bold().to_string()
+    }
+}
+
 /// Build a colored section header with bullet, title, and count.
-pub(super) fn build_section_header(title: &str, count: usize, level: Level) -> String {
+pub fn build_section_header(title: &str, count: usize, level: Level) -> String {
     let label = format!("{title} ({count})");
     match level {
         Level::Warn => format!("{} {}", "\u{25cf}".yellow(), label.yellow().bold()),
@@ -84,47 +97,51 @@ fn section_dead_code_footer_text(title: &str) -> Option<(&'static str, &'static 
     match title {
         "Unused files" => Some((
             "Files not reachable from any entry point",
-            "https://docs.fallow.tools/explanations/dead-code#unused-files",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-files",
         )),
         "Unused exports" => Some((
             "Exported symbols with no known consumers",
-            "https://docs.fallow.tools/explanations/dead-code#unused-exports",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-exports",
         )),
         "Unused type exports" => Some((
             "Type exports with no known consumers",
-            "https://docs.fallow.tools/explanations/dead-code#unused-types",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-types",
         )),
         "Private type leaks" => Some((
             "Exported signatures that reference same-file private types",
-            "https://docs.fallow.tools/explanations/dead-code#private-type-leaks",
+            "https://fallow.tools/docs/explanations/dead-code/#private-type-leaks",
+        )),
+        "Deprecated exports in use" => Some((
+            "Exports marked @deprecated that still have consumers",
+            "https://fallow.tools/docs/explanations/dead-code/#deprecated-exports-in-use",
         )),
         "Unused dependencies" => Some((
             "Listed in dependencies but never imported",
-            "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-dependencies",
         )),
         "Unused devDependencies" => Some((
             "Listed in devDependencies but never imported or referenced",
-            "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-dependencies",
         )),
         "Unused optionalDependencies" => Some((
             "Listed in optionalDependencies but never imported",
-            "https://docs.fallow.tools/explanations/dead-code#unused-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-dependencies",
         )),
         "Unused enum members" => Some((
             "Enum members never referenced outside their declaration",
-            "https://docs.fallow.tools/explanations/dead-code#unused-enum-members",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-enum-members",
         )),
         "Unused class members" => Some((
             "Class methods or properties never referenced outside their class",
-            "https://docs.fallow.tools/explanations/dead-code#unused-class-members",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-class-members",
         )),
         "Unused store members" => Some((
             "Store state or actions never accessed by any consumer",
-            "https://docs.fallow.tools/explanations/dead-code#unused-store-members",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-store-members",
         )),
         "Unresolved imports" => Some((
-            "Import paths that could not be resolved, check for missing packages or broken paths. Framework-specific imports may need a plugin: https://docs.fallow.tools/plugins",
-            "https://docs.fallow.tools/explanations/dead-code#unresolved-imports",
+            "Import paths that could not be resolved, check for missing packages or broken paths. Framework-specific imports may need a plugin: https://fallow.tools/docs/frameworks/built-in/",
+            "https://fallow.tools/docs/explanations/dead-code/#unresolved-imports",
         )),
         _ => None,
     }
@@ -134,43 +151,47 @@ fn section_dependency_footer_text(title: &str) -> Option<(&'static str, &'static
     match title {
         "Unlisted dependencies" => Some((
             "Packages imported in code but missing from package.json",
-            "https://docs.fallow.tools/explanations/dead-code#unlisted-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#unlisted-dependencies",
         )),
         "Duplicate exports" => Some((
             "Same export name defined in multiple files; barrel re-exports may resolve ambiguously",
-            "https://docs.fallow.tools/explanations/dead-code#duplicate-exports",
+            "https://fallow.tools/docs/explanations/dead-code/#duplicate-exports",
         )),
         "Circular dependencies" => Some((
             "Import cycles that can cause initialization failures and prevent tree-shaking",
-            "https://docs.fallow.tools/explanations/dead-code#circular-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#circular-dependencies",
+        )),
+        "Package cycles" => Some((
+            "Workspace packages that import each other in a loop and cannot be built in dependency order",
+            "https://fallow.tools/docs/explanations/dead-code/#package-cycles",
         )),
         "Boundary violations" => Some((
             "Imports that cross defined architecture zone boundaries",
-            "https://docs.fallow.tools/explanations/dead-code#boundary-violations",
+            "https://fallow.tools/docs/explanations/dead-code/#boundary-violations",
         )),
         "Stale suppressions" => Some((
             "Suppression comments or JSDoc tags that no longer match any issue",
-            "https://docs.fallow.tools/explanations/dead-code#stale-suppressions",
+            "https://fallow.tools/docs/explanations/dead-code/#stale-suppressions",
         )),
         "Unused catalog entries" => Some((
             "pnpm-workspace.yaml catalog entries not referenced by any workspace package via the `catalog:` protocol",
-            "https://docs.fallow.tools/explanations/dead-code#unused-catalog-entries",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-catalog-entries",
         )),
         "Unresolved catalog references" => Some((
-            "package.json `catalog:` / `catalog:<name>` references whose catalog does not declare the package (pnpm install will error)",
-            "https://docs.fallow.tools/explanations/dead-code#unresolved-catalog-references",
+            "`catalog:` / `catalog:<name>` references in package.json or pnpm overrides whose catalog does not declare the package (pnpm install will error)",
+            "https://fallow.tools/docs/explanations/dead-code/#unresolved-catalog-references",
         )),
         "Unused dependency overrides" => Some((
             "package-manager override entries whose target package is not declared by any workspace package or resolved in the lockfile",
-            "https://docs.fallow.tools/explanations/dead-code#unused-dependency-overrides",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-dependency-overrides",
         )),
         "Misconfigured dependency overrides" => Some((
             "package-manager override entries with an unparsable key or empty value",
-            "https://docs.fallow.tools/explanations/dead-code#misconfigured-dependency-overrides",
+            "https://fallow.tools/docs/explanations/dead-code/#misconfigured-dependency-overrides",
         )),
         t if t.starts_with("Type-only") => Some((
             "Dependencies only used for type imports; consider moving to devDependencies",
-            "https://docs.fallow.tools/explanations/dead-code#type-only-dependencies",
+            "https://fallow.tools/docs/explanations/dead-code/#type-only-dependencies",
         )),
         _ => None,
     }
@@ -180,19 +201,19 @@ fn section_framework_footer_text(title: &str) -> Option<(&'static str, &'static 
     match title {
         "Invalid client exports" => Some((
             "Server-only or route-config exports in a \"use client\" file (Next.js rejects this at build time)",
-            "https://docs.fallow.tools/explanations/dead-code#invalid-client-exports",
+            "https://fallow.tools/docs/explanations/dead-code/#invalid-client-exports",
         )),
         "Mixed client/server barrels" => Some((
             "Barrel re-exports both a \"use client\" module and a server-only module (one import drags the other's directive across the boundary)",
-            "https://docs.fallow.tools/explanations/dead-code#mixed-client-server-barrels",
+            "https://fallow.tools/docs/explanations/dead-code/#mixed-client-server-barrels",
         )),
         "Misplaced directives" => Some((
             "A \"use client\" / \"use server\" directive sits below an import, so the RSC bundler ignores it (move it above every import)",
-            "https://docs.fallow.tools/explanations/dead-code#misplaced-directives",
+            "https://fallow.tools/docs/explanations/dead-code/#misplaced-directives",
         )),
         "Unprovided injects" => Some((
             "A Vue inject / Svelte getContext whose key is provided nowhere in the project, so at runtime it returns undefined",
-            "https://docs.fallow.tools/explanations/dead-code#unprovided-injects",
+            "https://fallow.tools/docs/explanations/dead-code/#unprovided-injects",
         )),
         _ => None,
     }
@@ -202,47 +223,63 @@ fn section_component_footer_text(title: &str) -> Option<(&'static str, &'static 
     match title {
         "Unrendered components" => Some((
             "A Vue / Svelte component reachable through a barrel but rendered nowhere in the project (render it somewhere or remove it)",
-            "https://docs.fallow.tools/explanations/dead-code#unrendered-components",
+            "https://fallow.tools/docs/explanations/dead-code/#unrendered-components",
+        )),
+        "Absent optional component props" => Some((
+            "Known reachable callers omit this used optional prop; review defaults and API intent manually",
+            "https://fallow.tools/docs/explanations/dead-code/#absent-component-props",
         )),
         "Unused component props" => Some((
             "A Vue, Svelte, or React component prop referenced nowhere inside its own component (remove it or use it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-component-props",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-component-props",
         )),
         "Prop drilling" => Some((
             "A React/Preact prop forwarded unused through two or more intermediate components before a component consumes it (colocate the consumer or lift it to a context); opt-in, off by default",
-            "https://docs.fallow.tools/explanations/dead-code#prop-drilling",
+            "https://fallow.tools/docs/explanations/dead-code/#prop-drilling",
         )),
         "Thin wrappers" => Some((
             "A React/Preact component whose whole body forwards props to a single child (return <Child {...props}/>); inline it at call sites or delete it; opt-in, off by default",
-            "https://docs.fallow.tools/explanations/dead-code#thin-wrapper",
+            "https://fallow.tools/docs/explanations/dead-code/#thin-wrapper",
         )),
         "Duplicate prop shapes" => Some((
             "Three or more React/Preact components across two or more files declaring an identical prop-name set (after stripping common DOM props); extract a shared Props type or base component; opt-in, off by default",
-            "https://docs.fallow.tools/explanations/dead-code#duplicate-prop-shape",
+            "https://fallow.tools/docs/explanations/dead-code/#duplicate-prop-shape",
         )),
         "Unused component emits" => Some((
             "A Vue <script setup> defineEmits event emitted nowhere inside its own component (remove it or emit it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-component-emits",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-component-emits",
         )),
         "Unused component inputs" => Some((
             "An Angular @Input() / signal input() declaration read nowhere inside its own component (remove it or use it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-component-inputs",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-component-inputs",
         )),
         "Unused component outputs" => Some((
             "An Angular @Output() / signal output() declaration emitted nowhere inside its own component (remove it or emit it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-component-outputs",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-component-outputs",
         )),
         "Unused Svelte events" => Some((
             "A Svelte component dispatching a createEventDispatcher event whose name is listened to nowhere in the project (remove it or listen for it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-svelte-events",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-svelte-events",
+        )),
+        "Unused Effect layers" => Some((
+            "An Effect layer composed only into layers that nothing uses (remove the unused consumers, then this layer)",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-effect-layers",
+        )),
+        "Unused tagged errors" => Some((
+            "An Effect tagged error that only types or catchTag handlers reference; no code constructs or fails with it",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-tagged-errors",
+        )),
+        "Unproduced catch tags" => Some((
+            "A catchTag handler for a project tag that no code produces (remove the handler or fail with the error)",
+            "https://fallow.tools/docs/explanations/dead-code/#unproduced-catch-tags",
         )),
         "Unused server actions" => Some((
             "A Next.js Server Action exported from a \"use server\" file that no code in the project references (wire it to a consumer or remove it)",
-            "https://docs.fallow.tools/explanations/dead-code#unused-server-actions",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-server-actions",
         )),
         "Unused load data keys" => Some((
             "A SvelteKit load() return-object key no consumer reads (sibling +page.svelte data.<key> or project-wide page.data.<key>); delete the key or wire a consumer",
-            "https://docs.fallow.tools/explanations/dead-code#unused-load-data-keys",
+            "https://fallow.tools/docs/explanations/dead-code/#unused-load-data-keys",
         )),
         _ => None,
     }
@@ -260,6 +297,7 @@ fn section_issue_kind(title: &str) -> Option<IssueKind> {
         "Unused exports" => IssueKind::UnusedExport,
         "Unused type exports" => IssueKind::UnusedType,
         "Private type leaks" => IssueKind::PrivateTypeLeak,
+        "Deprecated exports in use" => IssueKind::DeprecatedExportInUse,
         "Unused dependencies" => IssueKind::UnusedDependency,
         "Unused devDependencies" => IssueKind::UnusedDevDependency,
         // "Unused optionalDependencies" has no backing IssueKind and its findings
@@ -272,6 +310,7 @@ fn section_issue_kind(title: &str) -> Option<IssueKind> {
         "Unlisted dependencies" => IssueKind::UnlistedDependency,
         "Duplicate exports" => IssueKind::DuplicateExport,
         "Circular dependencies" => IssueKind::CircularDependency,
+        "Package cycles" => IssueKind::PackageCycle,
         "Boundary violations" => IssueKind::BoundaryViolation,
         "Unused catalog entries" => IssueKind::PnpmCatalogEntry,
         "Unresolved catalog references" => IssueKind::UnresolvedCatalogReference,
@@ -290,6 +329,9 @@ fn section_issue_kind(title: &str) -> Option<IssueKind> {
         "Unused component inputs" => IssueKind::UnusedComponentInput,
         "Unused component outputs" => IssueKind::UnusedComponentOutput,
         "Unused Svelte events" => IssueKind::UnusedSvelteEvent,
+        "Unused Effect layers" => IssueKind::UnusedEffectLayer,
+        "Unused tagged errors" => IssueKind::UnusedTaggedError,
+        "Unproduced catch tags" => IssueKind::UnproducedCatchTag,
         "Unused server actions" => IssueKind::UnusedServerAction,
         "Unused load data keys" => IssueKind::UnusedLoadDataKey,
         _ => return None,
@@ -367,7 +409,53 @@ fn is_auto_fixable(title: &str) -> bool {
     )
 }
 
-/// Push a dimmed section footer line: description — docs_url, plus suppression hint.
+/// Width a section footer line renders within, including its indent.
+const FOOTER_LINE_WIDTH: usize = 80;
+
+/// Indent of every section footer line.
+const FOOTER_INDENT: &str = "  ";
+
+/// Push a dimmed docs footer: the description wrapped inside
+/// `FOOTER_LINE_WIDTH`, then the docs URL on its own line.
+///
+/// The footer is one entry with embedded newlines, so that a caller that
+/// deduplicates footers (the `--group-by` report) keeps or skips the
+/// description and the URL together. Two sections that share a URL but have
+/// different descriptions stay different entries.
+///
+/// A URL cannot break, so a line that holds only a long URL can be wider than
+/// `FOOTER_LINE_WIDTH`. Every other footer line fits.
+pub(super) fn push_docs_footer(lines: &mut Vec<String>, description: &str, url: &str) {
+    let budget = FOOTER_LINE_WIDTH - FOOTER_INDENT.len();
+    let mut footer: Vec<String> = wrap_words(description, budget)
+        .into_iter()
+        .map(|chunk| format!("{FOOTER_INDENT}{}", chunk.dimmed()))
+        .collect();
+    footer.push(format!("{FOOTER_INDENT}{}", url.dimmed()));
+    lines.push(footer.join("\n"));
+}
+
+/// Greedily wrap text at word boundaries to `width` columns. A word that is
+/// wider than `width` (such as a URL) gets a line of its own and is not cut.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Push a dimmed section footer: the description and docs URL, plus suppression hint.
 ///
 /// The `item_count` controls whether the suppress hint is shown (only for sections
 /// with 3+ items, to reduce noise for power users scanning many small sections).
@@ -407,7 +495,7 @@ fn push_section_footer_impl(
     auto_fixable_override: Option<bool>,
 ) {
     if let Some((desc, url)) = section_footer_text(title) {
-        lines.push(format!("  {}", format!("{desc} \u{2014} {url}").dimmed()));
+        push_docs_footer(lines, desc, url);
     }
     if item_count >= 3 {
         if auto_fixable_override.unwrap_or_else(|| is_auto_fixable(title)) {
@@ -513,7 +601,7 @@ where
     let mut file_map: rustc_hash::FxHashMap<String, usize> = rustc_hash::FxHashMap::default();
 
     for (i, item) in items.iter().enumerate() {
-        let file_str = relative_path(get_path(item), root).display().to_string();
+        let file_str = format_display_path(get_path(item), root);
         if let Some(&group_idx) = file_map.get(&file_str) {
             file_groups[group_idx].1.push(i);
         } else {
@@ -585,6 +673,45 @@ pub(super) fn plain(lines: &[String]) -> String {
         .map(|l| strip_ansi(l))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Assert that `lines` holds one docs footer for `url` in the shared layout:
+/// the description wrapped inside `FOOTER_LINE_WIDTH` without an em-dash,
+/// then the URL on its own line.
+#[cfg(test)]
+pub(super) fn assert_docs_footer_layout(lines: &[String], url: &str) {
+    let entry = lines
+        .iter()
+        .map(|line| strip_ansi(line))
+        .find(|line| line.contains(url))
+        .unwrap_or_else(|| panic!("no footer holds {url}"));
+    let footer: Vec<&str> = entry.lines().collect();
+    let (url_line, description) = footer
+        .split_last()
+        .unwrap_or_else(|| panic!("empty footer for {url}"));
+    assert_eq!(
+        *url_line,
+        format!("{FOOTER_INDENT}{url}"),
+        "footer: {entry}"
+    );
+    assert!(
+        !description.is_empty(),
+        "footer has no description: {entry}"
+    );
+    for line in description {
+        assert!(
+            line.chars().count() <= FOOTER_LINE_WIDTH,
+            "footer line is wider than {FOOTER_LINE_WIDTH} columns: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "footer line has an em-dash: {line:?}"
+        );
+        assert!(
+            !line.contains("fallow.tools/docs/"),
+            "URL not on its own line: {line:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -684,6 +811,7 @@ mod tests {
         "Unlisted dependencies",
         "Duplicate exports",
         "Circular dependencies",
+        "Package cycles",
         "Boundary violations",
         "Stale suppressions",
         "Unused catalog entries",
@@ -704,6 +832,9 @@ mod tests {
         "Unused component inputs",
         "Unused component outputs",
         "Unused Svelte events",
+        "Unused Effect layers",
+        "Unused tagged errors",
+        "Unproduced catch tags",
         "Unused server actions",
         "Unused load data keys",
     ];
@@ -884,5 +1015,57 @@ mod tests {
         assert!(!is_file_level_only(
             section_suppress_rule("Boundary violations").unwrap()
         ));
+    }
+
+    /// Assert that rendered footer lines fit the 80-column rule. A line that
+    /// holds only a URL is the one exception, because a URL cannot break.
+    fn assert_footer_lines_fit(context: &str, lines: &[String]) {
+        for line in lines.iter().flat_map(|l| {
+            strip_ansi(l)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        }) {
+            assert!(
+                !line.contains('\u{2014}'),
+                "{context}: footer line contains an em-dash: {line:?}",
+            );
+            let text = line.trim_start();
+            let url_only = text.starts_with("https://") && !text.contains(' ');
+            assert!(
+                url_only || line.chars().count() <= 80,
+                "{context}: footer line is {} columns wide: {line:?}",
+                line.chars().count(),
+            );
+        }
+    }
+
+    #[test]
+    fn every_section_footer_fits_eighty_columns_without_em_dash() {
+        for &title in ALL_FOOTER_SECTION_TITLES {
+            for rollup in [false, true] {
+                let mut lines = Vec::new();
+                push_section_footer_impl(&mut lines, title, 3, rollup, Some(true));
+                assert_footer_lines_fit(title, &lines);
+            }
+        }
+    }
+
+    #[test]
+    fn section_footer_puts_docs_url_on_its_own_line() {
+        let mut lines = Vec::new();
+        push_section_footer_with_count(&mut lines, "Package cycles", 1);
+        let rendered: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                [
+                    "  Workspace packages that import each other in a loop and cannot be built in",
+                    "  dependency order",
+                    "  https://fallow.tools/docs/explanations/dead-code/#package-cycles",
+                ]
+                .join("\n"),
+            ],
+        );
     }
 }

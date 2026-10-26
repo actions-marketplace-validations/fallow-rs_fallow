@@ -1,7 +1,9 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use fallow_types::discover::StableFileKey;
+use globset::{GlobSet, GlobSetBuilder};
 
 /// Compiled project-relative patterns for hiding source-owned findings.
 ///
@@ -77,6 +79,16 @@ impl FindingIgnoreMatcher {
         }
     }
 
+    /// Compile `ignoreFindings` patterns outside config resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the glob error of the first invalid pattern.
+    pub fn try_compile(patterns: &[String]) -> Result<Self, globset::Error> {
+        Self::build_sets(patterns)?;
+        Ok(Self::compile(patterns))
+    }
+
     pub(super) fn validate_compilation(patterns: &[String]) -> Result<(), globset::Error> {
         Self::build_sets(patterns).map(|_| ())
     }
@@ -94,7 +106,7 @@ impl FindingIgnoreMatcher {
                 (&mut hidden, &mut hidden_origins, pattern.as_str())
             };
             let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-            builder.add(Glob::new(pattern)?);
+            builder.add(super::compile_path_glob(pattern)?);
             origins.push(index);
         }
 
@@ -132,6 +144,42 @@ impl FindingIgnoreMatcher {
         usage.record(&usage.reported_origins, &indices);
 
         (self.hidden.is_empty() || hidden_hit) && !reported_hit
+    }
+
+    /// Whether a source path is hidden, for an absolute or a root-relative path.
+    ///
+    /// An absolute path outside `root` is never hidden.
+    #[must_use]
+    pub fn is_ignored_path(&self, root: &Path, path: &Path) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        // Strip the root before the absolute check: a root such as `/project`
+        // is not absolute on Windows, and a path below it must still match.
+        let key = if let Ok(relative) = path.strip_prefix(root) {
+            StableFileKey::from_relative(relative)
+        } else if path.is_absolute() {
+            return false;
+        } else {
+            StableFileKey::from_relative(path)
+        };
+        self.is_ignored(key.as_str())
+    }
+
+    /// Forget the pattern hits of an earlier analysis pass.
+    ///
+    /// A long-lived process (watch mode, the LSP, an engine session) keeps one
+    /// resolved config for many passes. Each dead-code pass calls this first,
+    /// so a pattern that matched in an earlier pass is reported again when its
+    /// findings are gone.
+    pub fn reset_usage(&self) {
+        let Some(usage) = self.usage.as_deref() else {
+            return;
+        };
+        usage.consulted.store(false, Ordering::Relaxed);
+        for flag in &usage.matched {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Configured patterns that matched no candidate finding path, in config
@@ -185,6 +233,32 @@ mod tests {
 
         assert!(matcher.is_ignored("src/app.test.ts"));
         assert!(!matcher.is_ignored("src/app.ts"));
+    }
+
+    #[test]
+    fn path_lookup_accepts_absolute_and_relative_paths() {
+        let matcher = matcher(&["test/fixtures/**"]);
+        // A path such as `/project` is not absolute on Windows, so build the
+        // absolute paths from the platform temp directory.
+        let base = std::env::temp_dir();
+        let root = base.join("project");
+        let root = root.as_path();
+
+        assert!(matcher.is_ignored_path(root, &root.join("test/fixtures/bad.js")));
+        assert!(matcher.is_ignored_path(root, Path::new("test/fixtures/bad.js")));
+        assert!(!matcher.is_ignored_path(root, &root.join("src/app.js")));
+        assert!(!matcher.is_ignored_path(root, &base.join("elsewhere/test/fixtures/bad.js")));
+    }
+
+    #[test]
+    fn path_lookup_strips_a_root_that_is_not_absolute() {
+        let matcher = matcher(&["test/fixtures/**"]);
+        // `/project` has no drive prefix on Windows, so it is not absolute
+        // there. A path below it must still match relative to the root.
+        let root = Path::new("project");
+
+        assert!(matcher.is_ignored_path(root, &root.join("test/fixtures/bad.js")));
+        assert!(!matcher.is_ignored_path(root, &root.join("src/app.js")));
     }
 
     #[test]
@@ -268,6 +342,21 @@ mod tests {
 
         assert!(clone.is_ignored("src/app.test.ts"));
         assert!(matcher.unmatched_patterns().is_empty());
+    }
+
+    #[test]
+    fn reset_usage_forgets_hits_of_an_earlier_pass() {
+        let matcher = matcher(&["src/legacy/**"]);
+        assert!(matcher.is_ignored("src/legacy/old.ts"));
+        assert!(matcher.unmatched_patterns().is_empty());
+
+        matcher.reset_usage();
+        assert!(
+            matcher.unmatched_patterns().is_empty(),
+            "a pass that consulted nothing reports nothing"
+        );
+        assert!(!matcher.is_ignored("src/app.ts"));
+        assert_eq!(matcher.unmatched_patterns(), vec!["src/legacy/**"]);
     }
 
     #[test]

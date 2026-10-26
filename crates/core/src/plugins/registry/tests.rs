@@ -17,6 +17,7 @@ fn make_external(name: &str, enablers: &[&str], config_patterns: &[&str]) -> Ext
         entry_point_role: fallow_config::EntryPointRole::Support,
         manifest_entries: Vec::new(),
         config_patterns: config_patterns.iter().map(|s| (*s).to_string()).collect(),
+        config_default_export_opt_out: Vec::new(),
         always_used: Vec::new(),
         tooling_dependencies: Vec::new(),
         used_exports: Vec::new(),
@@ -442,6 +443,7 @@ fn external_plugin_detected_by_enablers() {
         enablers: vec!["my-framework".to_string()],
         entry_points: vec!["src/routes/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec!["my.config.ts".to_string()],
         tooling_dependencies: vec!["my-framework-cli".to_string()],
         used_exports: vec![],
@@ -475,6 +477,7 @@ fn external_plugin_not_detected_when_dep_missing() {
         enablers: vec!["my-framework".to_string()],
         entry_points: vec!["src/routes/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -503,6 +506,7 @@ fn external_plugin_prefix_enabler() {
         enablers: vec!["@custom/".to_string()],
         entry_points: vec!["custom/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -527,6 +531,7 @@ fn external_plugin_detection_dependency() {
         enablers: vec![],
         entry_points: vec!["special/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -562,6 +567,7 @@ fn external_plugin_detection_any_combinator() {
         enablers: vec![],
         entry_points: vec!["any/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -593,6 +599,7 @@ fn external_plugin_detection_all_combinator_fails_partial() {
         enablers: vec![],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -615,6 +622,7 @@ fn external_plugin_used_exports_aggregated() {
         enablers: vec!["ue-dep".to_string()],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![ExternalUsedExport {
@@ -643,6 +651,7 @@ fn external_plugin_without_enablers_or_detection_stays_inactive() {
         enablers: vec![],
         entry_points: vec!["orphan/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -835,6 +844,7 @@ fn external_plugin_detection_overrides_enablers() {
         enablers: vec!["pkg-y".to_string()],
         entry_points: vec!["src/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -862,6 +872,7 @@ fn external_plugin_detection_overrides_enablers_positive() {
         enablers: vec!["pkg-y".to_string()],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -887,6 +898,7 @@ fn external_plugin_config_patterns_added_to_always_used() {
         enablers: vec!["cfg-dep".to_string()],
         entry_points: vec![],
         config_patterns: vec!["my-tool.config.ts".to_string()],
+        config_default_export_opt_out: vec![],
         always_used: vec!["setup.ts".to_string()],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -928,6 +940,7 @@ fn external_plugin_detection_all_combinator_succeeds() {
         enablers: vec![],
         entry_points: vec!["all/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -969,6 +982,7 @@ fn external_plugin_nested_any_inside_all() {
         enablers: vec![],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -1006,6 +1020,7 @@ fn external_plugin_detection_file_exists_against_discovered() {
         enablers: vec![],
         entry_points: vec!["special/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -1034,6 +1049,7 @@ fn external_plugin_detection_file_exists_no_match() {
         enablers: vec![],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -1151,17 +1167,26 @@ fn process_config_result_merges_all_fields() {
     let config_result = PluginResult {
         entry_patterns: vec![path_rule("src/routes/**/*.ts")],
         replace_entry_patterns: false,
+        accumulate_config_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("src/routes/**/*.ts", &["loader"])],
+        entry_export_credits: Vec::new(),
         used_class_members: vec![fallow_config::UsedClassMemberRule::from("agInit")],
         referenced_dependencies: vec!["lodash".to_string(), "axios".to_string()],
+        package_referenced_dependencies: vec![],
         always_used_files: vec!["setup.ts".to_string()],
         path_aliases: vec![],
         setup_files: vec![PathBuf::from("/project/test/setup.ts")],
         fixture_patterns: vec![],
         scss_include_paths: vec![],
         static_dir_mappings: vec![],
+        framework_static_dir_mappings: vec![],
         provided_dependencies: vec![],
+        config_diagnostics: vec![],
+        federation_sources: vec![],
+        jsx_import_sources: vec![],
+        jsx_package_credits: vec![],
+        tsconfig_jsx_dirs: Vec::new(),
     };
     process_config_result("test-plugin", config_result, &mut aggregated, None).unwrap();
 
@@ -1240,32 +1265,50 @@ fn process_config_result_accumulates_across_multiple_calls() {
     let result1 = PluginResult {
         entry_patterns: vec![path_rule("a.ts")],
         replace_entry_patterns: false,
+        accumulate_config_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("a.ts", &["default"])],
+        entry_export_credits: Vec::new(),
         used_class_members: vec![],
         referenced_dependencies: vec!["dep-a".to_string()],
+        package_referenced_dependencies: vec![],
         always_used_files: vec![],
         path_aliases: vec![],
         setup_files: vec![PathBuf::from("/project/setup-a.ts")],
         fixture_patterns: vec![],
         scss_include_paths: vec![],
         static_dir_mappings: vec![],
+        framework_static_dir_mappings: vec![],
         provided_dependencies: vec![],
+        config_diagnostics: vec![],
+        federation_sources: vec![],
+        jsx_import_sources: vec![],
+        jsx_package_credits: vec![],
+        tsconfig_jsx_dirs: Vec::new(),
     };
     let result2 = PluginResult {
         entry_patterns: vec![path_rule("b.ts")],
         replace_entry_patterns: false,
+        accumulate_config_entry_patterns: false,
         replace_used_export_rules: false,
         used_exports: vec![used_export_rule("b.ts", &["loader"])],
+        entry_export_credits: Vec::new(),
         used_class_members: vec![],
         referenced_dependencies: vec!["dep-b".to_string()],
+        package_referenced_dependencies: vec![],
         always_used_files: vec!["c.ts".to_string()],
         path_aliases: vec![],
         setup_files: vec![],
         fixture_patterns: vec![],
         scss_include_paths: vec![],
         static_dir_mappings: vec![],
+        framework_static_dir_mappings: vec![],
         provided_dependencies: vec![],
+        config_diagnostics: vec![],
+        federation_sources: vec![],
+        jsx_import_sources: vec![],
+        jsx_package_credits: vec![],
+        tsconfig_jsx_dirs: Vec::new(),
     };
 
     process_config_result("plugin-a", result1, &mut aggregated, None).unwrap();
@@ -1395,6 +1438,96 @@ fn process_config_result_replace_entry_patterns_removes_static_defaults() {
 }
 
 #[test]
+fn process_config_result_second_replacing_config_keeps_first_config_patterns() {
+    let mut aggregated = AggregatedPluginResult::default();
+    aggregated
+        .entry_patterns
+        .push((path_rule("**/*.spec.ts"), "playwright".to_string()));
+
+    for pattern in ["apps/one/ui/**/*.spec.ts", "apps/two/checks/**/*.spec.ts"] {
+        let config_result = PluginResult {
+            entry_patterns: vec![path_rule(pattern)],
+            replace_entry_patterns: true,
+            accumulate_config_entry_patterns: true,
+            ..Default::default()
+        };
+        process_config_result("playwright", config_result, &mut aggregated, None).unwrap();
+    }
+
+    let patterns: Vec<&str> = aggregated
+        .entry_patterns
+        .iter()
+        .map(|(rule, _)| rule.pattern.as_str())
+        .collect();
+    assert_eq!(
+        patterns,
+        vec!["apps/one/ui/**/*.spec.ts", "apps/two/checks/**/*.spec.ts"],
+        "the static default goes, and the patterns of both configs stay"
+    );
+}
+
+#[test]
+fn process_config_result_first_replacing_config_keeps_earlier_config_patterns() {
+    let mut aggregated = AggregatedPluginResult::default();
+    aggregated
+        .entry_patterns
+        .push((path_rule("**/*.test.ts"), "vitest".to_string()));
+
+    let nested = PluginResult {
+        entry_patterns: vec![path_rule("fixtures/app/src/**/*.test.ts")],
+        accumulate_config_entry_patterns: true,
+        ..Default::default()
+    };
+    process_config_result("vitest", nested, &mut aggregated, None).unwrap();
+    let root = PluginResult {
+        entry_patterns: vec![path_rule("test/**/*.test.ts")],
+        replace_entry_patterns: true,
+        accumulate_config_entry_patterns: true,
+        ..Default::default()
+    };
+    process_config_result("vitest", root, &mut aggregated, None).unwrap();
+
+    let patterns: Vec<&str> = aggregated
+        .entry_patterns
+        .iter()
+        .map(|(rule, _)| rule.pattern.as_str())
+        .collect();
+    assert_eq!(
+        patterns,
+        vec!["fixtures/app/src/**/*.test.ts", "test/**/*.test.ts"],
+        "the static default goes, and the pattern of the earlier config stays"
+    );
+}
+
+#[test]
+fn process_config_result_later_replacing_config_wins_without_accumulation() {
+    let mut aggregated = AggregatedPluginResult::default();
+    aggregated
+        .entry_patterns
+        .push((path_rule("**/*.test.ts"), "vitest".to_string()));
+
+    for pattern in ["a/**/*.t.ts", "b/**/*.t.ts"] {
+        let config_result = PluginResult {
+            entry_patterns: vec![path_rule(pattern)],
+            replace_entry_patterns: true,
+            ..Default::default()
+        };
+        process_config_result("vitest", config_result, &mut aggregated, None).unwrap();
+    }
+
+    let patterns: Vec<&str> = aggregated
+        .entry_patterns
+        .iter()
+        .map(|(rule, _)| rule.pattern.as_str())
+        .collect();
+    assert_eq!(
+        patterns,
+        vec!["b/**/*.t.ts"],
+        "a plugin that does not accumulate keeps only the last config's patterns"
+    );
+}
+
+#[test]
 fn process_config_result_replace_used_export_rules_removes_static_defaults() {
     let mut aggregated = AggregatedPluginResult::default();
     aggregated.used_exports.push(plugin_used_export_rule(
@@ -1479,50 +1612,6 @@ fn process_config_result_replace_used_export_rules_noop_when_empty() {
         aggregated.used_exports[0].rule.path.pattern,
         "src/routes/**/*.tsx"
     );
-}
-
-#[test]
-fn plugin_result_is_empty_for_default() {
-    assert!(
-        PluginResult::default().is_empty(),
-        "default PluginResult should be empty"
-    );
-}
-
-#[test]
-fn plugin_result_not_empty_when_any_field_set() {
-    let fields: Vec<PluginResult> = vec![
-        PluginResult {
-            entry_patterns: vec![path_rule("src/**/*.ts")],
-            ..Default::default()
-        },
-        PluginResult {
-            used_exports: vec![used_export_rule("src/**/*.ts", &["loader"])],
-            ..Default::default()
-        },
-        PluginResult {
-            referenced_dependencies: vec!["lodash".to_string()],
-            ..Default::default()
-        },
-        PluginResult {
-            always_used_files: vec!["setup.ts".to_string()],
-            ..Default::default()
-        },
-        PluginResult {
-            path_aliases: vec![("@".to_string(), "src".to_string())],
-            ..Default::default()
-        },
-        PluginResult {
-            setup_files: vec![PathBuf::from("/project/setup.ts")],
-            ..Default::default()
-        },
-    ];
-    for (i, result) in fields.iter().enumerate() {
-        assert!(
-            !result.is_empty(),
-            "PluginResult with field index {i} set should not be empty"
-        );
-    }
 }
 
 #[test]
@@ -1661,6 +1750,7 @@ fn multiple_external_plugins_independently_activated() {
         enablers: vec!["dep-a".to_string()],
         entry_points: vec!["a/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -1675,6 +1765,7 @@ fn multiple_external_plugins_independently_activated() {
         enablers: vec!["dep-b".to_string()],
         entry_points: vec!["b/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -1700,6 +1791,7 @@ fn external_plugin_multiple_used_exports() {
         enablers: vec!["multi-dep".to_string()],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![
@@ -1995,6 +2087,7 @@ fn process_external_plugins_prefix_enabler_requires_slash() {
         enablers: vec!["@org/".to_string()],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2020,6 +2113,7 @@ fn process_external_plugins_prefix_enabler_matches_scoped() {
         enablers: vec!["@org/".to_string()],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2069,17 +2163,20 @@ test: {
             .any(|(p, _)| p == "tests/**/*.test.ts"),
         "config parsing should extract test.include patterns"
     );
-    let vitest_patterns: Vec<_> = result
+    let vitest_patterns: Vec<&str> = result
         .entry_patterns
         .iter()
         .filter(|(_, name)| name == "vitest")
+        .map(|(rule, _)| rule.pattern.as_str())
         .collect();
     assert_eq!(
-        vitest_patterns.len(),
-        1,
-        "test.include should replace static defaults, not add to them; found: {vitest_patterns:?}"
+        vitest_patterns,
+        vec![
+            "tests/**/*.test.ts",
+            "**/*.{bench,benchmark}.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"
+        ],
+        "test.include replaces the static test defaults and keeps the bench default"
     );
-    assert_eq!(vitest_patterns[0].0, "tests/**/*.test.ts");
     assert!(
         !result.setup_files.is_empty(),
         "config parsing should extract setupFiles"
@@ -2186,6 +2283,7 @@ fn external_plugin_detection_all_with_file_and_dep() {
         enablers: vec![],
         entry_points: vec!["src/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2221,6 +2319,7 @@ fn external_plugin_detection_all_dep_and_file_missing_file() {
         enablers: vec![],
         entry_points: vec![],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2388,6 +2487,43 @@ fn in_memory_config_discovery_matches_filesystem() {
     );
 }
 
+/// A resolved plugin still probes a pattern that source discovery cannot index,
+/// but a file that the candidate index holds was already read in Phase 3a, so
+/// it resolves once.
+#[test]
+fn discover_config_files_reads_an_indexed_file_of_a_resolved_plugin_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let storybook_main = root.join(".rnstorybook/main.ts");
+    let build_config = root.join("build/webpack.prod.js");
+    for path in [&storybook_main, &build_config] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "module.exports = {};").unwrap();
+    }
+
+    let registry = PluginRegistry::default();
+    let matchers = registry.precompile_config_matchers();
+    let resolved: FxHashSet<&str> = ["storybook", "webpack"].into_iter().collect();
+    // `.rnstorybook` is a discovery hidden directory, so Phase 3a indexed its
+    // file. Source discovery skips `build/`, so the index does not hold it.
+    let index = ConfigCandidateIndex::build([storybook_main.as_path()]);
+
+    let hits: Vec<(PathBuf, &str)> =
+        discover_config_files(&matchers, &resolved, &[root], false, Some(&index))
+            .into_iter()
+            .map(|(path, plugin)| (path, plugin.name()))
+            .collect();
+    assert!(
+        !hits.iter().any(|(path, _)| path == &storybook_main),
+        "an indexed file of a resolved plugin was already read, got {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|(path, name)| path == &build_config && *name == "webpack"),
+        "a file that the index cannot hold is still read, got {hits:?}"
+    );
+}
+
 #[test]
 fn discover_config_files_skips_source_ext_root_patterns() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2406,35 +2542,6 @@ fn discover_config_files_skips_source_ext_root_patterns() {
         !found_vite_config,
         "discover_config_files should skip source-ext root patterns; Phase 3a handles them"
     );
-}
-
-#[test]
-fn create_builtin_plugins_returns_non_empty() {
-    let plugins = builtin::create_builtin_plugins();
-    assert!(
-        !plugins.is_empty(),
-        "create_builtin_plugins should return a non-empty list"
-    );
-}
-
-#[test]
-fn builtin_plugin_config_candidate_basenames_are_stable_and_non_empty() {
-    let basenames = super::builtin_plugin_config_candidate_basenames();
-
-    assert!(!basenames.is_empty());
-    assert!(basenames.windows(2).all(|window| window[0] <= window[1]));
-    assert!(basenames.iter().any(|name| name == "tsconfig.json"));
-    assert!(basenames.iter().any(|name| name == "bunfig.toml"));
-}
-
-#[test]
-fn create_builtin_plugins_all_have_unique_names() {
-    let plugins = builtin::create_builtin_plugins();
-    let mut seen = FxHashSet::default();
-    for plugin in &plugins {
-        let name = plugin.name();
-        assert!(seen.insert(name), "duplicate plugin name found: {name}");
-    }
 }
 
 #[test]
@@ -2462,17 +2569,6 @@ fn create_builtin_plugins_contains_critical_plugins() {
         assert!(
             names.contains(expected),
             "critical plugin '{expected}' missing from builtin plugins"
-        );
-    }
-}
-
-#[test]
-fn create_builtin_plugins_all_have_non_empty_names() {
-    let plugins = builtin::create_builtin_plugins();
-    for plugin in &plugins {
-        assert!(
-            !plugin.name().is_empty(),
-            "all builtin plugins must have a non-empty name"
         );
     }
 }
@@ -2634,6 +2730,7 @@ fn process_external_plugins_detection_dependency() {
         enablers: vec![],
         entry_points: vec!["src/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2664,6 +2761,7 @@ fn process_external_plugins_detection_not_matched() {
         enablers: vec![],
         entry_points: vec!["src/**/*.ts".to_string()],
         config_patterns: vec![],
+        config_default_export_opt_out: vec![],
         always_used: vec![],
         tooling_dependencies: vec![],
         used_exports: vec![],
@@ -2770,6 +2868,10 @@ fn framework_plugins_have_correct_enablers() {
     let result = registry.run(&redwoodsdk_pkg, Path::new("/project"), &[]);
     assert!(result.active_plugins.contains(&"redwoodsdk".to_string()));
 
+    let waku_pkg = make_pkg(&["waku"]);
+    let result = registry.run(&waku_pkg, Path::new("/project"), &[]);
+    assert!(result.active_plugins.contains(&"waku".to_string()));
+
     let wxt_pkg = make_pkg(&["wxt"]);
     let result = registry.run(&wxt_pkg, Path::new("/project"), &[]);
     assert!(result.active_plugins.contains(&"wxt".to_string()));
@@ -2782,6 +2884,7 @@ fn framework_plugins_have_correct_enablers() {
     let result = registry.run(&plain_vite_pkg, Path::new("/project"), &[]);
     assert!(!result.active_plugins.contains(&"redwoodsdk".to_string()));
     assert!(!result.active_plugins.contains(&"wxt".to_string()));
+    assert!(!result.active_plugins.contains(&"waku".to_string()));
 }
 
 #[test]
@@ -2847,24 +2950,6 @@ fn git_hooks_plugins_have_correct_enablers() {
     let lint_staged_pkg = make_pkg(&["lint-staged"]);
     let result = registry.run(&lint_staged_pkg, Path::new("/project"), &[]);
     assert!(result.active_plugins.contains(&"lint-staged".to_string()));
-}
-
-#[test]
-fn aggregated_result_default_is_empty() {
-    let result = AggregatedPluginResult::default();
-    assert!(result.entry_patterns.is_empty());
-    assert!(result.config_patterns.is_empty());
-    assert!(result.always_used.is_empty());
-    assert!(result.used_exports.is_empty());
-    assert!(result.referenced_dependencies.is_empty());
-    assert!(result.discovered_always_used.is_empty());
-    assert!(result.setup_files.is_empty());
-    assert!(result.tooling_dependencies.is_empty());
-    assert!(result.script_used_packages.is_empty());
-    assert!(result.virtual_module_prefixes.is_empty());
-    assert!(result.virtual_package_suffixes.is_empty());
-    assert!(result.path_aliases.is_empty());
-    assert!(result.active_plugins.is_empty());
 }
 
 #[test]
@@ -3557,4 +3642,393 @@ fn workspace_plugin_merge_deduplicates_semantic_framework_contracts() {
     });
 
     assert_eq!(aggregate.framework_class_member_contracts.len(), 1);
+}
+
+#[test]
+fn registry_reads_function_config_arrays_without_seeding_siblings() {
+    for tool in ["tsup", "tsdown"] {
+        for (export, expected) in [
+            (
+                "export default () => [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }]",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default defineConfig(() => [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }])",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default defineConfig(() => { return [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }]; })",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default function () { return [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }]; }",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default defineConfig(function () { return [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }]; })",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default () => { return { entry: 'custom/one.ts' }; return [{ entry: 'custom/dead.ts' }]; }",
+                &["custom/one.ts"][..],
+            ),
+            (
+                "export default function* () { return [{ entry: 'custom/dead.ts' }]; }",
+                &[][..],
+            ),
+            (
+                "export default async function* () { return [{ entry: 'custom/dead.ts' }]; }",
+                &[][..],
+            ),
+            (
+                "export default async () => [{ entry: 'custom/one.ts' }, { entry: ['custom/two.ts'] }]",
+                &["custom/one.ts", "custom/two.ts"][..],
+            ),
+            (
+                "export default defineConfig(function* () { return [{ entry: 'custom/dead.ts' }]; })",
+                &[][..],
+            ),
+            (
+                "export default () => () => [{ entry: 'custom/dead.ts' }]",
+                &[][..],
+            ),
+            (
+                "export default () => { return () => [{ entry: 'custom/dead.ts' }]; }",
+                &[][..],
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir(root.join("custom")).unwrap();
+            let config = root.join(format!("{tool}.config.ts"));
+            std::fs::write(&config, export).unwrap();
+            let mut files = vec![config];
+            for name in ["one", "two", "dead"] {
+                let path = root.join(format!("custom/{name}.ts"));
+                std::fs::write(&path, "export const value = 1;").unwrap();
+                files.push(path);
+            }
+            let result = PluginRegistry::default().run(&make_pkg(&[tool]), root, &files);
+            let credited: Vec<&str> = ["custom/one.ts", "custom/two.ts", "custom/dead.ts"]
+                .into_iter()
+                .filter(|file| {
+                    result.entry_patterns.iter().any(|(rule, _)| {
+                        globset::Glob::new(&rule.pattern)
+                            .unwrap()
+                            .compile_matcher()
+                            .is_match(file)
+                    })
+                })
+                .collect();
+            assert_eq!(credited, expected, "{tool}: {export}");
+        }
+    }
+}
+
+#[test]
+fn registry_discovers_nuxt_root_config_module_extensions() {
+    for extension in ["mjs", "mts", "cjs", "cts"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("custom")).unwrap();
+        let config = root.join(format!("nuxt.config.{extension}"));
+        let source = if matches!(extension, "cjs" | "cts") {
+            "module.exports = { plugins: ['./custom/live.ts'], modules: ['fixture-module'] };"
+        } else {
+            "export default { plugins: ['./custom/live.ts'], modules: ['fixture-module'] };"
+        };
+        std::fs::write(&config, source).unwrap();
+        std::fs::write(root.join("custom/live.ts"), "export default () => {};").unwrap();
+        std::fs::write(root.join("custom/dead.ts"), "export const dead = 1;").unwrap();
+        let files = vec![
+            config,
+            root.join("custom/live.ts"),
+            root.join("custom/dead.ts"),
+        ];
+        let result = PluginRegistry::default().run(&make_pkg(&[]), root, &files);
+        let credited: Vec<&str> = ["custom/live.ts", "custom/dead.ts"]
+            .into_iter()
+            .filter(|file| {
+                result.entry_patterns.iter().any(|(rule, _)| {
+                    globset::Glob::new(&rule.pattern)
+                        .unwrap()
+                        .compile_matcher()
+                        .is_match(file)
+                })
+            })
+            .collect();
+        assert_eq!(credited, ["custom/live.ts"], "extension: {extension}");
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"fixture-module".to_string())
+        );
+        assert!(result.always_used.iter().any(|(pattern, _)| {
+            globset::Glob::new(pattern)
+                .unwrap()
+                .compile_matcher()
+                .is_match(format!("nuxt.config.{extension}"))
+        }));
+    }
+}
+
+/// A script `--config` path that leaves the project root is not read. The same
+/// path inside the project root, outside the workspace package, is read.
+#[test]
+fn script_config_files_outside_the_project_root_are_not_read() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let package = project.join("packages/web");
+    std::fs::create_dir_all(&package).expect("create package");
+    std::fs::create_dir_all(project.join("shared")).expect("create shared");
+    std::fs::create_dir_all(temp.path().join("outside")).expect("create outside");
+    std::fs::write(
+        temp.path().join("outside/vitest.e2e.config.ts"),
+        "import outside from 'outside-dep'; export default {};",
+    )
+    .expect("write outside config");
+    std::fs::write(
+        project.join("shared/vitest.e2e.config.ts"),
+        "import inside from 'inside-dep'; export default {};",
+    )
+    .expect("write shared config");
+    let config_files = [
+        scripts::BinaryConfigFile {
+            binary: "vitest".to_string(),
+            path: "../../../outside/vitest.e2e.config.ts".to_string(),
+        },
+        scripts::BinaryConfigFile {
+            binary: "vitest".to_string(),
+            path: "../../shared/vitest.e2e.config.ts".to_string(),
+        },
+    ];
+
+    let result = PluginRegistry::default().resolve_script_config_files(
+        &config_files,
+        &package,
+        &project,
+        "packages/web",
+    );
+
+    assert!(
+        !result
+            .referenced_dependencies
+            .contains(&"outside-dep".to_string()),
+        "a config outside the project root must not be read, got: {:?}",
+        result.referenced_dependencies
+    );
+    assert!(
+        result
+            .referenced_dependencies
+            .contains(&"inside-dep".to_string()),
+        "a config inside the project root must be read, got: {:?}",
+        result.referenced_dependencies
+    );
+}
+
+/// A script `--config` path inside the project root that is a symlink to a
+/// file outside it is not read.
+#[cfg(unix)]
+#[test]
+fn script_config_file_symlink_outside_the_project_root_is_not_read() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(
+        temp.path().join("vitest.e2e.config.ts"),
+        "import outside from 'outside-dep'; export default {};",
+    )
+    .expect("write outside config");
+    std::os::unix::fs::symlink(
+        temp.path().join("vitest.e2e.config.ts"),
+        project.join("vitest.e2e.config.ts"),
+    )
+    .expect("create symlink");
+    let config_files = [scripts::BinaryConfigFile {
+        binary: "vitest".to_string(),
+        path: "vitest.e2e.config.ts".to_string(),
+    }];
+
+    let result = PluginRegistry::default().resolve_script_config_files(
+        &config_files,
+        &project,
+        &project,
+        "",
+    );
+
+    assert!(
+        !result
+            .referenced_dependencies
+            .contains(&"outside-dep".to_string()),
+        "a symlink to a config outside the project root must not be read, got: {:?}",
+        result.referenced_dependencies
+    );
+}
+
+fn config_default_patterns(result: &AggregatedPluginResult, plugin: &str) -> Vec<String> {
+    result
+        .config_export_credits
+        .iter()
+        .filter(|rule| rule.plugin_name == plugin)
+        .inspect(|rule| assert_eq!(rule.rule.exports, vec!["default".to_string()]))
+        .map(|rule| rule.rule.path.pattern.clone())
+        .collect()
+}
+
+#[test]
+fn config_default_export_opt_out_names_own_config_patterns() {
+    for plugin in builtin::create_builtin_plugins() {
+        for pattern in plugin.config_default_export_opt_out() {
+            assert!(
+                plugin.config_patterns().contains(pattern),
+                "plugin {} opts out of the default credit for {pattern}, which is not one of its config patterns",
+                plugin.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn config_export_credits_follow_config_patterns_and_anchored_files() {
+    let registry = PluginRegistry::default();
+    let pkg = make_pkg(&["gatsby", "@graphql-codegen/cli", "tailwindcss"]);
+    let result = registry.run(&pkg, Path::new("/project"), &[]);
+
+    assert_eq!(
+        config_default_patterns(&result, "gatsby"),
+        vec!["**/gatsby-config.{ts,js,mjs}".to_string()]
+    );
+    assert_eq!(
+        config_default_patterns(&result, "graphql-codegen"),
+        vec![
+            "**/graphql.config.{ts,js,cjs,mjs}".to_string(),
+            "codegen*.{ts,js,cjs,mjs}".to_string()
+        ]
+    );
+    assert_eq!(
+        config_default_patterns(&result, "tailwind"),
+        vec!["**/tailwind.config.{ts,js,cjs,mjs}".to_string()]
+    );
+}
+
+#[test]
+fn external_plugin_config_patterns_get_default_export_credit() {
+    let registry = PluginRegistry::new(vec![make_external(
+        "acme",
+        &["acme"],
+        &["acme.config.ts", ".acme/settings.ts"],
+    )]);
+    let pkg = make_pkg(&["acme"]);
+    let result = registry.run(&pkg, Path::new("/project"), &[]);
+
+    assert_eq!(
+        config_default_patterns(&result, "acme"),
+        vec![
+            "**/acme.config.ts".to_string(),
+            ".acme/settings.ts".to_string()
+        ]
+    );
+}
+
+#[test]
+fn config_export_credits_get_workspace_prefix() {
+    let mut workspace = AggregatedPluginResult::default();
+    workspace
+        .config_export_credits
+        .push(plugin_used_export_rule(
+            "tailwind",
+            "**/tailwind.config.js",
+            &["default"],
+        ));
+    workspace.apply_workspace_prefix("packages/web");
+
+    let mut root = AggregatedPluginResult::default();
+    root.merge_into(workspace);
+    assert_eq!(
+        config_default_patterns(&root, "tailwind"),
+        vec!["packages/web/**/tailwind.config.js".to_string()]
+    );
+}
+
+fn config_export_credits(
+    result: &AggregatedPluginResult,
+    plugin: &str,
+) -> Vec<(String, Vec<String>)> {
+    result
+        .config_export_credits
+        .iter()
+        .filter(|rule| rule.plugin_name == plugin)
+        .map(|rule| (rule.rule.path.pattern.clone(), rule.rule.exports.clone()))
+        .collect()
+}
+
+#[test]
+fn config_file_exports_are_anchored_and_keep_export_names() {
+    let registry = PluginRegistry::default();
+    let pkg = make_pkg(&["@cucumber/cucumber", "@vercel/config", "@capacitor/cli"]);
+    let result = registry.run(&pkg, Path::new("/project"), &[]);
+
+    assert_eq!(
+        config_export_credits(&result, "cucumber"),
+        vec![
+            (
+                "cucumber.{js,cjs,mjs,ts}".to_string(),
+                vec!["*".to_string()]
+            ),
+            (
+                "cucumber.config.{js,cjs,mjs,ts}".to_string(),
+                vec!["*".to_string()]
+            ),
+        ]
+    );
+    assert_eq!(
+        config_export_credits(&result, "vercel"),
+        vec![(
+            "vercel.{ts,js,mjs,cjs,mts}".to_string(),
+            vec!["*".to_string()]
+        )]
+    );
+    assert_eq!(
+        config_export_credits(&result, "capacitor"),
+        vec![(
+            "capacitor.config.{ts,js}".to_string(),
+            vec!["default".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn external_plugin_opt_out_removes_default_export_credit() {
+    let mut plugin = make_external("acme", &["acme"], &["acme.config.ts", "acme-*.ts"]);
+    plugin.config_default_export_opt_out = vec!["acme-*.ts".to_string()];
+    let registry = PluginRegistry::new(vec![plugin]);
+    let pkg = make_pkg(&["acme"]);
+    let result = registry.run(&pkg, Path::new("/project"), &[]);
+
+    assert_eq!(
+        config_default_patterns(&result, "acme"),
+        vec!["**/acme.config.ts".to_string()]
+    );
+    assert!(
+        result.config_patterns.contains(&"acme-*.ts".to_string()),
+        "an opted-out pattern stays a config pattern"
+    );
+}
+
+#[test]
+fn anchored_config_file_exports_get_workspace_prefix() {
+    let registry = PluginRegistry::default();
+    let pkg = make_pkg(&["@capacitor/cli"]);
+    let mut workspace = registry.run(&pkg, Path::new("/project/packages/mobile"), &[]);
+    workspace.apply_workspace_prefix("packages/mobile");
+
+    let mut root = AggregatedPluginResult::default();
+    root.merge_into(workspace);
+    assert_eq!(
+        config_export_credits(&root, "capacitor"),
+        vec![(
+            "packages/mobile/capacitor.config.{ts,js}".to_string(),
+            vec!["default".to_string()]
+        )]
+    );
 }

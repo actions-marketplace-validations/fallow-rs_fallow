@@ -20,6 +20,7 @@ fallow-config = { workspace = true }
 fallow-core = { workspace = true }
 fallow-extract = { workspace = true }
 fallow-graph = { workspace = true }
+fallow-mutation = { workspace = true }
 fallow-output = { workspace = true }
 fallow-security = { workspace = true }
 fallow-types = { workspace = true }
@@ -27,6 +28,7 @@ bitcode = { workspace = true }
 colored = { workspace = true }
 dunce = { workspace = true }
 globset = { workspace = true }
+ignore = { workspace = true }
 oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
@@ -37,12 +39,17 @@ oxc_coverage_instrument = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 sha2 = { workspace = true }
+srcmap-sourcemap = "0.3.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+url = "2"
 xxhash-rust = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [features]
 codspeed = []
@@ -50,6 +57,7 @@ schema = ["fallow-output/schema", "fallow-types/schema"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+insta = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
 

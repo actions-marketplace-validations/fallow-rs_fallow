@@ -21,6 +21,7 @@ export interface LspDuplicationOptions {
   readonly skipLocal: boolean | undefined;
   readonly crossLanguage: boolean | undefined;
   readonly ignoreImports: boolean | undefined;
+  readonly ignoreSymlinks: boolean | undefined;
 }
 
 export interface LspHealthInitializationOptions {
@@ -35,11 +36,14 @@ export interface LspTypeAwareInitializationOptions {
 
 export interface LspInitializationOptions {
   readonly issueTypes: Record<string, boolean>;
+  readonly mutedCategories?: readonly string[];
   readonly changedSince: string;
+  readonly packageBaselines?: boolean;
   readonly configPath: string;
   readonly allowRemoteExtends: boolean;
   readonly production: boolean | undefined;
   readonly duplication: LspDuplicationOptions;
   readonly health?: LspHealthInitializationOptions;
   readonly typeAware?: LspTypeAwareInitializationOptions;
+  readonly prewarm?: boolean;
 }

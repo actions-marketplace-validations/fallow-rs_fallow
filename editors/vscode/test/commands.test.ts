@@ -16,6 +16,7 @@ let mockBinaryVersions: Readonly<Record<string, string | null>> = {};
 let mockConfigPathSetting = "";
 let mockResolvedConfigRoots: string[] = [];
 let mockComplexityBreakdownEnabled = false;
+let mockIssueTypes: Readonly<Record<string, boolean>> = {};
 let mockTypeAwareSettings: {
   enabled: boolean;
   projects: readonly string[];
@@ -25,6 +26,7 @@ let mockTypeAwareSettings: {
   projects: [],
   require: "best-effort",
 };
+let mockTypeAwareTimeoutSeconds = 0;
 let mockActiveTextEditor:
   | {
       readonly document: {
@@ -43,6 +45,9 @@ let mockActiveTextEditor:
 
 vi.mock("node:fs", () => ({
   existsSync: (p: string) => mockFiles.has(p),
+  statSync: () => {
+    throw new Error("ENOENT");
+  },
 }));
 
 vi.mock("vscode", () => ({
@@ -94,9 +99,12 @@ vi.mock("../src/config.js", () => ({
   getAutoDownload: () => mockAutoDownload,
   getProductionOverride: () => undefined,
   getTypeAwareSettings: () => mockTypeAwareSettings,
+  getTypeAwareTimeoutSeconds: () => mockTypeAwareTimeoutSeconds,
   getAuditGate: () => "new-only",
+  getAuditWorsened: () => undefined,
   getDuplicationCrossLanguageOverride: () => undefined,
   getDuplicationIgnoreImportsOverride: () => undefined,
+  getDuplicationIgnoreSymlinksOverride: () => undefined,
   getDuplicationMinLinesOverride: () => undefined,
   getDuplicationMinOccurrencesOverride: () => undefined,
   getDuplicationMinTokensOverride: () => undefined,
@@ -108,8 +116,9 @@ vi.mock("../src/config.js", () => ({
   getHealthTopFindings: () => 20,
   getComplexityBreakdownEnabled: () => mockComplexityBreakdownEnabled,
   getComplexityDecorationCap: () => 200,
-  getIssueTypes: () => ({}),
+  getIssueTypes: () => mockIssueTypes,
   getChangedSince: () => "",
+  getPackageBaselines: () => true,
   getResolvedConfigPath: (workspaceRoot?: string) => {
     mockResolvedConfigRoots.push(workspaceRoot ?? "");
     return mockConfigPathSetting && workspaceRoot
@@ -119,21 +128,12 @@ vi.mock("../src/config.js", () => ({
   getWorkspaceScope: () => "",
 }));
 
-vi.mock("../src/binary-utils.js", () => ({
+// The real `resolveConfiguredBinaryPath` runs against the mocked node:fs.
+vi.mock("../src/binary-utils.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/binary-utils.js")>()),
   getExecutableExtension: () => "",
   findLocalBinary: (name: string) => (name === "fallow" ? mockLocalBinary : null),
   findBinaryInPath: (name: string) => (name === "fallow" ? mockPathBinary : null),
-  // Mirror the real sibling resolution against the mocked fs (mockFiles): the
-  // `fallow` CLI sibling of a configured `fallow.lspPath` is `<dir>/fallow`.
-  resolveConfiguredBinaryPath: (configured: string, name: string) => {
-    const slash = configured.lastIndexOf("/");
-    const dir = slash >= 0 ? configured.slice(0, slash) : ".";
-    const sibling = `${dir}/${name}`;
-    if (mockFiles.has(configured) && configured.endsWith(`/${name}`)) {
-      return configured;
-    }
-    return mockFiles.has(sibling) ? sibling : null;
-  },
 }));
 
 vi.mock("../src/download.js", () => ({
@@ -162,6 +162,8 @@ import {
 } from "../src/commands.js";
 import { AnalysisFailureBackoff } from "../src/analysisBackoff.js";
 import { resetBinarySkewToast } from "../src/binary-skew.js";
+import { resetTypeAwareDegradationNotice } from "../src/typeAwareDegradation.js";
+import type { FallowCheckResult } from "../src/types.js";
 
 const context = {} as unknown as vscode.ExtensionContext;
 const workspaceContext = {
@@ -174,11 +176,13 @@ beforeEach(() => {
   mockAutoDownload = true;
   mockConfigPathSetting = "";
   mockResolvedConfigRoots = [];
+  mockIssueTypes = {};
   mockTypeAwareSettings = { enabled: false, projects: [], require: "best-effort" };
+  mockTypeAwareTimeoutSeconds = 0;
 });
 
 const emptyCheck = {
-  schema_version: 9,
+  schema_version: 10,
   version: "0.0.0-test",
   elapsed_ms: 0,
   total_issues: 0,
@@ -198,6 +202,7 @@ const emptyCheck = {
   test_only_dependencies: [],
   circular_dependencies: [],
   re_export_cycles: [],
+  package_cycles: [],
   boundary_violations: [],
   stale_suppressions: [],
   unused_catalog_entries: [],
@@ -221,6 +226,7 @@ const emptyCheck = {
     test_only_dependencies: 0,
     circular_dependencies: 0,
     re_export_cycles: 0,
+    package_cycles: 0,
     boundary_violations: 0,
     stale_suppressions: 0,
     unused_catalog_entries: 0,
@@ -428,7 +434,7 @@ describe("resolveCliBinary", () => {
     mockDownloadedCli = "/storage/bin/fallow";
 
     await expect(resolveCliBinary(context)).resolves.toBe("/storage/bin/fallow");
-    expect(downloadCliBinary).toHaveBeenCalledWith(context);
+    expect(downloadCliBinary).toHaveBeenCalledWith(context, undefined);
   });
 
   it("does not download the CLI when auto-download is disabled", async () => {
@@ -506,7 +512,7 @@ describe("resolveCliForRun", () => {
       binary: "/storage/bin/fallow",
       version: "2.88.1",
     });
-    expect(downloadCliBinary).toHaveBeenCalledWith(context);
+    expect(downloadCliBinary).toHaveBeenCalledWith(context, undefined);
   });
 
   it("keeps a stale CLI (degraded) when auto-download is disabled", async () => {
@@ -548,12 +554,301 @@ describe("runAnalysis retry backoff", () => {
     vi.clearAllMocks();
   });
 
+  it("filters absent optional prop candidates without changing their review evidence", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fallow-vscode-absent-prop-"));
+    const script = join(dir, "fallow-cli.js");
+    const candidate = {
+      path: "src/Button.vue",
+      line: 7,
+      col: 2,
+      component_name: "Button",
+      prop_name: "highlight",
+      framework: "vue",
+      has_default: true,
+      inspected_call_sites: [{ path: "src/App.vue", line: 12, col: 4 }],
+      explanation:
+        "Known reachable callers omit this consumed optional prop. Review the default before changing it.",
+      finding_id: "dc1:absent-component-prop:0123456789abcdef",
+      effective_severity: "warn",
+      actions: [
+        {
+          type: "review-component-prop",
+          auto_fixable: false,
+          description: "Review the component contract",
+        },
+      ],
+    } satisfies NonNullable<FallowCheckResult["absent_component_props"]>[number];
+    const output = JSON.stringify({
+      check: { ...emptyCheck, absent_component_props: [candidate] },
+    });
+
+    try {
+      await writeFile(
+        script,
+        `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(output)});\n`,
+        "utf8",
+      );
+      await chmod(script, 0o755);
+      mockPathBinary = script;
+      setWorkspaceRoot(dir);
+      mockIssueTypes = { "absent-component-props": true };
+
+      const enabled = await runAnalysis(workspaceContext, undefined, {
+        backoff: new AnalysisFailureBackoff(),
+      });
+      expect(enabled.check?.absent_component_props).toEqual([candidate]);
+      expect(enabled.check?.total_issues).toBe(1);
+      expect(enabled.check?.summary.absent_component_props).toBe(1);
+
+      mockIssueTypes = { "absent-component-props": false };
+      const disabled = await runAnalysis(workspaceContext, undefined, {
+        backoff: new AnalysisFailureBackoff(),
+      });
+      expect(disabled.check?.absent_component_props).toEqual([]);
+      expect(disabled.check?.total_issues).toBe(0);
+      expect(disabled.check?.summary.absent_component_props).toBe(0);
+
+      const oldOutput = JSON.stringify({ check: emptyCheck });
+      await writeFile(
+        script,
+        `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(oldOutput)});\n`,
+        "utf8",
+      );
+      mockIssueTypes = { "absent-component-props": true };
+      const older = await runAnalysis(workspaceContext, undefined, {
+        backoff: new AnalysisFailureBackoff(),
+      });
+      expect(older.check?.total_issues).toBe(0);
+      expect(older.check?.summary.absent_component_props).toBe(0);
+    } finally {
+      setWorkspaceRoot(null);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  describe("issue-type filtering", () => {
+    // Each issue-type toggle and the check result arrays that it controls.
+    const TOGGLED_ARRAYS: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
+      ["unused-files", ["unused_files"]],
+      ["unused-exports", ["unused_exports"]],
+      ["unused-types", ["unused_types"]],
+      ["private-type-leaks", ["private_type_leaks"]],
+      ["unused-dependencies", ["unused_dependencies"]],
+      ["unused-dev-dependencies", ["unused_dev_dependencies"]],
+      ["unused-optional-dependencies", ["unused_optional_dependencies"]],
+      ["unused-enum-members", ["unused_enum_members"]],
+      ["unused-class-members", ["unused_class_members"]],
+      ["unused-store-members", ["unused_store_members"]],
+      ["unused-server-actions", ["unused_server_actions"]],
+      ["unused-load-data-keys", ["unused_load_data_keys"]],
+      ["unused-component-props", ["unused_component_props"]],
+      ["absent-component-props", ["absent_component_props"]],
+      ["unused-component-emits", ["unused_component_emits"]],
+      ["unused-component-inputs", ["unused_component_inputs"]],
+      ["unused-component-outputs", ["unused_component_outputs"]],
+      ["unused-svelte-events", ["unused_svelte_events"]],
+      ["unused-effect-layers", ["unused_effect_layers"]],
+      ["unused-tagged-errors", ["unused_tagged_errors"]],
+      ["unproduced-catch-tags", ["unproduced_catch_tags"]],
+      ["unrendered-components", ["unrendered_components"]],
+      ["unprovided-injects", ["unprovided_injects"]],
+      ["invalid-client-export", ["invalid_client_exports"]],
+      ["mixed-client-server-barrel", ["mixed_client_server_barrels"]],
+      ["misplaced-directive", ["misplaced_directives"]],
+      ["route-collision", ["route_collisions"]],
+      ["dynamic-segment-name-conflict", ["dynamic_segment_name_conflicts"]],
+      ["unresolved-imports", ["unresolved_imports"]],
+      ["unlisted-dependencies", ["unlisted_dependencies"]],
+      ["duplicate-exports", ["duplicate_exports"]],
+      ["type-only-dependencies", ["type_only_dependencies"]],
+      ["test-only-dependencies", ["test_only_dependencies"]],
+      ["dev-dependencies-in-production", ["dev_dependencies_in_production"]],
+      ["circular-dependencies", ["circular_dependencies"]],
+      ["re-export-cycle", ["re_export_cycles"]],
+      ["package-cycle", ["package_cycles"]],
+      [
+        "boundary-violation",
+        ["boundary_violations", "boundary_coverage_violations", "boundary_call_violations"],
+      ],
+      ["policy-violation", ["policy_violations"]],
+      ["stale-suppressions", ["stale_suppressions"]],
+      ["unused-catalog-entries", ["unused_catalog_entries"]],
+      ["empty-catalog-groups", ["empty_catalog_groups"]],
+      ["unresolved-catalog-references", ["unresolved_catalog_references"]],
+      ["unused-dependency-overrides", ["unused_dependency_overrides"]],
+      ["misconfigured-dependency-overrides", ["misconfigured_dependency_overrides"]],
+      ["prop-drilling", ["prop_drilling_chains"]],
+      ["thin-wrapper", ["thin_wrappers"]],
+      ["duplicate-prop-shape", ["duplicate_prop_shapes"]],
+    ];
+    // Advisory arrays stay in the result but do not add to total_issues.
+    const UNCOUNTED_ARRAYS = new Set([
+      "prop_drilling_chains",
+      "thin_wrappers",
+      "duplicate_prop_shapes",
+    ]);
+    const ARRAY_KEYS = TOGGLED_ARRAYS.flatMap(([, keys]) => keys);
+    // A different length for each array shows which array a count comes from.
+    const sizeOf = (key: string): number => ARRAY_KEYS.indexOf(key) + 1;
+    const countedSize = (keys: ReadonlyArray<string>): number =>
+      keys.filter((key) => !UNCOUNTED_ARRAYS.has(key)).reduce((sum, key) => sum + sizeOf(key), 0);
+    const fullCheck = {
+      ...emptyCheck,
+      deprecated_exports_in_use: [{ untouched: true }],
+      ...Object.fromEntries(
+        ARRAY_KEYS.map((key) => [
+          key,
+          Array.from({ length: sizeOf(key) }, (_, index) => ({ key, index })),
+        ]),
+      ),
+    };
+
+    const withAnalysisOutput = async (check: object, run: () => Promise<void>): Promise<void> => {
+      const dir = await mkdtemp(join(tmpdir(), "fallow-vscode-issue-types-"));
+      const script = join(dir, "fallow-cli.js");
+      const output = JSON.stringify({ check });
+      try {
+        await writeFile(
+          script,
+          `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(output)});\n`,
+          "utf8",
+        );
+        await chmod(script, 0o755);
+        mockPathBinary = script;
+        setWorkspaceRoot(dir);
+        await run();
+      } finally {
+        setWorkspaceRoot(null);
+        await rm(dir, { recursive: true, force: true });
+      }
+    };
+
+    const analyze = async (): Promise<FallowCheckResult | null> =>
+      (await runAnalysis(workspaceContext, undefined, { backoff: new AnalysisFailureBackoff() }))
+        .check;
+
+    it("keeps every array and recounts the summary when all toggles are on", async () => {
+      await withAnalysisOutput(fullCheck, async () => {
+        mockIssueTypes = Object.fromEntries(TOGGLED_ARRAYS.map(([type]) => [type, true]));
+        const check = await analyze();
+        const total = countedSize(ARRAY_KEYS);
+
+        expect(check).toEqual({
+          ...fullCheck,
+          total_issues: total,
+          summary: {
+            total_issues: total,
+            unused_files: sizeOf("unused_files"),
+            unused_exports: sizeOf("unused_exports"),
+            unused_types: sizeOf("unused_types"),
+            private_type_leaks: sizeOf("private_type_leaks"),
+            deprecated_exports_in_use: 0,
+            unused_dependencies:
+              sizeOf("unused_dependencies") +
+              sizeOf("unused_dev_dependencies") +
+              sizeOf("unused_optional_dependencies"),
+            unused_enum_members: sizeOf("unused_enum_members"),
+            unused_class_members: sizeOf("unused_class_members"),
+            absent_component_props: sizeOf("absent_component_props"),
+            unresolved_imports: sizeOf("unresolved_imports"),
+            unlisted_dependencies: sizeOf("unlisted_dependencies"),
+            duplicate_exports: sizeOf("duplicate_exports"),
+            type_only_dependencies: sizeOf("type_only_dependencies"),
+            test_only_dependencies: sizeOf("test_only_dependencies"),
+            dev_dependencies_in_production: sizeOf("dev_dependencies_in_production"),
+            circular_dependencies: sizeOf("circular_dependencies"),
+            re_export_cycles: sizeOf("re_export_cycles"),
+            package_cycles: sizeOf("package_cycles"),
+            boundary_violations: sizeOf("boundary_violations"),
+            boundary_coverage_violations: sizeOf("boundary_coverage_violations"),
+            boundary_call_violations: sizeOf("boundary_call_violations"),
+            policy_violations: sizeOf("policy_violations"),
+            stale_suppressions: sizeOf("stale_suppressions"),
+            unused_catalog_entries: sizeOf("unused_catalog_entries"),
+            empty_catalog_groups: sizeOf("empty_catalog_groups"),
+            unresolved_catalog_references: sizeOf("unresolved_catalog_references"),
+            unused_dependency_overrides: sizeOf("unused_dependency_overrides"),
+            misconfigured_dependency_overrides: sizeOf("misconfigured_dependency_overrides"),
+          },
+        });
+        expect(Object.keys(check?.summary ?? {})).toEqual([
+          "total_issues",
+          "unused_files",
+          "unused_exports",
+          "unused_types",
+          "private_type_leaks",
+          "deprecated_exports_in_use",
+          "unused_dependencies",
+          "unused_enum_members",
+          "unused_class_members",
+          "absent_component_props",
+          "unresolved_imports",
+          "unlisted_dependencies",
+          "duplicate_exports",
+          "type_only_dependencies",
+          "test_only_dependencies",
+          "dev_dependencies_in_production",
+          "circular_dependencies",
+          "re_export_cycles",
+          "package_cycles",
+          "boundary_violations",
+          "boundary_coverage_violations",
+          "boundary_call_violations",
+          "policy_violations",
+          "stale_suppressions",
+          "unused_catalog_entries",
+          "empty_catalog_groups",
+          "unresolved_catalog_references",
+          "unused_dependency_overrides",
+          "misconfigured_dependency_overrides",
+        ]);
+      });
+    });
+
+    it("keeps only the arrays of the one enabled toggle", { timeout: 60_000 }, async () => {
+      await withAnalysisOutput(fullCheck, async () => {
+        for (const [type, keys] of TOGGLED_ARRAYS) {
+          mockIssueTypes = { [type]: true };
+          const check = (await analyze()) as unknown as Record<string, unknown> | null;
+          const kept = ARRAY_KEYS.filter(
+            (key) => (check?.[key] as ReadonlyArray<unknown> | undefined)?.length,
+          );
+
+          expect({ type, kept, total: check?.total_issues }).toEqual({
+            type,
+            kept: keys,
+            total: countedSize(keys),
+          });
+          expect(check?.deprecated_exports_in_use).toEqual([{ untouched: true }]);
+        }
+      });
+    });
+
+    it("adds filtered arrays that an older CLI omits after the arrays it emits", async () => {
+      await withAnalysisOutput(emptyCheck, async () => {
+        mockIssueTypes = { "unused-store-members": true };
+        const check = await analyze();
+        const omitted = ARRAY_KEYS.filter((key) => !(key in emptyCheck));
+
+        expect(Object.keys(check ?? {})).toEqual([...Object.keys(emptyCheck), ...omitted]);
+        expect(check?.unused_store_members).toBeUndefined();
+        expect("unused_store_members" in (check ?? {})).toBe(true);
+        expect(check?.unused_server_actions).toEqual([]);
+        expect(check?.total_issues).toBe(0);
+      });
+    });
+  });
+
   it("runs analysis with the default max-file-size ceiling", async () => {
     const originalLimit = process.env.FALLOW_MAX_FILE_SIZE;
     const dir = await mkdtemp(join(tmpdir(), "fallow-vscode-analysis-env-"));
     const script = join(dir, "fallow-cli.js");
     const logPath = join(dir, "spawn.log");
-    const output = JSON.stringify({ check: emptyCheck, dupes: emptyDupes });
+    const output = JSON.stringify({
+      check: emptyCheck,
+      dupes: emptyDupes,
+      package_baselines: [{ workspace_root: "packages/web", reference: "main" }],
+    });
 
     try {
       delete process.env.FALLOW_MAX_FILE_SIZE;
@@ -578,11 +873,83 @@ describe("runAnalysis retry backoff", () => {
       const calls = await readSpawnLog(logPath);
 
       expect(result.check).not.toBeNull();
+      expect(result.scope?.package_baselines).toEqual([
+        { workspace_root: "packages/web", reference: "main" },
+      ]);
       expect(calls).toHaveLength(1);
       expect(calls[0]?.env).toBe("5");
       expect(calls[0]?.args).toEqual(["--format", "json", "--quiet", "--skip", "health"]);
     } finally {
       restoreMaxFileSizeEnv(originalLimit);
+      setWorkspaceRoot(null);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards the configured semantic timeout to the analysis process", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fallow-vscode-analysis-timeout-"));
+    const script = join(dir, "fallow-cli.js");
+    const logPath = join(dir, "spawn.log");
+    const output = JSON.stringify({ check: emptyCheck, dupes: emptyDupes });
+
+    try {
+      await writeFile(
+        script,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          `fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ env: process.env.FALLOW_TYPE_AWARE_TIMEOUT_SECS, args: process.argv.slice(2) }) + "\\n");`,
+          `process.stdout.write(${JSON.stringify(output)});`,
+        ].join("\n"),
+        "utf8",
+      );
+      await chmod(script, 0o755);
+
+      mockPathBinary = script;
+      mockTypeAwareTimeoutSeconds = 600;
+      setWorkspaceRoot(dir);
+
+      await runAnalysis(workspaceContext, undefined, { backoff: new AnalysisFailureBackoff() });
+      const calls = await readSpawnLog(logPath);
+
+      expect(calls[0]?.env).toBe("600");
+    } finally {
+      setWorkspaceRoot(null);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns once when the analysis kept the syntactic findings of a failed semantic pass", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fallow-vscode-analysis-degraded-"));
+    const script = join(dir, "fallow-cli.js");
+    const warning = "type-aware refinement unavailable for /repo: sidecar timed out";
+    const output = JSON.stringify({
+      _meta: { check: { type_aware: { executed: false, warnings: [warning, warning] } } },
+      check: emptyCheck,
+      dupes: emptyDupes,
+    });
+
+    try {
+      resetTypeAwareDegradationNotice();
+      await writeFile(
+        script,
+        ["#!/usr/bin/env node", `process.stdout.write(${JSON.stringify(output)});`].join("\n"),
+        "utf8",
+      );
+      await chmod(script, 0o755);
+
+      mockPathBinary = script;
+      setWorkspaceRoot(dir);
+
+      const backoff = new AnalysisFailureBackoff();
+      await runAnalysis(workspaceContext, undefined, { backoff });
+      await runAnalysis(workspaceContext, undefined, { backoff });
+
+      const shown = vi.mocked(mockWindow.showWarningMessage).mock.calls;
+      expect(shown).toHaveLength(1);
+      expect(String(shown[0]?.[0])).toContain(warning);
+    } finally {
+      resetTypeAwareDegradationNotice();
       setWorkspaceRoot(null);
       await rm(dir, { recursive: true, force: true });
     }
@@ -670,6 +1037,7 @@ describe("runAnalysis retry backoff", () => {
       await expect(runAnalysis(workspaceContext, undefined, { backoff })).resolves.toEqual({
         check: null,
         dupes: null,
+        scope: null,
       });
 
       await writeFile(modePath, "fail", "utf8");

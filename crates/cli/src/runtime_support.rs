@@ -129,6 +129,9 @@ pub enum AnalysisKind {
     DeadCode,
     Dupes,
     Health,
+    /// The architecture findings of the dead-code analysis: import cycles,
+    /// boundary violations and rule-pack policy violations.
+    Architecture,
 }
 
 /// Grouping mode for `--group-by`.
@@ -164,13 +167,23 @@ impl From<GroupBy> for GroupByMode {
 ///
 /// Returns `None` when no grouping is requested. Returns `Err(ExitCode)` when
 /// `--group-by owner` is requested but no CODEOWNERS file can be found.
+///
+/// `workspace_patterns` is the `workspaces.patterns` config value. `--group-by
+/// package` adds these patterns to the manifest patterns.
 pub fn build_ownership_resolver(
     group_by: Option<GroupBy>,
     root: &Path,
     codeowners_path: Option<&str>,
+    workspace_patterns: &[String],
     output: OutputFormat,
 ) -> Result<Option<crate::report::OwnershipResolver>, ExitCode> {
-    build_ownership_resolver_for_mode(group_by.map(Into::into), root, codeowners_path, output)
+    build_ownership_resolver_for_mode(
+        group_by.map(Into::into),
+        root,
+        codeowners_path,
+        workspace_patterns,
+        output,
+    )
 }
 
 /// Build an `OwnershipResolver` from a typed output grouping mode.
@@ -178,6 +191,7 @@ pub fn build_ownership_resolver_for_mode(
     group_by: Option<GroupByMode>,
     root: &Path,
     codeowners_path: Option<&str>,
+    workspace_patterns: &[String],
     output: OutputFormat,
 ) -> Result<Option<crate::report::OwnershipResolver>, ExitCode> {
     let Some(mode) = group_by else {
@@ -206,11 +220,15 @@ pub fn build_ownership_resolver_for_mode(
         },
         GroupByMode::Directory => Ok(Some(crate::report::OwnershipResolver::Directory)),
         GroupByMode::Package => {
-            let workspaces = fallow_engine::discover::discover_workspace_packages(root);
+            let workspaces = fallow_engine::discover::discover_workspace_packages_with_patterns(
+                root,
+                workspace_patterns,
+            );
             if workspaces.is_empty() {
                 Err(crate::error::emit_error(
                     "--group-by package requires a monorepo with workspace packages \
-                     (package.json workspaces, pnpm-workspace.yaml, or tsconfig references). \
+                     (package.json workspaces, pnpm-workspace.yaml, tsconfig references, \
+                     or \"workspaces.patterns\" in the fallow config). \
                      For single-package projects try --group-by directory instead.",
                     2,
                     output,
@@ -324,7 +342,7 @@ pub fn load_config_for_analysis(
 
     validate_config_extensions(root, &final_config, &options)?;
 
-    let cache_max_size_mb = resolve_cache_max_size_env();
+    let cache_max_size_mb = fallow_config::cache_max_size_env_override();
     let mut resolved = final_config.resolve(
         root.to_path_buf(),
         options.output,
@@ -336,7 +354,13 @@ pub fn load_config_for_analysis(
     if let Some(mb) = resolve_max_file_size_mb() {
         resolved.max_file_size_bytes = fallow_config::resolve_max_file_size_bytes(Some(mb));
     }
-    apply_cache_dir_env_override(root, &mut resolved, resolve_cache_dir_env());
+    if let Some(dir) = fallow_config::cache_dir_env_override() {
+        resolved.override_cache_dir(dir);
+    }
+    // The engine applies the same override for the LSP, MCP and Node hosts.
+    resolved.apply_package_baselines_env(
+        std::env::var_os(fallow_config::PACKAGE_BASELINES_ENV).as_deref(),
+    );
     crate::cache_notice::record_candidate(
         root,
         &resolved.cache_dir,
@@ -347,6 +371,7 @@ pub fn load_config_for_analysis(
 
     report_workspace_diagnostics(root, &resolved, &options)?;
     warn_unknown_security_categories(&resolved.security);
+    crate::output_runtime::set_workspace_patterns(&resolved.workspace_patterns);
 
     Ok(resolved)
 }
@@ -432,13 +457,11 @@ fn validate_config_extensions(
             ));
         }
     };
-    let boundaries =
-        fallow_config::resolve_boundaries_for_rule_pack_validation(config.boundaries.clone(), root);
-    let zone_errors = fallow_config::validate_rule_pack_zone_references(
+    let zone_errors = fallow_config::validate_rule_pack_zones(
         root,
+        &config.boundaries,
         &config.rule_packs,
         &packs,
-        &boundaries,
     );
     if !zone_errors.is_empty() {
         return Err(emit_joined_config_errors(
@@ -457,9 +480,10 @@ fn report_workspace_diagnostics(
     resolved: &ResolvedConfig,
     options: &ConfigLoadOptions,
 ) -> Result<(), ExitCode> {
-    match fallow_engine::discover::discover_workspace_packages_with_diagnostics(
+    match fallow_engine::discover::discover_workspace_packages_for_config(
         root,
         &resolved.ignore_patterns,
+        &resolved.workspace_patterns,
     ) {
         Ok((_, diagnostics)) => {
             fallow_config::stash_workspace_diagnostics(root, diagnostics.clone());
@@ -467,17 +491,31 @@ fn report_workspace_diagnostics(
                 && matches!(options.output, OutputFormat::Human)
                 && !options.quiet
             {
-                eprintln!(
-                    "fallow: {} workspace discovery diagnostic{}. \
-                     Run `fallow list --workspaces` for detail.",
-                    diagnostics.len(),
-                    if diagnostics.len() == 1 { "" } else { "s" }
-                );
+                eprintln!("{}", workspace_diagnostics_notice(diagnostics.len()));
             }
             Ok(())
         }
         Err(err) => Err(crate::error::emit_error(err.message(), 2, options.output)),
     }
+}
+
+/// Render the one-line stderr notice that workspace discovery produced
+/// diagnostics.
+///
+/// Built by name so the wording is unit testable rather than only observable
+/// through a subprocess. The notice names the dedicated `fallow workspaces`
+/// command rather than the equivalent `fallow list --workspaces`: both print
+/// the same per-entry block, and the dedicated command is the shorter, more
+/// direct spelling: at the four-digit count this treats as the realistic
+/// ceiling it leaves ten columns of the eighty-column terminal budget, against
+/// three for `fallow list --workspaces`. The pinning test measures the chosen
+/// spelling; the alternative's figure is stated here because nothing measures
+/// it.
+fn workspace_diagnostics_notice(count: usize) -> String {
+    format!(
+        "fallow: {count} workspace discovery diagnostic{}. Run `fallow workspaces`.",
+        crate::report::plural(count)
+    )
 }
 
 fn config_shape_for(
@@ -506,44 +544,6 @@ fn partial_rules_config_has_values(rules: &PartialRulesConfig) -> bool {
         .ok()
         .and_then(|value| value.as_object().map(|object| !object.is_empty()))
         .unwrap_or(false)
-}
-
-/// Read `FALLOW_CACHE_MAX_SIZE` (megabytes) into `Option<u32>`, returning
-/// `None` when the env var is unset or fails to parse as a positive integer.
-/// Resolved here rather than as a clap flag because the cache cap is a
-/// platform/CI ergonomic concern, not an analysis input; an env var keeps
-/// it out of the `--help` surface (see ADR-009).
-fn resolve_cache_max_size_env() -> Option<u32> {
-    std::env::var("FALLOW_CACHE_MAX_SIZE")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|mb| *mb > 0)
-}
-
-/// Read `FALLOW_CACHE_DIR` into an optional project-root-resolved cache path.
-/// Relative values use the same project-root base as `cache.dir`.
-fn resolve_cache_dir_env() -> Option<PathBuf> {
-    std::env::var_os("FALLOW_CACHE_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-}
-
-fn resolve_cache_dir_value(root: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    }
-}
-
-fn apply_cache_dir_env_override(
-    root: &Path,
-    resolved: &mut ResolvedConfig,
-    env_value: Option<PathBuf>,
-) {
-    if let Some(path) = env_value {
-        resolved.cache_dir = resolve_cache_dir_value(root, path);
-    }
 }
 
 #[cfg(test)]
@@ -581,6 +581,29 @@ mod tests {
         assert!(find_unknown_security_categories(&security).is_empty());
     }
 
+    /// The notice promises a route, so pin the exact sentence in both
+    /// spellings: `fallow workspaces` prints the per-entry block this line
+    /// summarises, and a rename of that command must fail here rather than
+    /// leave the warning pointing at nothing.
+    ///
+    /// The count is the only part that grows, so these two strings are also
+    /// the narrowest and widest plausible renderings: 66 columns at one
+    /// diagnostic, 70 once a monorepo drives the count to four digits. That
+    /// leaves ten columns of headroom under the eighty-column terminal
+    /// budget, so pinning the strings byte for byte is the width guard as
+    /// well; a rewording that spends the headroom fails here.
+    #[test]
+    fn workspace_diagnostics_notice_pins_wording_and_route() {
+        assert_eq!(
+            workspace_diagnostics_notice(1),
+            "fallow: 1 workspace discovery diagnostic. Run `fallow workspaces`."
+        );
+        assert_eq!(
+            workspace_diagnostics_notice(1234),
+            "fallow: 1234 workspace discovery diagnostics. Run `fallow workspaces`."
+        );
+    }
+
     #[test]
     fn config_loaded_notice_dedupes_by_config_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -592,44 +615,5 @@ mod tests {
         assert!(should_log_config_loaded(&first));
         assert!(!should_log_config_loaded(&first));
         assert!(should_log_config_loaded(&second));
-    }
-
-    #[test]
-    fn cache_dir_env_value_resolves_relative_to_project_root() {
-        assert_eq!(
-            resolve_cache_dir_value(Path::new("/repo"), PathBuf::from(".cache/fallow")),
-            PathBuf::from("/repo/.cache/fallow")
-        );
-        assert_eq!(
-            resolve_cache_dir_value(Path::new("/repo"), PathBuf::from("/tmp/fallow-cache")),
-            PathBuf::from("/tmp/fallow-cache")
-        );
-    }
-
-    #[test]
-    fn cache_dir_env_value_wins_over_configured_cache_dir() {
-        let mut resolved = FallowConfig {
-            cache: fallow_config::CacheConfig {
-                dir: Some(PathBuf::from(".cache/from-config")),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-        .resolve(
-            PathBuf::from("/repo"),
-            OutputFormat::Human,
-            1,
-            false,
-            true,
-            None,
-        );
-
-        apply_cache_dir_env_override(
-            Path::new("/repo"),
-            &mut resolved,
-            Some(PathBuf::from(".cache/from-env")),
-        );
-
-        assert_eq!(resolved.cache_dir, PathBuf::from("/repo/.cache/from-env"));
     }
 }

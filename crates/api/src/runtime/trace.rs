@@ -3,17 +3,23 @@ use fallow_types::duplicates::DuplicationReport;
 use rustc_hash::FxHashSet;
 
 use crate::{
-    ProgrammaticAnalysisContext, ProgrammaticError, TraceCloneOptions,
+    DependencyUsageQuery, ProgrammaticAnalysisContext, ProgrammaticError, TraceCloneOptions,
     TraceCloneProgrammaticOutput, TraceCloneTarget, TraceDependencyOptions,
-    TraceDependencyProgrammaticOutput, TraceExportOptions, TraceExportProgrammaticOutput,
-    TraceExportTargetOutput, TraceFileOptions, TraceFileProgrammaticOutput,
+    TraceDependencyProgrammaticOutput, TraceErrorOptions, TraceErrorProgrammaticOutput,
+    TraceExportOptions, TraceExportProgrammaticOutput, TraceExportTargetOutput, TraceFileOptions,
+    TraceFileProgrammaticOutput, TraceImportPathOptions, TraceImportPathProgrammaticOutput,
 };
 
 use super::{ProgrammaticResult, duplication, resolve_programmatic_analysis_context};
+use crate::analysis_context::validate_workspace_selection;
 
 struct TraceArtifacts {
     graph: fallow_engine::module_graph::RetainedModuleGraph,
     script_used_packages: FxHashSet<String>,
+    trace_provenance: fallow_engine::trace::TraceProvenance,
+    /// The findings of the analysis, which name the manifests that the
+    /// unused-dependency check flags.
+    results: fallow_types::results::AnalysisResults,
 }
 
 /// Trace why an export is considered used or unused.
@@ -21,13 +27,17 @@ struct TraceArtifacts {
 /// # Errors
 ///
 /// Returns a structured programmatic error for invalid options, config load
-/// failures, graph construction failures, or missing trace targets.
+/// failures, graph construction failures, or missing trace targets. When the
+/// `type_aware` option, `FALLOW_TYPE_AWARE` or `typeAware.enabled` turns on
+/// type-aware analysis, it returns [`super::TYPE_AWARE_CONFIG_UNSUPPORTED`]:
+/// the CLI trace then adds semantic evidence that this trace cannot.
 pub fn run_trace_export(
     options: &TraceExportOptions,
 ) -> ProgrammaticResult<TraceExportProgrammaticOutput> {
     validate_non_empty("file", &options.file)?;
     validate_non_empty("export_name", &options.export_name)?;
     let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    super::type_aware_config::reject_type_aware_trace(&options.analysis.type_aware, &resolved)?;
     resolved.install(|| {
         let session = load_trace_session(&resolved)?;
         let artifacts = trace_artifacts(&session)?;
@@ -35,12 +45,13 @@ pub fn run_trace_export(
         // enum / store member trace so the MCP tool and Code Mode match the
         // CLI's `--trace FILE:MEMBER` behavior instead of a hard not-found
         // (issue #1744).
-        let output = if let Some(export) = fallow_engine::trace::trace_export(
+        let output = if let Some(mut export) = fallow_engine::trace::trace_export(
             &artifacts.graph,
             session.root(),
             &options.file,
             &options.export_name,
         ) {
+            export.apply_plugin_credits(&artifacts.trace_provenance);
             TraceExportTargetOutput::Export(export)
         } else if let Some(member) = fallow_engine::trace::trace_class_member(
             &artifacts.graph,
@@ -83,7 +94,7 @@ pub fn run_trace_file(
     resolved.install(|| {
         let session = load_trace_session(&resolved)?;
         let artifacts = trace_artifacts(&session)?;
-        let output =
+        let mut output =
             fallow_engine::trace::trace_file(&artifacts.graph, session.root(), &options.file)
                 .ok_or_else(|| {
                     ProgrammaticError::new(
@@ -98,7 +109,122 @@ pub fn run_trace_file(
                     )
                     .with_context("trace_file")
                 })?;
+        output.sources = artifacts.trace_provenance.file_sources(&output.file);
+        output.apply_plugin_credits(&artifacts.trace_provenance);
         Ok(TraceFileProgrammaticOutput { output })
+    })
+}
+
+/// Trace the shortest import path between two modules.
+///
+/// An unreachable pair is a RESULT, not an error: the output reports
+/// `reachable: false` with zero hops. A missing or ambiguous endpoint is an error.
+///
+/// # Errors
+///
+/// Returns a structured programmatic error for invalid options, config load
+/// failures, graph construction failures, or a missing or ambiguous endpoint.
+pub fn run_trace_import_path(
+    options: &TraceImportPathOptions,
+) -> ProgrammaticResult<TraceImportPathProgrammaticOutput> {
+    validate_non_empty("from", &options.from)?;
+    validate_non_empty("to", &options.to)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    resolved.install(|| {
+        let session = load_trace_session(&resolved)?;
+        let artifacts = trace_artifacts(&session)?;
+        let trace = if options.eager_only {
+            fallow_engine::trace::trace_eager_import_path
+        } else {
+            fallow_engine::trace::trace_import_path
+        };
+        let output = trace(
+            &artifacts.graph,
+            session.root(),
+            &options.from,
+            &options.to,
+        )
+        .map_err(|endpoint| {
+            let label = endpoint.label();
+            let value = match endpoint {
+                fallow_engine::trace::ImportPathEndpoint::From
+                | fallow_engine::trace::ImportPathEndpoint::AmbiguousFrom => &options.from,
+                fallow_engine::trace::ImportPathEndpoint::To
+                | fallow_engine::trace::ImportPathEndpoint::AmbiguousTo => &options.to,
+            };
+            if endpoint.is_ambiguous() {
+                return ProgrammaticError::new(format!("'{value}' ({label}) matches multiple modules"), 2)
+                    .with_code("FALLOW_TRACE_TARGET_AMBIGUOUS")
+                    .with_help("Use the full project-relative path; run project_info to list discovered files.")
+                    .with_context("trace_import_path");
+            }
+            ProgrammaticError::new(format!("'{value}' ({label}) not found in module graph"), 2)
+                .with_code("FALLOW_TRACE_TARGET_NOT_FOUND")
+                .with_help(
+                    "The module is not in the analyzed module graph. Run project_info to list \
+                 discovered files; both paths must be project-relative and not excluded by \
+                 ignore patterns or outside the analyzed roots.",
+                )
+                .with_context("trace_import_path")
+        })?;
+        Ok(TraceImportPathProgrammaticOutput { output })
+    })
+}
+
+/// Resolve a runtime stack trace's frames against the project graph.
+///
+/// A trace in which nothing resolves is a RESULT, not an error: the output
+/// reports every frame with the origin and resolution that explain why. Only
+/// an empty trace argument, a config load failure, or a failed analysis is an
+/// error.
+///
+/// # Errors
+///
+/// Returns a structured programmatic error for an empty or oversized trace,
+/// config load failures, or graph construction failures.
+pub fn run_trace_error(
+    options: &TraceErrorOptions,
+) -> ProgrammaticResult<TraceErrorProgrammaticOutput> {
+    if options.trace.trim().is_empty() {
+        // Typed like the oversized-trace refusal below rather than through
+        // `validate_non_empty`: both are the same tool refusing the same
+        // argument, so both carry a `code`, a `help` and a `context`.
+        return Err(ProgrammaticError::new("trace must not be empty", 2)
+            .with_code("FALLOW_INVALID_TRACE_OPTIONS")
+            .with_help(
+                "Paste the stack trace text into `trace`, as your runtime printed it. \
+                 trace_error resolves frames against the project graph, so it has nothing \
+                 to resolve without them.",
+            )
+            .with_context("trace_error"));
+    }
+    if options.trace.len() as u64 > fallow_engine::trace_error::MAX_STACK_TRACE_BYTES {
+        let limit = fallow_engine::trace_error::MAX_STACK_TRACE_BYTES;
+        return Err(ProgrammaticError::new(
+            format!("stack trace exceeds the {limit}-byte limit"),
+            2,
+        )
+        .with_code("FALLOW_INVALID_TRACE_OPTIONS")
+        .with_help(
+            "A stack trace is a handful of kilobytes. Pass the trace itself rather than a \
+             redirected log file, and cut it to the frames that matter.",
+        )
+        .with_context("trace_error"));
+    }
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
+    resolved.install(|| {
+        let session = load_trace_session(&resolved)?;
+        let output = fallow_engine::trace_error::trace_error_with_session(
+            &session,
+            &options.trace,
+            options.source.clone(),
+        )
+        .map_err(|err| {
+            ProgrammaticError::new(format!("stack-trace resolution failed: {err}"), 2)
+                .with_code("FALLOW_ANALYSIS_FAILED")
+                .with_context("trace_error")
+        })?;
+        Ok(TraceErrorProgrammaticOutput { output })
     })
 }
 
@@ -115,15 +241,53 @@ pub fn run_trace_dependency(
     let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
         let session = load_trace_session(&resolved)?;
+        if let Some(query) = &options.usage {
+            return trace_dependency_usage(&session, &options.package_name, query);
+        }
         let artifacts = trace_artifacts(&session)?;
-        let output = fallow_engine::trace::trace_dependency(
-            &artifacts.graph,
-            session.root(),
+        let workspace_roots: Vec<&std::path::Path> = session
+            .workspaces()
+            .iter()
+            .map(|ws| ws.root.as_path())
+            .collect();
+        let output = fallow_engine::trace::build_dependency_trace(
+            &fallow_engine::trace::DependencyTraceInputs {
+                graph: &artifacts.graph,
+                root: session.root(),
+                workspace_roots: &workspace_roots,
+                ignore_patterns: &session.config().ignore_patterns,
+                script_used_packages: &artifacts.script_used_packages,
+                provenance: &artifacts.trace_provenance,
+                results: &artifacts.results,
+            },
             &options.package_name,
-            &artifacts.script_used_packages,
         );
         Ok(TraceDependencyProgrammaticOutput { output })
     })
+}
+
+/// Trace a dependency with its per-specifier usage.
+fn trace_dependency_usage(
+    session: &AnalysisSession,
+    package_name: &str,
+    query: &DependencyUsageQuery,
+) -> ProgrammaticResult<TraceDependencyProgrammaticOutput> {
+    let result = fallow_engine::trace::trace_dependency_with_session(session, package_name, query)
+        .map_err(|err| {
+            super::dead_code::map_engine_error(
+                &err,
+                "trace analysis failed",
+                "FALLOW_TRACE_FAILED",
+                "trace",
+            )
+        })?;
+    result
+        .map(|output| TraceDependencyProgrammaticOutput { output })
+        .map_err(|err| {
+            ProgrammaticError::new(err.to_string(), 2)
+                .with_code("FALLOW_TRACE_INVALID_CURSOR")
+                .with_context("cursor")
+        })
 }
 
 /// Trace duplicate-code groups by location or stable fingerprint.
@@ -138,13 +302,19 @@ pub fn run_trace_clone(
     validate_trace_clone_target(&options.target)?;
     let resolved = resolve_programmatic_analysis_context(&options.duplication.analysis)?;
     resolved.install(|| {
+        resolved.ensure_not_cancelled("config load and file discovery")?;
         let session = duplication::load_duplication_session(&options.duplication, &resolved)?;
+        validate_workspace_selection(&resolved, session.workspaces())?;
+        resolved.ensure_not_cancelled("duplication detection")?;
         let dupes_config =
             duplication::build_dupes_config(&options.duplication, &session.config().duplicates);
         let cache_dir = (!resolved.no_cache).then_some(session.config().cache_dir.as_path());
         let report = session
             .find_duplicates_with_defaults(&dupes_config, cache_dir)
             .report;
+        // Duplication detection is infallible, so the cancelled run has to be
+        // reported before the report is traced as a complete one.
+        resolved.ensure_not_cancelled("the clone trace")?;
         let (trace, not_found) = match &options.target {
             TraceCloneTarget::Location { file, line } => (
                 fallow_engine::trace::trace_clone(&report, session.root(), file, *line),
@@ -207,8 +377,14 @@ pub fn benchmark_trace_graph_family_compact_json(
         output: file,
     })?;
 
-    let dependency =
-        fallow_engine::trace::trace_dependency(graph, root, "trace-package", script_used_packages);
+    let dependency = fallow_engine::trace::trace_dependency(
+        graph,
+        root,
+        &[],
+        &fallow_config::IgnorePatternSet::empty(),
+        "trace-package",
+        script_used_packages,
+    );
     let dependency_import_count = dependency.import_count;
     let dependency_json =
         crate::serialize_trace_dependency_programmatic_json(TraceDependencyProgrammaticOutput {
@@ -371,19 +547,24 @@ fn validate_trace_clone_target(target: &TraceCloneTarget) -> ProgrammaticResult<
 fn load_trace_session(
     resolved: &ProgrammaticAnalysisContext,
 ) -> ProgrammaticResult<AnalysisSession> {
-    super::dead_code::load_dead_code_session(
+    let session = super::dead_code::load_dead_code_session(
         &super::dead_code::default_dead_code_options_for_context(resolved),
         resolved,
-    )
+    )?;
+    validate_workspace_selection(resolved, session.workspaces())?;
+    Ok(session)
 }
 
 fn trace_artifacts(session: &AnalysisSession) -> ProgrammaticResult<TraceArtifacts> {
     let artifacts = session
         .analyze_dead_code_with_session_artifacts(false, true, None)
         .map_err(|err| {
-            ProgrammaticError::new(format!("trace analysis failed: {err}"), 2)
-                .with_code("FALLOW_TRACE_FAILED")
-                .with_context("trace")
+            super::dead_code::map_engine_error(
+                &err,
+                "trace analysis failed",
+                "FALLOW_TRACE_FAILED",
+                "trace",
+            )
         })?;
     let graph = artifacts.analysis.graph.ok_or_else(|| {
         ProgrammaticError::new("trace requires a retained module graph", 2)
@@ -393,6 +574,8 @@ fn trace_artifacts(session: &AnalysisSession) -> ProgrammaticResult<TraceArtifac
     Ok(TraceArtifacts {
         graph,
         script_used_packages: artifacts.analysis.script_used_packages,
+        trace_provenance: artifacts.analysis.trace_provenance,
+        results: artifacts.analysis.results,
     })
 }
 

@@ -20,10 +20,14 @@ const CATEGORY_TO_REGISTRY_CODE = {
   "unused-server-action": "unused-server-action",
   "unused-load-data-keys": "unused-load-data-key",
   "unused-component-prop": "unused-component-prop",
+  "absent-component-prop": "absent-component-prop",
   "unused-component-emit": "unused-component-emit",
   "unused-component-input": "unused-component-input",
   "unused-component-output": "unused-component-output",
   "unused-svelte-event": "unused-svelte-event",
+  "unused-effect-layer": "unused-effect-layer",
+  "unused-tagged-error": "unused-tagged-error",
+  "unproduced-catch-tag": "unproduced-catch-tag",
   "unrendered-component": "unrendered-component",
   "unprovided-inject": "unprovided-inject",
   "invalid-client-export": "invalid-client-export",
@@ -39,6 +43,7 @@ const CATEGORY_TO_REGISTRY_CODE = {
   "dev-dependencies-in-production": "dev-dependency-in-production",
   "circular-dependencies": "circular-dependency",
   "re-export-cycles": "re-export-cycle",
+  "package-cycles": "package-cycle",
   "boundary-violation": "boundary-violation",
   "policy-violations": "policy-violation",
   "stale-suppressions": "stale-suppression",
@@ -47,6 +52,9 @@ const CATEGORY_TO_REGISTRY_CODE = {
   "unresolved-catalog-references": "unresolved-catalog-reference",
   "unused-dependency-overrides": "unused-dependency-override",
   "misconfigured-dependency-overrides": "misconfigured-dependency-override",
+  "prop-drilling": "prop-drilling",
+  "thin-wrapper": "thin-wrapper",
+  "duplicate-prop-shape": "duplicate-prop-shape",
 } as const;
 
 export type IssueCategory = keyof typeof CATEGORY_TO_REGISTRY_CODE;

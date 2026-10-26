@@ -11,7 +11,18 @@ updates:
         patterns: ["oxc_*"]
       crypto-rng:
         patterns: ["ed25519-dalek", "rand", "rand_core"]
+      # deser-value and deser-yaml share deser-core, so a minor bump of one
+      # does not compile without the other.
+      deser:
+        patterns: ["deser-*"]
     open-pull-requests-limit: 10
+    ignore:
+      # lightningcss types its public `Parse` trait against cssparser without
+      # re-exporting it, so the direct pin has to equal the version lightningcss
+      # resolves. A newer cssparser only adds a second copy to the graph and
+      # `CssColor::parse` stops compiling. Move both pins together when
+      # lightningcss releases on a newer cssparser.
+      - dependency-name: cssparser
 
   - package-ecosystem: cargo
     directory: /fuzz
@@ -52,6 +63,37 @@ updates:
       # Pinned so engines.vscode floor stays low and Cursor/Windsurf forks can install.
       # Bump deliberately when raising the engine floor.
       - dependency-name: "@types/vscode"
+      # Mocha 12 is ESM-only and its CommonJS implementation file requires ESM
+      # siblings, so it needs Node ^20.19 || >=22.12. The integration suites run
+      # in-process inside the VS Code 1.96 extension host, which ships Node
+      # 20.18.1, so the major cannot load there at all. Raise this together with
+      # the engine floor.
+      - dependency-name: mocha
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    directory: /.github/publishers/marketplace
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /.github/publishers/open-vsx
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /tools/mutation-runner
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
 
   - package-ecosystem: npm
     directory: /npm/fallow
@@ -78,25 +120,6 @@ updates:
     open-pull-requests-limit: 5
 
   - package-ecosystem: npm
-    directory: /apps/review-electron
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    ignore:
-      # electron-vite 5 supports Vite through version 7, while plugin-react 6
-      # requires Vite 8. Remove both guards when electron-vite supports Vite 8.
-      - dependency-name: vite
-        update-types: ["version-update:semver-major"]
-      - dependency-name: "@vitejs/plugin-react"
-        update-types: ["version-update:semver-major"]
-      # Electron 43 embeds Node 24. Keep the type surface aligned with the
-      # runtime and raise this together with Electron.
-      - dependency-name: "@types/node"
-        update-types: ["version-update:semver-major"]
-    open-pull-requests-limit: 5
-
-  - package-ecosystem: npm
     directory: /tests/coverage-producer-corpus/producers
     schedule:
       interval: weekly
@@ -120,8 +143,21 @@ updates:
       default-days: 7
     open-pull-requests-limit: 5
 
+  # The corepack version that Dockerfile and Dockerfile.dev install.
+  - package-ecosystem: npm
+    directory: /tools/corepack
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  # Covers Dockerfile and Dockerfile.dev. The tests/fixtures Dockerfiles are
+  # test inputs and stay out of scope.
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      - /.oss-scanner
     schedule:
       interval: weekly
     cooldown:
@@ -134,3 +170,17 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    groups:
+      # CodeQL fails when init, analyze and upload-sarif run different
+      # versions, so they update in one pull request.
+      codeql-action:
+        patterns: ["github/codeql-action*"]
+
+  # The hash-pinned cargo-zigbuild and ziglang wheels that release.yml installs.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5

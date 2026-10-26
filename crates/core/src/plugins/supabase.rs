@@ -27,8 +27,13 @@ const ENABLERS: &[&str] = &["supabase"];
 /// from these entries rather than being entries themselves.
 const ENTRY_PATTERNS: &[&str] = &["supabase/functions/*/index.{ts,tsx,js,jsx,mts,mjs,cts,cjs}"];
 
-/// The Supabase CLI is invoked from scripts, not imported, so credit it as a
-/// tooling dependency so it never reports as unused.
+/// The Supabase CLI config. It is the plugin's own config file, so an existing
+/// one credits the CLI as a tooling dependency.
+const ALWAYS_USED: &[&str] = &["supabase/config.toml"];
+
+/// The Supabase CLI is invoked from scripts, not imported. It is credited as a
+/// tooling dependency when the project has a CLI config or a script, CI or
+/// hook reference to it.
 const TOOLING_DEPENDENCIES: &[&str] = &["supabase"];
 
 /// Built-in plugin for Supabase Edge Function projects.
@@ -57,6 +62,10 @@ impl Plugin for SupabasePlugin {
         ENTRY_PATTERNS
     }
 
+    fn always_used(&self) -> &'static [&'static str] {
+        ALWAYS_USED
+    }
+
     fn tooling_dependencies(&self) -> &'static [&'static str] {
         TOOLING_DEPENDENCIES
     }
@@ -74,39 +83,32 @@ mod tests {
 
     #[test]
     fn activates_on_config_toml() {
-        let temp = std::env::temp_dir().join("fallow-supabase-config-test");
-        let _ = std::fs::remove_dir_all(&temp);
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path();
         std::fs::create_dir_all(temp.join("supabase")).unwrap();
         std::fs::write(temp.join("supabase/config.toml"), "project_id = \"x\"\n").unwrap();
 
         let plugin = SupabasePlugin;
-        assert!(plugin.is_enabled_with_deps(&[], &temp));
-
-        let _ = std::fs::remove_dir_all(&temp);
+        assert!(plugin.is_enabled_with_deps(&[], temp));
     }
 
     #[test]
     fn activates_on_functions_directory() {
-        let temp = std::env::temp_dir().join("fallow-supabase-functions-test");
-        let _ = std::fs::remove_dir_all(&temp);
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path();
         std::fs::create_dir_all(temp.join("supabase/functions/hello")).unwrap();
 
         let plugin = SupabasePlugin;
-        assert!(plugin.is_enabled_with_deps(&[], &temp));
-
-        let _ = std::fs::remove_dir_all(&temp);
+        assert!(plugin.is_enabled_with_deps(&[], temp));
     }
 
     #[test]
     fn does_not_activate_without_any_signal() {
-        let temp = std::env::temp_dir().join("fallow-supabase-negative-test");
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path();
 
         let plugin = SupabasePlugin;
-        assert!(!plugin.is_enabled_with_deps(&["react".to_string()], &temp));
-
-        let _ = std::fs::remove_dir_all(&temp);
+        assert!(!plugin.is_enabled_with_deps(&["react".to_string()], temp));
     }
 
     #[test]

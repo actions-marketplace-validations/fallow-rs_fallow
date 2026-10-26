@@ -28,12 +28,17 @@ use fallow_engine::{
     trace_chain::trace_symbol_chain_with_session,
 };
 use fallow_output::{
-    CoverageSource, HealthReport, RootEnvelopeMode, SuppressionInventoryOutputInput,
+    CoverageSource, HealthReport, SuppressionInventoryOutputInput,
     build_suppression_inventory_output, serialize_suppression_inventory_json_output,
 };
 use fallow_types::output_format::OutputFormat;
 use fallow_types::trace_chain::{SymbolChainQuery, TraceDirections};
 use tempfile::TempDir;
+
+#[path = "support/threads.rs"]
+mod threads;
+
+use threads::bench_threads;
 
 const FILE_COUNT: usize = 32;
 const WARM_FILE_COUNT: usize = 256;
@@ -94,6 +99,11 @@ struct GuardFixture {
     _temp_dir: TempDir,
     config: fallow_config::ResolvedConfig,
     files: Vec<String>,
+}
+
+/// Loads a default session whose file walk uses the benchmark thread count.
+fn load_session(root: &Path) -> AnalysisSession {
+    AnalysisSession::load_default_with_config(root, |config| config.threads = bench_threads())
 }
 
 fn write_file(root: &Path, path: &str, source: impl AsRef<str>) {
@@ -168,6 +178,8 @@ fn create_guard_fixture() -> GuardFixture {
             specifiers: Vec::new(),
             effects: vec![EffectKind::Network],
             exports: Vec::new(),
+            allowed_files: Vec::new(),
+            proof_kinds: Vec::new(),
             ignore_type_only: false,
             files: vec![format!("src/team-{rule_index}/**")],
             exclude: vec![format!("src/team-{rule_index}/generated/**")],
@@ -183,7 +195,14 @@ fn create_guard_fixture() -> GuardFixture {
         },
         ..FallowConfig::default()
     }
-    .resolve(root.clone(), OutputFormat::Json, 1, true, true, None);
+    .resolve(
+        root.clone(),
+        OutputFormat::Json,
+        bench_threads(),
+        true,
+        true,
+        None,
+    );
     config.rule_packs = vec![RulePackDef {
         schema: None,
         version: 1,
@@ -259,7 +278,7 @@ fn create_trace_engine_fixture() -> WarmEngineFixture {
         _temp_dir: temp_dir,
         root,
     };
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     WarmEngineFixture {
         fixture,
         session,
@@ -293,7 +312,7 @@ fn create_suppression_inventory_fixture() -> WarmEngineFixture {
         _temp_dir: temp_dir,
         root,
     };
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     session
         .analyze_dead_code_with_artifacts(false, false)
         .expect("suppression inventory warm-up succeeds");
@@ -313,8 +332,9 @@ fn suppression_inventory_json(fixture: &WarmEngineFixture) -> serde_json::Value 
         active: &analysis.results.active_suppressions,
         stale: &analysis.results.stale_suppressions,
         root: &fixture.fixture.root,
+        request_outcomes: None,
     });
-    serialize_suppression_inventory_json_output(output, RootEnvelopeMode::Tagged, None)
+    serialize_suppression_inventory_json_output(output, None)
         .expect("suppression inventory JSON serialization succeeds")
 }
 
@@ -337,7 +357,7 @@ fn trace_symbol_chain(fixture: &WarmEngineFixture) -> fallow_types::trace_chain:
 
 fn create_warm_engine_fixture() -> WarmEngineFixture {
     let fixture = create_engine_fixture_with_file_count(WARM_FILE_COUNT);
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     session
         .analyze_dead_code_with_complexity()
         .expect("warm-up analysis succeeds");
@@ -456,7 +476,7 @@ fn create_istanbul_crap_fixture() -> IstanbulCrapFixture {
         _temp_dir: temp_dir,
         root,
     };
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     session
         .analyze_dead_code_with_complexity()
         .expect("Istanbul CRAP fixture warm-up succeeds");
@@ -574,7 +594,7 @@ fn create_coverage_gap_engine_fixture() -> WarmEngineFixture {
         _temp_dir: temp_dir,
         root,
     };
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     WarmEngineFixture {
         fixture,
         session,
@@ -599,7 +619,7 @@ fn create_warm_css_engine_fixture() -> WarmEngineFixture {
             css,
         );
     }
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     session
         .analyze_dead_code_with_complexity()
         .expect("warm-up analysis succeeds");
@@ -640,7 +660,7 @@ export function Consumer{consumer_index}() {{
             ),
         );
     }
-    fixture.session = AnalysisSession::load_default(&fixture.fixture.root);
+    fixture.session = load_session(&fixture.fixture.root);
     fixture
         .session
         .analyze_dead_code_with_complexity()
@@ -704,7 +724,7 @@ fn create_css_deep_color_candidate_fixture() -> CssDeepEngineFixture {
         changed_files.push(fixture.root.join(path));
     }
 
-    let session = AnalysisSession::load_default(&fixture.root);
+    let session = load_session(&fixture.root);
     session
         .analyze_dead_code_with_complexity()
         .expect("warm-up analysis succeeds");
@@ -773,6 +793,9 @@ fn warm_health_options(fixture: &WarmEngineFixture) -> HealthExecutionOptions<'_
         churn_file: None,
         analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
         group_by: None,
+        group_filter: None,
+        trend_from: None,
+        scope: None,
     }
 }
 
@@ -891,7 +914,7 @@ fn component_engine_session_load(c: &mut Criterion) {
     c.bench_function("component_engine_session_load", |bencher| {
         bencher.iter_batched_ref(
             create_engine_fixture,
-            |fixture| AnalysisSession::load_default(&fixture.root),
+            |fixture| load_session(&fixture.root),
             BatchSize::LargeInput,
         );
     });
@@ -902,7 +925,7 @@ fn component_engine_parsed_parts(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_engine_fixture,
             |fixture| {
-                let session = AnalysisSession::load_default(&fixture.root);
+                let session = load_session(&fixture.root);
                 session.parsed_parts(false)
             },
             BatchSize::LargeInput,
@@ -915,7 +938,7 @@ fn component_engine_project_analysis_artifacts(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_engine_fixture,
             |fixture| {
-                let session = AnalysisSession::load_default(&fixture.root);
+                let session = load_session(&fixture.root);
                 session
                     .analyze_project_with_artifacts(
                         &DuplicatesConfig::default(),
@@ -1165,7 +1188,7 @@ fn component_engine_first_session_css_health_references_many_files(c: &mut Crite
         "component_engine_first_session_css_health_references_many_files",
         |bencher| {
             bencher.iter_batched(
-                || AnalysisSession::load_default(&fixture.fixture.root),
+                || load_session(&fixture.fixture.root),
                 |session| {
                     run_ungrouped_health_with_session(&options, None, &session, None)
                         .expect("first-session many-file CSS reference health analysis succeeds")

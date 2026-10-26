@@ -1,7 +1,11 @@
 import path from "node:path";
 
-import { SymbolFlags } from "typescript/unstable/sync";
-import {
+import { sync, ast } from "./backend.mjs";
+
+import { canonicalFileIdentity } from "./file-identity.mjs";
+
+const { SymbolFlags } = sync;
+const {
   isClassDeclaration,
   isClassExpression,
   isEnumDeclaration,
@@ -19,9 +23,7 @@ import {
   isSourceFile,
   isTypeAliasDeclaration,
   isVariableDeclaration,
-} from "typescript/unstable/ast/is";
-
-import { canonicalFileIdentity } from "./file-identity.mjs";
+} = ast;
 
 const DECLARATION_KIND_RULES = [
   [[isClassDeclaration, isClassExpression], "class"],
@@ -63,7 +65,7 @@ export const relativePath = (root, fileName) =>
 
 export const sourceFileIdentity = (sourceFile) => canonicalFileIdentity(sourceFile.fileName);
 
-export const positions = (node) => {
+const positions = (node) => {
   const sourceFile = node.getSourceFile();
   const nodes = node.name ? [node, node.name] : [node];
   return nodes.map((candidate) => {
@@ -79,7 +81,7 @@ export const positions = (node) => {
 
 export const nodeText = (node) => node?.text;
 
-export const declarationKind = (node) =>
+const declarationKind = (node) =>
   DECLARATION_KIND_RULES.find(([checks]) => matchesAny(node, checks))?.[1];
 
 export const declarationNamespaces = (node) =>
@@ -95,7 +97,7 @@ const ownerName = (node) => {
   return ownerName(node.parent);
 };
 
-export const declarationOwner = (node) => ownerName(node.parent);
+const declarationOwner = (node) => ownerName(node.parent);
 
 export const ownerDeclaration = (node) => {
   let current = node?.parent;

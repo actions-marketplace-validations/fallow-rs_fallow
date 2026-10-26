@@ -4,7 +4,8 @@ use std::path::Path;
 use colored::Colorize;
 use fallow_config::OutputFormat;
 
-use super::{plural, relative_path};
+use super::plural;
+use crate::report::format_display_path;
 
 pub(in crate::report) fn print_cross_reference_findings(
     cross_ref: &fallow_engine::cross_reference::CrossReferenceResult,
@@ -64,12 +65,10 @@ fn build_cross_reference_lines(
     lines.push(String::new());
 
     for finding in &cross_ref.combined_findings {
-        let relative = relative_path(&finding.clone_instance.file, root);
+        let relative = format_display_path(&finding.clone_instance.file, root);
         let location = format!(
             "{}:{}-{}",
-            relative.display(),
-            finding.clone_instance.start_line,
-            finding.clone_instance.end_line
+            relative, finding.clone_instance.start_line, finding.clone_instance.end_line
         );
 
         let reason = match &finding.dead_code_kind {
@@ -107,6 +106,7 @@ mod tests {
         let cross_ref = CrossReferenceResult {
             combined_findings: vec![CombinedFinding {
                 clone_instance: CloneInstance {
+                    is_symlink: false,
                     file: root.join("src/dead.ts"),
                     start_line: 1,
                     end_line: 10,
@@ -133,6 +133,7 @@ mod tests {
         let cross_ref = CrossReferenceResult {
             combined_findings: vec![CombinedFinding {
                 clone_instance: CloneInstance {
+                    is_symlink: false,
                     file: root.join("src/utils.ts"),
                     start_line: 5,
                     end_line: 15,
@@ -159,6 +160,7 @@ mod tests {
         let cross_ref = CrossReferenceResult {
             combined_findings: vec![CombinedFinding {
                 clone_instance: CloneInstance {
+                    is_symlink: false,
                     file: root.join("src/types.ts"),
                     start_line: 1,
                     end_line: 5,

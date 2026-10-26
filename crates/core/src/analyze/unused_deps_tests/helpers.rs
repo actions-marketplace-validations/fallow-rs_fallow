@@ -27,9 +27,8 @@ pub(super) use crate::suppress::{self, Suppression, SuppressionContext};
 #[allow(unused_imports, reason = "shared re-export for sibling test modules")]
 pub(super) use super::super::{
     DepCategoryConfig, LineOffsetsMap, SharedDepSets, UnlistedDependencyInput,
-    collect_unused_for_category, find_dev_dependencies_in_production, find_import_location,
-    find_test_only_dependencies, find_type_only_dependencies, find_unresolved_imports,
-    find_unused_dependencies, is_package_listed_for_file, should_skip_dependency,
+    collect_unused_for_category, find_dev_dependencies_in_production, find_test_only_dependencies,
+    find_type_only_dependencies, find_unresolved_imports, find_unused_dependencies,
     workspace_dependency_map,
 };
 
@@ -53,6 +52,7 @@ pub(super) fn find_unlisted_dependencies(
         workspaces,
         plugin_result,
         resolved_modules,
+        modules: &[],
         line_offsets_by_file,
     })
 }
@@ -165,36 +165,18 @@ pub(super) fn build_graph_with_npm_import_sources(
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }];
 
     let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
     (graph, resolved_modules)
 }
 
-pub(super) type SkipDepSets = (
-    FxHashSet<String>,
-    FxHashSet<&'static str>,
-    FxHashSet<&'static str>,
-    FxHashSet<&'static str>,
-    FxHashSet<&'static str>,
-);
-
-/// Helper: build empty sets for should_skip_dependency args.
-pub(super) fn empty_sets() -> SkipDepSets {
-    (
-        FxHashSet::default(),
-        FxHashSet::default(),
-        FxHashSet::default(),
-        FxHashSet::default(),
-        FxHashSet::default(),
-    )
-}
-
 pub(super) type SharedSets = (
     FxHashSet<&'static str>,
     FxHashSet<&'static str>,
     FxHashSet<&'static str>,
-    FxHashSet<&'static str>,
+    fallow_config::IgnoreDependencyMatcher,
 );
 
 pub(super) fn empty_shared_sets() -> SharedSets {
@@ -202,6 +184,6 @@ pub(super) fn empty_shared_sets() -> SharedSets {
         FxHashSet::default(),
         FxHashSet::default(),
         FxHashSet::default(),
-        FxHashSet::default(),
+        fallow_config::IgnoreDependencyMatcher::default(),
     )
 }

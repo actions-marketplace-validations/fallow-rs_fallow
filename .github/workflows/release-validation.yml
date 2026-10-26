@@ -21,6 +21,13 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # A background git repack after a fixture commit races the next git add.
+  # See scripts/workflow-policy.test.mjs.
+  GIT_CONFIG_COUNT: '2'
+  GIT_CONFIG_KEY_0: maintenance.auto
+  GIT_CONFIG_VALUE_0: 'false'
+  GIT_CONFIG_KEY_1: gc.auto
+  GIT_CONFIG_VALUE_1: '0'
 
 jobs:
   windows-verify:
@@ -39,11 +46,11 @@ jobs:
           components: clippy, rustfmt
           cache-key: release-windows-verify
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
+          version: 11.25.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -55,11 +62,13 @@ jobs:
       - name: Test Windows child-process wiring
         run: node --test tools/type-aware-sidecar/test/windows-child-process.test.mjs
 
+      # Without --no-fail-fast, cargo stops at the first failing test binary,
+      # so one Windows failure hides the failures in later binaries.
       - name: Run workspace tests
-        run: cargo test --workspace --lib --bins --tests --examples
+        run: cargo test --workspace --no-fail-fast --lib --bins --tests --examples
 
       - name: Run runtime-coverage integration tests
-        run: cargo test -p fallow-cli --features test-sidecar-key --test runtime_coverage_tests
+        run: cargo test -p fallow-cli --no-fail-fast --features test-sidecar-key --test runtime_coverage_tests --test audit_brief_runtime_focus_tests
 
       - name: Run schema drift gate
         run: cargo test -p fallow-cli --features schema-emit --bin fallow-schema-emit
@@ -121,9 +130,59 @@ jobs:
       - name: Check for uncommitted changes
         run: git diff --exit-code
 
+  # The release cross-compiles the Linux arm64 binaries on x86 and never runs
+  # them, and no job runs the test suite on Apple Silicon. This job runs the
+  # tests and the NAPI smoke test natively on both, so an architecture-specific
+  # bug cannot ship. Example: a hard-coded open flag that is O_NOFOLLOW only on
+  # x86-64 Linux (#3539).
+  arm64-verify:
+    name: arm64 correctness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-arm64-verify-${{ matrix.os }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install type-aware sidecar dependencies
+        run: npm ci --prefix tools/type-aware-sidecar --no-audit --no-fund --ignore-scripts
+
+      # Without --no-fail-fast, cargo stops at the first failing test binary.
+      - name: Run workspace tests
+        run: cargo test --workspace --no-fail-fast --lib --bins --tests --examples
+
+      - name: Run runtime-coverage integration tests
+        run: cargo test -p fallow-cli --no-fail-fast --features test-sidecar-key --test runtime_coverage_tests --test audit_brief_runtime_focus_tests
+
+      - name: Install NAPI package dependencies
+        run: cd crates/napi && npm ci --omit=optional --ignore-scripts
+
+      - name: Build NAPI package
+        run: cd crates/napi && npx napi build --platform --profile napi-release --no-js && npm run publish:prepare
+
+      - name: Run NAPI smoke test
+        run: cd crates/napi && npm test
+
+      - name: Check for uncommitted changes
+        run: git diff --exit-code
+
   vscode-package-targets:
     name: Package VS Code target artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -131,10 +190,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+          version: 11.25.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: pnpm
@@ -146,7 +205,7 @@ jobs:
       - name: Package target VSIX artifacts
         run: pnpm --dir editors/vscode package:variants -- --output-dir "$RUNNER_TEMP/fallow-vscode-targets"
       - name: Upload target VSIX artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: validation-vscode-targets
           path: ${{ runner.temp }}/fallow-vscode-targets
@@ -162,7 +221,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: linux-x64
             cli: target/debug/fallow
             lsp: target/debug/fallow-lsp
@@ -181,16 +240,16 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: release-vscode-target-${{ matrix.target }}
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
+          version: 11.25.0
       - name: Initialize pnpm store on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $store = pnpm store path --silent
           New-Item -ItemType Directory -Force -Path $store | Out-Null
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: pnpm
@@ -205,7 +264,7 @@ jobs:
       - name: Build current CLI and LSP binaries
         run: cargo build -p fallow-cli --bin fallow -p fallow-lsp --bin fallow-lsp
       - name: Download Ubuntu-built target VSIX artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: validation-vscode-targets
           path: ${{ runner.temp }}/fallow-vscode-targets
@@ -279,9 +338,119 @@ jobs:
       - name: Format
         run: cargo fmt --check --manifest-path editors/zed/Cargo.toml
 
+  # The similar-code sidecar keeps a temporary, expiring advisory allowlist.
+  # Run its audit here, so a new upstream advisory fails the validation
+  # dispatch before a version bump, and release.yml (which calls this
+  # workflow) fails before any publication job starts.
+  similar-code-audit:
+    name: Similar-code sidecar dependency audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit
+
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+
+      - name: Verify temporary dependency audit ownership
+        run: |
+          set -euo pipefail
+          node scripts/check-similar-code-sidecar-audit.mjs
+          cargo audit \
+            --file tools/similar-code-sidecar/Cargo.lock \
+            --deny unmaintained \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2026-0367 \
+            --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369
+          cargo deny \
+            --manifest-path tools/similar-code-sidecar/Cargo.toml \
+            check licenses
+
+  heavy-runner:
+    name: Select drift runner
+    if: >-
+      vars.BLACKSMITH_HEAVY_ALLOCATION != '' &&
+      github.repository == 'fallow-rs/fallow' && github.run_attempt == 1 &&
+      github.actor != 'dependabot[bot]' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      runner: ${{ steps.runner.outcome == 'success' && steps.runner.outputs.runner || 'ubuntu-26.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Select within the shared heavy allocation
+        id: runner
+        continue-on-error: true
+        env:
+          BLACKSMITH_HEAVY_ALLOCATION: ${{ vars.BLACKSMITH_HEAVY_ALLOCATION }}
+          BLACKSMITH_MIRI_ALLOCATION: ${{ vars.BLACKSMITH_MIRI_ALLOCATION }}
+          HEAVY_JOB: drift-full
+        run: |
+          if [ ! -f scripts/select-heavy-runner.mjs ]; then
+            echo 'runner=ubuntu-26.04' >> "$GITHUB_OUTPUT"
+            echo 'Drift uses GitHub: the trusted allocation helper is not available yet.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            node scripts/select-heavy-runner.mjs
+          fi
+      - name: Report selector fallback
+        if: steps.runner.outcome == 'failure'
+        run: echo 'Drift uses GitHub because allocation selection failed.' >> "$GITHUB_STEP_SUMMARY"
+
+  drift-full:
+    name: Drift harness (full run)
+    needs: heavy-runner
+    if: always() && !cancelled()
+    runs-on: ${{ github.run_attempt == 1 && needs['heavy-runner'].result == 'success' && needs['heavy-runner'].outputs.runner == 'blacksmith-4vcpu-ubuntu-2404' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-26.04' }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: release-drift-full
+
+      - name: Build fallow-mcp
+        run: cargo build -p fallow-mcp
+
+      # A random seed explores new projects on each run. A failure prints the
+      # seed and the case count, which reproduce it locally.
+      - name: Run drift harness
+        env:
+          FALLOW_DRIFT_CASES: '512'
+          FALLOW_DRIFT_SEED: random
+        run: cargo test -p fallow-cli --test drift -- --include-ignored
+
   check-codegen:
     name: Check codegen drift
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -293,11 +462,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
+          version: 11.25.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: '22'
 

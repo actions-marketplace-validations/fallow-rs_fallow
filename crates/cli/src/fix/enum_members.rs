@@ -234,14 +234,14 @@ struct EnumMemberDryRunInput<'a, 'b> {
 
 fn record_enum_member_dry_run(input: EnumMemberDryRunInput<'_, '_>) {
     let fixes = input.fixes;
+    let relative_display = input.relative.to_string_lossy().replace('\\', "/");
     for fix in input.member_fixes {
         if input.folded_parents.contains(fix.parent_name.as_str()) {
             continue;
         }
         if !matches!(input.output, OutputFormat::Json) {
             eprintln!(
-                "Would remove enum member from {}:{} `{}.{}`",
-                input.relative.display(),
+                "Would remove enum member from {relative_display}:{} `{}.{}`",
                 fix.line_idx + 1,
                 fix.parent_name,
                 fix.member_name,
@@ -249,7 +249,7 @@ fn record_enum_member_dry_run(input: EnumMemberDryRunInput<'_, '_>) {
         }
         fixes.push(serde_json::json!({
             "type": "remove_enum_member",
-            "path": input.relative.display().to_string(),
+            "path": relative_display,
             "line": fix.line_idx + 1,
             "parent": fix.parent_name,
             "name": fix.member_name,
@@ -258,16 +258,15 @@ fn record_enum_member_dry_run(input: EnumMemberDryRunInput<'_, '_>) {
     for fold in input.folded {
         if !matches!(input.output, OutputFormat::Json) {
             eprintln!(
-                "Would remove enum declaration from {}:{} `{}` (every member is unused; \
+                "Would remove enum declaration from {relative_display}:{} `{}` (every member is unused; \
                  importers in other files will need cleanup, run your TypeScript build to find them)",
-                input.relative.display(),
                 fold.decl_line + 1,
                 fold.parent_name,
             );
         }
         fixes.push(serde_json::json!({
             "type": "remove_export",
-            "path": input.relative.display().to_string(),
+            "path": relative_display,
             "line": fold.decl_line + 1,
             "name": fold.parent_name,
         }));
@@ -342,13 +341,14 @@ struct AppliedEnumMemberRecordInput<'a> {
 
 fn record_applied_enum_member_fixes(input: &mut AppliedEnumMemberRecordInput<'_>) {
     let target = input.path.display().to_string();
+    let relative_display = input.relative.to_string_lossy().replace('\\', "/");
     for fix in input.member_fixes {
         if input.folded_parents.contains(fix.parent_name.as_str()) {
             continue;
         }
         input.fixes.push(serde_json::json!({
             "type": "remove_enum_member",
-            "path": input.relative.display().to_string(),
+            "path": relative_display,
             "line": fix.line_idx + 1,
             "parent": fix.parent_name,
             "name": fix.member_name,
@@ -359,14 +359,13 @@ fn record_applied_enum_member_fixes(input: &mut AppliedEnumMemberRecordInput<'_>
     for fold in input.folded {
         if !matches!(input.output, OutputFormat::Json) {
             eprintln!(
-                "Removed unused enum `{}` from {}; importers in other files will need cleanup, run your TypeScript build to find them.",
+                "Removed unused enum `{}` from {relative_display}; importers in other files will need cleanup, run your TypeScript build to find them.",
                 fold.parent_name,
-                input.relative.display(),
             );
         }
         input.fixes.push(serde_json::json!({
             "type": "remove_export",
-            "path": input.relative.display().to_string(),
+            "path": relative_display,
             "line": fold.decl_line + 1,
             "name": fold.parent_name,
             "applied": true,
@@ -445,7 +444,7 @@ mod tests {
         let mut map: FxHashMap<PathBuf, Vec<&UnusedMember>> = FxHashMap::default();
         map.insert(file.to_path_buf(), vec![&member]);
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -517,7 +516,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -548,7 +547,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -645,7 +644,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&member]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -826,7 +825,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -905,8 +904,16 @@ mod tests {
 
     #[test]
     fn enum_fix_single_line_close_before_open() {
-        let result = remove_member_from_single_line("} enum Foo { A }", "A");
-        assert!(!result.is_empty());
+        let line = "} enum Foo {";
+        assert_eq!(remove_member_from_single_line(line, "A"), line);
+    }
+
+    #[test]
+    fn enum_fix_single_line_stray_close_before_enum() {
+        assert_eq!(
+            remove_member_from_single_line("} enum Foo { A }", "A"),
+            "} enum Foo {}"
+        );
     }
 
     #[test]
@@ -922,7 +929,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&member]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -952,7 +959,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&member]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -982,7 +989,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&member]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1015,7 +1022,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&member]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1058,7 +1065,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1093,7 +1100,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1130,7 +1137,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1165,7 +1172,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,
@@ -1198,7 +1205,7 @@ mod tests {
         members_by_file.insert(file.clone(), vec![&m1, &m2]);
 
         let mut fixes = Vec::new();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = capture_hashes(&[&file]);
         apply_enum_member_fixes(EnumMemberFixInput {
             root,

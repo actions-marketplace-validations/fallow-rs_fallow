@@ -866,6 +866,7 @@ mod tests {
             line,
             col: 0,
             cyclomatic: 20,
+            standard_cyclomatic: None,
             cognitive: 20,
             line_count: 20,
             param_count: 1,
@@ -875,7 +876,9 @@ mod tests {
             react_hook_profile: None,
             exceeded: ExceededThreshold::Crap,
             severity: FindingSeverity::High,
+            effective_severity: None,
             crap,
+            mutation: None,
             coverage_pct,
             coverage_tier: coverage_pct.map(|pct| {
                 if pct >= 70.0 {
@@ -912,6 +915,7 @@ mod tests {
                 invocations: 500,
                 percentile: 99,
                 actions: vec![],
+                optimization_target: None,
             }],
             blast_radius: vec![],
             importance: vec![],
@@ -945,6 +949,7 @@ mod tests {
                 evidence: RuntimeCoverageEvidence {
                     static_status: "unused".to_owned(),
                     test_coverage: "not_covered".to_owned(),
+                    test_only_reference: None,
                     v8_tracking: "tracked".to_owned(),
                     untracked_reason: None,
                     observation_days: 7,
@@ -988,6 +993,7 @@ mod tests {
                 evidence: RuntimeCoverageEvidence {
                     static_status: "used".to_owned(),
                     test_coverage: "not_covered".to_owned(),
+                    test_only_reference: None,
                     v8_tracking: "tracked".to_owned(),
                     untracked_reason: None,
                     observation_days: 7,
@@ -1034,6 +1040,8 @@ mod tests {
                 complexity_density: 0.5,
                 fan_in: 3,
                 trend: crate::churn::ChurnTrend::Stable,
+                median_files_per_commit: None,
+                median_lines_per_commit: None,
                 ownership: Some(OwnershipMetrics {
                     bus_factor: 1,
                     contributor_count: 1,

@@ -3,59 +3,69 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "3.21.0"
+version = "3.36.0"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.97"
 license = "MIT"
 repository = "https://github.com/fallow-rs/fallow"
-homepage = "https://docs.fallow.tools"
-documentation = "https://docs.fallow.tools"
+homepage = "https://fallow.tools/docs/"
+documentation = "https://fallow.tools/docs/"
 keywords = ["typescript", "javascript", "lint", "static-analysis", "code-quality"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-fallow-api = { version = "3.21.0", path = "crates/api" }
-fallow-core = { version = "3.21.0", path = "crates/core" }
-fallow-config = { version = "3.21.0", path = "crates/config" }
-fallow-extract = { version = "3.21.0", path = "crates/extract" }
-fallow-engine = { version = "3.21.0", path = "crates/engine" }
-fallow-graph = { version = "3.21.0", path = "crates/graph" }
-fallow-output = { version = "3.21.0", path = "crates/output" }
-fallow-process = { version = "3.21.0", path = "crates/process" }
-fallow-security = { version = "3.21.0", path = "crates/security" }
-fallow-types = { version = "3.21.0", path = "crates/types" }
+fallow-api = { version = "3.36.0", path = "crates/api" }
+fallow-core = { version = "3.36.0", path = "crates/core" }
+fallow-config = { version = "3.36.0", path = "crates/config" }
+fallow-extract = { version = "3.36.0", path = "crates/extract" }
+fallow-engine = { version = "3.36.0", path = "crates/engine" }
+fallow-graph = { version = "3.36.0", path = "crates/graph" }
+fallow-mutation = { version = "3.36.0", path = "crates/mutation" }
+fallow-output = { version = "3.36.0", path = "crates/output" }
+fallow-process = { version = "3.36.0", path = "crates/process" }
+fallow-security = { version = "3.36.0", path = "crates/security" }
+fallow-types = { version = "3.36.0", path = "crates/types" }
 
 # Parsing & analysis
-oxc_allocator = "0.126"
-oxc_ast = "0.126"
-oxc_ast_visit = "0.126"
-oxc_parser = "0.126"
+oxc_allocator = "0.155"
+oxc_ast = "0.155"
+oxc_ast_visit = "0.155"
+oxc_parser = "0.155"
 oxc_resolver = { version = "11", features = ["yarn_pnp"] }
-oxc_semantic = "0.126"
-oxc_span = "0.126"
-oxc_str = "0.126"
-oxc_syntax = "0.126"
-oxc_coverage_instrument = "0.9.0"
+oxc_semantic = "0.155"
+oxc_span = "0.155"
+oxc_str = "0.155"
+oxc_syntax = "0.155"
+oxc_coverage_instrument = "0.17.0"
 # CSS AST parser (browser-grade, built on Mozilla cssparser/selectors). Pinned
 # exact because it has no stable release line and pre-release semver matching is
 # brittle. Used by fallow-extract for CSS class/import extraction and analytics.
 lightningcss = { version = "=1.0.0-alpha.72", default-features = false, features = [
     "visitor",
 ] }
+# Pinned exact in lockstep with lightningcss above: lightningcss types its
+# public `Parse` trait against `cssparser` without re-exporting the crate, so
+# this pin must equal the version lightningcss resolves. A newer `cssparser`
+# gives two incompatible copies of the trait and the extractor stops compiling.
 cssparser = "=0.37.0"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+# `rc` here and `chrono04` on schemars match the features that rmcp
+# (fallow-mcp) enables. A package-scoped build such as `cargo build -p
+# fallow-cli` then resolves the same feature set as a workspace build, and a
+# switch between the two does not rebuild the dependents.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml_ng = "0.10"
+deser-value = "0.10"
+deser-yaml = "0.10"
 semver = "1"
-jsonc-parser = { version = "0.33", features = ["cst", "serde", "serde_json"] }
+jsonc-parser = { version = "0.34", features = ["cst", "serde", "serde_json"] }
 toml = "1.1"
 toml_edit = "0.25"
-schemars = "1"
+schemars = { version = "1", features = ["chrono04"] }
 flate2 = "1"
 
 # Parallelism
@@ -67,7 +77,10 @@ dunce = "1"
 ignore = "0.4"
 glob = "0.3"
 globset = { version = "0.4", features = ["serde1"] }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["event", "fs", "process"] }
+
+# Allocator for the musl binaries (musl malloc is slow under threads)
+mimalloc = { version = "0.1.52", default-features = false }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
 
 # Hashing
@@ -89,7 +102,7 @@ miette = { version = "7" }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 
 # Graph
 fixedbitset = "0.5"
@@ -102,7 +115,9 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # LSP
 ls-types = "0.0.6"
 tower-lsp-server = "0.23"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "process", "signal", "time"] }
+# `io-util` matches the feature that rmcp (fallow-mcp) enables; see the serde note.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-std", "io-util", "process", "signal", "time"] }
+tokio-util = { version = "0.7", default-features = false }
 
 # File watching
 notify = "8"
@@ -112,9 +127,8 @@ open = "5"
 
 # Testing
 criterion = { package = "codspeed-criterion-compat", version = "=4.7.0", default-features = false }
-dhat = "0.3"
 insta = { version = "1", features = ["yaml"] }
-jsonschema = { version = "0.49", default-features = false }
+jsonschema = { version = "0.59", default-features = false }
 proptest = "1"
 tempfile = "3"
 libc = "0.2"
@@ -167,29 +181,43 @@ significant_drop_in_scrutinee = "warn" # Catch temporaries dropped later than ex
 suspicious_operation_groupings = "warn" # Catch visually ambiguous arithmetic/bitwise grouping
 unused_peekable = "warn"               # Catch Peekable iterators that never peek
 
+# Restriction lints with few or no hits; they keep new code from regressing.
+mem_forget = "warn"                     # Leaks destructors; use ManuallyDrop
+lossy_float_literal = "warn"            # Literal that f32/f64 cannot represent
+mixed_read_write_in_expression = "warn" # Unspecified evaluation order
+try_err = "warn"                        # Err(x)? hides the return type
+fn_to_numeric_cast_any = "warn"         # Function pointer cast to an integer
+float_cmp_const = "warn"                # Exact compare against a float constant
+string_lit_chars_any = "warn"           # Use matches! on a char instead
+format_push_string = "warn"             # Use write! instead of a temporary String
+mutex_atomic = "warn"                   # Use an atomic for a single primitive
+suspicious_xor_used_as_pow = "warn"     # 2 ^ 8 is XOR, not a power
+empty_enum_variants_with_brackets = "warn" # Use `Variant` not `Variant {}`
+multiple_unsafe_ops_per_block = "warn"  # One SAFETY comment per unsafe operation
+unwrap_in_result = "warn"               # Return the error instead of panicking
+string_add = "warn"                     # Use push_str or format!
+redundant_type_annotations = "warn"     # Annotation repeats the initializer type
+deref_by_slicing = "warn"               # Use &* or as_slice() instead of [..]
+
 # Process-spawn ban (method list lives in .clippy.toml). Allowed workspace-wide
 # so CLI and MCP can spawn worktrees, sidecars, and subprocesses off the core
 # analysis path. Core, extract, graph, and engine re-deny it at their crate
 # roots; engine-owned Git wrappers carry narrow expectations at their call sites.
+# The list also bans raw `glob::glob`; the config crate re-denies it as well.
 disallowed_methods = "allow"
 
 # Allow common pedantic false positives
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
-missing_panics_doc = "allow"
 cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
 cast_precision_loss = "allow"
-cast_possible_wrap = "allow"
 too_many_lines = "warn"                 # SIG unit size, threshold in .clippy.toml
 items_after_statements = "allow"
 single_match_else = "allow"
-if_not_else = "allow"
 redundant_closure_for_method_calls = "allow"
 similar_names = "allow"
 wildcard_imports = "allow"
-unnested_or_patterns = "allow"
 doc_markdown = "allow"                  # False positives on technical terms
 too_long_first_doc_paragraph = "allow"  # Too strict for module-level docs
 struct_excessive_bools = "allow"        # CLI filter structs need many bools
@@ -200,13 +228,15 @@ option_if_let_else = "allow"            # Too many false positives in match-heav
 missing_const_for_fn = "allow"          # Not a const library
 fallible_impl_from = "allow"            # From impls that can fail are intentional
 use_self = "allow"                      # Too noisy with generics
+unused_async_trait_impl = "allow"       # Trait signatures (tower-lsp, rmcp) require async fn without .await
+assert_is_empty = "allow"               # The assert_eq! form needs `[] as [T; 0]` for most collections
 
 # Allow cargo lints that are unavoidable
 multiple_crate_versions = "allow"       # Transitive dependency version conflicts
 
 [workspace.lints.rust]
 absolute_paths_not_starting_with_crate = "warn" # Prefer crate/self/super paths inside crates
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)', 'cfg(fuzzing)'] }
 unsafe_code = "warn"
 unsafe_op_in_unsafe_fn = "warn"         # Require unsafe blocks even inside unsafe fn
 unused_unsafe = "warn"                  # Catch unnecessary unsafe blocks

@@ -1,0 +1,368 @@
+//! A listed package that a used dependency declares as a peer, required or
+//! optional, is credited by the unused-dependency check, and
+//! `--trace-dependency` names the used package that lists it. An optional
+//! peer passes credit on to its own peers only when the project lists it.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests and benches use unwrap and expect to keep fixture setup concise"
+)]
+
+use crate::common::{parse_json, run_fallow};
+use serde_json::{Value, json};
+
+const FIXTURE: &str = "optional-peer-of-used-dependency";
+const CHAIN_FIXTURE: &str = "peer-chain-through-unlisted-peer";
+const WORKSPACE_CHAIN_FIXTURE: &str = "peer-chain-through-workspace-peer";
+const ROOT_CHAIN_FIXTURE: &str = "peer-chain-through-root-peer";
+const IGNORED_WORKSPACE_FIXTURE: &str = "peer-chain-through-ignored-workspace";
+const REQUIRED_CHAIN_FIXTURE: &str = "peer-chain-through-required-peer";
+
+fn trace(package_name: &str) -> Value {
+    trace_in(FIXTURE, package_name)
+}
+
+fn trace_in(fixture: &str, package_name: &str) -> Value {
+    parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &[
+            "--trace-dependency",
+            package_name,
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+    ))
+}
+
+#[test]
+fn an_optional_peer_of_a_used_dependency_is_not_reported() {
+    assert_eq!(
+        unused_dependencies(FIXTURE),
+        vec!["peer-of-unused", "unused-host"]
+    );
+}
+
+fn unused_dependencies(fixture: &str) -> Vec<String> {
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    let mut unused: Vec<String> = output["unused_dependencies"]
+        .as_array()
+        .expect("unused_dependencies array")
+        .iter()
+        .map(|dep| {
+            dep["package_name"]
+                .as_str()
+                .expect("package_name")
+                .to_string()
+        })
+        .collect();
+    unused.sort_unstable();
+    unused
+}
+
+/// `host` is used. Its optional peer `unlisted-mid` is installed but not
+/// listed, so the project does not turn it on and its peers `leaf-a`
+/// (optional) and `leaf-b` (required) stay reported. The listed optional peer
+/// `listed-mid` and the required peer `req-mid` still pass credit on.
+#[test]
+fn an_unlisted_optional_peer_does_not_credit_its_own_peers() {
+    assert_eq!(unused_dependencies(CHAIN_FIXTURE), vec!["leaf-a", "leaf-b"]);
+
+    for leaf in ["leaf-a", "leaf-b"] {
+        let uncredited = trace_in(CHAIN_FIXTURE, leaf);
+        assert_eq!(uncredited["is_used"], false, "{uncredited:#}");
+        assert!(uncredited.get("peer_of").is_none(), "{uncredited:#}");
+    }
+    assert_eq!(
+        trace_in(CHAIN_FIXTURE, "leaf-c")["peer_of"],
+        json!(["listed-mid"])
+    );
+    assert_eq!(
+        trace_in(CHAIN_FIXTURE, "leaf-d")["peer_of"],
+        json!(["req-mid"])
+    );
+}
+
+#[test]
+fn the_trace_names_the_used_package_that_lists_the_peer() {
+    let credited = trace("opt-peer");
+    assert_eq!(credited["is_used"], true, "{credited:#}");
+    assert_eq!(credited["import_count"], 0, "{credited:#}");
+    assert_eq!(credited["peer_of"], json!(["host"]), "{credited:#}");
+
+    let uncredited = trace("peer-of-unused");
+    assert_eq!(uncredited["is_used"], false, "{uncredited:#}");
+    assert!(uncredited.get("peer_of").is_none(), "{uncredited:#}");
+}
+
+/// A workspace that installs the host in its own `node_modules` credits the
+/// optional peer in its manifest. The trace runs the same closure per
+/// workspace and names the host, and it names the manifest that the report
+/// still flags.
+#[test]
+fn the_trace_follows_a_host_installed_in_a_workspace() {
+    let fixture = "optional-peer-in-workspace-install";
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    let unused: Vec<&str> = output["unused_dependencies"]
+        .as_array()
+        .expect("unused_dependencies array")
+        .iter()
+        .map(|dep| dep["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(unused, vec!["packages/b/package.json"], "{output:#}");
+
+    let traced = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &[
+            "--trace-dependency",
+            "opt-peer",
+            "--format",
+            "json",
+            "--quiet",
+            "--no-cache",
+        ],
+    ));
+    assert_eq!(traced["is_used"], true, "{traced:#}");
+    assert_eq!(traced["peer_of"], json!(["host"]), "{traced:#}");
+    assert_eq!(
+        traced["unused_in"],
+        json!(["packages/b/package.json"]),
+        "{traced:#}"
+    );
+}
+
+/// The workspace `app` lists `host` and its optional peer `mid`, so `mid` is
+/// turned on for the shared install. `mid` declares `leaf` as a required
+/// peer, so the root `leaf` gets credit through `host` and `mid`.
+#[test]
+fn an_optional_peer_listed_by_a_workspace_credits_a_root_peer() {
+    let unused = unused_dependencies(WORKSPACE_CHAIN_FIXTURE);
+    assert!(!unused.iter().any(|name| name == "leaf"), "{unused:?}");
+    assert_eq!(
+        trace_in(WORKSPACE_CHAIN_FIXTURE, "leaf")["peer_of"],
+        json!(["mid"])
+    );
+}
+
+/// The root `package.json` lists the optional peer `mid` of `host`. The
+/// workspace `app` lists and imports `host` and lists `leaf`. The root turns
+/// `mid` on for the shared install, so the workspace check credits `leaf`
+/// through `host` and `mid`, and the trace agrees.
+#[test]
+fn an_optional_peer_listed_by_the_root_credits_a_workspace_peer() {
+    let unused = unused_dependencies(ROOT_CHAIN_FIXTURE);
+    assert!(unused.is_empty(), "{unused:?}");
+    assert_eq!(
+        trace_in(ROOT_CHAIN_FIXTURE, "leaf")["peer_of"],
+        json!(["mid"])
+    );
+}
+
+/// Only the workspace `packages/ignored` lists the optional peer `mid` of
+/// `host`, and `ignorePatterns` hides that workspace. The ignored manifest
+/// does not turn `mid` on, so the root `leaf` stays reported, and the trace
+/// agrees.
+#[test]
+fn an_ignored_workspace_does_not_turn_on_an_optional_peer() {
+    assert_eq!(unused_dependencies(IGNORED_WORKSPACE_FIXTURE), vec!["leaf"]);
+
+    let uncredited = trace_in(IGNORED_WORKSPACE_FIXTURE, "leaf");
+    assert_eq!(uncredited["is_used"], false, "{uncredited:#}");
+    assert!(uncredited.get("peer_of").is_none(), "{uncredited:#}");
+}
+
+/// `host` declares `mid` as a required peer, and `mid` declares `leaf` as an
+/// optional peer. The required peer `mid` is always expanded, so the listed
+/// optional peer `leaf` gets credit through it.
+#[test]
+fn a_required_peer_credits_its_own_optional_peer() {
+    assert!(unused_dependencies(REQUIRED_CHAIN_FIXTURE).is_empty());
+    assert_eq!(
+        trace_in(REQUIRED_CHAIN_FIXTURE, "leaf")["peer_of"],
+        json!(["mid"])
+    );
+}
+
+fn classified_names(output: &Value, field: &str) -> Vec<String> {
+    let mut names: Vec<String> = output[field]
+        .as_array()
+        .expect("dependency findings")
+        .iter()
+        .map(|dep| {
+            dep["package_name"]
+                .as_str()
+                .expect("package name")
+                .to_string()
+        })
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+fn production_peers_are_not_demoted_to_test_only() {
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        "runtime-peer-classification",
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    assert_eq!(
+        classified_names(&output, "test_only_dependencies"),
+        [
+            "genuine-test",
+            "leaf-unlisted",
+            "test-host",
+            "test-peer",
+            "type-host-peer",
+            "unused-peer"
+        ]
+    );
+    assert_eq!(
+        classified_names(&output, "unused_dependencies"),
+        ["unused-host"]
+    );
+}
+
+#[test]
+fn production_peers_are_not_demoted_to_type_only() {
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        "runtime-peer-classification",
+        &["--format", "json", "--quiet", "--no-cache", "--production"],
+    ));
+    assert_eq!(
+        classified_names(&output, "type_only_dependencies"),
+        ["genuine-type", "type-host"]
+    );
+    assert!(classified_names(&output, "unused_dependencies").contains(&"unused-host".to_string()));
+}
+
+#[test]
+fn production_peer_credit_respects_the_nearest_workspace_manifest() {
+    let fixture = "runtime-peer-workspace-classification";
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    assert_eq!(
+        classified_names(&output, "test_only_dependencies"),
+        ["genuine-test", "workspace-test-peer"]
+    );
+    let production = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache", "--production"],
+    ));
+    assert_eq!(
+        classified_names(&production, "type_only_dependencies"),
+        ["genuine-type", "workspace-type-peer"]
+    );
+}
+
+#[test]
+fn script_runtime_hosts_protect_their_production_peers() {
+    let fixture = "script-runtime-peer-classification";
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    assert_eq!(
+        classified_names(&output, "test_only_dependencies"),
+        [
+            "build-mode-peer",
+            "build-peer",
+            "dev-peer",
+            "genuine-test",
+            "test-mode-peer",
+            "test-peer",
+            "workspace-owned-test-peer"
+        ]
+    );
+    let production = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache", "--production"],
+    ));
+    assert_eq!(
+        classified_names(&production, "type_only_dependencies"),
+        [
+            "build-mode-type-peer",
+            "build-type-peer",
+            "dev-type-peer",
+            "genuine-type",
+            "test-mode-type-peer",
+            "workspace-owned-type-peer"
+        ]
+    );
+}
+
+fn unused_dev_dependencies(fixture: &str) -> Vec<String> {
+    let output = parse_json(&run_fallow(
+        "dead-code",
+        fixture,
+        &["--format", "json", "--quiet", "--no-cache"],
+    ));
+    let mut unused: Vec<String> = output["unused_dev_dependencies"]
+        .as_array()
+        .expect("unused_dev_dependencies array")
+        .iter()
+        .map(|dep| {
+            dep["package_name"]
+                .as_str()
+                .expect("package_name")
+                .to_string()
+        })
+        .collect();
+    unused.sort_unstable();
+    unused
+}
+
+/// Only a package.json script runs `host-cli`, so no file imports it. Its
+/// required peer `req-peer` and its listed optional peer `peer-runtime` get
+/// credit. Its unlisted optional peer `unlisted-opt` is not turned on, so
+/// `deep-peer`, the peer of `unlisted-opt`, stays reported.
+#[test]
+fn a_peer_of_a_script_used_package_is_not_reported() {
+    assert_eq!(
+        unused_dev_dependencies("peer-of-script-used-host"),
+        vec!["deep-peer"]
+    );
+}
+
+#[test]
+fn the_trace_names_the_script_used_host() {
+    let credited = trace_in("peer-of-script-used-host", "req-peer");
+    assert_eq!(credited["is_used"], true, "{credited:#}");
+    assert_eq!(credited["peer_of"], json!(["host-cli"]), "{credited:#}");
+
+    let uncredited = trace_in("peer-of-script-used-host", "deep-peer");
+    assert_eq!(uncredited["is_used"], false, "{uncredited:#}");
+    assert!(uncredited.get("peer_of").is_none(), "{uncredited:#}");
+}
+
+/// `.eslintrc.json` names the plugin `host`, so the ESLint plugin credits
+/// `eslint-plugin-host`. No file imports it. Its required peer `host-peer`
+/// gets credit, and the trace names the plugin package.
+#[test]
+fn a_peer_of_a_plugin_referenced_package_is_not_reported() {
+    let fixture = "peer-of-plugin-referenced-host";
+    assert!(unused_dev_dependencies(fixture).is_empty());
+    assert_eq!(
+        trace_in(fixture, "host-peer")["peer_of"],
+        json!(["eslint-plugin-host"])
+    );
+}

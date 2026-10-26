@@ -1,0 +1,17 @@
+---
+source: crates/cli/tests/integration/health_group_trend_tests.rs
+expression: "redact_all(&output.stdout, dir.path())"
+---
+## Health Score: 90 (A)
+
+## Fallow: 4 functions exceed complexity thresholds
+
+**4** functions analyzed (max cyclomatic: 20, max cognitive: 15, max CRAP: 30.0). This run does not list the functions. Run `fallow health --complexity` to list them.
+
+## Health by owner
+
+| Group | Score | Grade | Delta | Files | Critical | Hotspots |
+|:------|------:|:------|:------|------:|---------:|---------:|
+| `@team/a` | 90.0 | A | - | 2 | 2 | 0 |
+| `@team/b` | 90.0 | A | - | 2 | 2 | 0 |
+| `(unowned)` | 100.0 | A | - | 1 | 0 | 0 |

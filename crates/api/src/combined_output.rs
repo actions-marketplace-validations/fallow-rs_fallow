@@ -4,9 +4,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use fallow_output::{
-    COMBINED_SCHEMA_VERSION, CombinedMeta, CombinedOutput, HealthReport, RootEnvelopeMode,
-    check_meta, dupes_meta, harmonize_dead_code_health_suppress_line_actions, health_meta,
-    serialize_combined_json_output, strip_root_prefix,
+    COMBINED_SCHEMA_VERSION, CombinedMeta, CombinedOutput, HealthReport, check_meta, dupes_meta,
+    harmonize_dead_code_health_suppress_line_actions, health_meta, serialize_combined_json_output,
+    strip_root_prefix,
 };
 use fallow_types::envelope::{ElapsedMs, SchemaVersion, ToolVersion};
 use fallow_types::output::NextStep;
@@ -34,6 +34,17 @@ pub struct CombinedCheckJsonSection<'a> {
 
 /// Inputs for bare `fallow --format json` output assembly.
 pub struct CombinedJsonOutputInput<'a> {
+    /// Applied refs for exact workspace package roots.
+    pub package_baselines: Vec<fallow_output::PackageBaselineStatus>,
+    /// Every gate this run evaluated, absent when it evaluated none. The
+    /// programmatic route runs no CLI-layer gate and leaves this `None`.
+    pub gate_outcomes: Option<fallow_output::GateOutcomes>,
+    /// Every narrowing or shaping request this run received, absent when it
+    /// was asked for nothing. The programmatic route resolves no CLI flag and
+    /// leaves this `None`; an entry whose `status` is not `applied` means the
+    /// report is wider than what was asked for.
+    pub request_outcomes: Option<fallow_output::RequestOutcomes>,
+
     /// Dead-code section; `None` omits `check` from the envelope.
     pub check: Option<CombinedCheckJsonSection<'a>>,
     /// Duplication section; `None` omits `dupes` from the envelope.
@@ -56,8 +67,6 @@ pub struct CombinedJsonOutputInput<'a> {
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<&'a str>,
 }
@@ -106,9 +115,12 @@ pub fn serialize_combined_json(
     }
 
     let output = CombinedOutput {
+        package_baselines: input.package_baselines,
         schema_version: SchemaVersion(COMBINED_SCHEMA_VERSION),
         version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
         elapsed_ms: ElapsedMs(elapsed_ms_for_output(input.elapsed)),
+        gate_outcomes: input.gate_outcomes,
+        request_outcomes: input.request_outcomes,
         meta,
         check,
         dupes,
@@ -117,11 +129,7 @@ pub fn serialize_combined_json(
         next_steps: input.next_steps,
     };
 
-    let mut value = serialize_combined_json_output(
-        output,
-        input.envelope_mode,
-        input.telemetry_analysis_run_id,
-    )?;
+    let mut value = serialize_combined_json_output(output, input.telemetry_analysis_run_id)?;
     if let Some(diagnostics) = value.get_mut("workspace_diagnostics") {
         strip_root_prefix(diagnostics, &format!("{}/", input.root.display()));
     }
@@ -202,7 +210,6 @@ mod tests {
 
     use fallow_output::{
         ComplexityViolation, ExceededThreshold, FindingSeverity, HealthFinding, HealthReport,
-        RootEnvelopeMode,
     };
     use fallow_types::output_dead_code::UnusedExportFinding;
     use fallow_types::output_health::{HealthFindingAction, HealthFindingActionType};
@@ -214,6 +221,9 @@ mod tests {
     #[test]
     fn combined_json_root_contains_stable_envelope_fields() {
         let root = serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
             check: None,
             dupes: None,
             health: None,
@@ -223,7 +233,6 @@ mod tests {
             type_aware: None,
             workspace_diagnostics: Vec::new(),
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         })
         .expect("combined JSON root");
@@ -255,6 +264,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let health = HealthReport {
             findings: vec![HealthFinding::new(
@@ -264,6 +275,7 @@ mod tests {
                     line: 7,
                     col: 0,
                     cyclomatic: 22,
+                    standard_cyclomatic: None,
                     cognitive: 18,
                     line_count: 40,
                     param_count: 1,
@@ -272,8 +284,10 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
@@ -299,6 +313,9 @@ mod tests {
         };
 
         let output = serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
             check: Some(CombinedCheckJsonSection {
                 results: &results,
                 root,
@@ -314,7 +331,6 @@ mod tests {
             type_aware: None,
             workspace_diagnostics: Vec::new(),
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         })
         .expect("combined JSON");
@@ -336,6 +352,9 @@ mod tests {
     ) -> serde_json::Value {
         let results = AnalysisResults::default();
         serialize_combined_json(CombinedJsonOutputInput {
+            package_baselines: Vec::new(),
+            gate_outcomes: None,
+            request_outcomes: None,
             check: include_check.then(|| CombinedCheckJsonSection {
                 results: &results,
                 root,
@@ -351,7 +370,6 @@ mod tests {
             type_aware: None,
             workspace_diagnostics,
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         })
         .expect("combined JSON")

@@ -203,27 +203,36 @@ fn project_state_workspace_queries() {
     let workspaces = discover_workspaces(&root);
     let project = fallow_core::project::ProjectState::new(files, workspaces);
 
-    assert!(project.workspace_by_name("app").is_some());
-    assert!(project.workspace_by_name("shared").is_some());
-    assert!(project.workspace_by_name("@workspace/utils").is_some());
-    assert!(project.workspace_by_name("nonexistent").is_none());
+    let names: Vec<&str> = project
+        .workspaces()
+        .iter()
+        .map(|ws| ws.name.as_str())
+        .collect();
+    for expected in ["app", "shared", "@workspace/utils"] {
+        assert!(
+            names.contains(&expected),
+            "workspace {expected} should be discovered: {names:?}"
+        );
+    }
 
-    let app_ws = project.workspace_by_name("app").unwrap();
-    let app_files = project.files_in_workspace(app_ws);
+    let app_ws = project
+        .workspaces()
+        .iter()
+        .find(|ws| ws.name == "app")
+        .unwrap();
     assert!(
-        !app_files.is_empty(),
+        project
+            .files()
+            .iter()
+            .any(|file| file.path.starts_with(&app_ws.root)),
         "app workspace should have at least one file"
     );
 
-    for fid in &app_files {
-        if let Some(file) = project.file_by_id(*fid) {
-            assert!(
-                file.path.starts_with(&app_ws.root),
-                "File {:?} should be under app workspace root {:?}",
-                file.path,
-                app_ws.root
-            );
-        }
+    for file in project.files() {
+        let by_id = project
+            .file_by_id(file.id)
+            .expect("every discovered file should resolve by its FileId");
+        assert_eq!(by_id.path, file.path);
     }
 }
 
@@ -727,5 +736,91 @@ fn workspace_tsconfig_path_alias_to_unbuilt_dist_resolves_to_source() {
     assert!(
         !unused_files.contains(&"string.ts".to_string()),
         "utils/src/string.ts should be reachable via the subpath import, unused: {unused_files:?}"
+    );
+}
+
+#[test]
+fn workspace_declaration_exports_with_dotted_names_resolve_to_source() {
+    let root = fixture_path("workspace-declaration-dotted-exports");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved_specifiers: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|u| u.import.specifier.as_str())
+        .collect();
+    assert!(
+        unresolved_specifiers.is_empty(),
+        "declaration export targets should map back to source: {unresolved_specifiers:?}"
+    );
+
+    for reachable in [
+        "packages/lib/src/feature.port.ts",
+        "packages/lib/src/helper.mts",
+    ] {
+        assert!(
+            !results
+                .unused_files
+                .iter()
+                .any(|f| f.file.path.ends_with(reachable)),
+            "{reachable} should be reachable through the declaration export target"
+        );
+    }
+}
+
+/// A `<workspace-package>/package.json` import names a file that discovery
+/// does not collect. Without `node_modules`, the import must still credit the
+/// workspace dependency, the same as an installed workspace package. An
+/// `exports` map without a `./package.json` key blocks the import, as in Node.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn workspace_package_json_import_credits_the_workspace_dependency() {
+    let root = fixture_path("workspace-package-json-import");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|i| i.import.specifier.as_str())
+        .collect();
+    assert_eq!(
+        unresolved,
+        ["@fx/blocked/package.json"],
+        "only the subpath that the exports map blocks stays unresolved"
+    );
+
+    let unused_deps: Vec<&str> = results
+        .unused_dependencies
+        .iter()
+        .map(|d| d.dep.package_name.as_str())
+        .collect();
+    for credited in ["@fx/lib", "@fx/plain"] {
+        assert!(
+            !unused_deps.contains(&credited),
+            "{credited} is imported through its package.json, got: {unused_deps:?}"
+        );
+    }
+}
+
+/// `require('..')` from a package subdirectory names the package root. When
+/// `main` points at build output that is not on disk, the import uses the
+/// source entry, the same as `require('../')`.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn relative_package_root_dot_dot_resolves_to_the_source_entry() {
+    let root = fixture_path("relative-package-root-dot-dot");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unresolved: Vec<&str> = results
+        .unresolved_imports
+        .iter()
+        .map(|i| i.import.specifier.as_str())
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "require('..') must resolve to the package source, got: {unresolved:?}"
     );
 }

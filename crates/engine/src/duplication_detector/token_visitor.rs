@@ -3,7 +3,9 @@
 //! The `TokenExtractor` walks an Oxc AST and emits a `Vec<SourceToken>` suitable
 //! for suffix-array based clone detection.
 
+use fallow_extract::JsText;
 use oxc_ast::ast::*;
+use oxc_ast::match_expression;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_span::{GetSpan, Span};
@@ -18,6 +20,7 @@ pub(super) struct TokenExtractor {
     pub(super) tokens: Vec<SourceToken>,
     pub(super) function_spans: Vec<Span>,
     pub(super) atomic_invocation_spans: Vec<Span>,
+    pub(super) literal_argument_spans: Vec<Span>,
     /// When true, skip TypeScript type annotations, interfaces, and type aliases
     /// to enable cross-language clone detection between .ts and .js files.
     strip_types: bool,
@@ -32,6 +35,7 @@ impl TokenExtractor {
             tokens: Vec::new(),
             function_spans: Vec::new(),
             atomic_invocation_spans: Vec::new(),
+            literal_argument_spans: Vec::new(),
             strip_types,
             skip_imports,
         }
@@ -56,48 +60,117 @@ impl TokenExtractor {
     fn push_atomic_invocation_span(&mut self, span: Span) {
         self.atomic_invocation_spans.push(span);
     }
-}
 
-fn is_atomic_invocation_expr(expr: &Expression<'_>) -> bool {
-    match expr {
-        Expression::CallExpression(expr) => is_atomic_call_expression(expr),
-        Expression::NewExpression(expr) => is_atomic_new_expression(expr),
-        Expression::AwaitExpression(expr) => is_atomic_invocation_expr(&expr.argument),
-        Expression::ParenthesizedExpression(expr) => is_atomic_invocation_expr(&expr.expression),
-        Expression::TSAsExpression(expr) => is_atomic_invocation_expr(&expr.expression),
-        Expression::TSSatisfiesExpression(expr) => is_atomic_invocation_expr(&expr.expression),
-        Expression::TSNonNullExpression(expr) => is_atomic_invocation_expr(&expr.expression),
-        Expression::ChainExpression(expr) => match &expr.expression {
-            ChainElement::CallExpression(call) => is_atomic_call_expression(call),
-            _ => false,
-        },
-        _ => false,
+    /// Tokens of a meta property: the meta name at the start of `span` and the
+    /// property name at its end.
+    fn push_meta_property_tokens(&mut self, span: Span, meta: &str, property: &str) {
+        let meta_end = span.start.saturating_add(len_u32(meta)).min(span.end);
+        let property_start = span.end.saturating_sub(len_u32(property)).max(span.start);
+        self.push(
+            TokenKind::Identifier(meta.to_string()),
+            Span::new(span.start, meta_end),
+        );
+        self.push(
+            TokenKind::Identifier(property.to_string()),
+            Span::new(property_start, span.end),
+        );
+    }
+
+    /// Tokens of an interface heritage name, spelled as the member expression
+    /// it was before Oxc 0.151: `A.B` gives `A`, a dot and `B`.
+    fn visit_heritage_type_name(&mut self, name: &TSTypeName<'_>) {
+        match name {
+            TSTypeName::QualifiedName(qualified) => {
+                self.visit_heritage_type_name(&qualified.left);
+                self.push_punc(PunctuationType::Dot, point_span(qualified.left.span().end));
+                self.push(
+                    TokenKind::Identifier(qualified.right.name.to_string()),
+                    qualified.right.span,
+                );
+            }
+            _ => self.visit_ts_type_name(name),
+        }
+    }
+
+    /// Tokens of an expression in statement position: the expression, then a
+    /// semicolon.
+    fn visit_statement_expression(&mut self, expr: &Expression<'_>, span: Span) {
+        let functions_before = self.function_spans.len();
+        self.visit_expression(expr);
+        if is_invocation_expr(expr) {
+            self.push_atomic_invocation_span_if_no_function(span, functions_before);
+        }
+        self.push_punc(PunctuationType::Semicolon, span);
+    }
+
+    /// Record `span` as an atomic invocation when the visitor saw no function
+    /// since `functions_before`. A function anywhere inside the invocation (a
+    /// callback, an IIFE callee, or a method in an object literal argument such
+    /// as the options object of `defineComponent({ ... })`) holds real code, so
+    /// a clone inside it must stay reportable.
+    fn push_atomic_invocation_span_if_no_function(
+        &mut self,
+        span: Span,
+        functions_before: usize,
+    ) -> bool {
+        let atomic = self.function_spans.len() == functions_before;
+        if atomic {
+            self.push_atomic_invocation_span(span);
+        }
+        atomic
+    }
+
+    /// Record the atomic invocation `span` of a call or `new` expression, plus
+    /// the spans of its object and array literal arguments. The literal spans
+    /// let the filter keep a clone that starts inside one literal argument,
+    /// such as a copied `props` block in `defineComponent({ ... })`.
+    fn push_atomic_call_spans(
+        &mut self,
+        span: Span,
+        functions_before: usize,
+        arguments: &[Argument<'_>],
+    ) {
+        if self.push_atomic_invocation_span_if_no_function(span, functions_before) {
+            self.literal_argument_spans
+                .extend(arguments.iter().filter_map(literal_argument_span));
+        }
     }
 }
 
-fn is_atomic_call_expression(expr: &CallExpression<'_>) -> bool {
-    !expr.arguments.iter().any(argument_is_function_like)
+fn len_u32(text: &str) -> u32 {
+    u32::try_from(text.len()).unwrap_or(u32::MAX)
 }
 
-fn is_atomic_new_expression(expr: &NewExpression<'_>) -> bool {
-    !expr.arguments.iter().any(argument_is_function_like)
+/// The span of an object or array literal argument, optionally wrapped by
+/// parentheses or a type assertion.
+fn literal_argument_span(arg: &Argument<'_>) -> Option<Span> {
+    arg.as_expression().and_then(literal_expression_span)
 }
 
-fn argument_is_function_like(arg: &Argument<'_>) -> bool {
-    match arg {
-        Argument::ArrowFunctionExpression(_) | Argument::FunctionExpression(_) => true,
-        Argument::ParenthesizedExpression(expr) => expression_is_function_like(&expr.expression),
-        _ => false,
+fn literal_expression_span(expr: &Expression<'_>) -> Option<Span> {
+    match expr {
+        Expression::ObjectExpression(expr) => Some(expr.span),
+        Expression::ArrayExpression(expr) => Some(expr.span),
+        Expression::ParenthesizedExpression(expr) => literal_expression_span(&expr.expression),
+        Expression::TSAsExpression(expr) => literal_expression_span(&expr.expression),
+        Expression::TSSatisfiesExpression(expr) => literal_expression_span(&expr.expression),
+        _ => None,
     }
 }
 
-fn expression_is_function_like(expr: &Expression<'_>) -> bool {
+/// True when `expr` is a call or `new` invocation, optionally wrapped by
+/// `await`, parentheses, a type assertion, or an optional chain.
+fn is_invocation_expr(expr: &Expression<'_>) -> bool {
     match expr {
-        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
-        Expression::ParenthesizedExpression(expr) => expression_is_function_like(&expr.expression),
-        Expression::TSAsExpression(expr) => expression_is_function_like(&expr.expression),
-        Expression::TSSatisfiesExpression(expr) => expression_is_function_like(&expr.expression),
-        Expression::TSNonNullExpression(expr) => expression_is_function_like(&expr.expression),
+        Expression::CallExpression(_) | Expression::NewExpression(_) => true,
+        Expression::AwaitExpression(expr) => is_invocation_expr(&expr.argument),
+        Expression::ParenthesizedExpression(expr) => is_invocation_expr(&expr.expression),
+        Expression::TSAsExpression(expr) => is_invocation_expr(&expr.expression),
+        Expression::TSSatisfiesExpression(expr) => is_invocation_expr(&expr.expression),
+        Expression::TSNonNullExpression(expr) => is_invocation_expr(&expr.expression),
+        Expression::ChainExpression(expr) => {
+            matches!(&expr.expression, ChainElement::CallExpression(_))
+        }
         _ => false,
     }
 }
@@ -165,13 +238,12 @@ impl<'a> Visit<'a> for TokenExtractor {
     }
 
     fn visit_return_statement(&mut self, stmt: &ReturnStatement<'a>) {
-        if let Some(argument) = &stmt.argument
-            && is_atomic_invocation_expr(argument)
-        {
-            self.push_atomic_invocation_span(stmt.span);
-        }
+        let functions_before = self.function_spans.len();
         self.push_keyword(KeywordType::Return, stmt.span);
         walk::walk_return_statement(self, stmt);
+        if stmt.argument.as_ref().is_some_and(is_invocation_expr) {
+            self.push_atomic_invocation_span_if_no_function(stmt.span, functions_before);
+        }
     }
 
     fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
@@ -280,7 +352,10 @@ impl<'a> Visit<'a> for TokenExtractor {
     }
 
     fn visit_string_literal(&mut self, lit: &StringLiteral<'a>) {
-        self.push(TokenKind::StringLiteral(lit.value.to_string()), lit.span);
+        self.push(
+            TokenKind::StringLiteral(lit.value.text().into_owned()),
+            lit.span,
+        );
     }
 
     fn visit_numeric_literal(&mut self, lit: &NumericLiteral<'a>) {
@@ -329,9 +404,7 @@ impl<'a> Visit<'a> for TokenExtractor {
     }
 
     fn visit_call_expression(&mut self, expr: &CallExpression<'a>) {
-        if is_atomic_call_expression(expr) {
-            self.push_atomic_invocation_span(expr.span);
-        }
+        let functions_before = self.function_spans.len();
         self.visit_expression(&expr.callee);
         let open = point_span(expr.callee.span().end);
         self.push_punc(PunctuationType::OpenParen, open);
@@ -342,12 +415,11 @@ impl<'a> Visit<'a> for TokenExtractor {
         }
         let close = point_span(expr.span.end.saturating_sub(1));
         self.push_punc(PunctuationType::CloseParen, close);
+        self.push_atomic_call_spans(expr.span, functions_before, &expr.arguments);
     }
 
     fn visit_new_expression(&mut self, expr: &NewExpression<'a>) {
-        if is_atomic_new_expression(expr) {
-            self.push_atomic_invocation_span(expr.span);
-        }
+        let functions_before = self.function_spans.len();
         self.push_keyword(KeywordType::New, expr.span);
         self.visit_expression(&expr.callee);
         let open = point_span(expr.callee.span().end);
@@ -359,6 +431,7 @@ impl<'a> Visit<'a> for TokenExtractor {
         }
         let close = point_span(expr.span.end.saturating_sub(1));
         self.push_punc(PunctuationType::CloseParen, close);
+        self.push_atomic_call_spans(expr.span, functions_before, &expr.arguments);
     }
 
     fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
@@ -563,7 +636,7 @@ impl<'a> Visit<'a> for TokenExtractor {
         if let Some(id) = &class.id {
             self.push(TokenKind::Identifier(id.name.to_string()), id.span);
         }
-        if class.super_class.is_some() {
+        if class.heritage.is_some() {
             self.push_keyword(KeywordType::Extends, class.span);
         }
         walk::walk_class(self, class);
@@ -580,20 +653,36 @@ impl<'a> Visit<'a> for TokenExtractor {
         walk::walk_import_declaration(self, decl);
         self.push_keyword(KeywordType::From, decl.span);
         self.push(
-            TokenKind::StringLiteral(decl.source.value.to_string()),
+            TokenKind::StringLiteral(decl.source.value.text().into_owned()),
             decl.source.span,
         );
     }
 
+    fn visit_export_declaration(&mut self, decl: &ExportDeclaration<'a>) {
+        if self.strip_types && decl.export_kind().is_type() {
+            return;
+        }
+        self.push_keyword(KeywordType::Export, decl.span);
+        walk::walk_export_declaration(self, decl);
+    }
+
     fn visit_export_named_declaration(&mut self, decl: &ExportNamedDeclaration<'a>) {
-        if self.skip_imports && decl.source.is_some() {
+        if self.strip_types && decl.export_kind.is_type() {
+            return;
+        }
+        self.push_keyword(KeywordType::Export, decl.span);
+        walk::walk_export_named_declaration(self, decl);
+    }
+
+    fn visit_export_from_declaration(&mut self, decl: &ExportFromDeclaration<'a>) {
+        if self.skip_imports {
             return;
         }
         if self.strip_types && decl.export_kind.is_type() {
             return;
         }
         self.push_keyword(KeywordType::Export, decl.span);
-        walk::walk_export_named_declaration(self, decl);
+        walk::walk_export_from_declaration(self, decl);
     }
 
     fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
@@ -609,7 +698,7 @@ impl<'a> Visit<'a> for TokenExtractor {
         self.push_keyword(KeywordType::Export, decl.span);
         self.push_keyword(KeywordType::From, decl.span);
         self.push(
-            TokenKind::StringLiteral(decl.source.value.to_string()),
+            TokenKind::StringLiteral(decl.source.value.text().into_owned()),
             decl.source.span,
         );
     }
@@ -636,11 +725,18 @@ impl<'a> Visit<'a> for TokenExtractor {
         walk::walk_ts_type_alias_declaration(self, decl);
     }
 
-    fn visit_ts_module_declaration(&mut self, decl: &TSModuleDeclaration<'a>) {
+    fn visit_ts_namespace_declaration(&mut self, decl: &TSNamespaceDeclaration<'a>) {
         if self.strip_types && decl.declare {
             return;
         }
-        walk::walk_ts_module_declaration(self, decl);
+        walk::walk_ts_namespace_declaration(self, decl);
+    }
+
+    fn visit_ts_external_module_declaration(&mut self, decl: &TSExternalModuleDeclaration<'a>) {
+        if self.strip_types && decl.declare {
+            return;
+        }
+        walk::walk_ts_external_module_declaration(self, decl);
     }
 
     fn visit_ts_enum_declaration(&mut self, decl: &TSEnumDeclaration<'a>) {
@@ -703,6 +799,26 @@ impl<'a> Visit<'a> for TokenExtractor {
 
     fn visit_identifier_name(&mut self, ident: &IdentifierName<'a>) {
         self.push(TokenKind::Identifier(ident.name.to_string()), ident.span);
+    }
+
+    // Before Oxc 0.151 `import.meta` and `new.target` were one meta-property
+    // node with two identifier names, and the interface heritage name was an
+    // expression. The overrides below keep the tokens those shapes produced, so
+    // clone groups do not change with the parser version.
+
+    fn visit_import_meta(&mut self, it: &ImportMeta) {
+        self.push_meta_property_tokens(it.span, "import", "meta");
+    }
+
+    fn visit_new_target(&mut self, it: &NewTarget) {
+        self.push_meta_property_tokens(it.span, "new", "target");
+    }
+
+    fn visit_ts_interface_heritage(&mut self, it: &TSInterfaceHeritage<'a>) {
+        self.visit_heritage_type_name(&it.type_name);
+        if let Some(type_arguments) = &it.type_arguments {
+            self.visit_ts_type_parameter_instantiation(type_arguments);
+        }
     }
 
     fn visit_ts_string_keyword(&mut self, it: &TSStringKeyword) {
@@ -772,10 +888,19 @@ impl<'a> Visit<'a> for TokenExtractor {
     }
 
     fn visit_expression_statement(&mut self, stmt: &ExpressionStatement<'a>) {
-        if is_atomic_invocation_expr(&stmt.expression) {
-            self.push_atomic_invocation_span(stmt.span);
+        self.visit_statement_expression(&stmt.expression, stmt.span);
+    }
+
+    fn visit_arrow_function_body(&mut self, body: &ArrowFunctionBody<'a>) {
+        match body {
+            ArrowFunctionBody::FunctionBody(block) => self.visit_function_body(block),
+            // Before Oxc 0.151 a concise body was one expression statement with
+            // the span of the expression. Keep its tokens, so clone groups do
+            // not change with the parser version.
+            match_expression!(ArrowFunctionBody) => {
+                let expr = body.to_expression();
+                self.visit_statement_expression(expr, expr.span());
+            }
         }
-        walk::walk_expression_statement(self, stmt);
-        self.push_punc(PunctuationType::Semicolon, stmt.span);
     }
 }

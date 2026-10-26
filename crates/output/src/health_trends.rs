@@ -4,7 +4,7 @@ use crate::CoverageModel;
 
 /// Trend comparison between the current run and a previous snapshot. Shows
 /// per-metric deltas with directional indicators.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthTrend {
     /// The snapshot being compared against.
@@ -18,7 +18,7 @@ pub struct HealthTrend {
 }
 
 /// A reference to a snapshot used in trend comparison.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrendPoint {
     /// ISO 8601 timestamp of the snapshot.
@@ -32,6 +32,10 @@ pub struct TrendPoint {
     /// Letter grade from the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grade: Option<String>,
+    /// Formula used for the stored score; absent on legacy snapshots.
+    /// A score delta is emitted only when this matches the current score formula.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_formula_version: Option<u32>,
     /// Coverage model used for CRAP computation in this snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_model: Option<CoverageModel>,
@@ -40,14 +44,32 @@ pub struct TrendPoint {
     pub snapshot_schema_version: Option<u32>,
 }
 
+/// Explain why scores with unknown or differing formula identities cannot be
+/// compared. Uses identities from the saved report, independent of this binary.
+#[must_use]
+pub fn health_score_comparison_note(
+    previous_formula: Option<u32>,
+    current_formula: Option<u32>,
+) -> Option<&'static str> {
+    let (Some(previous), Some(current)) = (previous_formula, current_formula) else {
+        return Some("Score comparison omitted: score formula version is unknown.");
+    };
+    if previous != current {
+        return Some("Score comparison omitted: score formulas differ.");
+    }
+    None
+}
+
 /// A single metric's trend between two snapshots.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrendMetric {
     /// Metric identifier, e.g. `"score"` or `"dead_file_pct"`.
-    pub name: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub name: crate::static_str::StaticStr,
     /// Human-readable label, e.g. `"Health Score"` or `"Dead Files"`.
-    pub label: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub label: crate::static_str::StaticStr,
     /// Previous value (from snapshot).
     pub previous: f64,
     /// Current value (from this run).
@@ -57,7 +79,8 @@ pub struct TrendMetric {
     /// Direction of change.
     pub direction: TrendDirection,
     /// Unit for display, e.g. `"%"`, `""`, or `"pts"`.
-    pub unit: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub unit: crate::static_str::StaticStr,
     /// Raw count from previous snapshot (for JSON consumers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_count: Option<TrendCount>,
@@ -67,7 +90,7 @@ pub struct TrendMetric {
 }
 
 /// Raw numerator/denominator for a percentage metric.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrendCount {
     /// The numerator, e.g. dead files count.
@@ -77,7 +100,7 @@ pub struct TrendCount {
 }
 
 /// Direction of a metric's change, semantically (improving/declining/stable).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TrendDirection {

@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+
+const BACKEND_ENV = "FALLOW_TYPE_AWARE_BACKEND";
+const DEFAULT_BACKEND = "typescript-go";
+
+/** The backend family that `FALLOW_TYPE_AWARE_BACKEND` selects for this run. */
+export const selectedBackend = (env = process.env) => env[BACKEND_ENV]?.trim() || DEFAULT_BACKEND;
 
 const hashJson = (value, suffix = "") =>
   createHash("sha256")
@@ -88,25 +94,21 @@ const parseSidecarResponse = (stdout, fail) => {
 };
 
 const validEnvelope = (response, protocolVersion, isObject) =>
-  [
-    isObject(response),
-    response.protocol_version === protocolVersion,
-    response.operation === "semantic-queries",
-    typeof response.sidecar_version === "string",
-    response.backend === "typescript-go",
-    typeof response.backend_version === "string",
-    Array.isArray(response.results),
-  ].every(Boolean);
+  isObject(response) &&
+  response.protocol_version === protocolVersion &&
+  response.operation === "semantic-queries" &&
+  typeof response.sidecar_version === "string" &&
+  response.backend === selectedBackend() &&
+  typeof response.backend_version === "string" &&
+  Array.isArray(response.results);
 
 const validEvidenceLocation = (location, normalizedRelativePath, isObject, index) =>
-  [
-    isObject(location),
-    normalizedRelativePath(location.path, `results evidence ${index} path`) === location.path,
-    Number.isInteger(location.line),
-    location.line >= 1,
-    Number.isInteger(location.col),
-    location.col >= 0,
-  ].every(Boolean);
+  isObject(location) &&
+  normalizedRelativePath(location.path, `results evidence ${index} path`) === location.path &&
+  Number.isInteger(location.line) &&
+  location.line >= 1 &&
+  Number.isInteger(location.col) &&
+  location.col >= 0;
 
 const validateEvidence = (evidence, dependencies) => {
   for (const [index, location] of evidence.entries()) {
@@ -124,14 +126,13 @@ const validateEvidence = (evidence, dependencies) => {
 };
 
 const validateResult = (queryResult, expected, seen, dependencies) => {
-  const valid = [
-    dependencies.isObject(queryResult),
-    expected.has(queryResult.query_id),
-    expected.get(queryResult.query_id) === queryResult.operation,
-    !seen.has(queryResult.query_id),
-    dependencies.queryStatuses.has(queryResult.status),
-    Array.isArray(queryResult.evidence),
-  ].every(Boolean);
+  const valid =
+    dependencies.isObject(queryResult) &&
+    expected.has(queryResult.query_id) &&
+    expected.get(queryResult.query_id) === queryResult.operation &&
+    !seen.has(queryResult.query_id) &&
+    dependencies.queryStatuses.has(queryResult.status) &&
+    Array.isArray(queryResult.evidence);
   if (!valid)
     dependencies.fail(
       "type-aware evidence sidecar response has invalid query identity or evidence",
@@ -190,4 +191,43 @@ export const runExactSidecarRequest = ({
   const response = parseSidecarResponse(stdout, dependencies.fail);
   validateResponse(response, request, dependencies);
   return response;
+};
+
+const ISOLATED_BACKEND_COMMANDS = new Set([
+  "prepare",
+  "focused",
+  "discover",
+  "measure",
+  "evidence",
+  "verify-ledger",
+]);
+
+/** The child environment for Fallow and the sidecar, with the backend selection. */
+export const minimalEnvironment = (sidecarBin, env = process.env) => {
+  const environment = {};
+  for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "ComSpec", "PATHEXT"]) {
+    if (env[key]) environment[key] = env[key];
+  }
+  environment.FALLOW_FORMAT = "json";
+  environment.FALLOW_QUIET = "1";
+  if (env[BACKEND_ENV]) environment[BACKEND_ENV] = env[BACKEND_ENV];
+  if (sidecarBin) environment.FALLOW_TYPE_AWARE_BIN = sidecarBin;
+  return environment;
+};
+
+/**
+ * The tracked evidence comes from the default backend. A run on another
+ * backend writes only to an explicit non-canonical output directory, and only
+ * through commands that keep their artifacts in that directory.
+ */
+export const assertBackendIsolation = (options, defaultOutDir, env = process.env) => {
+  const backend = selectedBackend(env);
+  if (backend === DEFAULT_BACKEND) return;
+  const canonical = !options.outDirExplicit || resolve(options.outDir) === defaultOutDir;
+  if (!ISOLATED_BACKEND_COMMANDS.has(options.command) || canonical) {
+    throw new Error(
+      `${BACKEND_ENV}=${backend} runs only ${[...ISOLATED_BACKEND_COMMANDS].join(", ")} ` +
+        "with a non-canonical --out-dir",
+    );
+  }
 };

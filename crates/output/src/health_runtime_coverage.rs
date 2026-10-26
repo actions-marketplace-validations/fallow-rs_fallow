@@ -6,7 +6,7 @@ use fallow_types::serde_path;
 /// Runtime coverage JSON contract version. This is scoped to the
 /// `runtime_coverage` block and is independent of the top-level fallow
 /// JSON `schema_version`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum RuntimeCoverageSchemaVersion {
     /// First release of the runtime coverage block contract.
@@ -24,7 +24,7 @@ pub enum RuntimeCoverageSchemaVersion {
 /// touched-hot-path is event-tied to the current diff and reviewers need
 /// it to be the top-line signal. In standalone analysis (no change
 /// scope), `cold-code-detected` remains primary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeCoverageReportVerdict {
@@ -47,7 +47,7 @@ pub enum RuntimeCoverageReportVerdict {
 /// agents can reason about them independently of the headline. Order is
 /// stable: severity-descending so the first entry mirrors a sensible
 /// non-PR-context verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeCoverageSignal {
@@ -153,7 +153,7 @@ impl fmt::Display for RuntimeCoverageVerdict {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 /// Confidence level for a runtime coverage finding.
@@ -193,7 +193,7 @@ impl fmt::Display for RuntimeCoverageConfidence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 /// License or trial watermark applied to runtime coverage output.
@@ -225,7 +225,7 @@ impl fmt::Display for RuntimeCoverageWatermark {
 }
 
 /// Runtime coverage source used to produce the summary.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeCoverageDataSource {
@@ -254,7 +254,7 @@ impl fmt::Display for RuntimeCoverageDataSource {
 }
 
 /// Summary block mirroring `fallow_cov_protocol::Summary` (0.3 shape).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageSummary {
     /// Runtime evidence source used for this report. Local mode reads a
@@ -295,7 +295,7 @@ pub struct RuntimeCoverageSummary {
 
 /// Quality-of-capture signals emitted by the sidecar so the CLI can explain
 /// short-window captures honestly instead of letting users blame the tool.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageCaptureQuality {
     /// Total observation window in seconds. Finer-grained than period_days
@@ -313,7 +313,7 @@ pub struct RuntimeCoverageCaptureQuality {
 }
 
 /// Supporting evidence for a finding (mirrors `fallow_cov_protocol::Evidence`).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageEvidence {
     /// `used` when the function is reachable in the module graph, `unused`
@@ -322,6 +322,16 @@ pub struct RuntimeCoverageEvidence {
     /// `covered` when the project's test suite hits this function,
     /// `not_covered` otherwise.
     pub test_coverage: String,
+    /// `true` when the function is unreachable in the production module graph
+    /// but still referenced from a file that production mode excludes (test,
+    /// spec, story, fixture, or benchmark). Such a function is not dead code:
+    /// removing it breaks the referencing test. `false` when the production
+    /// graph was compared against the full tree and no such reference exists.
+    /// `null` when the report was produced without a production filter, or by
+    /// a surface that carries no second reachability answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub test_only_reference: Option<bool>,
     /// `tracked` when V8 observed the function, `untracked` otherwise.
     pub v8_tracking: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,7 +345,7 @@ pub struct RuntimeCoverageEvidence {
     pub deployments_observed: u32,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 /// Suggested follow-up action for a runtime coverage finding.
 pub struct RuntimeCoverageAction {
@@ -353,7 +363,7 @@ pub struct RuntimeCoverageAction {
 }
 
 /// Non-fatal diagnostic emitted while merging runtime coverage.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageMessage {
     /// Stable machine-readable warning code.
@@ -362,13 +372,13 @@ pub struct RuntimeCoverageMessage {
     pub message: String,
 }
 
-/// Discriminator inputs that PRODUCED a finding's verdict (fallow-rs/fallow-cloud#321),
+/// Discriminator inputs that PRODUCED a finding's verdict,
 /// emitted alongside the verdict so an agent can reproduce it and see the
 /// minimum-observation confidence cap instead of re-deriving them from scratch.
 /// F4: these make the EXISTING Fallow-owned discriminators legible; they are not
 /// a new or external signal and gate nothing. Pairs with `evidence.static_status`
 /// (the static half of the discriminator set).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageDiscriminators {
     /// Three-state runtime tracking: `called` (invocations > 0), `never_called`
@@ -396,7 +406,7 @@ pub struct RuntimeCoverageDiscriminators {
 }
 
 /// One per-function runtime-coverage finding in `runtime_coverage.findings`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageFinding {
     /// Per-finding suppression key of the form `fallow:prod:<hash>` (first 8 hex
@@ -456,7 +466,7 @@ pub struct RuntimeCoverageFinding {
 }
 
 /// One hot function in `runtime_coverage.hot_paths`, ranked by invocations.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageHotPath {
     /// Stable content-hash ID of the form `fallow:hot:<hash>`.
@@ -490,9 +500,69 @@ pub struct RuntimeCoverageHotPath {
     /// Suggested actions for this hot path (e.g., review-on-change). Omitted
     /// when empty.
     pub actions: Vec<RuntimeCoverageAction>,
+    /// Per-call cost inputs and the speed-work score for this hot function.
+    /// Omitted when the hot path has no `stable_id` or no static counterpart
+    /// in this checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub optimization_target: Option<RuntimeCoverageOptimizationTarget>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Speed-work inputs for one hot function: how often it runs and how much
+/// work each call does. `importance` ranks the risk of a change; this block
+/// ranks where speed work gives the largest gain.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeCoverageOptimizationTarget {
+    /// `invocations` multiplied by the per-call cost that `cost_basis` names.
+    /// Uncapped integer. Compare it only between hot paths with the same
+    /// `cost_basis`: sort by `cost_basis` first, then by `cost_score`
+    /// descending. On the `cognitive` basis the per-call cost is at least 1.
+    pub cost_score: u64,
+    /// Which per-call cost the score uses.
+    pub cost_basis: RuntimeCoverageCostBasis,
+    /// Static cognitive complexity of the function. A static proxy for the
+    /// work per call, not a measurement.
+    pub cognitive: u16,
+    /// Static cyclomatic complexity of the function.
+    pub cyclomatic: u16,
+    /// Number of lines in the function body.
+    pub line_count: u32,
+    /// Peak executions of one block inside the function per call, from V8
+    /// block coverage. `1.0` means no block ran more than once per call. A
+    /// loop body that runs 3 times per call gives `3.0`. Calls to other
+    /// functions do not change the value.
+    /// Omitted when the coverage input has no block counts for the function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub inner_iterations_per_call: Option<f64>,
+}
+
+/// The per-call cost that `optimization_target.cost_score` multiplies with
+/// `invocations`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCoverageCostBasis {
+    /// Measured: peak block executions per call from V8 block coverage.
+    InnerIterations,
+    /// Static proxy: cognitive complexity (minimum 1), used when the function
+    /// has no usable block counts.
+    Cognitive,
+}
+
+impl RuntimeCoverageCostBasis {
+    /// Snake-case wire value of the cost basis.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InnerIterations => "inner_iterations",
+            Self::Cognitive => "cognitive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 /// Blast-radius risk band. The current thresholds are high at >=20 static
@@ -527,7 +597,7 @@ impl fmt::Display for RuntimeCoverageRiskBand {
 
 /// One blast-radius entry in `runtime_coverage.blast_radius`: how far a
 /// change to the function would ripple.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageBlastRadiusEntry {
     /// Stable content-hash ID of the form `fallow:blast:<hash>`.
@@ -559,7 +629,7 @@ pub struct RuntimeCoverageBlastRadiusEntry {
 
 /// One production-importance entry in `runtime_coverage.importance`, scoring
 /// how much a function matters in production.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageImportanceEntry {
     /// Stable content-hash ID of the form `fallow:importance:<hash>`.
@@ -591,7 +661,7 @@ pub struct RuntimeCoverageImportanceEntry {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 /// Runtime coverage findings merged into the health report or emitted by
 /// `fallow coverage analyze`. Present in health output when --runtime-coverage
@@ -644,8 +714,8 @@ pub struct RuntimeCoverageReport {
     #[cfg_attr(feature = "schema", schemars(default))]
     /// Non-fatal merge or coverage diagnostics. Omitted when empty.
     pub warnings: Vec<RuntimeCoverageMessage>,
-    /// Whether an autonomous agent may act on this report (fallow-rs/fallow-cloud#316,
-    /// mirrors the cloud runtime-context contract). `false` when the capture
+    /// Whether an autonomous agent may act on this report (mirrors
+    /// the cloud runtime-context contract). `false` when the capture
     /// carries no usable runtime evidence (no tracked functions); then
     /// `actionability_verdict` is `insufficient_evidence` and
     /// `actionability_reason` explains. F4: a non-action floor, never a gate on a
@@ -662,16 +732,58 @@ pub struct RuntimeCoverageReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(default))]
     pub actionability_verdict: Option<String>,
-    /// Provenance an agent reads to self-attenuate confidence (fallow-rs/fallow-cloud#319,
-    /// mirrors the cloud runtime-context `provenance`). F4: context only.
+    /// Provenance an agent reads to self-attenuate confidence (mirrors
+    /// the cloud runtime-context `provenance`). F4: context only.
     pub provenance: RuntimeCoverageProvenance,
 }
 
-/// Provenance of a runtime-coverage report (fallow-rs/fallow-cloud#319), mirroring
+/// Warning code for hot paths that have no `optimization_target`: the hot
+/// path has no `stable_id`, or no static function matches its `stable_id`.
+pub const OPTIMIZATION_TARGET_UNMATCHED_WARNING: &str = "optimization_target_unmatched";
+
+impl RuntimeCoverageReport {
+    /// Set the `optimization_target_unmatched` warning from the hot paths that
+    /// this report shows. Call it after the last filter that removes hot
+    /// paths, so that the count agrees with the output.
+    pub fn set_optimization_target_warning(&mut self) {
+        self.warnings
+            .retain(|warning| warning.code != OPTIMIZATION_TARGET_UNMATCHED_WARNING);
+        let unmatched = self
+            .hot_paths
+            .iter()
+            .filter(|hot_path| hot_path.optimization_target.is_none())
+            .count();
+        if unmatched == 0 {
+            return;
+        }
+        self.warnings.push(RuntimeCoverageMessage {
+            code: OPTIMIZATION_TARGET_UNMATCHED_WARNING.to_owned(),
+            message: format!(
+                "Optimization targets are missing for {unmatched} of {total} hot paths. Each of these hot paths has no stable_id, or no static function in this checkout matches its stable_id.",
+                total = self.hot_paths.len(),
+            ),
+        });
+    }
+
+    /// Count the unmatched hot paths again after a filter removed hot paths.
+    /// Does nothing when the report has no `optimization_target_unmatched`
+    /// warning, because only the local merge computes optimization targets.
+    pub fn refresh_optimization_target_warning(&mut self) {
+        if self
+            .warnings
+            .iter()
+            .any(|warning| warning.code == OPTIMIZATION_TARGET_UNMATCHED_WARNING)
+        {
+            self.set_optimization_target_warning();
+        }
+    }
+}
+
+/// Provenance of a runtime-coverage report, mirroring
 /// the cloud runtime-context `provenance` block so the local-capture and cloud
 /// surfaces present one portable shape. F4: provenance is context only; it never
 /// gates a verdict or confidence.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeCoverageProvenance {
     /// `local` for a local capture, `cloud` for the cloud read path.
@@ -793,5 +905,74 @@ mod tests {
             value.get("kind").is_none(),
             "kind should be renamed to type"
         );
+    }
+
+    fn hot_path(matched: bool) -> RuntimeCoverageHotPath {
+        RuntimeCoverageHotPath {
+            id: "fallow:hot:test".to_owned(),
+            stable_id: None,
+            path: PathBuf::from("src/app.js"),
+            function: "resolve".to_owned(),
+            line: 1,
+            end_line: 7,
+            invocations: 600,
+            percentile: 100,
+            actions: Vec::new(),
+            optimization_target: matched.then_some(RuntimeCoverageOptimizationTarget {
+                cost_score: 600,
+                cost_basis: RuntimeCoverageCostBasis::Cognitive,
+                cognitive: 1,
+                cyclomatic: 1,
+                line_count: 7,
+                inner_iterations_per_call: None,
+            }),
+        }
+    }
+
+    fn unmatched_messages(report: &RuntimeCoverageReport) -> Vec<&str> {
+        report
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == OPTIMIZATION_TARGET_UNMATCHED_WARNING)
+            .map(|warning| warning.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn unmatched_warning_counts_the_hot_paths_left_after_filters() {
+        let mut report = RuntimeCoverageReport {
+            hot_paths: vec![hot_path(false), hot_path(true), hot_path(false)],
+            ..RuntimeCoverageReport::default()
+        };
+        report.set_optimization_target_warning();
+        assert_eq!(
+            unmatched_messages(&report),
+            [
+                "Optimization targets are missing for 2 of 3 hot paths. Each of these hot paths has no stable_id, or no static function in this checkout matches its stable_id."
+            ]
+        );
+
+        report.hot_paths.truncate(2);
+        report.refresh_optimization_target_warning();
+        assert_eq!(
+            unmatched_messages(&report),
+            [
+                "Optimization targets are missing for 1 of 2 hot paths. Each of these hot paths has no stable_id, or no static function in this checkout matches its stable_id."
+            ]
+        );
+
+        report.hot_paths.clear();
+        report.refresh_optimization_target_warning();
+        assert!(unmatched_messages(&report).is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_add_the_unmatched_warning() {
+        let mut report = RuntimeCoverageReport {
+            hot_paths: vec![hot_path(false)],
+            ..RuntimeCoverageReport::default()
+        };
+        report.refresh_optimization_target_warning();
+        assert!(report.warnings.is_empty());
     }
 }

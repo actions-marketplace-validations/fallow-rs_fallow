@@ -7,8 +7,18 @@ on:
         description: Version tag to publish, for example v3.11.0
         required: true
         type: string
+      auth_check:
+        description: Check registry identities without a release
+        required: false
+        default: false
+        type: boolean
+      pgo:
+        description: Build the Rust release binaries with profile-guided optimization (PGO)
+        required: false
+        default: true
+        type: boolean
 
-run-name: Release ${{ inputs.tag }} from ${{ github.sha }}
+run-name: ${{ inputs.auth_check && 'Check registry identities' || format('Release {0}', inputs.tag) }} from ${{ github.sha }}
 
 concurrency:
   group: release
@@ -23,16 +33,21 @@ env:
 jobs:
   release-context:
     name: Verify tag-last release context
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    if: ${{ !inputs.auth_check }}
+    runs-on: ubuntu-26.04
+    # The CI gate below waits up to 150 min for runs on the release commit.
+    # The free plan queue can hold push runs for a long time.
+    timeout-minutes: 170
     permissions:
       contents: read
+      # Read the workflow runs of the release commit for the CI gate.
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -48,6 +63,15 @@ jobs:
           fi
           if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Release tag must match vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          # The push workflows give a commit with this subject a concurrency
+          # group of its own, so a later merge cannot cancel the runs that the
+          # CI gate below waits for. Another subject would let them be
+          # cancelled, so fail here before the gate waits.
+          release_subject="$(git log -1 --format=%s)"
+          if [ "$release_subject" != "chore: release ${TAG_NAME}" ]; then
+            echo "::error::Release commit subject is '${release_subject}', expected 'chore: release ${TAG_NAME}'"
             exit 1
           fi
           workspace_version="$(
@@ -147,10 +171,28 @@ jobs:
             exit 1
           fi
 
+      # Pull requests run only part of CI. The other checks run on push to
+      # main, so a green PR does not prove a green release commit. This gate
+      # waits for every push run on the release SHA and fails when a required
+      # run is missing or when any run failed. It runs last in this job so the
+      # fast checks above fail first. Nothing builds or publishes before it.
+      - name: Verify CI passed on the release commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/verify-release-ci.mjs --sha "$GITHUB_SHA" --timeout-minutes 150
+
   publish-crates:
     name: Publish Rust crates
+    if: ${{ !inputs.auth_check }}
     needs: [release-verified, release-assets]
-    runs-on: ubuntu-latest
+    # Every credential-bearing job runs in the `release` environment. Its
+    # deployment branch policy admits `main` only, so a copy of this workflow
+    # dispatched from another ref gets neither the environment secrets nor an
+    # OIDC token that an environment-pinned trusted publisher accepts. The
+    # ref check in release-context lives in this file and protects against
+    # mistakes, not against an edited copy.
+    environment: release
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -227,7 +269,7 @@ jobs:
             done
           }
           first=1
-          for crate in fallow-types fallow-process fallow-config fallow-output fallow-extract fallow-graph fallow-security fallow-core fallow-engine fallow-api fallow-license fallow-v8-coverage fallow-cli fallow-mcp; do
+          for crate in fallow-types fallow-process fallow-config fallow-output fallow-extract fallow-graph fallow-security fallow-mutation fallow-core fallow-engine fallow-api fallow-license fallow-v8-coverage fallow-cli fallow-mcp; do
             # Settle delay between crates so a dependent crate usually finds its
             # dependency already indexed; the retry loop is the real guarantee.
             if [ "$first" = 0 ]; then sleep 30; fi
@@ -235,9 +277,134 @@ jobs:
             publish "$crate" || exit 1
           done
 
+  # Profile-guided optimization (PGO). This job builds an instrumented
+  # fallow-multicall on the release commit, runs scripts/pgo-train.sh on the
+  # pinned training fixtures, and uploads only the merged profile. The
+  # instrumented binary never leaves this job. A profile matches only a build
+  # for the same target on the same host toolchain, because Cargo hashes both
+  # into the crate symbol names. So each leg here uses the runner and the
+  # container of one build leg, and only these build legs get a profile. A
+  # failure here fails the release. With the `pgo` input set to false, this
+  # job does no work and the build job compiles without PGO. The job always
+  # runs, so a skipped job cannot skip the jobs after it.
+  pgo-profile:
+    name: Train PGO profile (${{ matrix.target }})
+    if: ${{ !inputs.auth_check }}
+    needs: release-context
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    container: ${{ matrix.container }}
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.mode.outputs.enabled }}
+    strategy:
+      fail-fast: true
+      # Keep each leg equal to the build leg with `pgo_profile: true`.
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-26.04
+            container: rust:1.97.1-bullseye@sha256:33e0cd779c556a248ac05acabb695c1da0cffaccc1796da507451482ac94d277
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - name: Resolve PGO mode
+        id: mode
+        shell: bash
+        env:
+          PGO_INPUT: ${{ inputs.pgo }}
+        run: |
+          if [ "$PGO_INPUT" = "false" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "PGO is off for this release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-rust
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools
+          cache-key: pgo-profile-instrumented-${{ matrix.target }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          node-version: '22'
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: steps.mode.outputs.enabled == 'true'
+        with:
+          # pnpm 10 and later switch to the packageManager version of each project.
+          version: 12.6.0
+
+      - name: Cache training fixtures
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: benchmarks/fixtures/real-world
+          key: pgo-train-fixtures-v1-${{ runner.os }}-${{ hashFiles('benchmarks/download-fixtures.mjs') }}
+
+      - name: Fetch training fixtures
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        run: node benchmarks/download-fixtures.mjs --only preact,fastify,zod,vue-core,svelte
+
+      # A per-target rustflags value in a `--config` file merges with
+      # .cargo/config.toml. Never set a global RUSTFLAGS in this workflow.
+      # Build only fallow-multicall: it gives the same crate hashes as the
+      # combined build in the build job.
+      # The instrumented build skips LTO through rustflags. Cargo hashes the
+      # profile LTO value into the crate symbol names, so a profile change
+      # makes the profile match almost no function. Rustflags do not change
+      # the hash. `-Clinker-plugin-lto=no` makes the crates emit object code,
+      # because a build without LTO cannot link bitcode-only crates.
+      - name: Build instrumented multicall binary
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          printf "[target.%s]\nrustflags = ['-Cprofile-generate=/tmp/pgo-raw', '-Clto=off', '-Clinker-plugin-lto=no']\n" "$FALLOW_TARGET" > target/pgo-generate.toml
+          cargo build --release --locked --target "$FALLOW_TARGET" -p fallow-multicall --config target/pgo-generate.toml
+
+      - name: Train PGO profile
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          scripts/pgo-train.sh \
+            "target/${FALLOW_TARGET}/release/fallow-multicall" \
+            benchmarks/fixtures/real-world \
+            pgo-profile/fallow.profdata
+          echo "PGO profile (${FALLOW_TARGET}): $(wc -c < pgo-profile/fallow.profdata) bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      # Upload only the profile. The artifact name must not start with
+      # `fallow-`: release-assets downloads that pattern as release assets.
+      - name: Upload PGO profile
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pgo-profile-${{ matrix.target }}
+          path: pgo-profile/fallow.profdata
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: false
+
   build:
     name: Build (${{ matrix.target }})
-    needs: release-context
+    if: ${{ !inputs.auth_check }}
+    needs: [release-context, pgo-profile]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     container: ${{ matrix.container }}
@@ -261,16 +428,18 @@ jobs:
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: darwin-arm64
+            pgo_profile: true
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-26.04
             container: rust:1.97.1-bullseye@sha256:33e0cd779c556a248ac05acabb695c1da0cffaccc1796da507451482ac94d277
             binary: fallow
             multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-x64-gnu
+            pgo_profile: true
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-26.04
             container: rust:1.97.1-bullseye@sha256:33e0cd779c556a248ac05acabb695c1da0cffaccc1796da507451482ac94d277
             binary: fallow
             multicall_binary: fallow-multicall
@@ -278,14 +447,14 @@ jobs:
             mcp_binary: fallow-mcp
             npm_dir: linux-arm64-gnu
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-26.04
             binary: fallow
             multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
             mcp_binary: fallow-mcp
             npm_dir: linux-x64-musl
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-26.04
             binary: fallow
             multicall_binary: fallow-multicall
             lsp_binary: fallow-lsp
@@ -314,9 +483,11 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
+          # llvm-profdata reads the function count of the PGO profile.
+          components: ${{ matrix.pgo_profile && 'llvm-tools' || '' }}
           cache-key: ${{ matrix.target }}-${{ matrix.container || 'host' }}
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -327,72 +498,173 @@ jobs:
           if command -v sudo >/dev/null 2>&1; then
             apt_get="sudo apt-get"
           fi
-          $apt_get update
+          # This leg runs on the hosted runner, whose image carries third-party
+          # apt sources this job never installs from; one of them serving a
+          # mismatched index fails the refresh for every source at once. Let it
+          # report and continue: apt uses only what it verified and fetched, and
+          # the install is the real gate.
+          $apt_get update || echo "apt-get update reported errors on at least one source"
           $apt_get install -y musl-tools
 
       - name: Install aarch64 cross-compilation tools
         if: contains(matrix.target, 'aarch64-unknown-linux')
         run: |
           apt_get="apt-get"
+          sed_i="sed -i"
           if command -v sudo >/dev/null 2>&1; then
             apt_get="sudo apt-get"
+            sed_i="sudo sed -i"
           fi
-          $apt_get update
+          # The gnu leg runs in the pinned bullseye container, which the
+          # published linux-gnu binaries take their glibc floor from, so the
+          # container stays. Debian 11 has left LTS and bullseye-security now
+          # serves an InRelease whose Valid-Until has passed, which makes
+          # `apt-get update` exit 100. Exempt that one frozen suite from the
+          # freshness check rather than the whole run: bullseye main, where
+          # gcc-aarch64-linux-gnu is actually fetched from, keeps replay
+          # protection, and every archive signature is still verified. Refuse
+          # to continue if the exemption did not apply, so a future sources
+          # format cannot degrade this into a silent skip. The musl leg runs on
+          # the runner rather than in the container and matches nothing here.
+          if [ -f /etc/apt/sources.list ] && grep -q 'deb.debian.org/debian-security' /etc/apt/sources.list; then
+            $sed_i 's|^deb http://deb.debian.org/debian-security|deb [check-valid-until=no] http://deb.debian.org/debian-security|' /etc/apt/sources.list
+            grep -q 'check-valid-until=no' /etc/apt/sources.list \
+              || { echo "could not scope the freshness exemption to bullseye-security"; exit 1; }
+          fi
+          # The musl leg of this step runs on the hosted runner, where a
+          # third-party source in the image can fail the refresh for every
+          # source at once; the install below is the real gate either way.
+          $apt_get update || echo "apt-get update reported errors on at least one source"
           $apt_get install -y gcc-aarch64-linux-gnu
 
-      # fallow-mcp pulls rquickjs (QuickJS, a C library). On aarch64-musl the
-      # glibc cross-gcc cannot link C objects into a musl binary, so the MCP
-      # build for this one target uses cargo-zigbuild (zig cc as a musl-capable
-      # C cross-compiler). Pinned to the pair validated locally against
-      # rquickjs-sys 0.12. x86_64-musl (native musl-gcc) and aarch64-gnu (glibc
-      # cross-gcc against a glibc target) keep the plain cargo build.
+      # On musl, every binary compiles the mimalloc allocator (C), and
+      # fallow-mcp also pulls rquickjs (QuickJS, C). On aarch64-musl the glibc
+      # cross-gcc cannot link C objects into a musl binary, so all builds for
+      # this one target use cargo-zigbuild (zig cc as a musl-capable C
+      # cross-compiler). Pinned to the pair validated locally against
+      # rquickjs-sys 0.12. cargo-zigbuild 0.23.0 or later is required: it drops
+      # the `--fix-cortex-a53-843419` linker arg that rustc 1.98 passes for
+      # this target and that zig rejects. x86_64-musl (native musl-gcc) and
+      # aarch64-gnu (glibc cross-gcc against a glibc target) keep the plain
+      # cargo build. The versions and wheel hashes live in
+      # .github/requirements/cargo-zigbuild.txt.
       - name: Install cargo-zigbuild for aarch64-musl C cross-compile
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          python3 -m pip install --user --break-system-packages cargo-zigbuild==0.22.3 ziglang==0.16.0
+          python3 -m pip install --user --break-system-packages --require-hashes --only-binary=:all: -r .github/requirements/cargo-zigbuild.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cargo-zigbuild" --version
           python3 -m ziglang version
 
-      - name: Build CLI release binary
-        run: cargo build --release --target ${{ matrix.target }} -p fallow-cli
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+      - name: Download PGO profile
+        if: needs.pgo-profile.outputs.enabled == 'true' && matrix.pgo_profile
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: pgo-profile-${{ matrix.target }}
+          path: target/pgo-profile
 
-      - name: Build LSP release binary
-        run: cargo build --release --target ${{ matrix.target }} -p fallow-lsp
+      # Each Rust binary build below passes `--config target/pgo-profile/pgo.toml`.
+      # Cargo merges a per-target rustflags value from that file with the
+      # rustflags in .cargo/config.toml, so the Windows /STACK flags stay. A
+      # global RUSTFLAGS would replace them, so this workflow never sets it.
+      # The file name holds the profile hash: Cargo tracks the flag string,
+      # not the file content, so a new profile must give a new flag string.
+      # Only the legs with `pgo_profile: true` get a profile, because a
+      # profile from another target matches no function. The other legs get
+      # a pgo.toml file without flags. The similar-code provider and the NAPI
+      # addon do not get the profile. The extra LLVM flag only reports each
+      # function without a profile record. It does not change the code.
+      - name: Resolve PGO build flags
+        shell: bash
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          PGO_ENABLED: ${{ needs.pgo-profile.outputs.enabled }}
+          PGO_PROFILE_LEG: ${{ matrix.pgo_profile && 'true' || 'false' }}
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          dir="${GITHUB_WORKSPACE}/target/pgo-profile"
+          # Windows: give rustc a C:/ path, not an MSYS path.
+          if command -v cygpath >/dev/null 2>&1; then
+            dir="$(cygpath -m "$dir")"
+          fi
+          mkdir -p "$dir"
+          if [ "$PGO_ENABLED" != "true" ]; then
+            echo "# PGO is off for this release." > "$dir/pgo.toml"
+            echo "PGO is off for this release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$PGO_PROFILE_LEG" != "true" ]; then
+            echo "# No PGO profile for ${FALLOW_TARGET}." > "$dir/pgo.toml"
+            echo "No PGO profile for ${FALLOW_TARGET}. This leg builds without PGO." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ ! -s "$dir/fallow.profdata" ]; then
+            echo "::error::PGO profile is missing or empty"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest="$(sha256sum "$dir/fallow.profdata" | cut -c1-16)"
+          else
+            digest="$(shasum -a 256 "$dir/fallow.profdata" | cut -c1-16)"
+          fi
+          profile="$dir/fallow-${digest}.profdata"
+          mv "$dir/fallow.profdata" "$profile"
+          printf "[target.%s]\nrustflags = ['-Cprofile-use=%s', '-Cllvm-args=-pgo-warn-missing-function']\n" "$FALLOW_TARGET" "$profile" > "$dir/pgo.toml"
+          cat "$dir/pgo.toml"
+          echo "PGO_PROFILE=$profile" >> "$GITHUB_ENV"
+          echo "PGO profile ${digest} applied to fallow-cli, fallow-lsp, fallow-mcp and fallow-multicall for ${FALLOW_TARGET}." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build MCP release binary
+      # One cargo invocation builds the four binaries. Cargo then resolves the
+      # features once, so every shared crate gets the same hash as in the
+      # fallow-multicall training build, and the profile matches. A separate
+      # build per package resolves other features and matches no function.
+      # The multicall binary bundles the CLI plus the LSP and MCP server libs
+      # into the single `fallow` binary the npm platform packages ship.
+      - name: Build Rust release binaries
         if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} -p fallow-mcp
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p fallow-cli -p fallow-lsp -p fallow-mcp -p fallow-multicall --config target/pgo-profile/pgo.toml 2>&1 | tee target/pgo-profile/build.log
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      # A profile from another target or another package set matches no
+      # function, but it still changes the code. This check fails the leg
+      # when most functions find no profile record.
+      - name: Check that the PGO profile matches the build
+        if: needs.pgo-profile.outputs.enabled == 'true' && matrix.pgo_profile
+        shell: bash
+        env:
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          profdata="$(rustc --print sysroot)/lib/rustlib/${host}/bin/llvm-profdata"
+          functions="$("$profdata" show "$PGO_PROFILE" | sed -n 's/^Total functions: //p')"
+          node .github/scripts/pgo-profile-match.mjs \
+            --log target/pgo-profile/build.log \
+            --functions "$functions" \
+            --title "PGO profile match (${FALLOW_TARGET})" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      # The aarch64-musl leg gets no PGO profile. Every binary on this leg
+      # compiles C: the mimalloc allocator (all four binaries) and rquickjs
+      # (QuickJS, in MCP and multicall). The glibc cross-gcc cannot link C into
+      # a musl binary, so all four builds use cargo-zigbuild.
+      - name: Build CLI release binary (aarch64-musl, mimalloc C via zig)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-cli --config target/pgo-profile/pgo.toml
+
+      - name: Build LSP release binary (aarch64-musl, mimalloc C via zig)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-lsp --config target/pgo-profile/pgo.toml
 
       - name: Build MCP release binary (aarch64-musl, QuickJS C via zig)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-mcp
-
-      # The multicall binary bundles the CLI plus the LSP and MCP server libs
-      # into the single `fallow` binary the npm platform packages ship. Because
-      # it links the MCP lib, it pulls rquickjs (QuickJS, C) exactly like the
-      # standalone MCP binary, so the aarch64-musl leg needs cargo-zigbuild for
-      # the same reason (the glibc cross-gcc cannot link C into a musl binary).
-      # Every other target keeps the plain cargo build.
-      - name: Build multicall release binary
-        if: matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} -p fallow-multicall
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-mcp --config target/pgo-profile/pgo.toml
 
       - name: Build multicall release binary (aarch64-musl, QuickJS C via zig)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-multicall
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p fallow-multicall --config target/pgo-profile/pgo.toml
 
       # `${{ matrix.target }}` rather than a `$FALLOW_TARGET` env var: the
       # Windows matrix entries run under pwsh, where `$FALLOW_TARGET` expands
@@ -416,6 +688,26 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+      # An instrumented binary links the LLVM profiler runtime, which holds
+      # the LLVM_PROFILE_FILE string. No release binary may contain it.
+      - name: Verify release binaries carry no PGO instrumentation
+        shell: bash
+        env:
+          FALLOW_BINARY: ${{ matrix.binary }}
+          FALLOW_LSP_BINARY: ${{ matrix.lsp_binary }}
+          FALLOW_MCP_BINARY: ${{ matrix.mcp_binary }}
+          FALLOW_MULTICALL_BINARY: ${{ matrix.multicall_binary }}
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          release="target/${FALLOW_TARGET}/release"
+          for bin in "$FALLOW_BINARY" "$FALLOW_LSP_BINARY" "$FALLOW_MCP_BINARY" "$FALLOW_MULTICALL_BINARY"; do
+            if grep -qa LLVM_PROFILE_FILE "$release/$bin"; then
+              echo "::error::$bin contains the LLVM profiler runtime"
+              exit 1
+            fi
+          done
 
       - name: Verify GNU glibc compatibility
         if: contains(matrix.target, 'unknown-linux-gnu')
@@ -492,7 +784,7 @@ jobs:
           7z a "../../../fallow-${FALLOW_TARGET}.zip" "$FALLOW_BINARY" "$FALLOW_LSP_BINARY" "$FALLOW_MCP_BINARY" fallow-similar-code.exe
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-${{ matrix.target }}
           path: fallow-${{ matrix.target }}.*
@@ -535,6 +827,371 @@ jobs:
           cp "target/${FALLOW_TARGET}/release/${FALLOW_MCP_BINARY}" "fallow-mcp-${FALLOW_NPM_DIR}.exe"
           cp "target/${FALLOW_TARGET}/release/fallow-similar-code.exe" "fallow-similar-code-${FALLOW_NPM_DIR}.exe"
 
+      - name: Upload unsigned binary payload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unsigned-binaries-${{ matrix.npm_dir }}
+          if-no-files-found: error
+          path: |
+            fallow-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            fallow-multicall-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            fallow-lsp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            fallow-similar-code-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Upload NAPI addon
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: napi-${{ matrix.npm_dir }}
+          path: crates/napi/fallow-node.${{ matrix.npm_dir }}.node
+
+  # Windows Smart App Control and SmartScreen trust an Authenticode signature,
+  # not the Ed25519 signature that `sign` adds. This job signs every Fallow
+  # Windows executable and NAPI addon before any packaging job reads them, and
+  # replaces the build artifacts with the signed copies under the same names.
+  # The signing app trusts only the `windows-signing` environment subject. The
+  # publisher jobs in `release` run third-party tools with `id-token: write`,
+  # so a shared subject would let that code request a Fallow B.V. signature.
+  # Third-party binaries are never signed here. `WINDOWS_SIGNING_MODE=off` (or
+  # unset) keeps the artifacts unchanged.
+  authenticode:
+    name: Authenticode (${{ matrix.npm_dir }})
+    if: ${{ !inputs.auth_check }}
+    needs: build
+    environment: windows-signing
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm_dir: win32-x64-msvc
+            target: x86_64-pc-windows-msvc
+          - npm_dir: win32-arm64-msvc
+            target: aarch64-pc-windows-msvc
+    steps:
+      - name: Select Windows signing mode
+        id: mode
+        shell: bash
+        env:
+          WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
+        run: |
+          case "${WINDOWS_SIGNING_MODE:-off}" in
+            authenticode)
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              ;;
+            off)
+              echo "::warning::WINDOWS_SIGNING_MODE is off. Windows binaries ship without an Authenticode signature."
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::WINDOWS_SIGNING_MODE must be authenticode or off"
+              exit 1
+              ;;
+          esac
+
+      - name: Validate Windows signing configuration
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.WINDOWS_SIGNING_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.WINDOWS_SIGNING_TENANT_ID }}
+          SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+          SIGNING_PROFILE: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+        run: |
+          azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+          name_pattern='^[A-Za-z0-9][A-Za-z0-9-]{1,98}[A-Za-z0-9]$'
+          if ! [[ "${AZURE_CLIENT_ID:-}" =~ $azure_id_pattern ]] || \
+              ! [[ "${AZURE_TENANT_ID:-}" =~ $azure_id_pattern ]] || \
+              ! [[ "${SIGNING_ENDPOINT:-}" =~ ^https://[a-z]+\.codesigning\.azure\.net/?$ ]] || \
+              ! [[ "${SIGNING_ACCOUNT:-}" =~ $name_pattern ]] || \
+              ! [[ "${SIGNING_PROFILE:-}" =~ $name_pattern ]] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::Windows signing configuration is incomplete"
+            exit 1
+          fi
+
+      - name: Download unsigned binaries
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: unsigned-binaries-${{ matrix.npm_dir }}
+          path: payload
+
+      - name: Download NAPI addon
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: napi-${{ matrix.npm_dir }}
+          path: napi
+
+      - name: Download release archive
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: fallow-${{ matrix.target }}
+          path: archive
+
+      # The archive must hold the same bytes as the raw payload. Then the
+      # rebuilt archive below differs from the build output only by the
+      # signatures.
+      - name: Validate Windows payload inventory
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          expected="$(printf '%s\n' fallow fallow-multicall fallow-lsp fallow-mcp fallow-similar-code \
+            | sed "s/\$/-${FALLOW_NPM_DIR}.exe/" | sort)"
+          entries() { find "$1" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort; }
+          if [ "$(entries payload)" != "$expected" ]; then
+            echo "::error::Unexpected Windows payload inventory"
+            exit 1
+          fi
+          if [ "$(entries napi)" != "fallow-node.${FALLOW_NPM_DIR}.node" ] || \
+              [ "$(entries archive)" != "fallow-${FALLOW_TARGET}.zip" ]; then
+            echo "::error::Unexpected NAPI addon or archive inventory"
+            exit 1
+          fi
+          mkdir unpacked
+          7z x -ounpacked "archive/fallow-${FALLOW_TARGET}.zip" >/dev/null
+          for name in fallow fallow-lsp fallow-mcp fallow-similar-code; do
+            if ! cmp -s "unpacked/${name}.exe" "payload/${name}-${FALLOW_NPM_DIR}.exe"; then
+              echo "::error::Archive entry ${name}.exe differs from the raw payload"
+              exit 1
+            fi
+          done
+          if [ "$(find unpacked -mindepth 1 | wc -l)" -ne 4 ]; then
+            echo "::error::Unexpected release archive entries"
+            exit 1
+          fi
+
+      - name: Authenticate Windows signing with Microsoft Entra
+        if: steps.mode.outputs.enabled == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.WINDOWS_SIGNING_CLIENT_ID }}
+          tenant-id: ${{ vars.WINDOWS_SIGNING_TENANT_ID }}
+          allow-no-subscriptions: true
+          audience: api://AzureADTokenExchange
+
+      - name: Sign Windows binaries
+        if: steps.mode.outputs.enabled == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\payload\fallow-${{ matrix.npm_dir }}.exe
+            ${{ github.workspace }}\payload\fallow-multicall-${{ matrix.npm_dir }}.exe
+            ${{ github.workspace }}\payload\fallow-lsp-${{ matrix.npm_dir }}.exe
+            ${{ github.workspace }}\payload\fallow-mcp-${{ matrix.npm_dir }}.exe
+            ${{ github.workspace }}\payload\fallow-similar-code-${{ matrix.npm_dir }}.exe
+            ${{ github.workspace }}\napi\fallow-node.${{ matrix.npm_dir }}.node
+          file-digest: SHA256
+          timestamp-digest: SHA256
+          description: Fallow
+          description-url: https://fallow.tools
+          exclude-environment-credential: true
+
+      - name: Verify Authenticode signatures
+        if: steps.mode.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @(Get-ChildItem payload, napi -File)
+          if ($files.Count -ne 6) { throw "Expected 6 signed files, found $($files.Count)" }
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "$($file.Name): signature status is $($signature.Status)"
+            }
+            if ($signature.SignerCertificate.Subject -notmatch '(^|, )O=Fallow B\.V\.(,|$)') {
+              throw "$($file.Name): unexpected signer $($signature.SignerCertificate.Subject)"
+            }
+            if ($null -eq $signature.TimeStamperCertificate) {
+              throw "$($file.Name): signature has no timestamp"
+            }
+            Write-Output "$($file.Name): $($signature.SignerCertificate.Subject)"
+          }
+
+      - name: Rebuild release archive with signed binaries
+        if: steps.mode.outputs.enabled == 'true'
+        shell: bash
+        env:
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rm -rf staged "archive/fallow-${FALLOW_TARGET}.zip"
+          mkdir staged
+          for name in fallow fallow-lsp fallow-mcp fallow-similar-code; do
+            cp "payload/${name}-${FALLOW_NPM_DIR}.exe" "staged/${name}.exe"
+          done
+          (cd staged && 7z a "../archive/fallow-${FALLOW_TARGET}.zip" \
+            fallow.exe fallow-lsp.exe fallow-mcp.exe fallow-similar-code.exe)
+
+      - name: Replace unsigned binary payload
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: unsigned-binaries-${{ matrix.npm_dir }}
+          path: payload/*
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Replace NAPI addon
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: napi-${{ matrix.npm_dir }}
+          path: napi/fallow-node.${{ matrix.npm_dir }}.node
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Replace release archive
+        if: steps.mode.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fallow-${{ matrix.target }}
+          path: archive/fallow-${{ matrix.target }}.zip
+          if-no-files-found: error
+          overwrite: true
+
+  # The build job checks the musl binaries only statically. This job executes
+  # the exact unsigned-binaries-<platform> artifact on its own architecture in
+  # Alpine, which has no glibc. Signing does not change the bytes, so these are
+  # the binaries that the GitHub release and the npm musl packages ship. The
+  # aarch64 leg is the only leg that cargo-zigbuild links without PGO.
+  # Read only, no secrets, and no network inside the container.
+  musl-smoke:
+    name: musl smoke (${{ matrix.npm_dir }})
+    if: ${{ !inputs.auth_check }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            npm_dir: linux-x64-musl
+            os: ubuntu-26.04
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            npm_dir: linux-arm64-musl
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    env:
+      # alpine:3.24.2, multi-arch index digest (linux/amd64 and linux/arm64).
+      ALPINE_IMAGE: alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download exact unsigned binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: unsigned-binaries-${{ matrix.npm_dir }}
+          path: ${{ runner.temp }}/musl-bin
+
+      - name: Run the shipped musl binaries in Alpine
+        shell: bash
+        env:
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/musl-smoke-out"
+          mkdir -p "$out"
+          docker run --rm --network none --platform "$FALLOW_PLATFORM" \
+            -e FALLOW_SMOKE_VERSION="${RELEASE_TAG#v}" \
+            -v "$RUNNER_TEMP/musl-bin:/smoke/bin:ro" \
+            -v "$GITHUB_WORKSPACE/tests/fixtures/basic-project:/smoke/fixture:ro" \
+            -v "$GITHUB_WORKSPACE/scripts/musl-smoke.sh:/smoke/musl-smoke.sh:ro" \
+            -v "$out:/smoke/out" \
+            "$ALPINE_IMAGE" \
+            sh /smoke/musl-smoke.sh /smoke/bin "$FALLOW_NPM_DIR" /smoke/fixture /smoke/out
+          # Alpine has no JSON parser, so parse each report on the runner.
+          for report in dead-code dead-code-multicall similar-code-status; do
+            jq -e 'type == "object"' "$out/$report.json" >/dev/null
+            echo "$report.json parses as a JSON object"
+          done
+
+  # Fresh runners keep build scripts and dependency execution away from the key.
+  sign:
+    name: Sign (${{ matrix.npm_dir }})
+    if: ${{ !inputs.auth_check }}
+    needs: [build, authenticode]
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm_dir: darwin-x64
+            ext: ''
+          - npm_dir: darwin-arm64
+            ext: ''
+          - npm_dir: linux-x64-gnu
+            ext: ''
+          - npm_dir: linux-arm64-gnu
+            ext: ''
+          - npm_dir: linux-x64-musl
+            ext: ''
+          - npm_dir: linux-arm64-musl
+            ext: ''
+          - npm_dir: win32-x64-msvc
+            ext: '.exe'
+          - npm_dir: win32-arm64-msvc
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Download unsigned binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: unsigned-binaries-${{ matrix.npm_dir }}
+          path: unsigned-binaries
+
+      - name: Validate unsigned binary inventory
+        env:
+          FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
+          FALLOW_BINARY_EXT: ${{ matrix.ext }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { lstatSync, readdirSync } from 'node:fs';
+          const { FALLOW_NPM_DIR: platform, FALLOW_BINARY_EXT: ext } = process.env;
+          const names = ['fallow', 'fallow-multicall', 'fallow-lsp', 'fallow-mcp', 'fallow-similar-code'];
+          const expected = names.map(name => `${name}-${platform}${ext}`).sort();
+          assert.deepEqual(readdirSync('unsigned-binaries').sort(), expected, 'Unexpected unsigned binary inventory');
+          for (const name of expected) {
+            const stat = lstatSync(`unsigned-binaries/${name}`);
+            assert.ok(stat.isFile() && stat.size > 0, `Expected a nonempty regular binary: ${name}`);
+          }
+          NODE
+
       - name: Verify binary-signing public key parity
         shell: bash
         env:
@@ -547,12 +1204,9 @@ jobs:
           ED25519_BINARY_SIGNING_PRIVATE_KEY: ${{ secrets.ED25519_BINARY_SIGNING_PRIVATE_KEY }}
           ED25519_BINARY_SIGNING_PUBLIC_KEY: ${{ vars.ED25519_BINARY_SIGNING_PUBLIC_KEY }}
           FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
-          FALLOW_RUNNER_OS: ${{ runner.os }}
+          FALLOW_BINARY_EXT: ${{ matrix.ext }}
         run: |
-          ext=""
-          if [ "$FALLOW_RUNNER_OS" = "Windows" ]; then
-            ext=".exe"
-          fi
+          ext="$FALLOW_BINARY_EXT"
 
           for bin in \
             "fallow-${FALLOW_NPM_DIR}${ext}" \
@@ -561,87 +1215,70 @@ jobs:
             "fallow-mcp-${FALLOW_NPM_DIR}${ext}" \
             "fallow-similar-code-${FALLOW_NPM_DIR}${ext}"
           do
-            node .github/scripts/sign-binary.mjs "$bin" "${bin}.sig"
-            node .github/scripts/verify-binary.mjs "$bin" "${bin}.sig"
+            node .github/scripts/sign-binary.mjs "unsigned-binaries/$bin" "unsigned-binaries/${bin}.sig"
+            node .github/scripts/verify-binary.mjs "unsigned-binaries/$bin" "unsigned-binaries/${bin}.sig"
           done
 
-      # The npm platform packages ship the multicall `fallow` binary and the
-      # exact-version local similar-code provider.
-      # (CLI + LSP + MCP linked into a single engine). Stage it plus its
-      # signature under the package's `fallow(.exe)` name so the "Upload npm
-      # binary" step carries exactly those two files into the npm-<platform>
-      # artifact, which `npm-prep` copies into `@fallow-cli/<platform>/`. The
-      # standalone per-binary GitHub release assets (`fallow-<npm_dir>`,
-      # `fallow-lsp-<npm_dir>`, `fallow-mcp-<npm_dir>`) are uploaded separately
-      # above and are unchanged. `npm/fallow/scripts/verify-binary.js` and the
-      # GitHub Action installer verify the Ed25519 signature, then cross-check
-      # SHA-256 against the release asset digest. Refs #465.
+      # npm ships the multicall binary as fallow, plus the exact-version
+      # similar-code provider. Preserve their existing signature siblings.
       - name: Stage npm platform payload (multicall binary as fallow)
         shell: bash
         env:
           FALLOW_NPM_DIR: ${{ matrix.npm_dir }}
-          FALLOW_RUNNER_OS: ${{ runner.os }}
+          FALLOW_BINARY_EXT: ${{ matrix.ext }}
         run: |
-          ext=""
-          if [ "$FALLOW_RUNNER_OS" = "Windows" ]; then
-            ext=".exe"
-          fi
+          ext="$FALLOW_BINARY_EXT"
           mkdir -p npm-payload
-          cp "fallow-multicall-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow${ext}"
-          cp "fallow-multicall-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow${ext}.sig"
-          cp "fallow-similar-code-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow-similar-code${ext}"
-          cp "fallow-similar-code-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow-similar-code${ext}.sig"
+          cp "unsigned-binaries/fallow-multicall-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow${ext}"
+          cp "unsigned-binaries/fallow-multicall-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow${ext}.sig"
+          cp "unsigned-binaries/fallow-similar-code-${FALLOW_NPM_DIR}${ext}"     "npm-payload/fallow-similar-code${ext}"
+          cp "unsigned-binaries/fallow-similar-code-${FALLOW_NPM_DIR}${ext}.sig" "npm-payload/fallow-similar-code${ext}.sig"
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-cli-${{ matrix.npm_dir }}
           path: |
-            fallow-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
-            fallow-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+            unsigned-binaries/fallow-${{ matrix.npm_dir }}${{ matrix.ext }}
+            unsigned-binaries/fallow-${{ matrix.npm_dir }}${{ matrix.ext }}.sig
 
       - name: Upload LSP artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-lsp-${{ matrix.npm_dir }}
           path: |
-            fallow-lsp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
-            fallow-lsp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+            unsigned-binaries/fallow-lsp-${{ matrix.npm_dir }}${{ matrix.ext }}
+            unsigned-binaries/fallow-lsp-${{ matrix.npm_dir }}${{ matrix.ext }}.sig
 
       - name: Upload MCP artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-mcp-${{ matrix.npm_dir }}
           path: |
-            fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
-            fallow-mcp-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+            unsigned-binaries/fallow-mcp-${{ matrix.npm_dir }}${{ matrix.ext }}
+            unsigned-binaries/fallow-mcp-${{ matrix.npm_dir }}${{ matrix.ext }}.sig
 
       - name: Upload similar-code provider artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-similar-code-${{ matrix.npm_dir }}
           path: |
-            fallow-similar-code-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}
-            fallow-similar-code-${{ matrix.npm_dir }}${{ runner.os == 'Windows' && '.exe' || '' }}.sig
+            unsigned-binaries/fallow-similar-code-${{ matrix.npm_dir }}${{ matrix.ext }}
+            unsigned-binaries/fallow-similar-code-${{ matrix.npm_dir }}${{ matrix.ext }}.sig
 
       - name: Upload npm binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: npm-${{ matrix.npm_dir }}
           path: |
-            npm-payload/fallow${{ runner.os == 'Windows' && '.exe' || '' }}
-            npm-payload/fallow${{ runner.os == 'Windows' && '.exe' || '' }}.sig
-            npm-payload/fallow-similar-code${{ runner.os == 'Windows' && '.exe' || '' }}
-            npm-payload/fallow-similar-code${{ runner.os == 'Windows' && '.exe' || '' }}.sig
-
-      - name: Upload NAPI addon
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: napi-${{ matrix.npm_dir }}
-          path: crates/napi/fallow-node.${{ matrix.npm_dir }}.node
+            npm-payload/fallow${{ matrix.ext }}
+            npm-payload/fallow${{ matrix.ext }}.sig
+            npm-payload/fallow-similar-code${{ matrix.ext }}
+            npm-payload/fallow-similar-code${{ matrix.ext }}.sig
 
   validate:
     name: Release validation
+    if: ${{ !inputs.auth_check }}
     needs: release-context
     uses: ./.github/workflows/release-validation.yml
     permissions:
@@ -649,8 +1286,9 @@ jobs:
 
   similar-code-conformance:
     name: Similar-code production conformance
-    needs: build
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [build, sign]
+    runs-on: ubuntu-26.04
     timeout-minutes: 75
     permissions:
       contents: read
@@ -659,20 +1297,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
-      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
-        with:
-          tool: cargo-audit
-
-      - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
-        with:
-          tool: cargo-deny
-
       - name: Download exact Linux x64 similar-code provider
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-similar-code-linux-x64-gnu
           path: ${{ runner.temp }}/fallow-similar-code
@@ -697,20 +1327,10 @@ jobs:
           fi
           echo "Similar-code provider size: ${actual_bytes} bytes" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify temporary dependency audit ownership
-        run: |
-          set -euo pipefail
-          node scripts/check-similar-code-sidecar-audit.mjs
-          cargo audit \
-            --file tools/similar-code-sidecar/Cargo.lock \
-            --deny unmaintained \
-            --ignore RUSTSEC-2024-0436
-          cargo deny \
-            --manifest-path tools/similar-code-sidecar/Cargo.toml \
-            check licenses
-
+      # The sidecar dependency audit runs in release-validation.yml, which the
+      # validate job calls. release-verified needs both jobs.
       - name: Cache verified pinned model artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/fallow-similar-code-cache
           key: similar-code-model-516f4baf13dec4ddddda8631e019b5737c8bc250-semantics-v1
@@ -730,7 +1350,7 @@ jobs:
           ' similar-code-candle-conformance.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload compact production conformance evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: similar-code-candle-conformance
           path: similar-code-candle-conformance.json
@@ -738,16 +1358,68 @@ jobs:
           retention-days: 30
           include-hidden-files: false
 
+  # One CycloneDX SBOM per target. `cargo cyclonedx` reads Cargo.lock and
+  # resolves the dependency graph for that target, so each SBOM lists the
+  # crates that the matching release binary links. The `fallow-*` artifact
+  # name makes `release-assets` stage it with the binaries.
+  sbom:
+    name: SBOM (${{ matrix.target }})
+    if: ${{ !inputs.auth_check }}
+    needs: [release-context]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate SBOM
+        shell: bash
+        env:
+          FALLOW_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --manifest-path crates/cli/Cargo.toml \
+            --format json --spec-version 1.5 --target "$FALLOW_TARGET" \
+            --override-filename "fallow-${FALLOW_TARGET}.cdx"
+          mkdir sbom
+          cp "crates/cli/fallow-${FALLOW_TARGET}.cdx.json" sbom/
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fallow-sbom-${{ matrix.target }}
+          path: sbom/fallow-${{ matrix.target }}.cdx.json
+          if-no-files-found: error
+
   release-assets:
     name: Stage GitHub Release assets
-    needs: [release-verified, vscode-prep, vscode-host-smoke]
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [release-verified, vscode-prep, vscode-host-smoke, sbom]
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           pattern: fallow-*
@@ -798,7 +1470,7 @@ jobs:
           done
 
       - name: Upload release asset bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-assets
           path: release-assets/
@@ -839,8 +1511,9 @@ jobs:
   # never install).
   release-verified:
     name: Release verified
-    needs: [build, validate, similar-code-conformance]
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [build, sign, validate, similar-code-conformance, musl-smoke]
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions: {}
     steps:
@@ -853,8 +1526,9 @@ jobs:
   # publish job. See the npm-publish job below for the matching pattern.
   npm-prep:
     name: Pack npm tarballs
-    needs: build
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [build, sign]
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -863,20 +1537,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           # Intentionally no registry-url: this job must not write
           # NODE_AUTH_TOKEN to .npmrc. Auth lives in the publish job.
 
       - name: Download all npm binaries
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: npm-*
           path: npm-artifacts
 
       - name: Download all NAPI addons
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: napi-*
           path: napi-artifacts
@@ -952,7 +1626,7 @@ jobs:
               }
               const digests = {};
               for (const entry of fs.readdirSync(dir)) {
-                if (entry.endsWith(".sig") || entry === "package.json" || entry === "README.md") {
+                if (entry.endsWith(".sig") || entry === "package.json" || entry === "README.md" || entry === "LICENSE") {
                   continue;
                 }
                 const full = path.join(dir, entry);
@@ -1025,6 +1699,25 @@ jobs:
           # cp will fail loud here instead of silently shipping a stale
           # schema to npm consumers. Refs #440.
           diff schema.json npm/fallow/schema.json
+
+      - name: Bundle LICENSE into fallow package
+        run: |
+          cp LICENSE npm/fallow/LICENSE
+          diff LICENSE npm/fallow/LICENSE
+
+      # npm always packs README and LICENSE, so every platform package gets
+      # both without a `files` entry. The napi platform directories exist only
+      # after `create-npm-dirs`, so this step writes their READMEs here.
+      - name: Bundle README and LICENSE into platform packages
+        run: |
+          node .github/scripts/prepare-platform-package-docs.mjs --license
+          node .github/scripts/prepare-platform-package-docs.mjs --check
+          for dir in npm/*/ crates/napi/npm/*/ crates/napi/; do
+            name=$(PKG_PATH="$GITHUB_WORKSPACE/${dir}package.json" node -p 'require(process.env.PKG_PATH).name')
+            case "$name" in
+              @fallow-cli/*) diff LICENSE "${dir}LICENSE" ;;
+            esac
+          done
 
       - name: Pack tarballs
         run: |
@@ -1111,7 +1804,7 @@ jobs:
             tarballs/20-cli-root/*.tgz
 
       - name: Upload npm tarballs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: npm-tarballs
           path: tarballs/
@@ -1120,27 +1813,31 @@ jobs:
 
   npm-publish:
     name: Publish to npm
+    if: ${{ !inputs.auth_check }}
     # Privileged job. Keep the surface tiny:
     # - downloads pre-packed tarballs (no fresh checkout, no installs)
-    # - the only network calls are `npm publish` and the `npm view` precheck
+    # - the only network calls are `npm publish`, the single stage call for
+    #   the `fallow` root, and the `npm view` precheck
     # - --ignore-scripts on every publish blocks lifecycle scripts inside the
     #   tarballs from executing here.
+    # - the `fallow` root is staged, not published. Its trusted publisher grants
+    #   stage publish only, and it becomes installable when the maintainer
+    #   approves the stage on npm with 2FA.
     # Anything that needs `npm ci` or runs dependency code belongs in npm-prep.
     needs: [npm-prep, release-assets]
-    runs-on: ubuntu-latest
+    environment: release
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
+    outputs:
+      fallow_sha256: ${{ steps.publish.outputs.fallow_sha256 }}
+      fallow_stage_id: ${{ steps.publish.outputs.fallow_stage_id }}
     env:
-      # Bootstrap fallback. When NPM_TOKEN is present in repo secrets,
-      # setup-node writes it to .npmrc and `npm publish` authenticates
-      # with it. When the secret is absent (steady state, once every
-      # package has a trusted publisher registered), this stays empty
-      # and OIDC / trusted publishing handles auth exactly like today.
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      NODE_AUTH_TOKEN: ''
     steps:
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -1156,19 +1853,20 @@ jobs:
       # repairs the tree so the second step (the actual pinned version that
       # holds OIDC trusted-publishing config) can land. Both invocations carry
       # --ignore-scripts so the supply-chain hardening surface stays narrow.
-      # See incident v2.71.0 -> v2.71.1.
+      # See incident v2.71.0 -> v2.71.1. Staged publishing needs npm >= 11.15.0.
       - name: Install pinned npm (required for trusted publishing)
         run: |
           npm install -g --ignore-scripts npm@10.9.8
-          npm install -g --ignore-scripts npm@11.14.1
+          npm install -g --ignore-scripts npm@11.19.0
 
       - name: Download npm tarballs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: npm-tarballs
           path: tarballs
 
       - name: Publish all tarballs
+        id: publish
         shell: bash
         run: |
           if [ ! -s tarballs/manifest.tsv ]; then
@@ -1216,6 +1914,20 @@ jobs:
             "@fallow-cli/fallow-node-win32-arm64-msvc"
             "@fallow-cli/fallow-node"
           )
+          # `fallow` pins its platform packages and `fallow-type-aware` to the
+          # exact release version, so those reach users only through a new
+          # root. Adding a name here needs a stage-only trusted publisher for
+          # it and costs one more maintainer approval per release.
+          STAGED_NAMES=("fallow")
+          is_staged_name() {
+            local candidate
+            for candidate in "${STAGED_NAMES[@]}"; do
+              if [ "$candidate" = "$1" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
           FAILED=0
           index=0
           # Manifest format (TSV): <tarball-path>\t<name>\t<version>. Rows are
@@ -1255,6 +1967,42 @@ jobs:
               index=$((index + 1))
               continue
             fi
+            if is_staged_name "$name"; then
+              digest=$(sha256sum "$file" | cut -d' ' -f1)
+              # npm-root-approved compares the public tarball against this
+              # digest before any VSIX is published.
+              echo "fallow_sha256=$digest" >> "$GITHUB_OUTPUT"
+              # One stage call per run, never a probing publish: every attempt
+              # signs and logs a provenance statement before npm answers. The
+              # token stays empty so authentication always uses the
+              # environment-scoped, stage-only trusted publisher.
+              set +e
+              stage_output=$(NODE_AUTH_TOKEN="" npm stage publish "$file" --access public --provenance --ignore-scripts 2>&1)
+              stage_status=$?
+              set -e
+              printf '%s\n' "$stage_output"
+              if [ "$stage_status" -eq 0 ]; then
+                stage_id=$(grep -oE 'staged with id [0-9a-f-]{36}' <<<"$stage_output" | head -n1 | cut -d' ' -f4 || true)
+                echo "fallow_stage_id=${stage_id:-}" >> "$GITHUB_OUTPUT"
+                echo "Staged $name@$version as ${stage_id:-unknown}, sha256 $digest"
+                echo "- Staged \`$name@$version\`, stage id \`${stage_id:-unknown}\`, sha256 \`$digest\`. Approve it on npm before the signed tag." >> "$GITHUB_STEP_SUMMARY"
+              elif grep -q '^npm error code E409$' <<<"$stage_output"; then
+                # A rerun after a successful stage. This job cannot read
+                # stages (`npm stage list` is E401 without a login), so E409
+                # is the only already-staged signal. The maintainer compares
+                # the staged bytes with the npm-tarballs artifact before
+                # approving, which proves which run built them.
+                # The stage id is unknown on this path; npm-root-approved gates
+                # on the digest, which is recorded above regardless.
+                echo "::notice::$name@$version is already staged or published; keeping the existing stage"
+                echo "- \`$name@$version\` was already staged, expected sha256 \`$digest\`. Approve it on npm before the signed tag." >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::Failed to stage $name@$version with npm provenance"
+                FAILED=1
+              fi
+              index=$((index + 1))
+              continue
+            fi
             if ! npm publish "$file" --access public --provenance --ignore-scripts; then
               echo "::error::Failed to publish $name@$version with npm provenance"
               FAILED=1
@@ -1269,13 +2017,98 @@ jobs:
             exit 1
           fi
 
+  # The VS Code extension downloads its binary from the GitHub Release of its
+  # own version and purges an installed binary of another version, so a VSIX
+  # that is public before that release exists breaks every auto-updating
+  # install. The release is created after the maintainer approves the staged
+  # `fallow` root. This is the only job that waits for that approval: it runs
+  # until the approval has made `fallow@<version>` public, and until the public
+  # bytes are the ones this run staged. Both VSIX publishers need this job, so
+  # they hold no runner while the approval is pending. No credentials: this job
+  # only reads the public registry.
+  npm-root-approved:
+    name: Wait for the approved fallow root
+    if: ${{ !inputs.auth_check }}
+    needs: npm-publish
+    runs-on: ubuntu-26.04
+    # GitHub stops a job after 6 hours. The loop gives up before that with the
+    # recovery path in its message; the approval itself does not expire.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      EXPECTED_SHA256: ${{ needs.npm-publish.outputs.fallow_sha256 }}
+      STAGE_ID: ${{ needs.npm-publish.outputs.fallow_stage_id }}
+      WAIT_MINUTES: '350'
+      POLL_SECONDS: '30'
+    steps:
+      - name: Ask for the npm approval of the staged fallow root
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          echo "::notice::Waiting for the maintainer to approve fallow@${VERSION} on npm (sha256 ${EXPECTED_SHA256}${STAGE_ID:+, stage ${STAGE_ID}})"
+          {
+            echo "- Waiting for \`fallow@${VERSION}\` to become public. Verify the stage against sha256 \`${EXPECTED_SHA256}\`, then approve it on npm. This job continues when the public tarball matches."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait until fallow@version is public with the staged bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          REGISTRY="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::The sha256 of the staged fallow tarball is missing"
+            exit 1
+          fi
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          body=""
+          while :; do
+            if body=$(curl -fsS -H 'Cache-Control: no-cache' "${REGISTRY}/fallow/${VERSION}" 2>/dev/null); then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::fallow@${VERSION} did not become public within ${WAIT_MINUTES} minutes. Approve the stage on npm, then rerun the failed jobs of this run: the wait passes at once."
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          public_version=$(jq -r '.version // empty' <<<"$body")
+          tarball_url=$(jq -r '.dist.tarball // empty' <<<"$body")
+          if [ "$public_version" != "$VERSION" ]; then
+            echo "::error::Registry answered with version '${public_version}' for fallow@${VERSION}"
+            exit 1
+          fi
+          case "$tarball_url" in
+            "${REGISTRY}/"*) ;;
+            *)
+              echo "::error::Refusing tarball URL outside the registry: ${tarball_url}"
+              exit 1
+              ;;
+          esac
+          # The registry redirects tarball downloads to its CDN; that is why -L
+          # is needed after the host check above. Nothing here carries a
+          # credential, and the digest comparison below fails closed on any
+          # substituted content.
+          curl -fsSL "$tarball_url" -o fallow-public.tgz
+          actual_sha256=$(sha256sum fallow-public.tgz | cut -d' ' -f1)
+          if [ "$actual_sha256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Public fallow@${VERSION} has sha256 ${actual_sha256}, but this run staged ${EXPECTED_SHA256}. Someone published other bytes under this version; do not tag this release."
+            exit 1
+          fi
+          publisher=$(jq -r '[._npmUser.name // "unknown", (._npmUser.approver.name // empty)] | join(", approved by ")' <<<"$body")
+          echo "fallow@${VERSION} is public with the staged bytes (published by ${publisher})"
+          echo "- \`fallow@${VERSION}\` is public with sha256 \`${actual_sha256}\`, published by ${publisher}." >> "$GITHUB_STEP_SUMMARY"
+
   # Build all marketplace variants in a job with no marketplace tokens.
   # Publisher jobs below receive only this closed artifact set. They never
   # check out or build repository code while a registry token is present.
   vscode-prep:
     name: Build VS Code target VSIX files
-    needs: build
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [build, sign]
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1284,11 +2117,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
+          version: 11.25.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: pnpm
@@ -1351,7 +2184,7 @@ jobs:
             "$root/inventory.json"
 
       - name: Upload VSIX target artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fallow-vscode-targets
           path: ${{ runner.temp }}/fallow-vscode-targets/
@@ -1363,6 +2196,7 @@ jobs:
   # binaries before any registry token or GitHub release asset staging runs.
   vscode-host-smoke:
     name: VS Code release target host (${{ matrix.target }})
+    if: ${{ !inputs.auth_check }}
     needs: vscode-prep
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -1372,7 +2206,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: linux-x64
             npm_dir: linux-x64-gnu
             cli: fallow-linux-x64-gnu
@@ -1392,9 +2226,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 10.33.0
+          version: 11.25.0
 
       - name: Initialize pnpm store on Windows
         if: runner.os == 'Windows'
@@ -1403,14 +2237,14 @@ jobs:
           $store = pnpm store path --silent
           New-Item -ItemType Directory -Force -Path $store | Out-Null
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: editors/vscode/pnpm-lock.yaml
 
       - name: Cache VS Code test download
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/fallow-vscode-test-cache
           key: release-vscode-host-${{ matrix.target }}-vscode-1.96.0
@@ -1419,19 +2253,19 @@ jobs:
         run: cd editors/vscode && pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Download exact prepared VSIX targets
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-vscode-targets
           path: ${{ runner.temp }}/fallow-vscode-targets
 
       - name: Download matching release CLI
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-cli-${{ matrix.npm_dir }}
           path: ${{ runner.temp }}/fallow-host-bin
 
       - name: Download matching release LSP
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-lsp-${{ matrix.npm_dir }}
           path: ${{ runner.temp }}/fallow-host-bin
@@ -1512,30 +2346,185 @@ jobs:
 
   vscode-publish-marketplace:
     name: Publish VS Code Marketplace targets
-    needs: [vscode-prep, vscode-host-smoke, release-assets]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions: {}
+    if: ${{ !inputs.auth_check }}
+    needs: [vscode-prep, vscode-host-smoke, release-assets, npm-prep, npm-root-approved]
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      # The publisher starts after npm-root-approved has seen the approved
+      # fallow root public with the bytes that this run staged. It checks
+      # those public bytes again against its own copy of the staged tarball
+      # before it uploads anything. The steps below use no credential.
+      - name: Download npm tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-tarballs
+
+      - name: Record the sha256 of the staged fallow root
+        shell: bash
+        env:
+          NPM_TARBALLS: ${{ runner.temp }}/npm-tarballs
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          # npm-publish stages this exact file and records the same digest.
+          digest=$(sha256sum "$NPM_TARBALLS/20-cli-root/fallow-${VERSION}.tgz" | cut -d' ' -f1)
+          echo "EXPECTED_SHA256=$digest" >> "$GITHUB_ENV"
+
+      - name: Wait until fallow@version is public with the staged bytes
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          # npm-root-approved did the long wait, so the root is already
+          # public. This short bound only covers a lagging registry read.
+          WAIT_MINUTES: '5'
+          POLL_SECONDS: '30'
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          REGISTRY="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::The sha256 of the staged fallow tarball is missing"
+            exit 1
+          fi
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          body=""
+          while :; do
+            if body=$(curl -fsS -H 'Cache-Control: no-cache' "${REGISTRY}/fallow/${VERSION}" 2>/dev/null); then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::fallow@${VERSION} did not become public within ${WAIT_MINUTES} minutes. Approve the stage on npm, then rerun the failed jobs of this run: the wait passes at once."
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          public_version=$(jq -r '.version // empty' <<<"$body")
+          tarball_url=$(jq -r '.dist.tarball // empty' <<<"$body")
+          if [ "$public_version" != "$VERSION" ]; then
+            echo "::error::Registry answered with version '${public_version}' for fallow@${VERSION}"
+            exit 1
+          fi
+          case "$tarball_url" in
+            "${REGISTRY}/"*) ;;
+            *)
+              echo "::error::Refusing tarball URL outside the registry: ${tarball_url}"
+              exit 1
+              ;;
+          esac
+          # The registry redirects tarball downloads to its CDN; that is why -L
+          # is needed after the host check above. Nothing here carries a
+          # credential, and the digest comparison below fails closed on any
+          # substituted content.
+          curl -fsSL "$tarball_url" -o fallow-public.tgz
+          actual_sha256=$(sha256sum fallow-public.tgz | cut -d' ' -f1)
+          if [ "$actual_sha256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Public fallow@${VERSION} has sha256 ${actual_sha256}, but this run staged ${EXPECTED_SHA256}. Someone published other bytes under this version; do not tag this release."
+            exit 1
+          fi
+          publisher=$(jq -r '[._npmUser.name // "unknown", (._npmUser.approver.name // empty)] | join(", approved by ")' <<<"$body")
+          echo "fallow@${VERSION} is public with the staged bytes (published by ${publisher})"
+          echo "- \`fallow@${VERSION}\` is public with sha256 \`${actual_sha256}\`, published by ${publisher}." >> "$GITHUB_STEP_SUMMARY"
+      - name: Checkout reviewed Marketplace publisher graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/publishers/marketplace
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
       - name: Download closed VSIX target artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-vscode-targets
           path: vscode-targets
 
       - name: Install VS Code Marketplace publisher
-        run: npm install -g --ignore-scripts @vscode/vsce@3.9.2
+        run: npm ci --prefix .github/publishers/marketplace --ignore-scripts --no-audit --no-fund
+
+      - name: Validate Marketplace Azure identity configuration
+        if: vars.VSCE_AUTH_MODE == 'azure'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.VSCE_AZURE_TENANT_ID }}
+        run: |
+          azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+          if ! [[ "${AZURE_CLIENT_ID:-}" =~ $azure_id_pattern ]] || \
+              ! [[ "${AZURE_TENANT_ID:-}" =~ $azure_id_pattern ]] || \
+              [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::Selected Azure identity configuration is incomplete"
+            exit 1
+          fi
+
+      - name: Authenticate Marketplace with Microsoft Entra
+        if: vars.VSCE_AUTH_MODE == 'azure'
+        id: marketplace_azure_login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.VSCE_AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+          audience: api://AzureADTokenExchange
 
       - name: Publish every target to VS Code Marketplace
         shell: bash
         env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          VSCE_AUTH_MODE: ${{ vars.VSCE_AUTH_MODE || 'pat' }}
+          VSCE_PAT: ${{ (vars.VSCE_AUTH_MODE == '' || vars.VSCE_AUTH_MODE == 'pat') && secrets.VSCE_PAT || '' }}
+          AZURE_CLIENT_ID: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.VSCE_AZURE_TENANT_ID }}
+          MARKETPLACE_AZURE_AUTHENTICATED: ${{ steps.marketplace_azure_login.outcome == 'success' }}
         run: |
           set -u
+          auth_args=()
+          case "$VSCE_AUTH_MODE" in
+            pat)
+              if [ -z "${VSCE_PAT:-}" ]; then
+                echo "::error::Selected PAT authorization is not configured"
+                exit 1
+              fi
+              ;;
+            oidc)
+              unset VSCE_PAT
+              if [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+                echo "::error::Selected OIDC authorization is not available"
+                exit 1
+              fi
+              auth_args=(--oidc)
+              ;;
+            azure)
+              unset VSCE_PAT AZURE_CLIENT_SECRET AZURE_CLIENT_CERTIFICATE_PATH AZURE_CLIENT_CERTIFICATE_PASSWORD
+              azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+              if [ "${MARKETPLACE_AZURE_AUTHENTICATED:-}" != "true" ] || \
+                  ! [[ "${AZURE_CLIENT_ID:-}" =~ $azure_id_pattern ]] || \
+                  ! [[ "${AZURE_TENANT_ID:-}" =~ $azure_id_pattern ]] || \
+                  [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+                echo "::error::Selected Azure identity authorization is not available"
+                exit 1
+              fi
+              auth_args=(--azure-credential)
+              ;;
+            *)
+              echo "::error::Unsupported publication authorization mode"
+              exit 1
+              ;;
+          esac
           version="${RELEASE_TAG#v}"
           targets=(universal darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64)
           mapfile -t files < <(jq -er '.entries[].file' vscode-targets/inventory.json)
@@ -1550,49 +2539,186 @@ jobs:
               exit 1
             fi
           done
+          # The gallery endpoint times out intermittently per target, so retry the
+          # failed set in later passes. --skip-duplicate makes a repeated attempt
+          # idempotent, and retrying per pass caps the total wait at one schedule.
+          delays=(20 40 60 90 120)
           failed=0
+          pending=()
           for file in "${files[@]}"; do
             if [ ! -f "vscode-targets/$file" ]; then
               echo "::error::Missing inventory file: $file"
               failed=1
               continue
             fi
-            if ! vsce publish \
-              --packagePath "vscode-targets/$file" \
-              --no-dependencies \
-              --skip-duplicate; then
-              echo "::error::VS Code Marketplace publication failed for $file"
-              failed=1
+            pending+=("$file")
+          done
+          pass=1
+          while [ "${#pending[@]}" -ne 0 ]; do
+            remaining=()
+            for file in "${pending[@]}"; do
+              if ! npx --no-install --prefix .github/publishers/marketplace vsce publish "${auth_args[@]}" \
+                  --packagePath "vscode-targets/$file" \
+                  --no-dependencies \
+                  --skip-duplicate; then
+                remaining+=("$file")
+              fi
+            done
+            if [ "${#remaining[@]}" -eq 0 ]; then
+              break
             fi
+            if [ "$pass" -gt "${#delays[@]}" ]; then
+              for file in "${remaining[@]}"; do
+                echo "::error::VS Code Marketplace publication failed for $file"
+                failed=1
+              done
+              break
+            fi
+            delay="${delays[$((pass - 1))]}"
+            echo "::warning::VS Code Marketplace pass $pass of $(( ${#delays[@]} + 1 )) failed for ${remaining[*]}; retrying in ${delay}s"
+            sleep "$delay"
+            pending=("${remaining[@]}")
+            pass=$((pass + 1))
           done
           exit "$failed"
 
   vscode-publish-open-vsx:
     name: Publish Open VSX targets
-    needs: [vscode-prep, vscode-host-smoke, release-assets]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions: {}
+    if: ${{ !inputs.auth_check }}
+    needs: [vscode-prep, vscode-host-smoke, release-assets, npm-prep, npm-root-approved]
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      # The publisher starts after npm-root-approved has seen the approved
+      # fallow root public with the bytes that this run staged. It checks
+      # those public bytes again against its own copy of the staged tarball
+      # before it uploads anything. The steps below use no credential.
+      - name: Download npm tarballs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: npm-tarballs
+          path: ${{ runner.temp }}/npm-tarballs
+
+      - name: Record the sha256 of the staged fallow root
+        shell: bash
+        env:
+          NPM_TARBALLS: ${{ runner.temp }}/npm-tarballs
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          # npm-publish stages this exact file and records the same digest.
+          digest=$(sha256sum "$NPM_TARBALLS/20-cli-root/fallow-${VERSION}.tgz" | cut -d' ' -f1)
+          echo "EXPECTED_SHA256=$digest" >> "$GITHUB_ENV"
+
+      - name: Wait until fallow@version is public with the staged bytes
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          # npm-root-approved did the long wait, so the root is already
+          # public. This short bound only covers a lagging registry read.
+          WAIT_MINUTES: '5'
+          POLL_SECONDS: '30'
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          REGISTRY="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::The sha256 of the staged fallow tarball is missing"
+            exit 1
+          fi
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          body=""
+          while :; do
+            if body=$(curl -fsS -H 'Cache-Control: no-cache' "${REGISTRY}/fallow/${VERSION}" 2>/dev/null); then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::fallow@${VERSION} did not become public within ${WAIT_MINUTES} minutes. Approve the stage on npm, then rerun the failed jobs of this run: the wait passes at once."
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+          public_version=$(jq -r '.version // empty' <<<"$body")
+          tarball_url=$(jq -r '.dist.tarball // empty' <<<"$body")
+          if [ "$public_version" != "$VERSION" ]; then
+            echo "::error::Registry answered with version '${public_version}' for fallow@${VERSION}"
+            exit 1
+          fi
+          case "$tarball_url" in
+            "${REGISTRY}/"*) ;;
+            *)
+              echo "::error::Refusing tarball URL outside the registry: ${tarball_url}"
+              exit 1
+              ;;
+          esac
+          # The registry redirects tarball downloads to its CDN; that is why -L
+          # is needed after the host check above. Nothing here carries a
+          # credential, and the digest comparison below fails closed on any
+          # substituted content.
+          curl -fsSL "$tarball_url" -o fallow-public.tgz
+          actual_sha256=$(sha256sum fallow-public.tgz | cut -d' ' -f1)
+          if [ "$actual_sha256" != "$EXPECTED_SHA256" ]; then
+            echo "::error::Public fallow@${VERSION} has sha256 ${actual_sha256}, but this run staged ${EXPECTED_SHA256}. Someone published other bytes under this version; do not tag this release."
+            exit 1
+          fi
+          publisher=$(jq -r '[._npmUser.name // "unknown", (._npmUser.approver.name // empty)] | join(", approved by ")' <<<"$body")
+          echo "fallow@${VERSION} is public with the staged bytes (published by ${publisher})"
+          echo "- \`fallow@${VERSION}\` is public with sha256 \`${actual_sha256}\`, published by ${publisher}." >> "$GITHUB_STEP_SUMMARY"
+      - name: Checkout reviewed Open VSX publisher graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/publishers/open-vsx
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
       - name: Download closed VSIX target artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-vscode-targets
           path: vscode-targets
 
       - name: Install Open VSX publisher
-        run: npm install -g --ignore-scripts ovsx@1.1.1
+        run: npm ci --prefix .github/publishers/open-vsx --ignore-scripts --no-audit --no-fund
 
       - name: Publish every target to Open VSX
         shell: bash
         env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          OVSX_AUTH_MODE: ${{ vars.OVSX_AUTH_MODE || 'pat' }}
+          OVSX_PAT: ${{ vars.OVSX_AUTH_MODE != 'oidc' && secrets.OVSX_PAT || '' }}
         run: |
           set -u
+          auth_args=()
+          case "$OVSX_AUTH_MODE" in
+            pat)
+              if [ -z "${OVSX_PAT:-}" ]; then
+                echo "::error::Selected PAT authorization is not configured"
+                exit 1
+              fi
+              ;;
+            oidc)
+              unset OVSX_PAT
+              if [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+                echo "::error::Selected OIDC authorization is not available"
+                exit 1
+              fi
+              auth_args=(--trusted-publishing)
+              ;;
+            *)
+              echo "::error::Unsupported publication authorization mode"
+              exit 1
+              ;;
+          esac
           version="${RELEASE_TAG#v}"
           targets=(universal darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64)
           mapfile -t files < <(jq -er '.entries[].file' vscode-targets/inventory.json)
@@ -1607,27 +2733,54 @@ jobs:
               exit 1
             fi
           done
+          # Open VSX answers 503 intermittently per target, so retry the failed set
+          # in later passes. --skip-duplicate makes a repeated attempt idempotent,
+          # and retrying per pass caps the total wait at one schedule.
+          delays=(20 40 60 90 120)
           failed=0
+          pending=()
           for file in "${files[@]}"; do
             if [ ! -f "vscode-targets/$file" ]; then
               echo "::error::Missing inventory file: $file"
               failed=1
               continue
             fi
-            if ! ovsx publish \
-              "vscode-targets/$file" \
-              --no-dependencies \
-              --skip-duplicate; then
-              echo "::error::Open VSX publication failed for $file"
-              failed=1
+            pending+=("$file")
+          done
+          pass=1
+          while [ "${#pending[@]}" -ne 0 ]; do
+            remaining=()
+            for file in "${pending[@]}"; do
+              if ! npx --no-install --prefix .github/publishers/open-vsx ovsx publish "${auth_args[@]}" \
+                  "vscode-targets/$file" \
+                  --no-dependencies \
+                  --skip-duplicate; then
+                remaining+=("$file")
+              fi
+            done
+            if [ "${#remaining[@]}" -eq 0 ]; then
+              break
             fi
+            if [ "$pass" -gt "${#delays[@]}" ]; then
+              for file in "${remaining[@]}"; do
+                echo "::error::Open VSX publication failed for $file"
+                failed=1
+              done
+              break
+            fi
+            delay="${delays[$((pass - 1))]}"
+            echo "::warning::Open VSX pass $pass of $(( ${#delays[@]} + 1 )) failed for ${remaining[*]}; retrying in ${delay}s"
+            sleep "$delay"
+            pending=("${remaining[@]}")
+            pass=$((pass + 1))
           done
           exit "$failed"
 
   vscode-public-verify:
     name: Verify public VS Code registry targets
+    if: ${{ !inputs.auth_check }}
     needs: [vscode-prep, vscode-publish-marketplace, vscode-publish-open-vsx]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -1636,12 +2789,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
       - name: Download closed VSIX target artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fallow-vscode-targets
           path: vscode-targets
@@ -1651,8 +2804,9 @@ jobs:
 
   release-ready:
     name: Release ready for signed tag
-    needs: [publish-crates, npm-publish, vscode-public-verify, release-assets]
-    runs-on: ubuntu-latest
+    if: ${{ !inputs.auth_check }}
+    needs: [publish-crates, npm-publish, npm-root-approved, vscode-public-verify, release-assets]
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1680,3 +2834,28 @@ jobs:
             exit 1
           fi
           echo "Release workflow completed with ${TAG_NAME} still absent"
+
+
+  publisher-auth-check:
+    name: Check registry publishing identities
+    if: inputs.auth_check && github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout reviewed identity check
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/publisher-auth-check.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check trusted registry identities
+        run: node .github/scripts/publisher-auth-check.mjs

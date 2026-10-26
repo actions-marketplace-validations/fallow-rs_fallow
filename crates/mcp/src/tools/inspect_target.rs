@@ -3,7 +3,10 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use crate::params::{InspectTarget, InspectTargetParams};
 
-use super::{push_global, push_remote_extends, push_scope, run_tool, validation_error_body};
+use super::{
+    push_global, push_remote_extends, push_scope, require_non_empty, run_tool_with_limit,
+    validation_error_body,
+};
 
 const TOOL: &str = "inspect_target";
 
@@ -13,7 +16,7 @@ pub async fn inspect_target(
     params: &InspectTargetParams,
 ) -> Result<CallToolResult, McpError> {
     match build_inspect_args(params) {
-        Ok(args) => run_tool(binary, TOOL, &args).await,
+        Ok(args) => run_tool_with_limit(binary, TOOL, &args, params.max_output_bytes).await,
         Err(message) => Ok(CallToolResult::error(vec![ContentBlock::text(
             validation_error_body(message),
         )])),
@@ -72,13 +75,6 @@ fn build_inspect_args(params: &InspectTargetParams) -> Result<Vec<String>, Strin
     Ok(args)
 }
 
-fn require_non_empty(field: &str, value: &str) -> Result<(), String> {
-    if value.trim().is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +97,7 @@ mod tests {
             },
             symbol_chain: None,
             include_churn: None,
+            max_output_bytes: None,
         };
 
         let args = build_inspect_args(&params).unwrap();
@@ -130,6 +127,7 @@ mod tests {
             },
             symbol_chain: Some(true),
             include_churn: None,
+            max_output_bytes: None,
         };
 
         let args = build_inspect_args(&params).unwrap();
@@ -159,6 +157,7 @@ mod tests {
             },
             symbol_chain: None,
             include_churn: None,
+            max_output_bytes: None,
         };
 
         let args = build_inspect_args(&params).unwrap();
@@ -183,6 +182,7 @@ mod tests {
             },
             symbol_chain: Some(true),
             include_churn: None,
+            max_output_bytes: None,
         };
 
         let args = build_inspect_args(&params).unwrap();
@@ -208,6 +208,7 @@ mod tests {
             },
             symbol_chain: None,
             include_churn: Some(true),
+            max_output_bytes: None,
         };
 
         let args = build_inspect_args(&params).unwrap();

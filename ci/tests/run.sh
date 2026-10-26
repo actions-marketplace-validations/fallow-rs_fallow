@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Test suite for fallow GitLab CI jq scripts and bash helpers
+# Test suite for the fallow GitLab CI template and bash helpers
 # Run: bash ci/tests/run.sh
 
 set -o pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CI_JQ_DIR="$DIR/../jq"
 SHARED_JQ_DIR="$DIR/../../action/jq"
 FIXTURES="$DIR/fixtures"
 PASSED=0
@@ -247,9 +246,117 @@ if [ "${1:-}" = "report" ]; then
   printf '[]\n'
   exit 0
 fi
+if [ -n "${MOCK_GATE_ENVELOPE:-}" ]; then
+  cat "$MOCK_GATE_ENVELOPE"
+  exit "${MOCK_GATE_EXIT:-0}"
+fi
 if [ "${MOCK_TYPE_AWARE_INCOMPLETE:-}" = "1" ]; then
   printf '%s\n' '{"kind":"dead-code","schema_version":9,"version":"test","total_issues":0,"_meta":{"type_aware":{"required_completeness":"complete","identity":{"completeness":"partial"},"queries":[]}}}'
   exit 1
+fi
+if [ "${MOCK_BASELINE_STALENESS:-}" = "1" ]; then
+  if [ -n "${FALLOW_TEST_LOG:-}" ] && [ -n "${FALLOW_DIFF_FILE:-}" ]; then
+    printf 'diff_file=set\n' >> "$FALLOW_TEST_LOG"
+  fi
+  # The real binary serializes scope_reasons in its own declaration order,
+  # never in argv order, so the mock sorts into that order too.
+  REASON_ORDER="diff changed-since package-baselines changed-files workspace changed-workspaces scope file issue-type-filter production include-entry-exports"
+  found=""
+  for arg in "$@"; do
+    case "$arg" in
+      --changed-since|--changed-since=*) found="$found changed-since" ;;
+      --production) found="$found production" ;;
+    esac
+  done
+  if [ -n "${FALLOW_DIFF_FILE:-}" ]; then
+    found="$found diff"
+  fi
+  # workspaces.changedSince comes from the config, so only the opt-out flag
+  # removes it.
+  if [ "${MOCK_PACKAGE_MAP:-}" = "1" ]; then
+    case " $* " in
+      *" --no-package-baselines "*) ;;
+      *) found="$found package-baselines" ;;
+    esac
+  fi
+  if [ -n "${MOCK_SCOPE_REASONS:-}" ]; then
+    found=$(printf '%s' "$MOCK_SCOPE_REASONS" | tr ',' ' ')
+  fi
+  reasons=""
+  for candidate in $REASON_ORDER; do
+    case " $found " in
+      *" $candidate "*)
+        if [ -z "$reasons" ]; then reasons="\"$candidate\""; else reasons="$reasons,\"$candidate\""; fi
+        ;;
+    esac
+  done
+  scoped=false
+  if [ -n "$reasons" ]; then
+    scoped=true
+  fi
+  # A bare-run envelope with a health or dupes section baseline. The check
+  # section carries no staleness, so each section is read on its own.
+  if [ "${MOCK_BARE_SECTIONS:-}" = "1" ]; then
+    if [ "$scoped" = "true" ]; then
+      printf '{"total_issues":0,"health":{"summary":{"baseline_staleness":{"baseline_entries":6,"matched_entries":0,"stale_entries":6,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"scope_reasons":[%s]}}},"gate_outcomes":{"stale-baseline":{"status":"skipped","enforced":false}}}\n' "$reasons"
+    else
+      printf '%s\n' '{"total_issues":0,"health":{"summary":{"baseline_staleness":{"baseline_entries":6,"matched_entries":2,"stale_entries":4,"current_findings":2,"change_scoped":false,"stale":true,"warning":"partial","gate_trips":true}}},"gate_outcomes":{"stale-baseline":{"status":"fail","enforced":false}}}'
+    fi
+    exit 0
+  fi
+  if [ "${MOCK_BARE_SECTIONS:-}" = "2" ]; then
+    printf '%s\n' '{"total_issues":0,"dupes":{"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":false,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true,"saved_by":"health"}},"gate_outcomes":{"stale-baseline":{"status":"fail","enforced":false}}}'
+    exit 0
+  fi
+  if [ "$scoped" = "true" ]; then
+    if [ "${MOCK_NO_SCOPE_REASONS:-}" = "1" ]; then
+      printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":8,"matched_entries":0,"stale_entries":8,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false}}'
+    else
+      printf '{"total_issues":0,"baseline_staleness":{"baseline_entries":8,"matched_entries":0,"stale_entries":8,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"scope_reasons":[%s]}}\n' "$reasons"
+    fi
+    exit 0
+  fi
+  if [ "${MOCK_GATE_RUN_BROKEN:-}" = "1" ]; then
+    printf 'not json at all\n'
+    exit 2
+  fi
+  if [ "${MOCK_AUDIT_BASELINES:-}" = "2" ]; then
+    # Every section states its recognition verdict outright, including a
+    # literal `false`, which the shared reader keeps distinct from an absent
+    # member.
+    printf '%s\n' '{"kind":"audit","total_issues":0,"verdict":"pass","dead_code":{"baseline_staleness":{"baseline_entries":12,"matched_entries":4,"stale_entries":8,"current_findings":4,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"unrecognised_format":false,"scope_reasons":["changed-since"]}},"complexity":{"summary":{"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true,"scope_reasons":["changed-files"]}}},"gate_outcomes":{"stale-baseline":{"status":"skipped","enforced":false},"audit-verdict":{"status":"pass","enforced":true}}}'
+    exit 0
+  fi
+  if [ "${MOCK_AUDIT_BASELINES:-}" = "1" ]; then
+    printf '%s\n' '{"kind":"audit","total_issues":0,"verdict":"pass","dead_code":{"baseline_staleness":{"baseline_entries":12,"matched_entries":4,"stale_entries":8,"current_findings":4,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"scope_reasons":["changed-since"]}},"duplication":{"baseline_staleness":{"baseline_entries":3,"matched_entries":0,"stale_entries":3,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"scope_reasons":["changed-files"]}},"complexity":{"summary":{"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":false,"unrecognised_format":true,"scope_reasons":["changed-files"]}}},"gate_outcomes":{"stale-baseline":{"status":"skipped","enforced":false},"audit-verdict":{"status":"pass","enforced":true}}}'
+    exit 0
+  fi
+  if [ "${MOCK_UNRECOGNISED_BASELINE:-}" = "3" ]; then
+    # The writer member is a literal null, which reads as absent.
+    printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":false,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true,"saved_by":null}}'
+    exit 0
+  fi
+  if [ "${MOCK_UNRECOGNISED_BASELINE:-}" = "2" ]; then
+    # The same file, with the writer named in saved_by.
+    printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":false,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true,"saved_by":"health"}}'
+    exit 0
+  fi
+  if [ "${MOCK_AUDIT_BASELINES:-}" = "3" ]; then
+    printf '%s\n' '{"kind":"audit","total_issues":0,"verdict":"pass","complexity":{"summary":{"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":true,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true,"saved_by":"dead-code","scope_reasons":["changed-files"]}}},"gate_outcomes":{"stale-baseline":{"status":"skipped","enforced":false},"audit-verdict":{"status":"pass","enforced":true}}}'
+    exit 0
+  fi
+  if [ "${MOCK_UNRECOGNISED_BASELINE:-}" = "1" ]; then
+    # gate_trips travels with the recognition verdict, as the binary reports it:
+    # a file this command cannot read as its own suppresses nothing.
+    printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":false,"stale":false,"warning":"none","gate_trips":true,"unrecognised_format":true}}'
+    exit 0
+  fi
+  if [ "${MOCK_ZERO_ENTRY_BASELINE:-}" = "1" ]; then
+    printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":0,"matched_entries":0,"stale_entries":0,"current_findings":0,"change_scoped":false,"stale":false,"warning":"none","gate_trips":false}}'
+    exit 0
+  fi
+  printf '%s\n' '{"total_issues":0,"baseline_staleness":{"baseline_entries":8,"matched_entries":3,"stale_entries":5,"current_findings":3,"change_scoped":false,"stale":true,"warning":"partial","gate_trips":true}}'
+  exit 0
 fi
 printf '{"total_issues":0}\n'
 SH
@@ -284,6 +391,7 @@ OUT=$(cd "$RUNNER_TMP" && env \
   FALLOW_CHANGED_SINCE= \
   FALLOW_BASELINE= \
   FALLOW_SAVE_BASELINE= \
+  FALLOW_FAIL_ON_STALE_BASELINE=false \
   FALLOW_WORKSPACE= \
   FALLOW_CHANGED_WORKSPACES= \
   FALLOW_ISSUE_TYPES= \
@@ -319,6 +427,7 @@ OUT=$(cd "$RUNNER_TMP" && env \
   FALLOW_SAVE_SNAPSHOT= \
   FALLOW_TREND=false \
   FALLOW_AUDIT_GATE= \
+  FALLOW_AUDIT_WORSENED= \
   FALLOW_AUDIT_DEAD_CODE_BASELINE= \
   FALLOW_AUDIT_HEALTH_BASELINE= \
   FALLOW_AUDIT_DUPES_BASELINE= \
@@ -376,6 +485,582 @@ run_generated_gitlab_fixture() {
       bash /tmp/fallow-run.sh 2>&1
   )
 }
+
+# --- Audit forwards FALLOW_ONLY and FALLOW_SKIP (issue #3381) ---
+
+SELECTION_WORK="$RUNNER_TMP/audit-selection"
+mkdir -p "$SELECTION_WORK"
+run_generated_gitlab_fixture "$SELECTION_WORK" \
+  FALLOW_COMMAND=audit \
+  FALLOW_SKIP=dead-code,dupes >/dev/null
+SELECTION_ARGS=""
+while IFS= read -r -d '' arg; do
+  SELECTION_ARGS+="${arg} "
+done < "$SELECTION_WORK/fallow-analysis-args.bin"
+assert_contains "$SELECTION_ARGS" "audit " "audit selection: the command is audit"
+assert_contains "$SELECTION_ARGS" "--skip dead-code,dupes" "audit selection: FALLOW_SKIP reaches audit"
+rm -rf "$SELECTION_WORK"
+
+# --- Baseline staleness gate (issue #2673) ---
+
+STALE_WORK="$RUNNER_TMP/stale-baseline"
+mkdir -p "$STALE_WORK"
+
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_BASELINE=baseline.json)
+cmd_status=$?
+assert_contains "$OUT" "WARNING: baseline is partially stale: 5 of 8 entries" \
+  "stale gate: a partially stale baseline warns without the gate"
+if [ "$cmd_status" -eq 0 ]; then
+  pass "stale gate: the advisory alone does not fail the pipeline"
+else
+  fail "stale gate: the advisory alone does not fail the pipeline" "exit $cmd_status"
+fi
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed: 5 of 8 entries" \
+  "stale gate: the gate fails the pipeline"
+if [ "$cmd_status" -eq 1 ]; then
+  pass "stale gate: a tripped gate exits 1"
+else
+  fail "stale gate: a tripped gate exits 1" "exit $cmd_status"
+fi
+
+# The template's own MR auto-scoping is the shape that made a plain variable
+# inert, so the gate re-runs the comparison unscoped.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_SAVE_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+GATE_ARGV=$(sed -n '2p' "$STALE_LOG")
+assert_not_contains "$GATE_ARGV" "--changed-since" \
+  "stale gate: the unscoped re-run drops --changed-since"
+assert_not_contains "$GATE_ARGV" "--save-baseline" \
+  "stale gate: the unscoped re-run never rewrites the baseline"
+assert_contains "$GATE_ARGV" "--baseline baseline.json" \
+  "stale gate: the unscoped re-run still loads the baseline"
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed" \
+  "stale gate: the re-run's verdict fails the merge-request pipeline"
+if [ "$cmd_status" -eq 1 ]; then
+  pass "stale gate: the merge-request re-run can fail the pipeline"
+else
+  fail "stale gate: the merge-request re-run can fail the pipeline" "exit $cmd_status"
+fi
+
+# The advisory is not gated behind the variable: a merge-request pipeline
+# re-reads the baseline unscoped so the warning reaches a job that asked for no
+# gate.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "2" ]; then
+  pass "stale gate: a scoped pipeline re-reads the baseline even with the gate off"
+else
+  fail "stale gate: a scoped pipeline re-reads the baseline even with the gate off" "ran $STALE_RUNS times"
+fi
+assert_contains "$OUT" "WARNING: baseline is partially stale: 5 of 8 entries" \
+  "stale gate: the advisory reaches a merge-request pipeline with no gate"
+assert_not_contains "$OUT" "ERROR: Fallow baseline gate failed" \
+  "stale gate: with the gate off the advisory never fails the pipeline"
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "1" ]; then
+  pass "stale gate: an unscoped pipeline analyzes exactly once"
+else
+  fail "stale gate: an unscoped pipeline analyzes exactly once" "ran $STALE_RUNS times"
+fi
+
+# The stand-down names the channels the run reported, and scoping smuggled
+# through FALLOW_ARGS is visible there instead of sending the template into an
+# unscoped re-read that comes back narrowed anyway.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_SCOPE_REASONS=production \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "1" ]; then
+  pass "stale gate: an unremovable reason skips the re-read even with no matching variable"
+else
+  fail "stale gate: an unremovable reason skips the re-read even with no matching variable" "ran $STALE_RUNS times"
+fi
+assert_contains "$OUT" "only part of the project (production)" \
+  "stale gate: the stand-down names the smuggled channel"
+
+# Reasons this template can remove still earn the re-read.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_SCOPE_REASONS=changed-files,scope \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "2" ]; then
+  pass "stale gate: removable reasons still earn the unscoped re-read"
+else
+  fail "stale gate: removable reasons still earn the unscoped re-read" "ran $STALE_RUNS times"
+fi
+
+# The package map comes from the config. The re-read turns it off with the
+# opt-out flag, so it can judge the baseline.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_PACKAGE_MAP=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "2" ]; then
+  pass "stale gate: a package-map run earns the re-read"
+else
+  fail "stale gate: a package-map run earns the re-read" "ran $STALE_RUNS times"
+fi
+assert_contains "$(sed -n '2p' "$STALE_LOG")" "--no-package-baselines" \
+  "stale gate: the re-read turns the package map off"
+assert_not_contains "$OUT" "still narrowed" \
+  "stale gate: the re-read is not narrowed again by the map"
+
+# A binary that predates the member keeps the variable-based guess.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_NO_SCOPE_REASONS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_PRODUCTION=true)
+assert_contains "$OUT" "only part of the project (production mode or workspace scoping)" \
+  "stale gate: a binary without the member falls back to the variable-based reason"
+
+# A baseline written by another command suppresses nothing, so the pipeline says
+# so and an armed gate fails on it. The branch reads the binary's own verdict,
+# not the entry count.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_UNRECOGNISED_BASELINE=1 \
+  FALLOW_BASELINE=wrong-kind.json)
+assert_contains "$OUT" "WARNING: the baseline at wrong-kind.json has no entries this command recognises" \
+  "stale gate: a baseline that recognises nothing is called out"
+assert_not_contains "$OUT" "0 of 0 baseline entries matched nothing" \
+  "stale gate: the count advisory stands aside for the recognition warning"
+assert_not_contains "$OUT" "ERROR: Fallow baseline gate failed" \
+  "stale gate: with no gate armed a baseline nothing recognises does not fail the pipeline"
+
+# With the gate armed the pipeline fails, and names the recognition failure
+# rather than a count both sides of which are zero.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_UNRECOGNISED_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_UNRECOGNISED_BASELINE=1 \
+  FALLOW_BASELINE=wrong-kind.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true 2>&1) || STALE_UNRECOGNISED_EXIT=$?
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed: the baseline wrong-kind.json has no entries this command recognises" \
+  "stale gate: the armed gate names the recognition failure"
+if [ "$STALE_UNRECOGNISED_EXIT" -eq 1 ]; then
+  pass "stale gate: an armed gate fails on a baseline nothing recognises"
+else
+  fail "stale gate: an armed gate fails on a baseline nothing recognises" "exit $STALE_UNRECOGNISED_EXIT"
+fi
+
+# A file that names a known writer: the warning and the gate line name it.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_SAVED_BY_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_UNRECOGNISED_BASELINE=2 \
+  FALLOW_BASELINE=wrong-kind.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true 2>&1) || STALE_SAVED_BY_EXIT=$?
+assert_contains "$OUT" 'WARNING: `fallow health` saved the baseline at wrong-kind.json, so this command reads nothing from it' \
+  "saved by: the warning names the command that saved the baseline"
+assert_contains "$OUT" 'ERROR: Fallow baseline gate failed: `fallow health` saved the baseline wrong-kind.json' \
+  "saved by: the gate line names the same command"
+if [ "$STALE_SAVED_BY_EXIT" -eq 1 ]; then
+  pass "saved by: the armed gate still fails"
+else
+  fail "saved by: the armed gate still fails" "exit $STALE_SAVED_BY_EXIT"
+fi
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_UNRECOGNISED_BASELINE=3 \
+  FALLOW_BASELINE=wrong-kind.json)
+assert_contains "$OUT" "WARNING: the baseline at wrong-kind.json has no entries this command recognises" \
+  "saved by: a null value falls back to the hedged warning"
+assert_not_contains "$OUT" "fallow null" \
+  "saved by: a null value is never quoted as a command"
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_AUDIT_BASELINES=3 \
+  FALLOW_COMMAND=audit \
+  FALLOW_AUDIT_HEALTH_BASELINE=audit/he.json)
+assert_contains "$OUT" 'WARNING: `fallow dead-code` saved the complexity baseline at audit/he.json' \
+  "audit baselines: a section with a known writer names it"
+
+# A baseline passed through FALLOW_ARGS never reaches FALLOW_BASELINE, so the
+# line degrades to the subject instead of going missing.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_UNRECOGNISED_BASELINE=1 \
+  FALLOW_ARGS="--baseline wrong-kind.json")
+assert_contains "$OUT" "WARNING: the loaded baseline has no entries this command recognises" \
+  "stale gate: a baseline passed through FALLOW_ARGS is called out without a path"
+
+# A baseline saved on a project with nothing to record carries zero entries and
+# is not a mistake, so the documented save-on-green-main workflow stays quiet.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_ZERO_ENTRY_BASELINE=1 \
+  FALLOW_BASELINE=own-empty.json)
+assert_not_contains "$OUT" "has no entries this command recognises" \
+  "stale gate: a baseline this command saved itself is never called the wrong file"
+
+# A populated baseline never earns that warning.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_BASELINE=baseline.json)
+assert_not_contains "$OUT" "has no entries this command recognises" \
+  "stale gate: a populated baseline says nothing about recognition"
+
+# fallow audit loads up to three baselines and judges none of them, and the
+# single-analysis // chain is first-match, so it would report one and hide the
+# other two. One line per section instead, naming the command a reader has to
+# run rather than the section it sits in.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_AUDIT_BASELINES=1 \
+  FALLOW_COMMAND=audit \
+  FALLOW_AUDIT_DEAD_CODE_BASELINE=audit/dc.json \
+  FALLOW_AUDIT_DUPES_BASELINE=audit/du.json \
+  FALLOW_AUDIT_HEALTH_BASELINE=audit/he.json)
+assert_contains "$OUT" "NOTICE: the dead-code baseline (audit/dc.json) has 12 entries and was not judged" \
+  "audit baselines: the dead-code baseline is reported with its path"
+assert_contains "$OUT" "Run 'fallow dupes --baseline audit/du.json' over the whole project" \
+  "audit baselines: duplication points at fallow dupes, not at the section name"
+assert_contains "$OUT" "WARNING: the complexity baseline at audit/he.json has no entries this command recognises" \
+  "audit baselines: an unrecognised audit baseline gets the recognition warning"
+
+# Each section's own recognition verdict decides its line, including a section
+# that states `false` outright: the loop reads it through the shared reader,
+# whose `has` guard keeps a literal `false` from reading as an absent member.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_AUDIT_BASELINES=2 \
+  FALLOW_COMMAND=audit \
+  FALLOW_AUDIT_DEAD_CODE_BASELINE=audit/dc.json \
+  FALLOW_AUDIT_HEALTH_BASELINE=audit/he.json)
+assert_contains "$OUT" "NOTICE: the dead-code baseline (audit/dc.json) has 12 entries and was not judged" \
+  "audit baselines: a section that reports recognition false keeps the inert-baseline notice"
+assert_contains "$OUT" "WARNING: the complexity baseline at audit/he.json has no entries this command recognises" \
+  "audit baselines: and the section beside it still earns the recognition warning"
+assert_not_contains "$OUT" "the dead-code baseline at audit/dc.json has no entries" \
+  "audit baselines: a recognised baseline is never called the wrong file"
+
+# The gate cannot apply to audit and FALLOW_BASELINE is already rejected for
+# it, so the pair is only reachable through FALLOW_ARGS.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+# This suite runs without `set -e`, so the exit code is captured inline rather
+# than by toggling it: enabling it here would abort every later case.
+STALE_ARGS_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  FALLOW_COMMAND=audit \
+  FALLOW_ARGS=--fail-on-stale-baseline 2>&1) || STALE_ARGS_EXIT=$?
+if [ "$STALE_ARGS_EXIT" -eq 2 ]; then
+  pass "audit baselines: --fail-on-stale-baseline smuggled through FALLOW_ARGS is rejected"
+else
+  fail "audit baselines: --fail-on-stale-baseline smuggled through FALLOW_ARGS is rejected" "exit $STALE_ARGS_EXIT"
+fi
+assert_contains "$OUT" "cannot apply to command: audit" \
+  "audit baselines: the rejection says why"
+
+# The bare run reads FALLOW_BASELINE as the dead-code baseline only, so it
+# forwards FALLOW_HEALTH_BASELINE and FALLOW_DUPES_BASELINE through their own
+# flags, and the gate judges each one.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+BARE_SECTION_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_BARE_SECTIONS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_COMMAND= \
+  FALLOW_HEALTH_BASELINE=he.json \
+  FALLOW_DUPES_BASELINE=du.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true 2>&1) || BARE_SECTION_EXIT=$?
+assert_contains "$(sed -n '1p' "$STALE_LOG")" "--health-baseline he.json" \
+  "bare baselines: the bare run forwards FALLOW_HEALTH_BASELINE"
+assert_contains "$(sed -n '1p' "$STALE_LOG")" "--dupes-baseline du.json" \
+  "bare baselines: the bare run forwards FALLOW_DUPES_BASELINE"
+assert_contains "$OUT" "WARNING: the health baseline at he.json is partially stale: 4 of 6 entries" \
+  "bare baselines: a stale health baseline warns"
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed: 4 of 6 entries in the health baseline at he.json matched nothing this run" \
+  "bare baselines: the gate fails on a stale health baseline"
+if [ "$BARE_SECTION_EXIT" -eq 1 ]; then
+  pass "bare baselines: a tripped section gate exits 1"
+else
+  fail "bare baselines: a tripped section gate exits 1" "exit $BARE_SECTION_EXIT"
+fi
+
+assert_not_contains "$OUT" "has no baseline to judge" \
+  "bare baselines: section variables alone are a baseline the gate can judge"
+
+# A baseline that only FALLOW_ARGS passes still counts.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+BARE_SECTION_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_BARE_SECTIONS=1 \
+  FALLOW_COMMAND= \
+  FALLOW_ARGS="--health-baseline codex-app/health-baseline.json" \
+  FALLOW_FAIL_ON_STALE_BASELINE=true 2>&1) || BARE_SECTION_EXIT=$?
+assert_not_contains "$OUT" "has no baseline to judge" \
+  "bare baselines: --health-baseline in FALLOW_ARGS is a baseline the gate can judge"
+assert_contains "$OUT" "WARNING: the health baseline passed through FALLOW_ARGS is partially stale: 4 of 6 entries" \
+  "bare baselines: a health baseline from FALLOW_ARGS gets the staleness warning"
+if [ "$BARE_SECTION_EXIT" -eq 1 ]; then
+  pass "bare baselines: a health baseline from FALLOW_ARGS fails the pipeline when stale"
+else
+  fail "bare baselines: a health baseline from FALLOW_ARGS fails the pipeline when stale" "exit $BARE_SECTION_EXIT"
+fi
+
+# Other commands keep ignoring the two variables.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_COMMAND=health \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_HEALTH_BASELINE=he.json)
+assert_not_contains "$(cat "$STALE_LOG")" "--health-baseline" \
+  "bare baselines: FALLOW_COMMAND health does not forward FALLOW_HEALTH_BASELINE"
+
+# On another command a section variable alone is still no baseline to judge.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+BARE_SECTION_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  FALLOW_COMMAND=health \
+  FALLOW_HEALTH_BASELINE=he.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true 2>&1) || BARE_SECTION_EXIT=$?
+if [ "$BARE_SECTION_EXIT" -eq 2 ]; then
+  pass "bare baselines: FALLOW_COMMAND health with only FALLOW_HEALTH_BASELINE still rejects the gate"
+else
+  fail "bare baselines: FALLOW_COMMAND health with only FALLOW_HEALTH_BASELINE still rejects the gate" "exit $BARE_SECTION_EXIT"
+fi
+assert_contains "$OUT" "Set FALLOW_BASELINE, or turn the gate off." \
+  "bare baselines: the rejection on other commands keeps its wording"
+
+# A merge-request pipeline is scoped, so a section baseline alone earns the
+# unscoped re-read.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_BARE_SECTIONS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_COMMAND= \
+  FALLOW_HEALTH_BASELINE=he.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "2" ]; then
+  pass "bare baselines: a scoped pipeline re-reads a health baseline unscoped"
+else
+  fail "bare baselines: a scoped pipeline re-reads a health baseline unscoped" "ran $STALE_RUNS times"
+fi
+assert_not_contains "$(sed -n '2p' "$STALE_LOG")" "--changed-since" \
+  "bare baselines: the re-read drops --changed-since"
+assert_contains "$(sed -n '2p' "$STALE_LOG")" "--health-baseline he.json" \
+  "bare baselines: the re-read still loads the health baseline"
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed: 4 of 6 entries in the health baseline at he.json" \
+  "bare baselines: the re-read verdict fails the merge-request pipeline"
+
+# A baseline another command saved names the variable that reads it.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_BARE_SECTIONS=2 \
+  FALLOW_COMMAND= \
+  FALLOW_DUPES_BASELINE=du.json)
+assert_contains "$OUT" 'WARNING: `fallow health` saved the dupes baseline at du.json, so this run reads nothing from it and it suppresses nothing. Pass that file with FALLOW_HEALTH_BASELINE instead.' \
+  "bare baselines: a health baseline in FALLOW_DUPES_BASELINE points at FALLOW_HEALTH_BASELINE"
+
+# On the bare run FALLOW_SAVE_BASELINE writes the dead-code baseline, so
+# naming the health baseline file there replaces it.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_BARE_SECTIONS=1 \
+  FALLOW_COMMAND= \
+  FALLOW_HEALTH_BASELINE=he.json \
+  FALLOW_SAVE_BASELINE=he.json)
+assert_contains "$OUT" "WARNING: FALLOW_SAVE_BASELINE and FALLOW_HEALTH_BASELINE name the same file (he.json)" \
+  "bare baselines: FALLOW_SAVE_BASELINE over the health baseline warns"
+
+# Diff scoping reaches the CLI through FALLOW_DIFF_FILE, not argv.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_DIFF_FILE=/tmp/does-not-matter.diff \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+STALE_DIFF_LINES=$(grep -c '^diff_file=set' "$STALE_LOG" || true)
+if [ "$STALE_DIFF_LINES" = "1" ]; then
+  pass "stale gate: the unscoped re-read runs with FALLOW_DIFF_FILE cleared"
+else
+  fail "stale gate: the unscoped re-read runs with FALLOW_DIFF_FILE cleared" \
+    "saw $STALE_DIFF_LINES invocations with the variable set"
+fi
+assert_contains "$OUT" "ERROR: Fallow baseline gate failed" \
+  "stale gate: clearing the diff file lets the re-read judge the baseline"
+
+# `--save-snapshot` takes an optional value: the strip must not swallow the flag
+# that follows the bare form.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_COMMAND=health \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_SAVE_SNAPSHOT=true \
+  FALLOW_TREND=true \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+GATE_ARGV=$(grep '^fallow ' "$STALE_LOG" | sed -n '2p')
+assert_not_contains "$GATE_ARGV" "--save-snapshot" \
+  "stale gate: the re-read never writes a snapshot"
+assert_contains "$GATE_ARGV" "--trend" \
+  "stale gate: a bare --save-snapshot does not swallow the next flag"
+
+# A baseline re-saved to the path it is read from can never be stale.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_SAVE_BASELINE=baseline.json)
+assert_contains "$OUT" "name the same file" \
+  "stale gate: a self-healing baseline is called out"
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+STALE_LOG="$STALE_WORK/fallow.log"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_TEST_LOG="$STALE_LOG" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_PRODUCTION=true \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+STALE_RUNS=$(grep -c '^fallow ' "$STALE_LOG" || true)
+if [ "$STALE_RUNS" = "1" ]; then
+  pass "stale gate: production mode skips the re-run instead of paying for it"
+else
+  fail "stale gate: production mode skips the re-run instead of paying for it" "ran $STALE_RUNS times"
+fi
+assert_contains "$OUT" "WARNING: baseline staleness could not be judged" \
+  "stale gate: a stand-down is stated, never silent"
+assert_contains "$OUT" "FALLOW_FAIL_ON_STALE_BASELINE stood down." \
+  "stale gate: the stand-down names the gate when the gate was asked for"
+if [ "$cmd_status" -eq 0 ]; then
+  pass "stale gate: a stand-down does not fail the pipeline"
+else
+  fail "stale gate: a stand-down does not fail the pipeline" "exit $cmd_status"
+fi
+
+# The same stand-down with no gate asked for is a note, not a warning.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_PRODUCTION=true)
+assert_contains "$OUT" "NOTE: baseline staleness could not be judged" \
+  "stale gate: a stand-down with no gate asked for is a note"
+assert_not_contains "$OUT" "WARNING: baseline staleness could not be judged" \
+  "stale gate: a pipeline that asked for nothing is not warned at"
+
+# A re-read that produces nothing readable warns and leaves the pipeline green.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  MOCK_BASELINE_STALENESS=1 \
+  MOCK_GATE_RUN_BROKEN=1 \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_CHANGED_SINCE=abc123 \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+assert_contains "$OUT" "produced no readable result" \
+  "stale gate: a broken re-read warns"
+if [ "$cmd_status" -eq 0 ]; then
+  pass "stale gate: a broken re-read fails open"
+else
+  fail "stale gate: a broken re-read fails open" "exit $cmd_status"
+fi
+
+# A binary older than the envelope field must warn, not fail.
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  FALLOW_BASELINE=baseline.json \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+assert_contains "$OUT" "A fallow that predates this feature cannot report it" \
+  "stale gate: an old binary warns instead of failing silently"
+if [ "$cmd_status" -eq 0 ]; then
+  pass "stale gate: an old binary fails open"
+else
+  fail "stale gate: an old binary fails open" "exit $cmd_status"
+fi
+
+rm -rf "$STALE_WORK"; mkdir -p "$STALE_WORK"
+OUT=$(run_generated_gitlab_fixture "$STALE_WORK" \
+  FALLOW_FAIL_ON_STALE_BASELINE=true)
+cmd_status=$?
+assert_contains "$OUT" "has no baseline to judge" \
+  "stale gate: the gate without a baseline is rejected"
+if [ "$cmd_status" -eq 2 ]; then
+  pass "stale gate: an invalid combination exits 2"
+else
+  fail "stale gate: an invalid combination exits 2" "exit $cmd_status"
+fi
 
 INCOMPLETE_WORK="$RUNNER_TMP/type-aware-incomplete"
 mkdir -p "$INCOMPLETE_WORK"
@@ -509,18 +1194,33 @@ echo "=== Wrapper trap parity (action vs gitlab) ==="
 ACTION_ANALYZE_SH="$DIR/../../action/scripts/analyze.sh"
 CI_TEMPLATE_YAML="$DIR/../gitlab-ci.yml"
 
+# Each trap must be present in each wrapper. A missing trap in one or both
+# wrappers is a failure.
+assert_wrapper_parity() {
+  local desc="$1" action_pattern="$2" gitlab_pattern="$3"
+  shift 3
+  local missing=""
+  grep -qE "$action_pattern" "$@" 2>/dev/null || missing="action"
+  grep -qE "$gitlab_pattern" "$CI_TEMPLATE_YAML" 2>/dev/null || missing="${missing:+$missing, }gitlab"
+  if [ -z "$missing" ]; then
+    pass "parity: $desc"
+  else
+    fail "parity: $desc" "trap missing in: $missing"
+  fi
+}
+
 # Audit baseline rejection: both must check command=audit AND a non-empty
 # generic baseline / save-baseline before invoking fallow.
-ACTION_HAS_AUDIT_BASELINE_TRAP=$(grep -cE 'INPUT_COMMAND.*=.*"audit".*INPUT_(SAVE_)?BASELINE' "$ACTION_ANALYZE_SH" 2>/dev/null || echo 0)
-CI_HAS_AUDIT_BASELINE_TRAP=$(grep -cE 'FALLOW_COMMAND.*=.*"audit".*FALLOW_(SAVE_)?BASELINE' "$CI_TEMPLATE_YAML" 2>/dev/null || echo 0)
-if [ "$ACTION_HAS_AUDIT_BASELINE_TRAP" != "0" ] && [ "$CI_HAS_AUDIT_BASELINE_TRAP" != "0" ]; then
-  pass "parity: both wrappers reject generic baseline on audit"
-elif [ "$ACTION_HAS_AUDIT_BASELINE_TRAP" = "0" ] && [ "$CI_HAS_AUDIT_BASELINE_TRAP" = "0" ]; then
-  pass "parity: neither wrapper has audit baseline trap (consistent)"
-else
-  fail "parity: audit baseline trap" \
-    "asymmetric: action=$ACTION_HAS_AUDIT_BASELINE_TRAP, gitlab=$CI_HAS_AUDIT_BASELINE_TRAP"
-fi
+assert_wrapper_parity "both wrappers reject generic baseline on audit" \
+  'INPUT_COMMAND.*=.*"audit".*INPUT_(SAVE_)?BASELINE' \
+  'FALLOW_COMMAND.*=.*"audit".*FALLOW_(SAVE_)?BASELINE' \
+  "$ACTION_ANALYZE_SH"
+
+# fix loads and saves no baseline: both must reject the generic inputs.
+assert_wrapper_parity "both wrappers reject generic baseline on fix" \
+  'INPUT_COMMAND.*=.*"fix".*INPUT_(SAVE_)?BASELINE' \
+  'FALLOW_COMMAND.*=.*"fix".*FALLOW_(SAVE_)?BASELINE' \
+  "$ACTION_ANALYZE_SH"
 
 # Both must point users at the audit-specific baseline inputs by name.
 assert_contains "$(cat "$ACTION_ANALYZE_SH")" "dead-code-baseline" \
@@ -528,41 +1228,27 @@ assert_contains "$(cat "$ACTION_ANALYZE_SH")" "dead-code-baseline" \
 assert_contains "$(cat "$CI_TEMPLATE_YAML")" "FALLOW_AUDIT_DEAD_CODE_BASELINE" \
   "parity: gitlab error message names FALLOW_AUDIT_DEAD_CODE_BASELINE"
 
-# Structured-error trap: both must inspect `.error == true` in
-# fallow-results.json BEFORE any `// 0`-defaulted issue extraction.
-ACTION_HAS_ERROR_TRAP=$(grep -cE "jq -e.*\.error == true.*fallow-results\.json" "$ACTION_ANALYZE_SH" 2>/dev/null || echo 0)
-CI_HAS_ERROR_TRAP=$(grep -cE "jq -e.*\.error == true.*fallow-results\.json" "$CI_TEMPLATE_YAML" 2>/dev/null || echo 0)
-if [ "$ACTION_HAS_ERROR_TRAP" != "0" ] && [ "$CI_HAS_ERROR_TRAP" != "0" ]; then
-  pass "parity: both wrappers trap structured fallow errors before issue extraction"
-elif [ "$ACTION_HAS_ERROR_TRAP" = "0" ] && [ "$CI_HAS_ERROR_TRAP" = "0" ]; then
-  pass "parity: neither wrapper has structured-error trap (consistent)"
-else
-  fail "parity: structured-error trap" \
-    "asymmetric: action=$ACTION_HAS_ERROR_TRAP, gitlab=$CI_HAS_ERROR_TRAP"
-fi
+# Structured-error trap: both must inspect `.error == true` in the main
+# results file BEFORE any `// 0`-defaulted issue extraction.
+assert_wrapper_parity "both wrappers trap structured fallow errors before issue extraction" \
+  "jq -e '\\.error == true' \"\\\$RESULTS_FILE\"" \
+  "jq -e '\\.error == true' fallow-results\\.json" \
+  "$ACTION_ANALYZE_SH"
 
 # Verdict-driven threshold for audit: both wrappers must gate on
 # `verdict == "fail"` for audit (severity-aware), not on raw issue count.
 # Otherwise warn-tier findings fail CI even though the verdict says "warn"
 # (the original issue #302 bug).
-ACTION_HAS_VERDICT_GATE=$(grep -cE 'VERDICT.*=.*"fail"|VERDICT" = "fail"' "$ACTION_ANALYZE_SH" "$DIR/../../action.yml" 2>/dev/null | awk -F: '{s+=$2} END {print s}')
-CI_HAS_VERDICT_GATE=$(grep -cE 'VERDICT.*=.*"fail"|VERDICT" = "fail"' "$CI_TEMPLATE_YAML" 2>/dev/null || echo 0)
-if [ "$ACTION_HAS_VERDICT_GATE" != "0" ] && [ "$CI_HAS_VERDICT_GATE" != "0" ]; then
-  pass "parity: both wrappers gate audit on verdict, not raw count"
-else
-  fail "parity: verdict-driven threshold" \
-    "asymmetric: action=$ACTION_HAS_VERDICT_GATE, gitlab=$CI_HAS_VERDICT_GATE"
-fi
+assert_wrapper_parity "both wrappers gate audit on verdict, not raw count" \
+  'VERDICT.*=.*"fail"|VERDICT" = "fail"' \
+  'VERDICT.*=.*"fail"|VERDICT" = "fail"' \
+  "$ACTION_ANALYZE_SH" "$DIR/../../action.yml"
 
 # Both wrappers must extract verdict + gate from audit JSON before issue count.
-ACTION_HAS_VERDICT_EXTRACT=$(grep -cE 'VERDICT=\$\(jq -r .*\.verdict' "$ACTION_ANALYZE_SH" 2>/dev/null || echo 0)
-CI_HAS_VERDICT_EXTRACT=$(grep -cE 'VERDICT=\$\(jq -r .*\.verdict' "$CI_TEMPLATE_YAML" 2>/dev/null || echo 0)
-if [ "$ACTION_HAS_VERDICT_EXTRACT" != "0" ] && [ "$CI_HAS_VERDICT_EXTRACT" != "0" ]; then
-  pass "parity: both wrappers extract verdict from audit JSON"
-else
-  fail "parity: verdict extraction" \
-    "asymmetric: action=$ACTION_HAS_VERDICT_EXTRACT, gitlab=$CI_HAS_VERDICT_EXTRACT"
-fi
+assert_wrapper_parity "both wrappers extract verdict from audit JSON" \
+  'VERDICT=\$\(jq -r .*\.verdict' \
+  'VERDICT=\$\(jq -r .*\.verdict' \
+  "$ACTION_ANALYZE_SH"
 
 # Security gate support must stay symmetric across the official wrappers.
 assert_contains "$(cat "$ACTION_ANALYZE_SH")" 'INPUT_COMMAND" in' \
@@ -581,507 +1267,6 @@ assert_contains "$(cat "$ACTION_ANALYZE_SH")" '.gate.new_count' \
   "parity: action counts security gate new_count"
 assert_contains "$(cat "$CI_TEMPLATE_YAML")" '.gate.new_count' \
   "parity: gitlab counts security gate new_count"
-
-# =========================================================================
-# GitLab-specific summary jq tests
-# =========================================================================
-
-echo ""
-echo "=== GitLab Summary scripts ==="
-
-echo "  summary-check.jq (GitLab):"
-OUT=$(jq -r -f "$CI_JQ_DIR/summary-check.jq" "$FIXTURES/check.json" 2>&1)
-assert_valid_markdown "$OUT" "produces output"
-assert_contains "$OUT" "Fallow Analysis" "has title"
-assert_contains "$OUT" "issues" "mentions issues"
-assert_contains "$OUT" "Unused" "lists unused categories"
-assert_contains "$OUT" "Imported elsewhere" "shows dependency workspace context column"
-assert_contains "$OUT" 'packages/client' "shows dependency workspace context value"
-assert_contains "$OUT" "Empty catalog groups" "shows empty catalog group row"
-assert_contains "$OUT" 'legacy' "shows empty catalog group name"
-assert_not_contains "$OUT" '!\[NOTE\]' "no GitHub callout NOTE"
-assert_not_contains "$OUT" '!\[WARNING\]' "no GitHub callout WARNING"
-assert_not_contains "$OUT" '!\[TIP\]' "no GitHub callout TIP"
-
-OUT_POLICY=$(jq '.policy_violations = [{"path": "src/app.ts", "line": 7, "col": 2, "pack": "team-policy", "rule_id": "no-moment", "kind": "banned-import", "matched": "moment", "severity": "error", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_POLICY" "Policy violations" "policy: shows summary row and section"
-assert_contains "$OUT_POLICY" "team-policy/no-moment" "policy: shows pack/rule identity"
-
-OUT_ICE=$(jq '.invalid_client_exports = [{"path": "src/app.ts", "line": 5, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_ICE" "Invalid client exports" "ice: shows summary row and section"
-assert_contains "$OUT_ICE" "metadata" "ice: shows export name in section"
-
-OUT_MCSB=$(jq '.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 0, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_MCSB" "Mixed client/server barrels" "mcsb: shows summary row and section"
-assert_contains "$OUT_MCSB" "./fetchUser" "mcsb: shows server origin in section"
-
-OUT_MD=$(jq '.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 0, "directive": "use client", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_MD" "Misplaced directives" "md: shows summary row and section"
-assert_contains "$OUT_MD" "use client" "md: shows directive in section"
-
-# Directive column renders with the surrounding quotes from the `\"\(.directive)\"` template.
-# Asserting the export-cell + directive-cell pair so a quote-escaping regression is caught
-# (the bare "use client" string also appears in the section header text).
-assert_contains "$OUT_ICE" '`metadata` | `"use client"` |' "ice: directive column renders with surrounding quotes"
-# `"use server"` directive path (the section description mentions both, so a use-server-only
-# fixture proves the row template, not just the header text).
-OUT_MD_SERVER=$(jq '.misplaced_directives = [{"path": "src/action.ts", "line": 3, "col": 0, "directive": "use server", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_MD_SERVER" '`"use server"` |' "md: use-server directive renders in section row"
-
-# Vue/Next framework IssueKinds: summary row + section render in the GitLab variant.
-OUT_USA=$(jq '.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 0, "action_name": "submitForm", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_USA" "Unused server actions" "usa: shows summary row and section"
-assert_contains "$OUT_USA" "submitForm" "usa: shows action name in section"
-
-OUT_URC=$(jq '.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_URC" "Unrendered components" "urc: shows summary row and section"
-assert_contains "$OUT_URC" "Foo" "urc: shows component name in section"
-
-OUT_UCP=$(jq '.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 0, "component_name": "Widget", "prop_name": "variant", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UCP" "Unused component props" "ucp: shows summary row and section"
-assert_contains "$OUT_UCP" "variant" "ucp: shows prop name in section"
-
-OUT_UCI=$(jq '.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 0, "component_name": "Widget", "input_name": "variant", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UCI" "Unused component inputs" "uci: shows summary row and section"
-assert_contains "$OUT_UCI" "variant" "uci: shows input name in section"
-
-OUT_UCE=$(jq '.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 0, "component_name": "Widget", "emit_name": "submit", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UCE" "Unused component emits" "uce: shows summary row and section"
-assert_contains "$OUT_UCE" "submit" "uce: shows emit name in section"
-
-OUT_UCO=$(jq '.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 0, "component_name": "Widget", "output_name": "submit", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UCO" "Unused component outputs" "uco: shows summary row and section"
-assert_contains "$OUT_UCO" "submit" "uco: shows output name in section"
-
-OUT_USE=$(jq '.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 0, "component_name": "Child", "event_name": "dead", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_USE" "Unused Svelte events" "use: shows summary row and section"
-assert_contains "$OUT_USE" "dead" "use: shows event name in section"
-
-OUT_UPI=$(jq '.unprovided_injects = [{"path": "src/useTheme.ts", "line": 7, "col": 0, "key_name": "themeKey", "framework": "vue", "actions": []}] | .total_issues = (.total_issues + 1)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UPI" "Unprovided injects" "upi: shows summary row and section"
-assert_contains "$OUT_UPI" "themeKey" "upi: shows inject key in section"
-
-# Missing keys must never crash jq (defensive `// []` / null-safe helpers).
-OUT_NO_FRAMEWORK_KEYS=$(jq 'del(.unused_server_actions, .unrendered_components, .unused_component_props, .unused_component_inputs, .unused_component_emits, .unused_component_outputs, .unused_svelte_events, .unprovided_injects, .route_collisions, .dynamic_segment_name_conflicts, .invalid_client_exports, .mixed_client_server_barrels, .misplaced_directives)' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_NO_FRAMEWORK_KEYS" "Fallow Analysis" "missing-keys: GitLab summary-check survives absent framework keys"
-
-OUT_CLEAN=$(jq -r -f "$CI_JQ_DIR/summary-check.jq" "$FIXTURES/check-clean.json" 2>&1)
-assert_contains "$OUT_CLEAN" "No issues found" "clean: shows no issues"
-
-# Issue #449: kind_known: false renders "unknown kind \`token\`" in the table.
-OUT_UNKNOWN_KIND_SUMMARY=$(jq '.unused_files = [] | .unused_exports = [] | .unused_types = [] | .unused_dependencies = [] | .unused_dev_dependencies = [] | .unused_optional_dependencies = [] | .unused_enum_members = [] | .unused_class_members = [] | .unresolved_imports = [] | .unlisted_dependencies = [] | .duplicate_exports = [] | .circular_dependencies = [] | .boundary_violations = [] | .type_only_dependencies = [] | .test_only_dependencies = [] | .unused_catalog_entries = [] | .empty_catalog_groups = [] | .unresolved_catalog_references = [] | .unused_dependency_overrides = [] | .misconfigured_dependency_overrides = [] | .private_type_leaks = [] | .stale_suppressions = [{"path": "src/utils.ts", "line": 1, "col": 0, "origin": {"type": "comment", "issue_kind": "complexity-typo", "is_file_level": false, "kind_known": false}}] | .total_issues = 1' "$FIXTURES/check.json" | jq -r -f "$CI_JQ_DIR/summary-check.jq" 2>&1)
-assert_contains "$OUT_UNKNOWN_KIND_SUMMARY" 'unknown kind' "GitLab summary unknown kind: prefix renders"
-assert_contains "$OUT_UNKNOWN_KIND_SUMMARY" 'complexity-typo' "GitLab summary unknown kind: verbatim token renders"
-
-echo "  summary-health.jq (GitLab):"
-OUT=$(jq -r -f "$CI_JQ_DIR/summary-health.jq" "$FIXTURES/health.json" 2>&1)
-assert_valid_markdown "$OUT" "produces output"
-assert_not_contains "$OUT" '!\[NOTE\]' "no GitHub callout NOTE"
-assert_not_contains "$OUT" '!\[WARNING\]' "no GitHub callout WARNING"
-
-OUT_CLEAN=$(jq -r -f "$CI_JQ_DIR/summary-health.jq" "$FIXTURES/health-clean.json" 2>&1)
-assert_contains "$OUT_CLEAN" "No functions exceed" "clean: no functions exceed"
-
-echo "  summary-health.jq (delta header with trend, GitLab):"
-assert_contains "$OUT" "Health: B (72.3)" "delta: shows grade and score"
-assert_contains "$OUT" "+7.2 pts vs previous" "delta: shows score delta"
-assert_contains "$OUT" "C 65.1" "delta: shows previous grade and score"
-assert_contains "$OUT" "dead exports 41.2%" "delta: shows dead export pct"
-assert_contains "$OUT" "(-3.8%)" "delta: shows dead export delta"
-assert_contains "$OUT" "avg complexity 7.1 (-1.2)" "delta: shows complexity delta"
-assert_contains "$OUT" "chart_with_upwards_trend" "delta: uses GitLab emoji (no GitHub callout)"
-
-echo "  summary-health.jq (delta header without trend, GitLab):"
-assert_contains "$OUT_CLEAN" "Health: A (92.5)" "no-trend: shows absolute score"
-assert_not_contains "$OUT_CLEAN" "vs previous" "no-trend: no delta line"
-assert_contains "$OUT_CLEAN" "FALLOW_SAVE_SNAPSHOT" "no-trend: shows save-snapshot hint"
-
-echo "  summary-health.jq (no delta header without score, GitLab):"
-OUT_NO_SCORE=$(jq 'del(.health_score) | del(.health_trend)' "$FIXTURES/health.json" | jq -r -f "$CI_JQ_DIR/summary-health.jq" 2>&1)
-assert_not_contains "$OUT_NO_SCORE" "Health:" "no-score: no delta header"
-
-echo "  summary-health.jq (runtime coverage findings and hot paths, GitLab):"
-OUT_PROD=$(jq '.runtime_coverage = {"verdict":"cold-code-detected","summary":{"functions_tracked":4,"functions_hit":2,"functions_unhit":1,"functions_untracked":1,"coverage_percent":50,"trace_count":1200,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"},{"path":"src/lazy.ts","function":"lateBound","line":8,"verdict":"coverage_unavailable","confidence":"none"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/health-clean.json" | jq -r -f "$CI_JQ_DIR/summary-health.jq" 2>&1)
-assert_contains "$OUT_PROD" "Runtime Coverage" "prod: has runtime coverage section"
-assert_contains "$OUT_PROD" "hotPath" "prod: shows hot path function"
-
-echo "  summary-audit.jq (GitLab):"
-OUT_AUDIT=$(jq -n --slurpfile h "$FIXTURES/health.json" --slurpfile c "$FIXTURES/check.json" --slurpfile d "$FIXTURES/dupes.json" '{
-  schema_version: 3,
-  command: "audit",
-  verdict: "fail",
-  changed_files_count: 2,
-  elapsed_ms: 42,
-  summary: {dead_code_issues: 1, complexity_findings: 3, duplication_clone_groups: 1},
-  attribution: {gate: "new-only", dead_code_introduced: 1, dead_code_inherited: 0, complexity_introduced: 2, complexity_inherited: 1, duplication_introduced: 0, duplication_inherited: 1, styling_introduced: 1, styling_inherited: 1, duplication_demoted: 1},
-  dead_code: ($c[0] | .unused_exports |= map(. + {introduced: true}) | .unused_dependencies |= map(. + {introduced: false})),
-  complexity: ($h[0]
-    | .findings |= [.[0] + {coverage_tier: "partial"}, .[1] + {coverage_tier: "high"}, .[2]]
-    | .summary.coverage_model = "istanbul"
-    | .summary.istanbul_matched = 8
-    | .summary.istanbul_total = 10
-    | .styling_findings = [
-        {code: "css-selector-complexity", sub_kind: "high-specificity", path: "src/styles.css", line: 4, value: "#app .card .title", effective_severity: "error", introduced: true},
-        {code: "css-important", sub_kind: "important", path: "src/legacy.css", line: 9, value: "!important", effective_severity: "warn", introduced: false}
-      ]),
-  duplication: ($d[0] | .clone_groups |= map(. + {introduced: false, demotion_reason: "no-added-lines"}))
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_valid_markdown "$OUT_AUDIT" "produces audit output"
-assert_contains "$OUT_AUDIT" "Fallow Audit" "audit: has title"
-assert_contains "$OUT_AUDIT" "Audit failed" "audit: shows failed verdict"
-assert_contains "$OUT_AUDIT" "Dead Code" "audit: has dead-code details"
-assert_contains "$OUT_AUDIT" "fetchFromApi" "audit: lists dead-code findings"
-assert_contains "$OUT_AUDIT" "parseContentBlocks" "audit: lists complexity findings"
-assert_contains "$OUT_AUDIT" "Duplication" "audit: has duplication details"
-assert_contains "$OUT_AUDIT" "24 lines / 125 tokens" "audit: lists clone group size"
-assert_contains "$OUT_AUDIT" "Inherited" "audit: has inherited column"
-assert_contains "$OUT_AUDIT" "Coverage |" "audit: has coverage column header"
-assert_contains "$OUT_AUDIT" "| partial |" "audit: shows coverage tier value"
-assert_contains "$OUT_AUDIT" "| high |" "audit: shows alt coverage tier"
-assert_contains "$OUT_AUDIT" "| - |" "audit: missing coverage_tier renders as dash"
-assert_contains "$OUT_AUDIT" "Coverage model: istanbul" "audit: shows istanbul coverage model footer"
-assert_contains "$OUT_AUDIT" "Matched 8/10" "audit: shows istanbul match rate"
-assert_contains "$OUT_AUDIT" "### Styling" "audit: has styling details"
-assert_contains "$OUT_AUDIT" "css-selector-complexity" "audit: lists styling rule"
-assert_contains "$OUT_AUDIT" "src/styles.css:4" "audit: lists styling location"
-assert_contains "$OUT_AUDIT" "1 introduced clone group demoted to inherited" "audit: shows demotion footnote"
-assert_not_contains "$OUT_AUDIT" '!\[WARNING\]' "audit: no GitHub callout warning"
-
-OUT_AUDIT_STYLE_NEW=$(jq -n '{
-  command: "audit", verdict: "fail", changed_files_count: 1, elapsed_ms: 4,
-  summary: {dead_code_issues: 0, complexity_findings: 0, duplication_clone_groups: 0},
-  attribution: {gate: "new-only", styling_introduced: 1, styling_inherited: 0},
-  complexity: {styling_findings: [{code: "css-important", path: "src/styles.css", line: 2, value: "!important", effective_severity: "error", introduced: true}]}
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_contains "$OUT_AUDIT_STYLE_NEW" "| Styling | 1 | 1 | 0 |" "audit: styling-only new-only totals are visible"
-assert_contains "$OUT_AUDIT_STYLE_NEW" "| new |" "audit: styling-only new-only status is visible"
-assert_not_contains "$OUT_AUDIT_STYLE_NEW" "demoted to inherited" "audit: no demotion footnote without demotions"
-
-OUT_AUDIT_STYLE_ALL=$(jq -n '{
-  command: "audit", verdict: "fail", changed_files_count: 1, elapsed_ms: 4,
-  summary: {dead_code_issues: 0, complexity_findings: 0, duplication_clone_groups: 0},
-  attribution: {gate: "all"},
-  complexity: {styling_findings: [{code: "css-important", path: null, line: null, value: "!important", effective_severity: "error"}]}
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_contains "$OUT_AUDIT_STYLE_ALL" "| Styling | 1 | 0 | 0 |" "audit: styling-only all totals are visible"
-assert_contains "$OUT_AUDIT_STYLE_ALL" '| - | `css-important`' "audit: null styling path uses a safe placeholder"
-assert_contains "$OUT_AUDIT_STYLE_ALL" "Audit gate: all" "audit: styling-only all gate is visible"
-
-# Low match-rate variant: footer should warn about --coverage-root
-OUT_AUDIT_LOWMATCH=$(jq -n --slurpfile h "$FIXTURES/health.json" '{
-  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
-  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
-  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
-  complexity: ($h[0] | .summary.coverage_model = "istanbul" | .summary.istanbul_matched = 1 | .summary.istanbul_total = 10)
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_contains "$OUT_AUDIT_LOWMATCH" "Low match rate" "audit: low match rate flags --coverage-root"
-
-# Static-estimate variant: footer should suggest --coverage
-OUT_AUDIT_STATIC=$(jq -n --slurpfile h "$FIXTURES/health.json" --slurpfile c "$FIXTURES/check.json" --slurpfile d "$FIXTURES/dupes.json" '{
-  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
-  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
-  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
-  complexity: ($h[0] | .summary.coverage_model = "static_estimated")
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_contains "$OUT_AUDIT_STATIC" "Coverage model: static (estimated)" "audit: static-estimate footer suggests --coverage"
-assert_contains "$OUT_AUDIT_STATIC" "for measured coverage" "audit: static branch reworded"
-
-# Absent-model variant: footer should not be present at all
-OUT_AUDIT_NOMODEL=$(jq -n --slurpfile h "$FIXTURES/health.json" '{
-  schema_version: 3, command: "audit", verdict: "fail", changed_files_count: 2, elapsed_ms: 42,
-  summary: {dead_code_issues: 0, complexity_findings: 3, duplication_clone_groups: 0},
-  attribution: {gate: "new-only", dead_code_introduced: 0, dead_code_inherited: 0, complexity_introduced: 3, complexity_inherited: 0, duplication_introduced: 0, duplication_inherited: 0},
-  complexity: ($h[0] | del(.summary.coverage_model))
-}' | jq -r -f "$CI_JQ_DIR/summary-audit.jq" 2>&1)
-assert_not_contains "$OUT_AUDIT_NOMODEL" "Coverage model:" "audit: absent coverage_model omits footer"
-
-echo "  summary-combined.jq (GitLab):"
-OUT=$(jq -r -f "$CI_JQ_DIR/summary-combined.jq" "$FIXTURES/combined.json" 2>&1)
-assert_valid_markdown "$OUT" "produces output"
-assert_contains "$OUT" "Fallow" "has title"
-assert_contains "$OUT" "code issues" "mentions code issues"
-assert_contains "$OUT" "Maintainability" "shows vital signs"
-assert_not_contains "$OUT" '!\[NOTE\]' "no GitHub callout NOTE"
-assert_not_contains "$OUT" '!\[TIP\]' "no GitHub callout TIP"
-
-assert_contains "$OUT" "Codebase health" "has codebase health header"
-assert_contains "$OUT" "CRAP" "combined: shows CRAP column"
-assert_contains "$OUT" "thresholds: cyclomatic" "combined: shows complexity threshold line"
-assert_not_contains "$OUT" "Dead exports" "no dead_export_pct in PR comment"
-
-# Duplication block: locations table replaces metric-only table
-assert_contains "$OUT" "Locations | Lines | Tokens" "dupes: locations table header"
-assert_contains "$OUT" "content-parser.ts:27-50" "dupes: shows first clone instance line range"
-assert_contains "$OUT" "Across 2 files" "dupes: footer reports file count"
-assert_contains "$OUT" "2 groups · 66 lines" "dupes: header carries group count and total lines"
-assert_not_contains "$OUT" "| [Duplicated lines]" "dupes: old metric table is gone"
-
-OUT_EMPTY_DUPES_GL=$(jq '.dupes.clone_groups = [] | .dupes.clone_families = [] | .dupes.stats.clone_groups = 2 | .dupes.stats.clone_instances = 5 | .dupes.stats.files_with_clones = 4 | .dupes.stats.duplicated_lines = 59 | .dupes.stats.duplication_percentage = 0.16' "$FIXTURES/combined-clean.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_EMPTY_DUPES_GL" "Quality gate passed" "combined: empty dupes groups keep clean GitLab summary"
-assert_contains "$OUT_EMPTY_DUPES_GL" "No duplication" "combined: empty dupes groups render no GitLab duplication"
-assert_not_contains "$OUT_EMPTY_DUPES_GL" "2 groups" "combined: nonzero dupes stats do not render GitLab actionable groups"
-
-# Linkified cells engage when CI_PROJECT_URL + CI_COMMIT_SHA are set; GitLab fragment is #L<start>-<end> (single L)
-OUT_LINKED_GL=$(CI_PROJECT_URL="https://gitlab.com/foo/bar" CI_COMMIT_SHA="deadbeef" jq -r -f "$CI_JQ_DIR/summary-combined.jq" "$FIXTURES/combined.json" 2>&1)
-assert_contains "$OUT_LINKED_GL" "https://gitlab.com/foo/bar/-/blob/deadbeef/src/helpers/content-parser.ts#L27-50" "dupes: file_link engages with GitLab env vars"
-
-# Deep paths (>3 segments): display is rel_path-truncated but URL keeps the full path
-OUT_DEEP_GL=$(jq '.dupes.clone_groups = [{line_count: 10, token_count: 50, instances: [{file: "apps/web/src/services/billing/calculator.ts", start_line: 5, end_line: 15}, {file: "apps/api/src/services/billing/calculator.ts", start_line: 8, end_line: 18}]}] | .dupes.stats.clone_groups = 1 | .dupes.stats.files_with_clones = 2' "$FIXTURES/combined.json" | CI_PROJECT_URL="https://gitlab.com/foo/bar" CI_COMMIT_SHA="deadbeef" jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_DEEP_GL" "\`services/billing/calculator.ts:5-15\`" "deep-path: display uses rel_path"
-assert_contains "$OUT_DEEP_GL" "/-/blob/deadbeef/apps/web/src/services/billing/calculator.ts#L5-15" "deep-path: URL keeps full path"
-assert_contains "$OUT_DEEP_GL" "/-/blob/deadbeef/apps/api/src/services/billing/calculator.ts#L8-18" "deep-path: URL keeps full path (sibling)"
-
-# Singular-group header
-OUT_ONE_GL=$(jq '.dupes.stats.clone_groups = 1 | .dupes.clone_groups = [.dupes.clone_groups[0]]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_ONE_GL" "(1 group ·" "dupes: singular group header"
-assert_not_contains "$OUT_ONE_GL" "(1 groups ·" "dupes: no '1 groups' grammar"
-
-# Status-bar pluralization: 1 of each renders singular
-OUT_SINGULAR_GL=$(jq '.check.unused_files = [.check.unused_files[0]] | .check.unused_exports = [] | .check.unused_dependencies = [] | .check.unused_dev_dependencies = [] | .check.unused_optional_dependencies = [] | .check.unused_types = [] | .check.unused_enum_members = [] | .check.unused_class_members = [] | .check.unresolved_imports = [] | .check.unlisted_dependencies = [] | .check.duplicate_exports = [] | .check.circular_dependencies = [] | .check.boundary_violations = [] | .check.type_only_dependencies = [] | .check.test_only_dependencies = [] | .check.stale_suppressions = [] | .check.unused_catalog_entries = [] | .check.unresolved_catalog_references = [] | .check.unused_dependency_overrides = [] | .check.misconfigured_dependency_overrides = [] | .check.private_type_leaks = [] | .check.total_issues = 1 | .dupes.stats.clone_groups = 1 | .dupes.clone_groups = [.dupes.clone_groups[0]] | .health.summary.functions_above_threshold = 1 | .health.findings = [.health.findings[0]]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_SINGULAR_GL" "**1** code issue " "status-bar: singular code issue"
-assert_not_contains "$OUT_SINGULAR_GL" "**1** code issues" "status-bar: no '1 code issues' grammar"
-assert_contains "$OUT_SINGULAR_GL" "**1** clone group " "status-bar: singular clone group"
-assert_not_contains "$OUT_SINGULAR_GL" "**1** clone groups" "status-bar: no '1 clone groups' grammar"
-assert_not_contains "$OUT_SINGULAR_GL" "**1** health findings" "status-bar: no '1 health findings' grammar"
-
-# Complexity <details> summary pluralizes when functions_above_threshold == 1
-assert_contains "$OUT_SINGULAR_GL" "(1 function above threshold)" "complexity dropdown: singular function"
-assert_not_contains "$OUT_SINGULAR_GL" "(1 functions above threshold)" "complexity dropdown: no '1 functions' grammar"
-
-# RSC findings appear in the combined-mode Code issues breakdown table (not just
-# summary-check.jq standalone). All three RSC types injected into .check at once.
-OUT_RSC_GL=$(jq '.check.invalid_client_exports = [{"path": "src/app.tsx", "line": 5, "col": 0, "export_name": "metadata", "directive": "use client", "actions": []}] | .check.mixed_client_server_barrels = [{"path": "src/index.ts", "line": 2, "col": 0, "client_origin": "./Button", "server_origin": "./fetchUser", "actions": []}] | .check.misplaced_directives = [{"path": "src/widget.tsx", "line": 4, "col": 0, "directive": "use server", "actions": []}] | .check.total_issues = (.check.total_issues + 3)' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_RSC_GL" "| [Invalid client exports](" "combined: RSC invalid-client-exports row in breakdown"
-assert_contains "$OUT_RSC_GL" "| [Mixed client/server barrels](" "combined: RSC mixed-barrel row in breakdown"
-assert_contains "$OUT_RSC_GL" "| [Misplaced directives](" "combined: RSC misplaced-directives row in breakdown"
-
-# Next.js routing keys (route_collisions + dynamic_segment_name_conflicts) were previously
-# absent from the GitLab combined-mode Code issues breakdown; assert they now render.
-OUT_ROUTING_GL=$(jq '.check.route_collisions = [{"path": "src/app/(a)/p/page.tsx", "url": "/p", "conflicting_paths": ["src/app/(b)/p/page.tsx"], "actions": []}] | .check.dynamic_segment_name_conflicts = [{"path": "src/app/[id]/page.tsx", "position": "0", "conflicting_segments": ["id", "slug"], "actions": []}] | .check.total_issues = (.check.total_issues + 2)' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_ROUTING_GL" "| [Route collisions](" "combined: route-collisions row in breakdown"
-assert_contains "$OUT_ROUTING_GL" "| [Dynamic segment conflicts](" "combined: dynamic-segment-conflicts row in breakdown"
-
-# Vue/Next framework keys appear in the GitLab combined-mode Code issues breakdown table.
-OUT_FRAMEWORK_GL=$(jq '.check.unused_server_actions = [{"path": "src/actions.ts", "line": 9, "col": 0, "action_name": "submitForm", "actions": []}] | .check.unrendered_components = [{"path": "src/Foo.vue", "line": 1, "col": 0, "component_name": "Foo", "framework": "vue", "actions": []}] | .check.unused_component_props = [{"path": "src/Widget.vue", "line": 12, "col": 0, "component_name": "Widget", "prop_name": "variant", "actions": []}] | .check.unused_component_inputs = [{"path": "src/widget.component.ts", "line": 12, "col": 0, "component_name": "Widget", "input_name": "variant", "actions": []}] | .check.unused_component_emits = [{"path": "src/Widget.vue", "line": 14, "col": 0, "component_name": "Widget", "emit_name": "submit", "actions": []}] | .check.unused_component_outputs = [{"path": "src/widget.component.ts", "line": 14, "col": 0, "component_name": "Widget", "output_name": "submit", "actions": []}] | .check.unused_svelte_events = [{"path": "src/Child.svelte", "line": 6, "col": 0, "component_name": "Child", "event_name": "dead", "actions": []}] | .check.unprovided_injects = [{"path": "src/useTheme.ts", "line": 7, "col": 0, "key_name": "themeKey", "framework": "vue", "actions": []}] | .check.total_issues = (.check.total_issues + 8)' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused server actions](" "combined: unused-server-actions row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unrendered components](" "combined: unrendered-components row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused component props](" "combined: unused-component-props row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused component inputs](" "combined: unused-component-inputs row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused component emits](" "combined: unused-component-emits row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused component outputs](" "combined: unused-component-outputs row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unused Svelte events](" "combined: unused-svelte-events row in breakdown"
-assert_contains "$OUT_FRAMEWORK_GL" "| [Unprovided injects](" "combined: unprovided-injects row in breakdown"
-
-# Worst-case truncation: 50 groups (paths differentiated per-group via `. as $g |`),
-# top-5 + overflow line, output stays under 65k chars.
-# line_count is ASCENDING in input order so the sort_by in summary-combined.jq must do work.
-OUT_LARGE_GL=$(jq -n '
-  {
-    schema_version: 3,
-    check: {total_issues: 0, unused_files: [], unused_exports: [], unused_types: [], unused_dependencies: [], unused_dev_dependencies: [], unused_optional_dependencies: [], unused_enum_members: [], unused_class_members: [], unresolved_imports: [], unlisted_dependencies: [], duplicate_exports: [], circular_dependencies: [], boundary_violations: [], type_only_dependencies: [], test_only_dependencies: [], stale_suppressions: [], unused_catalog_entries: [], unresolved_catalog_references: [], unused_dependency_overrides: [], misconfigured_dependency_overrides: [], private_type_leaks: []},
-    dupes: {
-      stats: {clone_groups: 50, clone_instances: 200, files_with_clones: 50, duplicated_lines: 5000, total_lines: 100000, duplication_percentage: 5.0},
-      clone_groups: ([range(0;50)] | map(. as $g | {line_count: ($g + 1), token_count: ($g * 5 + 50), instances: ([range(0;4)] | map(. as $i | {file: ("src/group_\($g)/file_\($i).ts"), start_line: ($i * 10 + 1), end_line: ($i * 10 + 9)}))}))
-    },
-    health: {summary: {functions_above_threshold: 0}, vital_signs: {}, file_scores: [], findings: []}
-  }
-' | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_LARGE_GL" "and 45 more groups" "dupes: large input truncates with overflow line"
-assert_contains "$OUT_LARGE_GL" "Across 50 files" "dupes: large input footer count is correct"
-LARGE_LEN_GL=${#OUT_LARGE_GL}
-if [ "$LARGE_LEN_GL" -lt 65000 ]; then
-  pass "dupes: large input stays under PR comment cap (got $LARGE_LEN_GL chars)"
-else
-  fail "dupes: large input over PR comment cap" "got $LARGE_LEN_GL chars (cap 65000)"
-fi
-assert_contains "$OUT_LARGE_GL" "src/group_49/file_0.ts:1-9" "dupes: largest group (49) ranks first after sort"
-assert_contains "$OUT_LARGE_GL" "src/group_45/file_0.ts" "dupes: top-5 contains group_45 (5th largest)"
-assert_not_contains "$OUT_LARGE_GL" "src/group_44/file_0.ts" "dupes: group_44 (6th largest) is truncated"
-assert_not_contains "$OUT_LARGE_GL" "src/group_0/file_0.ts" "dupes: smallest group is truncated"
-
-# Null duplication_percentage must not crash pct(); render as 0%
-OUT_NULL_PCT_GL=$(jq 'del(.dupes.stats.duplication_percentage)' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_NULL_PCT_GL" "66 lines · 0%" "dupes: missing duplication_percentage renders as 0%"
-assert_not_contains "$OUT_NULL_PCT_GL" "cannot be multiplied" "dupes: pct(null) does not crash"
-
-OUT_CRAP_ONLY=$(jq '.health.summary.functions_above_threshold = 1 | .health.findings = [{"path":"src/ui/pagination.tsx","name":"buildPageItems","line":42,"col":0,"cyclomatic":17,"cognitive":8,"crap":30,"line_count":13,"severity":"moderate","exceeded":"crap"}]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_CRAP_ONLY" "buildPageItems" "combined: renders CRAP-only finding"
-assert_contains "$OUT_CRAP_ONLY" "CRAP >= 30" "combined: explains CRAP threshold"
-
-OUT_CRAP_SORT=$(jq '.health.summary.functions_above_threshold = 6 | .health.findings = [
-  {"path":"src/a.ts","name":"cyclo1","line":1,"col":0,"cyclomatic":80,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
-  {"path":"src/a.ts","name":"cyclo2","line":2,"col":0,"cyclomatic":70,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
-  {"path":"src/a.ts","name":"cyclo3","line":3,"col":0,"cyclomatic":60,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
-  {"path":"src/a.ts","name":"cyclo4","line":4,"col":0,"cyclomatic":50,"cognitive":4,"line_count":10,"severity":"critical","exceeded":"cyclomatic"},
-  {"path":"src/a.ts","name":"cyclo5","line":5,"col":0,"cyclomatic":40,"cognitive":4,"line_count":10,"severity":"high","exceeded":"cyclomatic"},
-  {"path":"src/a.ts","name":"crapOnly","line":6,"col":0,"cyclomatic":8,"cognitive":4,"crap":30,"line_count":10,"severity":"moderate","exceeded":"crap"}
-]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_CRAP_SORT" "crapOnly" "combined: severity sort surfaces CRAP-only finding in visible rows"
-
-OUT_OLD_HEALTH=$(jq 'del(.health.summary.max_cyclomatic_threshold) | del(.health.summary.max_cognitive_threshold) | del(.health.summary.max_crap_threshold) | .health.findings = [{"path":"src/a.ts","name":"legacyComplex","line":1,"col":0,"cyclomatic":25,"cognitive":20,"line_count":10,"severity":"moderate","exceeded":"both"}]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_OLD_HEALTH" "thresholds: cyclomatic > default, cognitive > default" "combined: old JSON threshold fallback is explicit"
-assert_not_contains "$OUT_OLD_HEALTH" "CRAP" "combined: old JSON without CRAP metadata hides CRAP column"
-
-echo "  summary-combined.jq (scoped maintainability, GitLab):"
-OUT_SCOPED=$(jq '.health.file_scores = [.health.file_scores[0]]' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_SCOPED" "changed files" "scoped: shows changed files maintainability row"
-assert_contains "$OUT_SCOPED" "76.2" "scoped: shows scoped maintainability value"
-assert_contains "$OUT_SCOPED" "86.8" "scoped: still shows codebase maintainability"
-
-echo "  summary-combined.jq (no scoped row when unfiltered, GitLab):"
-assert_not_contains "$OUT" "changed files" "unfiltered: no scoped maintainability row"
-
-echo "  summary-combined.jq (conditional tips, GitLab):"
-assert_contains "$OUT" "fallow fix --dry-run" "tip: shows fix tip when fixable issues present"
-assert_contains "$OUT" "@public" "tip: shows @public tip when unused exports present"
-OUT_NO_FIX=$(jq '.check.unused_exports = [] | .check.unused_dependencies = [] | .check.unused_enum_members = [] | .check.circular_dependencies = [{"files":["a.ts","b.ts"],"length":2}] | .check.total_issues = 1' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_not_contains "$OUT_NO_FIX" "fallow fix" "tip: no fix tip when no fixable issues"
-assert_not_contains "$OUT_NO_FIX" "@public" "tip: no @public tip when no unused exports"
-
-echo "  summary-combined.jq (clean state, GitLab):"
-OUT_CLEAN=$(jq -r -f "$CI_JQ_DIR/summary-combined.jq" "$FIXTURES/combined-clean.json" 2>&1)
-assert_contains "$OUT_CLEAN" "Quality gate passed" "clean: no issues"
-assert_contains "$OUT_CLEAN" "Maintainability" "clean: shows maintainability"
-
-echo "  summary-combined.jq (delta header with trend, GitLab):"
-assert_contains "$OUT" "Health: B (72.3)" "delta: shows grade and score"
-assert_contains "$OUT" "+7.2 pts vs previous" "delta: shows score delta"
-assert_contains "$OUT" "C 65.1" "delta: shows previous grade and score"
-assert_contains "$OUT" "dead exports 41.2%" "delta: shows dead export pct"
-assert_contains "$OUT" "(-3.8%)" "delta: shows dead export delta"
-assert_contains "$OUT" "avg complexity 7.1 (-1.2)" "delta: shows complexity delta"
-assert_contains "$OUT" "chart_with_upwards_trend" "delta: uses GitLab emoji"
-
-echo "  summary-combined.jq (delta header without trend, GitLab):"
-assert_contains "$OUT_CLEAN" "Health: A (92.5)" "clean+score: shows absolute score"
-assert_not_contains "$OUT_CLEAN" "vs previous" "clean+score: no delta when no trend"
-assert_contains "$OUT_CLEAN" "FALLOW_SAVE_SNAPSHOT" "clean+score: shows save-snapshot hint"
-
-echo "  summary-combined.jq (no delta header without score, GitLab):"
-OUT_NO_SCORE=$(jq 'del(.health.health_score) | del(.health.health_trend)' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_not_contains "$OUT_NO_SCORE" "Health:" "no-score: no delta header"
-
-echo "  summary-combined.jq (delta header with increasing dead exports, GitLab):"
-OUT_WORSE=$(jq '.health.health_trend.metrics[1].delta = 5.0 | .health.health_trend.metrics[1].current = 50.0' "$FIXTURES/combined.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_WORSE" "suppress?" "worsening: shows suppress link when dead exports increase"
-
-echo "  summary-combined.jq (runtime coverage details, GitLab):"
-OUT_COMBINED_PROD=$(jq '.health.runtime_coverage = {"verdict":"hot-path-touched","summary":{"functions_tracked":4,"functions_hit":3,"functions_unhit":0,"functions_untracked":1,"coverage_percent":75,"trace_count":2400,"period_days":7,"deployments_seen":2},"findings":[{"path":"src/cold.ts","function":"coldPath","line":14,"verdict":"review_required","invocations":0,"confidence":"medium"}],"hot_paths":[{"path":"src/hot.ts","function":"hotPath","line":3,"invocations":250,"percentile":99}]}' "$FIXTURES/combined-clean.json" | jq -r -f "$CI_JQ_DIR/summary-combined.jq" 2>&1)
-assert_contains "$OUT_COMBINED_PROD" "Runtime coverage" "combined prod: has runtime coverage details"
-assert_contains "$OUT_COMBINED_PROD" "hotPath" "combined prod: shows hot path"
-assert_contains "$OUT_COMBINED_PROD" "hot path touched" "combined prod (GitLab, verdict hot-path-touched): header uses 'touched' framing"
-
-echo "  renderer semantic parity (GitHub vs GitLab):"
-PARITY_OUT=$(node - "$SHARED_JQ_DIR" "$CI_JQ_DIR" "$DIR/../../action/tests/fixtures" <<'NODE'
-const { execFileSync } = require("node:child_process");
-const { readFileSync } = require("node:fs");
-const [actionJqDir, gitlabJqDir, fixturesDir] = process.argv.slice(2);
-
-const readFixture = (fixture) => JSON.parse(readFileSync(`${fixturesDir}/${fixture}`, "utf8"));
-const checkFixture = readFixture("check.json");
-const healthFixture = readFixture("health.json");
-const dupesFixture = readFixture("dupes.json");
-const auditFixture = {
-  schema_version: 3,
-  command: "audit",
-  verdict: "fail",
-  changed_files_count: 2,
-  elapsed_ms: 42,
-  summary: { dead_code_issues: 1, complexity_findings: 3, duplication_clone_groups: 1 },
-  attribution: {
-    gate: "new-only",
-    dead_code_introduced: 1,
-    dead_code_inherited: 0,
-    complexity_introduced: 2,
-    complexity_inherited: 1,
-    duplication_introduced: 0,
-    duplication_inherited: 1,
-  },
-  dead_code: {
-    ...checkFixture,
-    unused_exports: checkFixture.unused_exports.map((item) => ({ ...item, introduced: true })),
-    unused_dependencies: checkFixture.unused_dependencies.map((item) => ({
-      ...item,
-      introduced: false,
-    })),
-  },
-  complexity: {
-    ...healthFixture,
-    findings: [
-      { ...healthFixture.findings[0], coverage_tier: "partial" },
-      { ...healthFixture.findings[1], coverage_tier: "high" },
-      healthFixture.findings[2],
-    ],
-    summary: {
-      ...healthFixture.summary,
-      coverage_model: "istanbul",
-      istanbul_matched: 8,
-      istanbul_total: 10,
-    },
-  },
-  duplication: {
-    ...dupesFixture,
-    clone_groups: dupesFixture.clone_groups.map((item) => ({ ...item, introduced: false })),
-  },
-};
-
-const cases = [
-  { name: "summary-check", fixture: "check.json" },
-  { name: "summary-health", fixture: "health.json" },
-  { name: "summary-audit", input: auditFixture },
-  { name: "summary-combined", fixture: "combined.json" },
-];
-
-const render = (dir, testCase) => {
-  const args = ["-r", "-f", `${dir}/${testCase.name}.jq`];
-  const options = { encoding: "utf8" };
-  if (testCase.fixture) {
-    args.push(`${fixturesDir}/${testCase.fixture}`);
-  } else {
-    options.input = JSON.stringify(testCase.input);
-  }
-  return execFileSync("jq", args, options);
-};
-
-const normalize = (text) =>
-  text
-    .split(/\r?\n/)
-    .map((line) =>
-      line
-        .replace(/^> \[![A-Z]+\]$/, "")
-        .replace(/^> :warning: /, "> ")
-        .replace(/^> :bulb: /, "> ")
-        .replace(/^> :chart_with_upwards_trend: /, "> ")
-        .replace(/^# :seedling: Fallow$/, "# Fallow")
-        .replace(/^# .* Fallow$/, "# Fallow"),
-    )
-    .filter((line) => line.trim() !== "")
-    .filter((line) => !line.startsWith("> Run `fallow fix --dry-run`"))
-    .filter((line) => !line.startsWith("> Intentionally public?"))
-    .filter((line) => !line.startsWith("> Add [`/** @public */`"))
-    .filter((line) => !line.startsWith("> Add [`// fallow-ignore-next-line`"))
-    .join("\n");
-
-const failures = [];
-for (const testCase of cases) {
-  const github = normalize(render(actionJqDir, testCase));
-  const gitlab = normalize(render(gitlabJqDir, testCase));
-  if (github !== gitlab) {
-    failures.push(`${testCase.name}: normalized output drifted`);
-  }
-}
-
-if (failures.length > 0) {
-  console.log(failures.join("\n"));
-  process.exit(1);
-}
-NODE
-)
-if [ -z "$PARITY_OUT" ]; then
-  pass "renderer parity: normalized GitHub and GitLab summaries match"
-else
-  fail "renderer parity: normalized GitHub and GitLab summaries match" "$PARITY_OUT"
-fi
 
 # =========================================================================
 # Shared summary scripts (reused from action/jq/, should still work)
@@ -1105,23 +1290,6 @@ echo "  summary-fix.jq:"
 # Just verify it doesn't crash on missing data
 OUT=$(echo '{"fixes":[],"dry_run":true}' | jq -r -f "$SHARED_JQ_DIR/summary-fix.jq" 2>&1)
 assert_contains "$OUT" "No fixable issues" "empty fix: no fixable issues"
-
-# =========================================================================
-# GitLab-specific: no GitHub callouts in any output
-# =========================================================================
-
-echo ""
-echo "=== GitLab markdown compatibility ==="
-
-echo "  verify no GitHub-specific callouts in GitLab scripts:"
-for jq_file in "$CI_JQ_DIR"/*.jq; do
-  name=$(basename "$jq_file")
-  if /usr/bin/grep -q '!\[NOTE\]\|!\[WARNING\]\|!\[TIP\]\|!\[IMPORTANT\]\|!\[CAUTION\]' "$jq_file" 2>/dev/null; then
-    fail "$name" "contains GitHub callout syntax"
-  else
-    pass "$name has no GitHub callouts"
-  fi
-done
 
 # =========================================================================
 # GitLab CI YAML structure tests
@@ -1190,7 +1358,6 @@ assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "gitlab_common.sh" "loads sha
 assert_contains "$GITLAB_COMMON" "curl_retry" "wraps GitLab API calls with retry"
 assert_not_contains "$GITLAB_COMMON" "source fallow-analysis-args" "legacy render fallback does not source workspace shell"
 assert_contains "$GITLAB_COMMON" "rate limit response; retrying" "retries GitLab rate-limit responses"
-assert_not_contains "$GITLAB_COMMON" "curl_paginate" "does not ship an unused pagination helper"
 
 TMP_CLEANUP_WORK=$(mktemp -d)
 TMP_CLEANUP_REGISTRY="$TMP_CLEANUP_WORK/registry"
@@ -1262,9 +1429,18 @@ if [ "${1:-}" = "ci" ]; then
   if [ "${2:-}" = "post-pr-comment" ]; then
     printf '{"action":"update","marker_id":"fallow-results","comment_id":"777","body":"ok"}\n'
   elif [ "${2:-}" = "post-review" ]; then
+    if [ -n "${MOCK_CAPTURE_ENVELOPE:-}" ]; then
+      previous=""
+      for arg in "$@"; do
+        if [ "$previous" = "--envelope" ]; then
+          cp "$arg" "$MOCK_CAPTURE_ENVELOPE"
+        fi
+        previous="$arg"
+      done
+    fi
     case "${MOCK_POST_REVIEW_ERRORS:-}" in
       apply)
-        printf '{"action":"post_review","comments_posted":1,"apply_errors":["resolve failed"],"post_errors":[],"apply_hint":"refresh provider state"}\n'
+        printf '{"action":"post_review","comments_posted":1,"apply_errors":["resolve failed"],"post_errors":[],"apply_hint":"refresh provider state","failed_fingerprints":["a"],"unapplied_fingerprints":["a"]}\n'
         ;;
       post)
         printf '{"action":"post_review","comments_posted":0,"apply_errors":[],"post_errors":["post failed"],"apply_hint":"rerun the job"}\n'
@@ -1297,15 +1473,31 @@ for arg in "$@"; do
 done
 case "$format" in
   pr-comment-gitlab)
+    # MOCK_BASELINE_ADVISORY mirrors what the real renderer emits for a rotted
+    # baseline with the gate armed: the advisory plus the gate inventory in the
+    # body's status blockquote, and one decision row per armed gate.
     if [ -n "${FALLOW_PR_DECISION_FILE:-}" ]; then
-      printf '{"schema":"fallow-pr-decision/v1","title":"Fallow","conclusion":"success","gates":[],"annotations":[],"details":{"summary_markdown":"Clean","full_report_path":null,"details_url":null}}\n' > "$FALLOW_PR_DECISION_FILE"
+      if [ "${MOCK_BASELINE_ADVISORY:-}" = "1" ]; then
+        printf '{"schema":"fallow-pr-decision/v1","title":"Fallow","conclusion":"success","gates":[{"id":"check","label":"Dead code","status":"success","observed":"0 findings","threshold":null,"scope":"new code"},{"id":"stale-baseline","label":"Stale baseline","status":"failure","observed":"fail","threshold":null,"scope":"this run"}],"annotations":[],"details":{"summary_markdown":"Clean","full_report_path":null,"details_url":null}}\n' > "$FALLOW_PR_DECISION_FILE"
+      else
+        printf '{"schema":"fallow-pr-decision/v1","title":"Fallow","conclusion":"success","gates":[],"annotations":[],"details":{"summary_markdown":"Clean","full_report_path":null,"details_url":null}}\n' > "$FALLOW_PR_DECISION_FILE"
+      fi
     fi
     if [ -n "${FALLOW_PR_DETAILS_FILE:-}" ]; then
       printf '{"schema":"fallow-pr-details/v1","title":"Fallow","sections":[]}\n' > "$FALLOW_PR_DETAILS_FILE"
     fi
     printf '<!-- fallow-id: fallow-results -->\n### Fallow smoke\n\nGenerated by fallow.\n'
+    if [ "${MOCK_BASELINE_ADVISORY:-}" = "1" ]; then
+      printf '\n> **Baseline matched nothing.** All 8 saved entries went unmatched. Paths may have changed, or the baseline was saved elsewhere. Re-save it from a whole-project run. Gate outcomes: failed stale-baseline.\n'
+    fi
     ;;
   review-gitlab)
+    if [ "${MOCK_V3_REVIEW:-}" = "1" ]; then
+      cat <<'JSON'
+{"body":"### Fallow smoke\n\n<!-- fallow-review -->","summary":{"body":"### Fallow smoke\n\n<!-- fallow-review -->","fingerprint":"aaaaaaaaaaaaaaaa"},"comments":[{"body":"**error** `fallow/unused-export`: smoke\n\n<!-- fallow-fingerprint:v3: 0123456789abcdef -->","position":{"base_sha":"base","start_sha":"start","head_sha":"head","position_type":"text","old_path":"src/a.ts","new_path":"src/a.ts","new_line":9},"fingerprint":"0123456789abcdef","legacy_fingerprint":"fedcba9876543210"}],"marker_regex":"^<!-- fallow-fingerprint:v[23]: ((?:[a-z]+:)?[0-9a-f]{16}) -->\\s*$","marker_regex_flags":"m","meta":{"schema":"fallow-review-envelope/v3","provider":"gitlab"}}
+JSON
+      exit 0
+    fi
     if [ "${MOCK_ZERO_REVIEW:-}" = "1" ]; then
       cat <<'JSON'
 {"body":"### Fallow smoke\n\n<!-- fallow-review -->","comments":[],"meta":{"schema":"fallow-review-envelope/v1","provider":"gitlab"}}
@@ -1394,6 +1586,19 @@ printf '%s\0' check --format json --root . > "$CI_TYPED_WORK/fallow-analysis-arg
     bash "$SCRIPTS_DIR/review.sh" > /dev/null
   PATH="$CI_TYPED_BIN:$PATH" \
     MOCK_LOG="$CI_TYPED_LOG" \
+    MOCK_V3_REVIEW="1" \
+    MOCK_CAPTURE_ENVELOPE="$CI_TYPED_WORK/posted-v3-envelope.json" \
+    GITLAB_TOKEN="test" \
+    CI_API_V4_URL="https://gitlab.example/api/v4" \
+    CI_PROJECT_ID="18" \
+    CI_MERGE_REQUEST_IID="123" \
+    CI_COMMIT_SHA="abcdef1234567890" \
+    FALLOW_COMMAND="check" \
+    FALLOW_ROOT="." \
+    MAX_COMMENTS="5" \
+    bash "$SCRIPTS_DIR/review.sh" > "$CI_TYPED_WORK/review-v3.out"
+  PATH="$CI_TYPED_BIN:$PATH" \
+    MOCK_LOG="$CI_TYPED_LOG" \
     MOCK_POST_REVIEW_ERRORS="apply" \
     GITLAB_TOKEN="test" \
     CI_API_V4_URL="https://gitlab.example/api/v4" \
@@ -1477,6 +1682,34 @@ assert_contains "$CI_TYPED_OUT" "fallow ci post-pr-comment --provider gitlab" "c
 assert_contains "$CI_TYPED_OUT" "summary_scope=diff" "comment.sh passes FALLOW_SUMMARY_SCOPE to typed MR comment render"
 assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "FALLOW_PR_DECISION_FILE" "comment.sh asks fallow for typed MR decision sidecar"
 assert_contains "$(cat "$SCRIPTS_DIR/comment.sh")" "FALLOW_PR_DETAILS_FILE" "comment.sh asks fallow for typed MR details artifact"
+
+# #2675, mirroring the GitHub assertions: the advisory and the gate row are the
+# CLI's render, and the template's job is to carry them to the MR note and to
+# the decision sidecar a downstream job reads.
+CI_BASELINE_LOG="$CI_TYPED_WORK/baseline-comment.log"
+: > "$CI_BASELINE_LOG"
+(
+  cd "$CI_TYPED_WORK"
+  PATH="$CI_TYPED_BIN:$PATH" \
+    MOCK_LOG="$CI_BASELINE_LOG" \
+    MOCK_BASELINE_ADVISORY="1" \
+    GITLAB_TOKEN="test" \
+    CI_API_V4_URL="https://gitlab.example/api/v4" \
+    CI_PROJECT_ID="18" \
+    CI_MERGE_REQUEST_IID="123" \
+    FALLOW_COMMAND="check" \
+    bash "$SCRIPTS_DIR/comment.sh" > /dev/null
+)
+CI_BASELINE_BODY=$(cat "$CI_TYPED_WORK/fallow-mr-comment.md")
+CI_BASELINE_DECISION=$(cat "$CI_TYPED_WORK/fallow-mr-decision.json")
+assert_contains "$CI_BASELINE_BODY" "**Baseline matched nothing.**" \
+  "the posted MR note carries the baseline advisory"
+assert_contains "$CI_BASELINE_BODY" "Gate outcomes: failed stale-baseline." \
+  "the posted MR note keeps the gate inventory beside the advisory"
+assert_contains "$CI_BASELINE_DECISION" '"id":"stale-baseline"' \
+  "the MR decision sidecar carries the stale-baseline gate row"
+assert_contains "$(cat "$CI_BASELINE_LOG")" "ci post-pr-comment --provider gitlab" \
+  "the note carrying the advisory is the one posted"
 assert_contains "$(cat "$DIR/../../ci/gitlab-ci.yml")" "FALLOW_PR_COMMENT_LAYOUT" "GitLab template exposes sticky MR comment layout"
 CI_BLANK_SUMMARY_SCOPE_COUNT=$(printf '%s\n' "$CI_TYPED_OUT" | grep -c '^summary_scope=$' || true)
 if [ "$CI_BLANK_SUMMARY_SCOPE_COUNT" -ge 1 ]; then
@@ -1485,6 +1718,22 @@ else
   fail "review.sh does not receive FALLOW_SUMMARY_SCOPE by default" "$CI_TYPED_OUT"
 fi
 assert_contains "$CI_TYPED_OUT" "fallow ci post-review --provider gitlab" "review.sh invokes GitLab review post command"
+# A v3 envelope: the v3 marker and the legacy fingerprint reach the
+# binary unchanged, because the binary matches older v2 threads through it.
+CI_V3_POSTED="$CI_TYPED_WORK/posted-v3-envelope.json"
+if [ -s "$CI_V3_POSTED" ]; then
+  pass "review.sh posts a v3 review envelope"
+else
+  fail "review.sh posts a v3 review envelope" "$(cat "$CI_TYPED_WORK/review-v3.out")"
+fi
+CI_V3_LEGACY=$(jq -r '.comments[0].legacy_fingerprint' "$CI_V3_POSTED" 2>/dev/null)
+if [ "$CI_V3_LEGACY" = "fedcba9876543210" ]; then
+  pass "review.sh keeps legacy_fingerprint for v2 thread matching"
+else
+  fail "review.sh keeps legacy_fingerprint for v2 thread matching" "got $CI_V3_LEGACY"
+fi
+assert_contains "$(cat "$CI_V3_POSTED" 2>/dev/null)" "fallow-fingerprint:v3: 0123456789abcdef" \
+  "review.sh keeps the v3 marker in the posted comment body"
 assert_contains "$(cat "$CI_TYPED_WORK/review-clean.out")" \
   "0 resolution replies posted, 0 threads resolved" \
   "review.sh exposes successful reconciliation counters"
@@ -1495,6 +1744,9 @@ assert_not_contains "$(cat "$CI_TYPED_WORK/review-clean.out")" "WARNING: fallow 
 assert_contains "$(cat "$CI_TYPED_WORK/review-apply-error.out")" \
   "WARNING: fallow post-review incomplete: refresh provider state" \
   "review.sh warns when applying reconciliation is incomplete"
+assert_contains "$(cat "$CI_TYPED_WORK/review-apply-error.out")" \
+  "(unapplied fingerprints: a)" \
+  "review.sh names the fingerprints reconciliation did not apply"
 assert_contains "$(cat "$CI_TYPED_WORK/review-post-error.out")" \
   "WARNING: fallow post-review incomplete: rerun the job" \
   "review.sh warns when posting review comments is incomplete"
@@ -1804,19 +2056,14 @@ fi
 
 rm -rf "$CI_API_FAIL_WORK"
 
-# --- IssueKind summary drift guard ---
+# --- IssueKind summary drift guard helpers ---
 #
-# Same guard as the GitHub Action suite, run against every GitLab jq surface
-# that carries the full dead-code set. A new dead-code IssueKind not wired into
-# one of these would otherwise vanish silently from MR output. GitLab has no
-# annotations / filter-changed surfaces, so all three are gated "all".
-#
-#   summary-check.jq      dead-code summary table
-#   summary-combined.jq   combined-mode Code-issues breakdown
-#   summary-audit.jq      audit dead_code_rows
+# The GitHub Action suite runs the guard against the action/jq surfaces. The
+# GitLab scripts use the typed Rust formats, so this suite checks only the
+# helpers of the guard: the schema fallback rows and the key matcher.
 
 echo ""
-echo "=== IssueKind summary drift guard (GitLab) ==="
+echo "=== IssueKind summary drift guard helpers ==="
 
 GUARD_DIR="$DIR/../../action/tests"
 # shellcheck source=action/tests/issuekind-drift-guard.sh
@@ -1847,10 +2094,666 @@ if issuekind_key_present '["unused_files"] # rendered table row' "unused_files";
 else
   fail "issuekind guard: string tokens still satisfy key coverage" "quoted key token did not match"
 fi
-assert_issuekind_summary_coverage "gitlab summary-check"    "$CI_JQ_DIR/summary-check.jq"
-assert_issuekind_summary_table_contract "gitlab summary-check" "$CI_JQ_DIR/summary-check.jq"
-assert_issuekind_summary_coverage "gitlab summary-combined" "$CI_JQ_DIR/summary-combined.jq"
-assert_issuekind_summary_coverage "gitlab summary-audit"    "$CI_JQ_DIR/summary-audit.jq"
+
+
+
+# --- Every variable the script reads is declared (issue #2693 review) ---
+#
+# The generated script runs under `set -euo pipefail`, so a `$FALLOW_X` that is
+# not in the template's `variables:` block is unbound and kills the job on the
+# first read. The rest of this suite cannot catch that: the fixture runner seeds
+# every scraped name to empty, which is exactly the safety net production does
+# not have.
+
+echo ""
+echo "Variable declarations"
+
+UNDECLARED=""
+DECLARED=$(awk '/^variables:/{f=1;next} /^[^ #]/{f=0} f' "$DIR/../gitlab-ci.yml" \
+  | grep -oE '^  FALLOW_[A-Z0-9_]+' | tr -d ' ' | sort -u)
+while IFS= read -r used; do
+  [ -z "$used" ] && continue
+  case "$used" in
+    # Set by the script itself or by GitLab, never declared as an input.
+    FALLOW_EXIT_CODE|FALLOW_RENDER_PATH_PREFIX_SET|FALLOW_SCRIPT_EOF|FALLOW_RUN_WRITER_EOF|FALLOW_TEST_LOG|FALLOW_TEST_ENV_FILE) continue ;;
+  esac
+  case "
+$DECLARED
+" in
+    *"
+$used
+"*) ;;
+    *) UNDECLARED="${UNDECLARED:+${UNDECLARED} }${used}" ;;
+  esac
+done < <(grep -oE '\$FALLOW_[A-Z0-9_]+' /tmp/fallow-run.sh | tr -d '$' | sort -u)
+
+if [ -z "$UNDECLARED" ]; then
+  pass "every \$FALLOW_* the generated script reads is declared in variables:"
+else
+  fail "every \$FALLOW_* the generated script reads is declared in variables:" \
+    "undeclared, so set -u kills the job: $UNDECLARED"
+fi
+
+# --- Gate verdicts (issues #2680, #2681, #2683, #2685, #2686) ---
+
+echo ""
+echo "Gate verdicts"
+
+GATE_WORK="$RUNNER_TMP/gate-verdicts"
+mkdir -p "$GATE_WORK"
+
+gitlab_gate_envelope() {
+  local gates=$1 extra=${2:-} body
+  body='"kind":"dead-code","schema_version":9,"version":"3.27.0","total_issues":0,"summary":{"total_issues":0},"unused_files":[],"unused_exports":[]'
+  [ -n "$gates" ] && body="${body},\"gate_outcomes\":${gates}"
+  [ -n "$extra" ] && body="${body},${extra}"
+  printf '{%s}\n' "$body" > "$GATE_WORK/envelope.json"
+  printf '%s' "$GATE_WORK/envelope.json"
+}
+
+# A loaded health baseline filters the findings, but
+# summary.functions_above_threshold still counts the functions it accepts. The
+# issue count reads remaining_findings, so a fully baselined run is clean.
+BASELINED_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$FIXTURES/health-baselined.json" \
+  FALLOW_COMMAND=health \
+  FALLOW_BASELINE=h.json \
+  FALLOW_FAIL_ON_ISSUES=true 2>&1) || BASELINED_EXIT=$?
+assert_contains "$OUT" "Found 0 issues" \
+  "baselined count: FALLOW_COMMAND health counts only the findings the baseline does not accept"
+if [ "$BASELINED_EXIT" -eq 0 ]; then
+  pass "baselined count: a fully baselined health run passes FALLOW_FAIL_ON_ISSUES"
+else
+  fail "baselined count: a fully baselined health run passes FALLOW_FAIL_ON_ISSUES" "exit $BASELINED_EXIT"
+fi
+jq '.summary.baseline_staleness.remaining_findings = 2' "$FIXTURES/health-baselined.json" > "$GATE_WORK/health-two-new.json"
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$GATE_WORK/health-two-new.json" \
+  FALLOW_COMMAND=health \
+  FALLOW_BASELINE=h.json \
+  FALLOW_FAIL_ON_ISSUES=false)
+assert_contains "$OUT" "Found 2 issues" \
+  "baselined count: new functions above a threshold still count"
+BASELINED_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$FIXTURES/combined-health-baselined.json" \
+  FALLOW_COMMAND= \
+  FALLOW_HEALTH_BASELINE=h.json \
+  FALLOW_FAIL_ON_ISSUES=true 2>&1) || BASELINED_EXIT=$?
+assert_contains "$OUT" "Found 0 issues" \
+  "baselined count: the bare run counts only the health findings the baseline does not accept"
+if [ "$BASELINED_EXIT" -eq 0 ]; then
+  pass "baselined count: a fully baselined bare run passes FALLOW_FAIL_ON_ISSUES"
+else
+  fail "baselined count: a fully baselined bare run passes FALLOW_FAIL_ON_ISSUES" "exit $BASELINED_EXIT"
+fi
+
+# Diff-risk findings are introduced by the change, so both gates count them.
+for diff_risk_gate in new-only all; do
+  printf '{"command":"audit","verdict":"warn","attribution":{"gate":"%s","dead_code_introduced":0,"complexity_introduced":0,"duplication_introduced":0,"diff_risk_introduced":2},"summary":{"dead_code_issues":0,"complexity_findings":0,"duplication_clone_groups":0}}\n' \
+    "$diff_risk_gate" > "$GATE_WORK/audit-diff-risk.json"
+  OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+    MOCK_GATE_ENVELOPE="$GATE_WORK/audit-diff-risk.json" \
+    FALLOW_COMMAND=audit \
+    FALLOW_FAIL_ON_ISSUES=false)
+  assert_contains "$OUT" "Found 2 issues" \
+    "audit count: the $diff_risk_gate gate counts diff-risk findings"
+done
+
+# A worsened complexity finding counts under new-only only when the run used
+# `--worsened error`. Under `warn` it gives a warn verdict and no count.
+for worsened_mode in warn error; do
+  if [ "$worsened_mode" = "error" ]; then worsened_verdict=fail; else worsened_verdict=warn; fi
+  printf '{"command":"audit","verdict":"%s","attribution":{"gate":"new-only","worsened":"%s","dead_code_introduced":0,"complexity_introduced":0,"complexity_inherited":1,"complexity_worsened":1,"duplication_introduced":0},"summary":{"dead_code_issues":0,"complexity_findings":1,"duplication_clone_groups":0}}\n' \
+    "$worsened_verdict" "$worsened_mode" > "$GATE_WORK/audit-worsened.json"
+  WORSENED_EXIT=0
+  OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+    MOCK_GATE_ENVELOPE="$GATE_WORK/audit-worsened.json" \
+    FALLOW_COMMAND=audit \
+    FALLOW_FAIL_ON_ISSUES=true 2>&1) || WORSENED_EXIT=$?
+  if [ "$worsened_mode" = "error" ]; then
+    assert_contains "$OUT" "Fallow audit failed (gate: new-only, 1 finding(s) at error severity" \
+      "audit count: worsened error counts the worsened finding in the failure"
+    [ "$WORSENED_EXIT" -ne 0 ] && pass "audit count: worsened error fails the pipeline" \
+      || fail "audit count: worsened error fails the pipeline" "exit $WORSENED_EXIT"
+  else
+    assert_contains "$OUT" "Found 0 issues" \
+      "audit count: worsened warn does not count the worsened finding"
+    [ "$WORSENED_EXIT" -eq 0 ] && pass "audit count: worsened warn passes the pipeline" \
+      || fail "audit count: worsened warn passes the pipeline" "exit $WORSENED_EXIT"
+  fi
+done
+
+# FALLOW_AUDIT_WORSENED reaches audit as --worsened, and a bad value stops the job.
+WORSENED_WORK="$RUNNER_TMP/audit-worsened"
+mkdir -p "$WORSENED_WORK"
+run_generated_gitlab_fixture "$WORSENED_WORK" \
+  FALLOW_COMMAND=audit \
+  FALLOW_AUDIT_WORSENED=error >/dev/null
+WORSENED_ARGS=""
+while IFS= read -r -d '' arg; do
+  WORSENED_ARGS+="${arg} "
+done < "$WORSENED_WORK/fallow-analysis-args.bin"
+assert_contains "$WORSENED_ARGS" "--worsened error" "audit worsened: FALLOW_AUDIT_WORSENED reaches audit"
+WORSENED_EXIT=0
+OUT=$(run_generated_gitlab_fixture "$WORSENED_WORK" \
+  FALLOW_COMMAND=audit \
+  FALLOW_AUDIT_WORSENED=strict) || WORSENED_EXIT=$?
+assert_contains "$OUT" "FALLOW_AUDIT_WORSENED must be 'warn', 'error' or 'off', got: strict" \
+  "audit worsened: a bad FALLOW_AUDIT_WORSENED value is rejected"
+[ "$WORSENED_EXIT" -eq 2 ] && pass "audit worsened: a bad value exits 2" \
+  || fail "audit worsened: a bad value exits 2" "exit $WORSENED_EXIT"
+rm -rf "$WORSENED_WORK"
+
+# Styling findings count like the GitHub Action counts them: every styling
+# finding under the all gate, and the introduced ones under new-only.
+printf '%s\n' '{"command":"audit","verdict":"warn","attribution":{"gate":"all"},"summary":{"dead_code_issues":0,"complexity_findings":0,"duplication_clone_groups":0},"complexity":{"styling_findings":[{"effective_severity":"warn"},{"effective_severity":"warn"},{"effective_severity":"warn"}]}}' \
+  > "$GATE_WORK/audit-styling-all.json"
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$GATE_WORK/audit-styling-all.json" \
+  FALLOW_COMMAND=audit \
+  FALLOW_FAIL_ON_ISSUES=false)
+assert_contains "$OUT" "Found 3 issues" \
+  "audit count: the all gate counts styling findings"
+printf '%s\n' '{"command":"audit","verdict":"warn","attribution":{"gate":"new-only","dead_code_introduced":0,"complexity_introduced":0,"duplication_introduced":0,"styling_introduced":1,"styling_inherited":2},"summary":{"dead_code_issues":0,"complexity_findings":0,"duplication_clone_groups":0},"complexity":{"styling_findings":[{"effective_severity":"warn","introduced":true},{"effective_severity":"warn","introduced":false},{"effective_severity":"warn","introduced":false}]}}' \
+  > "$GATE_WORK/audit-styling-new.json"
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$GATE_WORK/audit-styling-new.json" \
+  FALLOW_COMMAND=audit \
+  FALLOW_FAIL_ON_ISSUES=false)
+assert_contains "$OUT" "Found 1 issues" \
+  "audit count: the new-only gate counts introduced styling findings"
+
+for prop_command in dead-code ""; do
+  for prop_severity in warn error; do
+    prop_total=0
+    [ "$prop_severity" = error ] && prop_total=1
+    if [ "$prop_command" = dead-code ]; then
+      prop_envelope=$(gitlab_gate_envelope '' '')
+      jq --arg level "$prop_severity" --argjson count "$prop_total" '.total_issues = $count | .summary.total_issues = $count | .prop_drilling_chains = [{prop:"user",depth:3,hops:[{file:"src/Page.tsx",line:4,component:"Page"}],effective_severity:$level}]' "$prop_envelope" > "$GATE_WORK/prop-envelope.json"
+    else
+      jq --arg level "$prop_severity" --argjson count "$prop_total" '.check.total_issues = $count | .check.prop_drilling_chains = [{prop:"user",depth:3,hops:[{file:"src/Page.tsx",line:4,component:"Page"}],effective_severity:$level}]' "$FIXTURES/combined-health-baselined.json" > "$GATE_WORK/prop-envelope.json"
+    fi
+    PROP_EXIT=0
+    OUT=$(run_generated_gitlab_fixture "$GATE_WORK" MOCK_GATE_ENVELOPE="$GATE_WORK/prop-envelope.json" FALLOW_COMMAND="$prop_command" FALLOW_HEALTH_BASELINE=h.json FALLOW_FAIL_ON_ISSUES=true 2>&1) || PROP_EXIT=$?
+    assert_contains "$OUT" "Found $prop_total issues" "prop gating: $prop_command $prop_severity preserves issue accounting"
+    if [ "$PROP_EXIT" -eq "$prop_total" ]; then
+      pass "prop gating: $prop_command $prop_severity strict exit"
+    else
+      fail "prop gating: $prop_command $prop_severity strict exit" "exit $PROP_EXIT: $OUT"
+    fi
+  done
+done
+
+# A gate the variable asked for fails the pipeline even with
+# FALLOW_FAIL_ON_ISSUES false, which is the whole point of every issue here.
+ENVELOPE=$(gitlab_gate_envelope '{"regression":{"status":"fail","enforced":true}}' '"regression":{"delta":4}')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false \
+  FALLOW_FAIL_ON_REGRESSION=true \
+  FALLOW_TOLERANCE=0) || true
+assert_contains "$OUT" "ERROR: Fallow regression gate failed" \
+  "gitlab gate: regression fails with FALLOW_FAIL_ON_ISSUES false"
+
+# #2685: the security gate keeps exit 8 and used to sit inside the
+# FALLOW_FAIL_ON_ISSUES conditional, where it could not be reached.
+ENVELOPE=$(gitlab_gate_envelope '{"security":{"status":"fail","enforced":true}}' '"gate":{"mode":"new","verdict":"fail","new_count":2}')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=security \
+  FALLOW_FAIL_ON_ISSUES=false \
+  FALLOW_SECURITY_GATE=new)
+GATE_STATUS=$?
+assert_contains "$OUT" "ERROR: Fallow security gate failed" \
+  "gitlab gate: security fails with FALLOW_FAIL_ON_ISSUES false"
+if [ "$GATE_STATUS" = "8" ]; then
+  pass "gitlab gate: security keeps exit 8"
+else
+  fail "gitlab gate: security keeps exit 8" "got $GATE_STATUS"
+fi
+
+# #2727: no variable owns the parse-error gate. The entry exists only when
+# `failOnParseError` in config or `--fail-on-parse-error` in FALLOW_ARGS armed
+# it, so an enforced failure fails the pipeline both ways and names each file.
+PARSE_ERROR_ENTRY='{"parse-error":{"status":"fail","enforced":true,"observed":1.0,"files":[{"path":"src/Broken.tsx","error_count":1,"panicked":true}]}}'
+for PARSE_ARGS in "" "--fail-on-parse-error"; do
+  PARSE_LABEL=${PARSE_ARGS:-config}
+  ENVELOPE=$(gitlab_gate_envelope "$PARSE_ERROR_ENTRY")
+  OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+    MOCK_GATE_ENVELOPE="$ENVELOPE" \
+    FALLOW_COMMAND=dead-code \
+    FALLOW_FAIL_ON_ISSUES=false \
+    FALLOW_ARGS="$PARSE_ARGS")
+  GATE_STATUS=$?
+  assert_contains "$OUT" "ERROR: Fallow parse-error gate failed: fallow could not parse src/Broken.tsx (1 parser error, the parser stopped)." \
+    "gitlab gate: parse-error armed by $PARSE_LABEL fails and names the file"
+  if [ "$GATE_STATUS" = "1" ]; then
+    pass "gitlab gate: parse-error armed by $PARSE_LABEL exits 1"
+  else
+    fail "gitlab gate: parse-error armed by $PARSE_LABEL exits 1" "got $GATE_STATUS"
+  fi
+done
+
+# A file that nests too deep to parse counts for the gate, but it is not a
+# parser error, so the message names the reason instead.
+DEEP_PARSE_ENTRY='{"parse-error":{"status":"fail","enforced":true,"observed":1.0,"files":[{"path":"src/deep.ts","error_count":1,"panicked":true,"reason":"nesting-too-deep"}]}}'
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$(gitlab_gate_envelope "$DEEP_PARSE_ENTRY")" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false)
+assert_contains "$OUT" "ERROR: Fallow parse-error gate failed: fallow could not parse src/deep.ts (nests too deep to parse)." \
+  "gitlab gate: parse-error names a too-deep file by its reason"
+
+# A newline in a file name must not split the ERROR line of the job log.
+ENVELOPE=$(gitlab_gate_envelope '{"parse-error":{"status":"fail","enforced":true,"observed":1.0,"files":[{"path":"src/a%\r\nERROR: injected.ts","error_count":1,"panicked":true}]}}')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "could not parse src/a%25%0D%0AERROR: injected.ts (1 parser error, the parser stopped)." \
+  "gitlab gate: a parse-error path with a newline stays on one line"
+if grep -q '^ERROR: injected' <<< "$OUT"; then
+  fail "gitlab gate: a parse-error path starts no new log line" "$OUT"
+else
+  pass "gitlab gate: a parse-error path starts no new log line"
+fi
+
+# A gate nobody asked for reports and never fails.
+ENVELOPE=$(gitlab_gate_envelope '{"regression":{"status":"fail","enforced":true}}')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false)
+GATE_STATUS=$?
+assert_contains "$OUT" "WARNING: Fallow regression gate reports a failure" \
+  "gitlab gate: an unowned failure warns"
+if [ "$GATE_STATUS" = "0" ]; then
+  pass "gitlab gate: an unowned failure leaves the pipeline green"
+else
+  fail "gitlab gate: an unowned failure leaves the pipeline green" "got $GATE_STATUS"
+fi
+
+# On the bare combined run, --fail-on-issues in FALLOW_ARGS enforces the
+# duplication-threshold entry. FALLOW_FAIL_ON_ISSUES false stays authoritative:
+# the verdict warns and the pipeline stays green. With the variable true, the
+# enforced verdict fails the pipeline.
+COMBINED_THRESHOLD_ENTRY='{"duplication-threshold":{"status":"fail","enforced":true,"observed":40.0,"threshold":5.0}}'
+ENVELOPE=$(gitlab_gate_envelope "$COMBINED_THRESHOLD_ENTRY")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND= \
+  FALLOW_FAIL_ON_ISSUES=false \
+  FALLOW_THRESHOLD=5 \
+  FALLOW_ARGS=--fail-on-issues)
+GATE_STATUS=$?
+assert_contains "$OUT" "WARNING: Fallow duplication-threshold gate reports a failure: duplication 40% exceeds the 5% threshold. It does not fail this pipeline: the combined run enforces that gate through FALLOW_FAIL_ON_ISSUES" \
+  "gitlab gate: a combined threshold verdict that FALLOW_ARGS enforced warns"
+assert_not_contains "$OUT" "ERROR: Fallow duplication-threshold gate failed" \
+  "gitlab gate: a combined threshold verdict that FALLOW_ARGS enforced prints no error"
+if [ "$GATE_STATUS" = "0" ]; then
+  pass "gitlab gate: a combined threshold verdict that FALLOW_ARGS enforced leaves the pipeline green"
+else
+  fail "gitlab gate: a combined threshold verdict that FALLOW_ARGS enforced leaves the pipeline green" "got $GATE_STATUS: $OUT"
+fi
+ENVELOPE=$(gitlab_gate_envelope "$COMBINED_THRESHOLD_ENTRY")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND= \
+  FALLOW_FAIL_ON_ISSUES=true \
+  FALLOW_THRESHOLD=5 \
+  FALLOW_ARGS=--fail-on-issues)
+GATE_STATUS=$?
+assert_contains "$OUT" "ERROR: Fallow duplication-threshold gate failed" \
+  "gitlab gate: a combined threshold verdict fails with FALLOW_FAIL_ON_ISSUES true"
+if [ "$GATE_STATUS" = "1" ]; then
+  pass "gitlab gate: a combined threshold verdict with FALLOW_FAIL_ON_ISSUES true exits 1"
+else
+  fail "gitlab gate: a combined threshold verdict with FALLOW_FAIL_ON_ISSUES true exits 1" "got $GATE_STATUS: $OUT"
+fi
+
+# Every envelope carries its default exit rule, also when no gate was armed.
+# A failing default rule belongs to the count gate: with FALLOW_FAIL_ON_ISSUES
+# false it prints nothing and leaves the pipeline green.
+# The dotenv still names the failing default rule, so a job that reads
+# `FALLOW_GATES_FAILED != ''` sees it on every run with findings.
+for DEFAULT_CASE in \
+  '{"error-severity-findings":{"status":"fail","enforced":true}}|error-severity-findings' \
+  '{"health-findings":{"status":"fail","enforced":true}}|health-findings' \
+  '{"error-severity-findings":{"status":"fail","enforced":false},"health-findings":{"status":"fail","enforced":false}}|error-severity-findings,health-findings' \
+  '{"duplication-findings":{"status":"fail","enforced":true,"observed":1.0,"threshold":0.0}}|duplication-findings' \
+  ; do
+  IFS='|' read -r DEFAULT_GATES DEFAULT_FAILED <<< "$DEFAULT_CASE"
+  ENVELOPE=$(gitlab_gate_envelope "$DEFAULT_GATES")
+  rm -f "$GATE_WORK/fallow-gates.env"
+  OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+    MOCK_GATE_ENVELOPE="$ENVELOPE" \
+    FALLOW_COMMAND=dead-code \
+    FALLOW_FAIL_ON_ISSUES=false)
+  GATE_STATUS=$?
+  if grep -qx "FALLOW_GATES_FAILED=${DEFAULT_FAILED}" "$GATE_WORK/fallow-gates.env" 2>/dev/null; then
+    pass "gitlab gate: the default rule $DEFAULT_GATES is named in FALLOW_GATES_FAILED"
+  else
+    fail "gitlab gate: the default rule $DEFAULT_GATES is named in FALLOW_GATES_FAILED" \
+      "expected FALLOW_GATES_FAILED=${DEFAULT_FAILED}, got: $(cat "$GATE_WORK/fallow-gates.env" 2>/dev/null)"
+  fi
+  assert_not_contains "$OUT" "gate reports a failure" \
+    "gitlab gate: the default rule $DEFAULT_GATES prints no gate line"
+  if [ "$GATE_STATUS" = "0" ]; then
+    pass "gitlab gate: the default rule $DEFAULT_GATES leaves the pipeline green"
+  else
+    fail "gitlab gate: the default rule $DEFAULT_GATES leaves the pipeline green" "got $GATE_STATUS"
+  fi
+done
+
+# A pinned binary older than the index still delivers the verdicts that had a
+# feature-local field, and warns only about the gates that never had one.
+ENVELOPE=$(gitlab_gate_envelope '' '"regression":{"exceeded":true,"delta":4}')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false \
+  FALLOW_FAIL_ON_REGRESSION=true \
+  FALLOW_TOLERANCE=0) || true
+assert_contains "$OUT" "ERROR: Fallow regression gate failed" \
+  "gitlab gate: the regression fallback reads .regression.exceeded"
+ENVELOPE=$(gitlab_gate_envelope '')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "could not be checked" \
+  "gitlab gate: a pinned binary warns about nothing the pipeline did not configure"
+
+# #2686: one aggregated warning, and the empty case behind its own variable.
+DEGRADED='"workspace_diagnostics":[{"path":"a","kind":"skipped-large-file","message":"m","degrades_analysis":true},{"path":"b","kind":"skipped-large-file","message":"m","degrades_analysis":true},{"path":".","kind":"boundaries-not-configured","message":"m"}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$DEGRADED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "skipped-large-file (2)" "gitlab degraded: kinds and counts are aggregated"
+assert_not_contains "$OUT" "boundaries-not-configured" "gitlab degraded: unconfigured-check kinds are not reported"
+assert_contains "$OUT" "Fallow ran with degraded inputs" \
+  "gitlab degraded: the sentence covers a degraded input as well as a narrower file set"
+
+# #2959: config patterns that matched nothing reach the job log in one line,
+# also on a review-only pipeline. Audit keeps the entries under `dead_code`.
+UNMATCHED_PATTERNS='"workspace_diagnostics":[{"path":".","kind":"ignore-findings-pattern-unmatched","pattern":"src/legcy/**","message":"m"},{"path":".","kind":"ignore-dependencies-glob-unmatched","pattern":"@typo/*","message":"m"}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$UNMATCHED_PATTERNS")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "WARNING: Fallow config entries matched nothing in this run, so they have no effect: ignoreDependencies @typo/*, ignoreFindings src/legcy/**." \
+  "gitlab unmatched patterns: one line names each setting and pattern"
+AUDIT_UNMATCHED='"dead_code":{"workspace_diagnostics":[{"path":".","kind":"ignore-dependencies-glob-unmatched","pattern":"@typo/*","message":"m"}]}'
+ENVELOPE=$(gitlab_gate_envelope '' "$AUDIT_UNMATCHED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=audit \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "have no effect: ignoreDependencies @typo/*." \
+  "gitlab unmatched patterns: the audit envelope is read under dead_code"
+ENVELOPE=$(gitlab_gate_envelope '' "$DEGRADED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "matched nothing in this run" \
+  "gitlab unmatched patterns: no line without an unmatched entry"
+
+# #2689: the health pipeline's own degraded inputs reach the same aggregated
+# line through the same selector, with no change to this template's jq.
+HEALTH_DEGRADED='"workspace_diagnostics":[{"path":".","kind":"hotspots-skipped","message":"m","degrades_analysis":true},{"path":"coverage/coverage-final.json","kind":"coverage-auto-detected","message":"m"}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$HEALTH_DEGRADED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=health \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "hotspots-skipped (1)" \
+  "gitlab degraded: the health kinds are reported without a template change"
+assert_not_contains "$OUT" "coverage-auto-detected" \
+  "gitlab degraded: auto-detected coverage is provenance and not a degraded run"
+
+# #2736: a build config a framework plugin could not read reaches the same line
+# through the same selector, and the quiet sibling kind stays out of it.
+PLUGIN_DEGRADED='"workspace_diagnostics":[{"path":"module-federation.config.ts","kind":"plugin-config-unreadable","plugin":"module-federation","key":"exposes","reason":"not-object-literal","message":"m","degrades_analysis":true},{"path":"module-federation.config.ts","kind":"plugin-config-unreadable","plugin":"module-federation","key":"remotes","reason":"spread","message":"m","degrades_analysis":true},{"path":"nuxt.config.ts","kind":"plugin-effect-not-modeled","plugin":"nuxt","key":"imports","reason":"key-effect-not-modeled","message":"m"}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$PLUGIN_DEGRADED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "plugin-config-unreadable (2)" \
+  "gitlab degraded: two unreadable keys in one config are counted separately"
+assert_not_contains "$OUT" "plugin-effect-not-modeled" \
+  "gitlab degraded: a config whose effect is not modeled lost nothing measurable"
+
+# #2757: the reason set is open, so the call and import reasons reach the same
+# line with no template change.
+PLUGIN_NEW_REASONS='"workspace_diagnostics":[{"path":"webpack.config.js","kind":"plugin-config-unreadable","plugin":"webpack","key":"exposes","reason":"unrecognized-call","message":"m","degrades_analysis":true},{"path":"rspack.config.js","kind":"plugin-config-unreadable","plugin":"rspack","key":"remotes","reason":"import-target-unreadable","message":"m","degrades_analysis":true}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$PLUGIN_NEW_REASONS")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_contains "$OUT" "plugin-config-unreadable (2)" \
+  "gitlab degraded: the call and import reasons are counted like every other reason"
+
+# #2687, #2688: this job runs fallow with --quiet and a machine format, so the
+# envelope is the only channel that reaches the pipeline.
+REQUESTS='"request_outcomes":{"changed-since":{"status":"not-applied","affects":"scope","requested":"origin/main","reason":"git-failed","message":"m"},"diff-filter":{"status":"applied","affects":"scope","requested":"--diff-stdin"}}'
+ENVELOPE=$(gitlab_gate_envelope '' "$REQUESTS")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false)
+GATE_STATUS=$?
+assert_contains "$OUT" "WARNING: Fallow could not apply: changed-since (git-failed)" \
+  "gitlab requests: an unapplied request warns once with its reason"
+assert_not_contains "$OUT" "could not apply: changed-since (git-failed), diff-filter" \
+  "gitlab requests: an honoured request is not named in the warning"
+if [ "$GATE_STATUS" = "0" ]; then
+  pass "gitlab requests: an unapplied request leaves the pipeline green"
+else
+  fail "gitlab requests: an unapplied request leaves the pipeline green" "got $GATE_STATUS"
+fi
+
+APPLIED='"request_outcomes":{"diff-filter":{"status":"applied","affects":"scope","requested":"--diff-stdin"}}'
+ENVELOPE=$(gitlab_gate_envelope '' "$APPLIED")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "could not apply" \
+  "gitlab requests: a run that applied everything it was asked stays silent"
+assert_not_contains "$OUT" "empty scope" \
+  "gitlab requests: an applied request that measured nothing is not called empty"
+
+# #2734: an applied request over a scope it measured as empty. The unapplied
+# line must stay clear of it while the advisory names it.
+EMPTY_SCOPE='"request_outcomes":{"diff-filter":{"status":"applied","affects":"scope","requested":"--diff-file pr.diff","scope_size":0}}'
+ENVELOPE=$(gitlab_gate_envelope '' "$EMPTY_SCOPE")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false)
+GATE_STATUS=$?
+assert_contains "$OUT" "WARNING: Fallow applied diff-filter over an empty scope" \
+  "gitlab requests: an applied request over an empty scope is advised"
+assert_not_contains "$OUT" "could not apply" \
+  "gitlab requests: an empty scope is not reported as an unapplied request"
+if [ "$GATE_STATUS" = "0" ]; then
+  pass "gitlab requests: an empty scope leaves the pipeline green"
+else
+  fail "gitlab requests: an empty scope leaves the pipeline green" "got $GATE_STATUS"
+fi
+
+FULL_SCOPE='"request_outcomes":{"diff-filter":{"status":"applied","affects":"scope","requested":"--diff-file pr.diff","scope_size":12}}'
+ENVELOPE=$(gitlab_gate_envelope '' "$FULL_SCOPE")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "empty scope" \
+  "gitlab requests: a measured non-empty scope stays silent"
+
+ENVELOPE=$(gitlab_gate_envelope '')
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "could not apply" \
+  "gitlab requests: a pinned binary that publishes no object warns about nothing"
+
+# A request that writes a file beside the report narrows nothing.
+ARTIFACT='"request_outcomes":{"sarif-file":{"status":"not-applied","affects":"artifact","requested":"gl-fallow.sarif","reason":"write-failed","message":"m"}}'
+ENVELOPE=$(gitlab_gate_envelope '' "$ARTIFACT")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false) || true
+assert_not_contains "$OUT" "could not apply" \
+  "gitlab requests: an unwritten output file is not reported as an unscoped run"
+
+EMPTY='"workspace_diagnostics":[{"path":".","kind":"no-source-files-analyzed","message":"m","excluded_file_count":3,"degrades_analysis":true}]'
+ENVELOPE=$(gitlab_gate_envelope '' "$EMPTY")
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false)
+GATE_STATUS=$?
+assert_contains "$OUT" "WARNING: Fallow analyzed no source file at all" "gitlab empty analysis: warns by default"
+if [ "$GATE_STATUS" = "0" ]; then
+  pass "gitlab empty analysis: passes by default"
+else
+  fail "gitlab empty analysis: passes by default" "got $GATE_STATUS"
+fi
+OUT=$(run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_COMMAND=dead-code \
+  FALLOW_FAIL_ON_ISSUES=false \
+  FALLOW_FAIL_ON_EMPTY_ANALYSIS=true)
+GATE_STATUS=$?
+assert_contains "$OUT" "ERROR: Fallow analyzed no source file at all" "gitlab empty analysis: fails behind the variable"
+if [ "$GATE_STATUS" = "1" ]; then
+  pass "gitlab empty analysis: exits 1 behind the variable"
+else
+  fail "gitlab empty analysis: exits 1 behind the variable" "got $GATE_STATUS"
+fi
+
+# #2682: --min-score implies --score, so the template keeps the reporting
+# surfaces populated unless a health section variable is set.
+ENVELOPE=$(gitlab_gate_envelope '')
+FALLOW_TEST_LOG="$GATE_WORK/argv.log"
+: > "$FALLOW_TEST_LOG"
+run_generated_gitlab_fixture "$GATE_WORK" \
+  MOCK_GATE_ENVELOPE="$ENVELOPE" \
+  FALLOW_TEST_LOG="$FALLOW_TEST_LOG" \
+  FALLOW_COMMAND=health \
+  FALLOW_MIN_SCORE=90 \
+  FALLOW_FAIL_ON_ISSUES=false > /dev/null 2>&1 || true
+ARGV=$(cat "$FALLOW_TEST_LOG")
+assert_contains "$ARGV" "--min-score 90" "gitlab gate: min-score reaches the CLI"
+assert_contains "$ARGV" "--complexity" "gitlab gate: min-score adds --complexity"
+
+rm -rf "$GATE_WORK"
+
+# --- Architecture command (issue #3271) ---
+#
+# `fallow architecture` runs the dead-code analysis with only the cycle,
+# boundary and policy issue types. Its JSON has `kind: "architecture"` and the
+# dead-code body. The fixture is real `fallow architecture --format json`
+# output, shared with the GitHub Action suite.
+
+echo ""
+echo "Architecture command"
+
+ARCH_WORK="$RUNNER_TMP/architecture"
+mkdir -p "$ARCH_WORK"
+ARCH_FIXTURE="$DIR/../../action/tests/fixtures/architecture.json"
+ARCH_TOTAL=$(jq -r '.total_issues' "$ARCH_FIXTURE")
+FALLOW_TEST_LOG="$ARCH_WORK/argv.log"
+
+: > "$FALLOW_TEST_LOG"
+OUT=$(run_generated_gitlab_fixture "$ARCH_WORK" \
+  MOCK_GATE_ENVELOPE="$ARCH_FIXTURE" \
+  FALLOW_TEST_LOG="$FALLOW_TEST_LOG" \
+  FALLOW_COMMAND=architecture \
+  FALLOW_FAIL_ON_ISSUES=false)
+ARCH_STATUS=$?
+if [ "$ARCH_STATUS" = "0" ]; then
+  pass "gitlab architecture: the command is accepted"
+else
+  fail "gitlab architecture: the command is accepted" "got $ARCH_STATUS: $OUT"
+fi
+if grep -qE '^fallow architecture ' "$FALLOW_TEST_LOG"; then
+  pass "gitlab architecture: the analysis runs fallow architecture"
+else
+  fail "gitlab architecture: the analysis runs fallow architecture" "argv: $(cat "$FALLOW_TEST_LOG")"
+fi
+assert_contains "$OUT" "Found ${ARCH_TOTAL} issues" "gitlab architecture: the issue count is total_issues"
+
+OUT=$(run_generated_gitlab_fixture "$ARCH_WORK" \
+  MOCK_GATE_ENVELOPE="$ARCH_FIXTURE" \
+  FALLOW_COMMAND=architecture \
+  FALLOW_FAIL_ON_ISSUES=true)
+ARCH_STATUS=$?
+assert_contains "$OUT" "ERROR: Fallow found ${ARCH_TOTAL} architecture issues" \
+  "gitlab architecture: FALLOW_FAIL_ON_ISSUES names architecture issues"
+assert_not_contains "$OUT" "unused code issues" \
+  "gitlab architecture: the gate line does not say unused code"
+if [ "$ARCH_STATUS" = "1" ]; then
+  pass "gitlab architecture: FALLOW_FAIL_ON_ISSUES exits 1"
+else
+  fail "gitlab architecture: FALLOW_FAIL_ON_ISSUES exits 1" "got $ARCH_STATUS: $OUT"
+fi
+
+: > "$FALLOW_TEST_LOG"
+run_generated_gitlab_fixture "$ARCH_WORK" \
+  MOCK_GATE_ENVELOPE="$ARCH_FIXTURE" \
+  FALLOW_TEST_LOG="$FALLOW_TEST_LOG" \
+  FALLOW_COMMAND=architecture \
+  FALLOW_ISSUE_TYPES="cycles, policy" > /dev/null 2>&1 || true
+assert_contains "$(grep '^fallow architecture ' "$FALLOW_TEST_LOG")" "--cycles --policy" \
+  "gitlab architecture: FALLOW_ISSUE_TYPES forwards the architecture filter flags"
+
+: > "$FALLOW_TEST_LOG"
+OUT=$(run_generated_gitlab_fixture "$ARCH_WORK" \
+  MOCK_GATE_ENVELOPE="$ARCH_FIXTURE" \
+  FALLOW_TEST_LOG="$FALLOW_TEST_LOG" \
+  FALLOW_COMMAND=architecture \
+  FALLOW_ISSUE_TYPES="boundaries, circular-deps")
+ARCH_STATUS=$?
+if [ "$ARCH_STATUS" = "2" ]; then
+  pass "gitlab architecture: an unknown FALLOW_ISSUE_TYPES value exits 2"
+else
+  fail "gitlab architecture: an unknown FALLOW_ISSUE_TYPES value exits 2" "got $ARCH_STATUS: $OUT"
+fi
+assert_contains "$OUT" "ERROR: Invalid FALLOW_ISSUE_TYPES value for the architecture command: 'circular-deps'. Valid values: cycles, boundaries, policy." \
+  "gitlab architecture: the FALLOW_ISSUE_TYPES error names the valid values"
+assert_not_contains "$(cat "$FALLOW_TEST_LOG")" "fallow architecture " \
+  "gitlab architecture: an unknown FALLOW_ISSUE_TYPES value does not run the analysis"
+
+OUT=$(run_generated_gitlab_fixture "$ARCH_WORK" \
+  MOCK_GATE_ENVELOPE="$ARCH_FIXTURE" \
+  FALLOW_COMMAND=architectural)
+ARCH_STATUS=$?
+if [ "$ARCH_STATUS" = "2" ]; then
+  pass "gitlab architecture: a misspelled command exits 2"
+else
+  fail "gitlab architecture: a misspelled command exits 2" "got $ARCH_STATUS"
+fi
+assert_contains "$OUT" "Must be dead-code, architecture, dupes, health, audit, security, fix, or empty (runs all)." \
+  "gitlab architecture: the invalid-command error lists architecture"
+
+assert_contains "$(grep -E '^  FALLOW_COMMAND:' "$DIR/../gitlab-ci.yml")" "architecture" \
+  "gitlab architecture: the FALLOW_COMMAND variable documents the command"
+
+unset FALLOW_TEST_LOG
+rm -rf "$ARCH_WORK"
 
 # --- Summary ---
 

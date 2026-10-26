@@ -6,40 +6,50 @@ use fallow_types::discover::DiscoveredFile;
 use fallow_types::extract::ModuleInfo;
 use fallow_types::results::AnalysisResults;
 
-use crate::baseline::{BaselineData, filter_new_issues};
+use crate::baseline::{BaselineData, BaselineStaleness, BaselineStalenessWarning};
+use crate::baseline_gate::LoadedBaselineStaleness;
 use crate::error::emit_error;
+use crate::exit_codes::gate_failed_exit_code;
 use crate::load_config_for_analysis;
+use crate::process_clock::{self, ProcessSpan};
 use crate::regression::{self, RegressionOpts, RegressionOutcome};
 use crate::report;
+use fallow_output::GateName;
 
+mod baseline_notes;
 #[expect(
     clippy::redundant_pub_crate,
     reason = "reused by crate::security; check is crate-private so pub(crate) is the minimal widening that exposes filtering crate-wide"
 )]
 pub(crate) mod filtering;
 mod output;
-mod rules;
+pub mod rules;
 
-pub use filtering::get_changed_files;
 pub use filtering::resolve_workspace_scope;
+pub use filtering::try_get_changed_files;
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IssueFilters {
     pub unused_files: bool,
     pub unused_exports: bool,
     pub unused_deps: bool,
     pub unused_types: bool,
     pub private_type_leaks: bool,
+    pub deprecated_exports_in_use: bool,
     pub unused_enum_members: bool,
     pub unused_class_members: bool,
     pub unused_store_members: bool,
     pub unprovided_injects: bool,
     pub unrendered_components: bool,
     pub unused_component_props: bool,
+    pub absent_component_props: bool,
     pub unused_component_emits: bool,
     pub unused_component_inputs: bool,
     pub unused_component_outputs: bool,
     pub unused_svelte_events: bool,
+    pub unused_effect_layers: bool,
+    pub unused_tagged_errors: bool,
+    pub unproduced_catch_tags: bool,
     pub unused_server_actions: bool,
     pub unused_load_data_keys: bool,
     pub unresolved_imports: bool,
@@ -47,6 +57,7 @@ pub struct IssueFilters {
     pub duplicate_exports: bool,
     pub circular_deps: bool,
     pub re_export_cycles: bool,
+    pub package_cycles: bool,
     pub boundary_violations: bool,
     pub policy_violations: bool,
     pub stale_suppressions: bool,
@@ -60,6 +71,53 @@ pub struct IssueFilters {
     pub misplaced_directives: bool,
     pub route_collisions: bool,
     pub dynamic_segment_name_conflicts: bool,
+    /// Bare `fallow --only architecture` / `--skip architecture`. The selection
+    /// applies after the baseline stage, so it narrows the report and leaves the
+    /// baseline file and the health input as a run without it has them.
+    pub architecture_selection: ArchitectureSelection,
+}
+
+/// Which dead-code findings a bare `fallow` run reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArchitectureSelection {
+    /// Every dead-code finding (the default).
+    #[default]
+    All,
+    /// Only the architecture findings (`--only architecture`).
+    Only,
+    /// Every finding except the architecture findings (`--skip architecture`).
+    Exclude,
+}
+
+impl ArchitectureSelection {
+    /// Remove the findings the selection leaves out of the report.
+    pub fn apply(self, results: &mut fallow_types::results::AnalysisResults) {
+        match self {
+            Self::All => {}
+            Self::Only => {
+                let mut only = IssueFilters::default();
+                for flag in [
+                    "--circular-deps",
+                    "--re-export-cycles",
+                    "--package-cycles",
+                    "--boundary-violations",
+                    "--policy-violations",
+                ] {
+                    only.enable_cli_filter_flag(flag);
+                }
+                only.apply(results);
+            }
+            Self::Exclude => {
+                results.circular_dependencies.clear();
+                results.re_export_cycles.clear();
+                results.package_cycles.clear();
+                results.boundary_violations.clear();
+                results.boundary_coverage_violations.clear();
+                results.boundary_call_violations.clear();
+                results.policy_violations.clear();
+            }
+        }
+    }
 }
 
 impl IssueFilters {
@@ -70,16 +128,21 @@ impl IssueFilters {
             "--unused-deps" => self.unused_deps = true,
             "--unused-types" => self.unused_types = true,
             "--private-type-leaks" => self.private_type_leaks = true,
+            "--deprecated-exports-in-use" => self.deprecated_exports_in_use = true,
             "--unused-enum-members" => self.unused_enum_members = true,
             "--unused-class-members" => self.unused_class_members = true,
             "--unused-store-members" => self.unused_store_members = true,
             "--unprovided-injects" => self.unprovided_injects = true,
             "--unrendered-components" => self.unrendered_components = true,
             "--unused-component-props" => self.unused_component_props = true,
+            "--absent-component-props" => self.absent_component_props = true,
             "--unused-component-emits" => self.unused_component_emits = true,
             "--unused-component-inputs" => self.unused_component_inputs = true,
             "--unused-component-outputs" => self.unused_component_outputs = true,
             "--unused-svelte-events" => self.unused_svelte_events = true,
+            "--unused-effect-layers" => self.unused_effect_layers = true,
+            "--unused-tagged-errors" => self.unused_tagged_errors = true,
+            "--unproduced-catch-tags" => self.unproduced_catch_tags = true,
             "--unused-server-actions" => self.unused_server_actions = true,
             "--unused-load-data-keys" => self.unused_load_data_keys = true,
             "--unresolved-imports" => self.unresolved_imports = true,
@@ -87,6 +150,7 @@ impl IssueFilters {
             "--duplicate-exports" => self.duplicate_exports = true,
             "--circular-deps" => self.circular_deps = true,
             "--re-export-cycles" => self.re_export_cycles = true,
+            "--package-cycles" => self.package_cycles = true,
             "--boundary-violations" => self.boundary_violations = true,
             "--policy-violations" => self.policy_violations = true,
             "--stale-suppressions" => self.stale_suppressions = true,
@@ -108,16 +172,21 @@ impl IssueFilters {
             || self.unused_deps
             || self.unused_types
             || self.private_type_leaks
+            || self.deprecated_exports_in_use
             || self.unused_enum_members
             || self.unused_class_members
             || self.unused_store_members
             || self.unprovided_injects
             || self.unrendered_components
             || self.unused_component_props
+            || self.absent_component_props
             || self.unused_component_emits
             || self.unused_component_inputs
             || self.unused_component_outputs
             || self.unused_svelte_events
+            || self.unused_effect_layers
+            || self.unused_tagged_errors
+            || self.unproduced_catch_tags
             || self.unused_server_actions
             || self.unused_load_data_keys
             || self.unresolved_imports
@@ -125,6 +194,7 @@ impl IssueFilters {
             || self.duplicate_exports
             || self.circular_deps
             || self.re_export_cycles
+            || self.package_cycles
             || self.boundary_violations
             || self.policy_violations
             || self.stale_suppressions
@@ -140,10 +210,27 @@ impl IssueFilters {
             || self.dynamic_segment_name_conflicts
     }
 
+    /// Whether the report keeps dependency findings: no filter is active, or
+    /// `--unused-deps` or `--unlisted-deps` is one of the active filters, and
+    /// the run does not report only the architecture findings.
+    ///
+    /// These are the issue types `ignoreDependencies` controls, so an
+    /// unmatched `ignoreDependencies` glob is reported only when this is true.
+    pub fn reports_dependency_findings(&self) -> bool {
+        self.architecture_selection != ArchitectureSelection::Only
+            && (!self.any_active() || self.unused_deps || self.unlisted_deps)
+    }
+
     /// Enable off-by-default issue types when explicitly requested as filters.
     pub fn activate_explicit_opt_ins(&self, rules: &mut RulesConfig) {
+        if self.absent_component_props && rules.absent_component_props == Severity::Off {
+            rules.absent_component_props = Severity::Warn;
+        }
         if self.private_type_leaks && rules.private_type_leaks == Severity::Off {
             rules.private_type_leaks = Severity::Warn;
+        }
+        if self.deprecated_exports_in_use && rules.deprecated_exports_in_use == Severity::Off {
+            rules.deprecated_exports_in_use = Severity::Warn;
         }
     }
 
@@ -162,6 +249,7 @@ impl IssueFilters {
     fn apply_core_filters(&self, results: &mut fallow_types::results::AnalysisResults) {
         if !self.unused_files {
             results.unused_files.clear();
+            results.cascade.suppressed_unused_files.clear();
         }
         if !self.unused_exports {
             results.unused_exports.clear();
@@ -171,6 +259,9 @@ impl IssueFilters {
         }
         if !self.private_type_leaks {
             results.private_type_leaks.clear();
+        }
+        if !self.deprecated_exports_in_use {
+            results.deprecated_exports_in_use.clear();
         }
         if !self.unused_deps {
             results.unused_dependencies.clear();
@@ -201,6 +292,9 @@ impl IssueFilters {
         if !self.unrendered_components {
             results.unrendered_components.clear();
         }
+        if !self.absent_component_props {
+            results.absent_component_props.clear();
+        }
         if !self.unused_component_props {
             results.unused_component_props.clear();
         }
@@ -215,6 +309,15 @@ impl IssueFilters {
         }
         if !self.unused_svelte_events {
             results.unused_svelte_events.clear();
+        }
+        if !self.unused_effect_layers {
+            results.unused_effect_layers.clear();
+        }
+        if !self.unused_tagged_errors {
+            results.unused_tagged_errors.clear();
+        }
+        if !self.unproduced_catch_tags {
+            results.unproduced_catch_tags.clear();
         }
         if !self.unused_server_actions {
             results.unused_server_actions.clear();
@@ -251,6 +354,9 @@ impl IssueFilters {
         }
         if !self.re_export_cycles {
             results.re_export_cycles.clear();
+        }
+        if !self.package_cycles {
+            results.package_cycles.clear();
         }
         if !self.boundary_violations {
             results.boundary_violations.clear();
@@ -311,6 +417,35 @@ impl TraceOptions {
     }
 }
 
+/// The command a standalone dead-code pipeline run reports for.
+///
+/// Both commands run the same analysis. The surface changes the human
+/// layout, the hint that points from `dead-code` to `architecture`, the JSON
+/// `kind` and `schema_version`, and the command that follow-up steps name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CheckSurface {
+    /// `fallow dead-code`.
+    #[default]
+    DeadCode,
+    /// `fallow architecture`: cycles, boundaries and rule-pack policy rules.
+    Architecture,
+}
+
+impl CheckSurface {
+    /// The subcommand that runs this surface, as `fallow <command>` spells it.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::DeadCode => "dead-code",
+            Self::Architecture => "architecture",
+        }
+    }
+}
+
+/// The stderr hint that `fallow dead-code` prints when it reports an
+/// architecture finding.
+pub const ARCHITECTURE_HINT: &str = "Tip: run `fallow architecture` for import cycles, boundaries and policy rules. A future major version removes them from `fallow dead-code`.";
+
 pub struct CheckOptions<'a> {
     pub root: &'a std::path::Path,
     pub config_path: &'a Option<std::path::PathBuf>,
@@ -323,10 +458,25 @@ pub struct CheckOptions<'a> {
     pub fail_on_issues: bool,
     pub filters: &'a IssueFilters,
     pub changed_since: Option<&'a str>,
+    /// Who owns the change scope. `audit` owns it, so its runs never read
+    /// `workspaces.changedSince`.
+    pub change_scope_owner: fallow_engine::change_scope::ChangeScopeOwner,
+    /// `--no-package-baselines`: ignore `workspaces.changedSince` for this run.
+    pub no_package_baselines: bool,
     pub diff_index: Option<&'a crate::report::ci::diff_filter::DiffIndex>,
     pub use_shared_diff_index: bool,
     pub baseline: Option<&'a std::path::Path>,
+    /// Which argument carried `baseline`, so the note about a baseline another
+    /// command saved names an argument this run accepts. `fallow audit` passes
+    /// `--dead-code-baseline`; every other caller passes `--baseline`.
+    pub baseline_flag: &'a str,
+    /// True for the dead-code sub-pass of bare `fallow`. There `--baseline`
+    /// holds the dead-code baseline only, so the note about a health or dupes
+    /// baseline names `--health-baseline` or `--dupes-baseline` instead.
+    pub bare_run: bool,
     pub save_baseline: Option<&'a std::path::Path>,
+    /// Fail the run when a loaded `baseline` has entries that match nothing.
+    pub fail_on_stale_baseline: bool,
     pub sarif_file: Option<&'a std::path::Path>,
     pub production: bool,
     pub production_override: Option<bool>,
@@ -351,25 +501,49 @@ pub struct CheckOptions<'a> {
     pub top: Option<usize>,
     /// Only report issues in these file(s). Empty means no file filter.
     pub file: &'a [std::path::PathBuf],
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Appended to the workspace-roots channel, so it composes with
+    /// `--workspace` the way multiple workspace roots compose (union), and
+    /// intersects with `--changed-since` / `--diff-file` like every other
+    /// scope flag. `None` means whole-project scope.
+    pub scope: Option<std::path::PathBuf>,
+    /// `--finding-id`: report only these findings. The filter runs after
+    /// every other filter and after the baseline. `None` reports every
+    /// finding.
+    pub finding_ids: Option<&'a fallow_engine::dead_code::FindingIdFilter>,
     /// Report unused exports in entry files instead of auto-marking them as used.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
+    /// `--fail-on-parse-error`. Applied to the resolved config, which also
+    /// carries the `failOnParseError` key, so the config holds the armed state.
+    pub fail_on_parse_error: bool,
     /// When true, emit a condensed summary instead of full item-level output.
     /// Consumed by combined mode only; standalone check ignores this flag.
     pub summary: bool,
     pub regression_opts: RegressionOpts<'a>,
     /// When true, retain parsed modules and discovered files for sharing with health.
     pub retain_modules_for_health: bool,
-    /// When true, return timings without printing them so combined mode can add
-    /// later stages before rendering the table.
+    /// When true, return timings without printing them. Combined mode adds
+    /// later stages before it renders the table, and `run_check` renders it
+    /// after the report so that the process clock covers the output. A trace
+    /// view that ends the command still prints the table.
     pub defer_performance: bool,
     /// Which revision this pass analyzes. `Base` marks the isolated
     /// `audit --base` pass so revision-specific diagnostics name the base
     /// revision instead of reading as a current-configuration defect.
     pub analysis_snapshot: fallow_config::AnalysisSnapshot,
+    /// Expand the skipped-file notes: with this set, a human run also reports
+    /// which built-in discovery ignore patterns removed candidate source files
+    /// (issue #2638). The typed diagnostics reach JSON either way.
+    pub explain_skipped: bool,
+    /// The command this run reports for. Only the standalone print reads it.
+    pub surface: CheckSurface,
 }
 
 /// Result of executing check analysis without printing.
 pub struct CheckResult {
+    pub package_baselines: Vec<fallow_api::PackageBaselineStatus>,
     pub results: AnalysisResults,
     pub config: ResolvedConfig,
     pub config_fixable: bool,
@@ -379,6 +553,13 @@ pub struct CheckResult {
     pub baseline_deltas: Option<crate::baseline::BaselineDeltas>,
     /// When a baseline was loaded: (total entries in baseline, entries that matched current issues).
     pub baseline_matched: Option<(usize, usize)>,
+    /// When a baseline was loaded: this run's full view of it, for the opt-in
+    /// stale-baseline gate. `baseline_matched` is derived from the same values.
+    pub baseline_staleness: Option<LoadedBaselineStaleness>,
+    /// Whether `--fail-on-stale-baseline` was requested.
+    pub fail_on_stale_baseline: bool,
+    /// The answer to `--finding-id`, when the run received one.
+    pub finding_id_query: Option<fallow_output::FindingIdQuery>,
     pub timings: Option<fallow_types::trace::PipelineTimings>,
     /// Retained parse data for sharing with health (only populated when retain_modules_for_health=true).
     pub shared_parse: Option<fallow_engine::health::HealthSharedParseData>,
@@ -395,6 +576,11 @@ pub struct CheckResult {
     /// same combined run re-walks the project and clears the source-discovery
     /// entries this walk recorded (issue #2366).
     pub workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    /// Source files this run's walk discovered. Zero plus a non-empty
+    /// `excluded-by-default-ignore` tally is the one shape that earns a
+    /// default stderr line: the run analyzed nothing and a built-in ignore
+    /// pattern is the reason (issue #2638).
+    pub discovered_file_count: usize,
     /// Pre-refinement dead-code audit keys captured immediately before the
     /// type-aware pass mutated `results`. `None` when type-aware analysis was
     /// not enabled. The audit gate uses this identity-independent set to fall
@@ -407,6 +593,14 @@ pub struct CheckResult {
     /// `None` outside the brief path. Holds root-relative paths so it survives
     /// the graph drop and serializes directly.
     pub impact_closure: Option<fallow_engine::module_graph::ImpactClosurePaths>,
+    /// Co-change gaps for the review brief: changed files whose hidden
+    /// change-coupling partner is not in the diff. Computed on the brief path
+    /// from the retained graph and the cached churn pass; empty elsewhere.
+    pub co_change_gaps: Vec<fallow_output::CoChangeGapFact>,
+    /// Churn pass of the review brief, read once for the co-change gaps and
+    /// the reviewer routing. `None` outside the brief path and without a
+    /// commit history.
+    pub brief_churn: Option<fallow_engine::churn::ChurnResult>,
     /// Exports-aware public-export key set for the review brief: the
     /// `<rel_path>::<name>` keys reachable through `package.json` `exports` +
     /// re-export reachability. Computed from the retained graph on the brief
@@ -434,6 +628,24 @@ pub struct CheckResult {
     /// retained graph on the brief path BEFORE the graph is dropped; `None`
     /// otherwise. Internal (CheckResult is not serialized).
     pub export_lines: Option<rustc_hash::FxHashMap<String, Vec<(String, u32)>>>,
+    /// Literal-search gaps of the exports of the changed files: consumers that
+    /// a text search for the export name does not find or finds only under
+    /// another name. Computed from the retained graph on the brief path BEFORE
+    /// the graph is dropped; `None` otherwise. Internal (not serialized).
+    pub search_gaps: Option<Vec<fallow_engine::module_graph::ExportSearchGapPaths>>,
+    /// Test reach of the value exports of the changed files. Computed from
+    /// the retained graph on the brief path BEFORE the graph is dropped;
+    /// `None` otherwise. Internal (not serialized).
+    pub test_reach: Option<fallow_engine::module_graph::TestReachPaths>,
+    /// The export names of each test reach file at the base side of the
+    /// diff, keyed by head path. A file that did not exist at the base maps
+    /// to an empty set. A file that git could not read is absent. Computed
+    /// on the brief path; `None` otherwise. Internal (not serialized).
+    pub test_reach_base_exports:
+        Option<rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>>,
+    /// Which configs name which files, dependencies and configuration
+    /// exports. The brief reads the framework configuration exports from it.
+    pub trace_provenance: fallow_engine::trace::TraceProvenance,
     /// Per-anchor `rel_path -> count of in-repo modules OUTSIDE the diff that
     /// directly import it`, for the decision surface's honest per-decision consumer
     /// number. Computed from the retained graph's reverse-deps on the brief path
@@ -449,6 +661,11 @@ pub struct CheckResult {
     pub package_importers:
         Option<rustc_hash::FxHashMap<String, fallow_engine::module_graph::PackageImporters>>,
     pub workspaces: Vec<WorkspaceInfo>,
+    /// Whether this run asked for the expanded skipped-file notes
+    /// (`--explain-skipped`), carried on the result the way `DupesResult`
+    /// carries it so every human-output site reads one owned value instead of
+    /// re-plumbing the flag (issue #2638).
+    pub explain_skipped: bool,
     retained_files: Option<Vec<DiscoveredFile>>,
 }
 
@@ -460,13 +677,16 @@ struct CheckAnalysisData {
     retained_files: Option<Vec<DiscoveredFile>>,
     workspaces: Vec<WorkspaceInfo>,
     workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
+    discovered_file_count: usize,
     script_used_packages: rustc_hash::FxHashSet<String>,
+    trace_provenance: fallow_engine::trace::TraceProvenance,
 }
 
 fn check_data_from_artifacts(
     output: fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
     session: &fallow_engine::session::AnalysisSession,
 ) -> CheckAnalysisData {
+    crate::requests::measure_changed_since_scope(session.files());
     CheckAnalysisData {
         results: output.results,
         trace_graph: output.graph,
@@ -475,7 +695,9 @@ fn check_data_from_artifacts(
         retained_files: output.files,
         workspaces: session.workspaces().to_vec(),
         workspace_diagnostics: session.current_workspace_diagnostics(),
+        discovered_file_count: session.files().len(),
         script_used_packages: output.script_used_packages,
+        trace_provenance: output.trace_provenance,
     }
 }
 
@@ -483,6 +705,7 @@ fn check_data_from_plain_artifacts(
     output: fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
     session: &fallow_engine::session::AnalysisSession,
 ) -> CheckAnalysisData {
+    crate::requests::measure_changed_since_scope(session.files());
     CheckAnalysisData {
         results: output.results,
         trace_graph: None,
@@ -491,7 +714,9 @@ fn check_data_from_plain_artifacts(
         retained_files: None,
         workspaces: session.workspaces().to_vec(),
         workspace_diagnostics: session.current_workspace_diagnostics(),
+        discovered_file_count: session.files().len(),
         script_used_packages: output.script_used_packages,
+        trace_provenance: output.trace_provenance,
     }
 }
 
@@ -501,39 +726,65 @@ fn run_check_analysis(
 ) -> Result<CheckAnalysisData, ExitCode> {
     let session = fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
         .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))?;
+    // Resolve the package map before the analysis, so a map that names no
+    // workspace fails fast. The run-wide memo keeps the result for the scope.
+    fallow_engine::change_scope::ChangeScope::resolve(
+        fallow_engine::change_scope::ChangeScopeRequest {
+            owner: opts.change_scope_owner,
+            global_ref: opts.changed_since.is_some(),
+            files: None,
+            cache: Some(crate::requests::package_baseline_cache()),
+            no_package_baselines: opts.no_package_baselines,
+        },
+        config,
+        session.workspaces(),
+    )
+    .map_err(|err| emit_error(&format!("Workspace baseline error: {err}"), 2, opts.output))?;
 
-    if opts.retain_modules_for_health {
-        return session
+    let result = if opts.retain_modules_for_health {
+        session
             .analyze_dead_code_with_artifacts(true, true)
             .map(|output| check_data_from_artifacts(output, &session))
-            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output));
-    }
-
-    if opts.include_dupes {
-        return session
+            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))
+    } else if opts.include_dupes {
+        session
             .analyze_dead_code_retaining_files(false, opts.trace_opts.any_active())
             .map(|mut output| {
                 output.modules = None;
                 check_data_from_artifacts(output, &session)
             })
-            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output));
-    }
-
-    if opts.trace_opts.any_active() || config.type_aware.enabled {
-        return session
+            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))
+    } else if opts.trace_opts.any_active() || config.type_aware.enabled {
+        session
             .analyze_dead_code_with_artifacts(false, true)
             .map(|mut output| {
                 output.modules = None;
                 output.files = None;
                 check_data_from_artifacts(output, &session)
             })
-            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output));
-    }
+            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))
+    } else {
+        session
+            .analyze_dead_code_with_artifacts(false, false)
+            .map(|output| check_data_from_plain_artifacts(output, &session))
+            .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))
+    };
+    drop_in_background(session);
+    result
+}
 
-    session
-        .analyze_dead_code_with_artifacts(false, false)
-        .map(|output| check_data_from_plain_artifacts(output, &session))
-        .map_err(|e| emit_error(&format!("Analysis error: {e}"), 2, opts.output))
+/// Free a large value on a helper thread.
+///
+/// The session holds every parsed module. Freeing them took about five
+/// percent of a CLI run, on the thread that renders the report next. A short
+/// CLI run exits before the helper finishes, and the exit frees the memory.
+/// When no thread can start, the value drops here.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    // On a spawn error the closure, and the value in it, drops here.
+    let spawned = std::thread::Builder::new()
+        .name("fallow-drop".to_owned())
+        .spawn(move || drop(value));
+    drop(spawned);
 }
 
 fn prepare_check_config(opts: &CheckOptions<'_>) -> Result<ResolvedConfig, ExitCode> {
@@ -544,9 +795,11 @@ fn prepare_check_config(opts: &CheckOptions<'_>) -> Result<ResolvedConfig, ExitC
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -555,6 +808,12 @@ fn prepare_check_config(opts: &CheckOptions<'_>) -> Result<ResolvedConfig, ExitC
     config.analysis_snapshot = opts.analysis_snapshot;
     if opts.include_entry_exports {
         config.include_entry_exports = true;
+    }
+    if opts.show_cascade {
+        config.show_cascade = true;
+    }
+    if opts.fail_on_parse_error {
+        config.fail_on_parse_error = true;
     }
     apply_type_aware_overrides(opts, &mut config)?;
     opts.filters.activate_explicit_opt_ins(&mut config.rules);
@@ -666,39 +925,39 @@ fn parse_type_aware_require(
 fn handle_trace_side_effects(
     opts: &CheckOptions<'_>,
     config: &ResolvedConfig,
-    trace_graph: Option<&fallow_engine::module_graph::RetainedModuleGraph>,
-    trace_timings: Option<&fallow_types::trace::PipelineTimings>,
-    script_used_packages: &rustc_hash::FxHashSet<String>,
+    data: &CheckAnalysisData,
 ) -> Result<(), ExitCode> {
+    let trace_timings = data.trace_timings.as_ref();
+    let trace_exit = data.trace_graph.as_ref().and_then(|graph| {
+        crate::telemetry::note_graph_structure(graph);
+        output::handle_type_aware_trace_output(graph, opts, config, &data.trace_provenance).or_else(
+            || {
+                output::handle_trace_output(
+                    graph,
+                    opts.trace_opts,
+                    &config.root,
+                    config.output,
+                    opts.json_style,
+                    &output::TraceFacts {
+                        script_used_packages: &data.script_used_packages,
+                        provenance: &data.trace_provenance,
+                        workspaces: &data.workspaces,
+                        results: &data.results,
+                        ignore_patterns: &config.ignore_patterns,
+                    },
+                )
+            },
+        )
+    });
+    // A trace view ends the command here, so a deferred report prints now.
     if let Some(timings) = trace_timings
         && opts.trace_opts.performance
-        && !opts.defer_performance
+        && (!opts.defer_performance || trace_exit.is_some())
     {
-        report::print_performance(timings, config.output, opts.json_style);
+        // The trace output is not clocked, so no process spans.
+        report::print_performance(timings, None, false, config.output, opts.json_style);
     }
-    if let Some(graph) = trace_graph {
-        crate::telemetry::note_graph_structure(graph);
-        if let Some(code) = output::handle_type_aware_trace_output(
-            graph,
-            opts.trace_opts,
-            config,
-            opts.explain,
-            opts.json_style,
-        ) {
-            return Err(code);
-        }
-        if let Some(code) = output::handle_trace_output(
-            graph,
-            opts.trace_opts,
-            &config.root,
-            config.output,
-            opts.json_style,
-            script_used_packages,
-        ) {
-            return Err(code);
-        }
-    }
-    Ok(())
+    trace_exit.map_or(Ok(()), Err)
 }
 
 fn apply_scope_filters(
@@ -706,30 +965,24 @@ fn apply_scope_filters(
     config: &ResolvedConfig,
     results: &mut AnalysisResults,
     ws_roots: Option<&Vec<std::path::PathBuf>>,
-    changed_files: Option<&rustc_hash::FxHashSet<std::path::PathBuf>>,
+    change_scope: &fallow_engine::change_scope::ChangeScope,
 ) {
-    if let Some(ws_roots) = ws_roots {
-        filtering::filter_to_workspaces(results, ws_roots);
-    }
-    if let Some(changed) = changed_files {
-        filtering::filter_changed_files(results, changed);
-    }
     let diff_index = match opts.diff_index {
         Some(index) => Some(index),
         None if opts.use_shared_diff_index => crate::report::ci::diff_filter::shared_diff_index(),
         None => None,
     };
-    if let Some(diff_index) = diff_index {
-        filtering::filter_results_by_diff(results, diff_index, opts.root);
-    }
-
-    // Scope filters prune the owner list of a multi-owner finding in place
-    // (`duplicate_exports` narrows `locations`), so a group the engine kept
-    // because one owner was outside `ignoreFindings` can end up holding only
-    // ignored owners. Re-apply the ignore filter over the scoped result so the
-    // "hidden only when every owner matches" contract holds for what is actually
-    // reported. The helper returns immediately when no patterns are configured.
-    fallow_engine::dead_code::filter_configured_ignored_findings(results, config);
+    let files = file_scope(opts);
+    fallow_engine::dead_code::apply_scope(
+        results,
+        &fallow_engine::dead_code::DeadCodeScope {
+            workspace_roots: ws_roots.map(Vec::as_slice),
+            changes: Some(change_scope),
+            diff: diff_index.map(|index| (index, opts.root)),
+            files: files.as_ref(),
+        },
+        config,
+    );
 }
 
 fn apply_rules_and_filters(
@@ -737,16 +990,20 @@ fn apply_rules_and_filters(
     config: &ResolvedConfig,
     results: &mut AnalysisResults,
 ) {
+    // The issue-type filter runs first, as in the programmatic runtime, so the
+    // rule pass counts `cascade_hidden` over the same selected kinds there.
+    opts.filters.apply(results);
     rules::apply_rules(results, config);
     if opts.fail_on_issues {
-        rules::promote_policy_finding_warns(results);
+        rules::promote_finding_warns(results);
     }
-    opts.filters.apply(results);
 }
 
-fn apply_file_filter(opts: &CheckOptions<'_>, results: &mut AnalysisResults) {
+/// The `--file` set of the run, resolved against the root, or `None` when the
+/// flag is absent. Warns for each path that does not exist.
+fn file_scope(opts: &CheckOptions<'_>) -> Option<rustc_hash::FxHashSet<std::path::PathBuf>> {
     if opts.file.is_empty() {
-        return;
+        return None;
     }
     let file_set: rustc_hash::FxHashSet<std::path::PathBuf> = opts
         .file
@@ -768,13 +1025,7 @@ fn apply_file_filter(opts: &CheckOptions<'_>, results: &mut AnalysisResults) {
             );
         }
     }
-    filtering::filter_changed_files(results, &file_set);
-    results.unused_dependencies.clear();
-    results.unused_dev_dependencies.clear();
-    results.unused_optional_dependencies.clear();
-    results.type_only_dependencies.clear();
-    results.test_only_dependencies.clear();
-    results.dev_dependencies_in_production.clear();
+    Some(file_set)
 }
 
 fn warn_scoped_regression_save(opts: &CheckOptions<'_>) {
@@ -786,9 +1037,9 @@ fn warn_scoped_regression_save(opts: &CheckOptions<'_>) {
         return;
     }
     eprintln!(
-        "Warning: saving regression baseline with --changed-since, --workspace, or \
-         --changed-workspaces active. The baseline will reflect only scoped results, \
-         not the full project."
+        "Warning: saving regression baseline from a scoped run (--changed-since, \
+         --workspace, --changed-workspaces, a path, or --only/--skip architecture). \
+         The baseline will reflect only scoped results, not the full project."
     );
 }
 
@@ -827,13 +1078,7 @@ fn save_check_regression_baseline(
 }
 
 fn regression_config_path(opts: &CheckOptions<'_>) -> std::path::PathBuf {
-    opts.config_path.as_ref().map_or_else(
-        || {
-            fallow_config::FallowConfig::find_config_path(opts.root)
-                .unwrap_or_else(|| opts.root.join(".fallowrc.json"))
-        },
-        Clone::clone,
-    )
+    regression::regression_config_target(opts.config_path.as_deref(), opts.root)
 }
 
 fn build_shared_parse_data(
@@ -880,33 +1125,44 @@ fn resolve_check_regression(
         &opts.regression_opts,
         config_baseline,
         analysis_identity,
+        opts.surface.command(),
     )
 }
 
 struct CheckCompletionInput<'a> {
+    package_baselines: Vec<fallow_api::PackageBaselineStatus>,
     opts: &'a CheckOptions<'a>,
     config: ResolvedConfig,
     data: CheckAnalysisData,
     elapsed: Duration,
     regression_outcome: Option<RegressionOutcome>,
-    baseline_matched: Option<(usize, usize)>,
+    baseline_staleness: Option<LoadedBaselineStaleness>,
     type_aware: Option<fallow_api::TypeAwareOutcome>,
     type_coupling: Option<fallow_types::semantic::TypeCouplingReport>,
     syntactic_dead_code_keys: Option<rustc_hash::FxHashSet<String>>,
+    finding_id_query: Option<fallow_output::FindingIdQuery>,
+    /// The results before the architecture selection, when it narrowed them.
+    health_results: Option<AnalysisResults>,
 }
 
 fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
     let CheckCompletionInput {
+        package_baselines,
         opts,
         config,
         data,
         elapsed,
         regression_outcome,
-        baseline_matched,
+        baseline_staleness,
         type_aware,
         type_coupling,
         syntactic_dead_code_keys,
+        finding_id_query,
+        health_results,
     } = input;
+    let baseline_matched = baseline_staleness
+        .as_ref()
+        .map(|loaded| (loaded.staleness.entries, loaded.staleness.matched));
     let CheckAnalysisData {
         results,
         trace_graph,
@@ -915,17 +1171,27 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
         mut retained_files,
         workspaces,
         workspace_diagnostics,
+        discovered_file_count,
         script_used_packages,
+        trace_provenance,
     } = data;
+    // A `--file` run drops dependency findings, so it reports none, like a
+    // filter without the dependency issue types.
+    let reports_dependencies = opts.filters.reports_dependency_findings() && opts.file.is_empty();
+    let workspace_diagnostics = fallow_types::workspace::merge_workspace_diagnostics(
+        workspace_diagnostics,
+        baseline_notes::run_notes(&config, reports_dependencies, baseline_staleness.as_ref()),
+    );
 
     if let Some(sarif_path) = opts.sarif_file {
-        output::write_sarif_file(
-            &results,
-            &config,
+        output::write_sarif_file(&output::SarifFileInput {
+            results: &results,
+            config: &config,
             sarif_path,
-            opts.quiet,
-            type_aware.as_ref().map(|outcome| &outcome.meta),
-        );
+            quiet: opts.quiet,
+            type_aware: type_aware.as_ref().map(|outcome| &outcome.meta),
+            workspace_diagnostics: &workspace_diagnostics,
+        });
     }
 
     let retained_files_for_cross_reference = if opts.include_dupes && retained_modules.is_some() {
@@ -937,7 +1203,7 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
     };
 
     let shared_parse = build_shared_parse_data(
-        &results,
+        health_results.as_ref().unwrap_or(&results),
         trace_graph,
         retained_modules,
         retained_files,
@@ -945,42 +1211,45 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
         &script_used_packages,
     );
 
-    let config_fixable = crate::fix::is_config_fixable(opts.root, opts.config_path.as_ref());
-    let required_completeness = config.type_aware.require.into();
-    let (type_aware_meta, type_aware_warnings) = type_aware.map_or_else(
-        || (None, Vec::new()),
-        |outcome| {
-            let mut meta = outcome.meta;
-            meta.required_completeness = Some(required_completeness);
-            (Some(meta), outcome.warnings)
-        },
-    );
+    let (type_aware_meta, type_aware_warnings) = split_type_aware_outcome(type_aware, &config);
 
     // Report result volume to telemetry from the real result, independent of
     // the exit-code gate. Exact counts are bucketed before serialization.
     crate::telemetry::note_result_count(results.total_issues());
 
     CheckResult {
+        package_baselines,
         results,
         config,
-        config_fixable,
+        config_fixable: crate::fix::is_config_fixable(opts.root, opts.config_path.as_ref()),
         elapsed,
         fail_on_issues: opts.fail_on_issues,
         regression: regression_outcome,
         baseline_deltas: None,
         baseline_matched,
+        baseline_staleness,
+        fail_on_stale_baseline: opts.fail_on_stale_baseline,
+        finding_id_query,
         timings: trace_timings,
         shared_parse,
         type_aware_meta,
         type_coupling,
         type_aware_warnings,
         workspace_diagnostics,
+        discovered_file_count,
+        explain_skipped: opts.explain_skipped,
         syntactic_dead_code_keys,
         impact_closure: None,
+        co_change_gaps: Vec::new(),
+        brief_churn: None,
         public_api_keys: None,
         partition_order: None,
         focus_facts: None,
         export_lines: None,
+        search_gaps: None,
+        test_reach: None,
+        test_reach_base_exports: None,
+        trace_provenance,
         internal_consumers: None,
         test_adjacency: None,
         package_importers: None,
@@ -997,29 +1266,32 @@ fn complete_check_execution(input: CheckCompletionInput<'_>) -> CheckResult {
 pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
     let start = Instant::now();
 
-    let config = prepare_check_config(opts)?;
+    let config = process_clock::time(ProcessSpan::Config, || prepare_check_config(opts))?;
     validate_effective_type_aware_output(opts.output, config.type_aware.enabled)?;
 
-    let ws_roots = filtering::resolve_workspace_scope(
+    let mut ws_roots = filtering::resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
+        &config.workspace_patterns,
         opts.output,
     )?;
+    if let Some(scope) = opts.scope.as_ref() {
+        ws_roots.get_or_insert_with(Vec::new).push(scope.clone());
+    }
 
-    let changed_files: Option<rustc_hash::FxHashSet<std::path::PathBuf>> = opts
-        .changed_since
-        .and_then(|git_ref| filtering::get_changed_files(opts.root, git_ref));
+    let changed_files: Option<rustc_hash::FxHashSet<std::path::PathBuf>> =
+        opts.changed_since.and_then(|git_ref| {
+            process_clock::time(ProcessSpan::Git, || {
+                crate::requests::resolve_changed_since(opts.root, git_ref)
+            })
+        });
 
-    let mut data = run_check_analysis(opts, &config)?;
+    let mut data =
+        process_clock::time(ProcessSpan::Analysis, || run_check_analysis(opts, &config))?;
+    let _post_analysis = process_clock::start(ProcessSpan::PostAnalysis);
 
-    if let Err(code) = handle_trace_side_effects(
-        opts,
-        &config,
-        data.trace_graph.as_ref(),
-        data.trace_timings.as_ref(),
-        &data.script_used_packages,
-    ) {
+    if let Err(code) = handle_trace_side_effects(opts, &config, &data) {
         // A focused trace / closure view exits here without building the full
         // CheckResult (where the normal path records find-state below). The full
         // analysis still ran, so record its find-state for telemetry on the
@@ -1032,17 +1304,38 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
         return Err(code);
     }
     let unfiltered_unused_files = data.results.unused_files.clone();
+    let mut finding_id_trace = opts.finding_ids.map(|filter| {
+        fallow_engine::dead_code::FindingIdTrace::start(filter.clone(), &mut data.results)
+    });
+
+    let change_scope = process_clock::time(ProcessSpan::Git, || {
+        fallow_engine::change_scope::ChangeScope::resolve(
+            fallow_engine::change_scope::ChangeScopeRequest {
+                owner: opts.change_scope_owner,
+                global_ref: opts.changed_since.is_some(),
+                files: changed_files.as_ref(),
+                cache: Some(crate::requests::package_baseline_cache()),
+                no_package_baselines: opts.no_package_baselines,
+            },
+            &config,
+            &data.workspaces,
+        )
+    })
+    .map_err(|err| emit_error(&format!("Workspace baseline error: {err}"), 2, opts.output))?;
+    crate::requests::warn_if_package_baselines_stood_down(&change_scope);
 
     apply_scope_filters(
         opts,
         &config,
         &mut data.results,
         ws_roots.as_ref(),
-        changed_files.as_ref(),
+        &change_scope,
     );
-    apply_file_filter(opts, &mut data.results);
 
     apply_rules_and_filters(opts, &config, &mut data.results);
+    if let Some(trace) = finding_id_trace.as_mut() {
+        trace.end_stage(&mut data.results);
+    }
 
     // Capture the pre-refinement dead-code keys so the audit gate can fall
     // back to identity-independent syntactic attribution when base and head
@@ -1087,49 +1380,168 @@ pub fn execute_check(opts: &CheckOptions<'_>) -> Result<CheckResult, ExitCode> {
             opts.retain_modules_for_health,
         );
         data.results.unused_files = reported_unused_files;
-        let outcome = outcome.map_err(|error| {
-            emit_error(
-                &format!("Type-aware analysis failed: {error}"),
-                2,
-                opts.output,
-            )
-        })?;
-        outcome.map_or((None, None), |outcome| {
-            (Some(outcome.type_aware), outcome.type_coupling)
-        })
+        match outcome {
+            Ok(outcome) => outcome.map_or((None, None), |outcome| {
+                (Some(outcome.type_aware), outcome.type_coupling)
+            }),
+            Err(error) => {
+                let meta = crate::type_aware_degrade::degrade_or_fail(
+                    &crate::type_aware_degrade::DegradeContext {
+                        root: &config.root,
+                        error: &error.to_string(),
+                        failure_label: "Type-aware analysis failed",
+                        require: config.type_aware.require,
+                        quiet: opts.quiet,
+                        output: opts.output,
+                    },
+                )?;
+                // `degrade_or_fail` already put this on stderr, honoring
+                // `--quiet`. Copying it into the outcome would print the same
+                // sentence a second time from `print_type_aware_warnings`,
+                // which has no quiet or format guard. The warning still travels
+                // in `meta` for `_meta.type_aware.warnings`.
+                (
+                    Some(fallow_api::TypeAwareOutcome {
+                        meta,
+                        warnings: Vec::new(),
+                    }),
+                    None,
+                )
+            }
+        }
     } else {
         (None, None)
     };
+    if config.type_aware.enabled {
+        // Reconciliation can add findings anywhere in the project, such as
+        // private-type leaks. Every scope filter (workspace, change scope,
+        // diff, file list) narrows the final result, so they run again over
+        // the refined set. They only remove findings, so this pass keeps what
+        // the first pass kept. The first pass only saves sidecar work.
+        apply_scope_filters(
+            opts,
+            &config,
+            &mut data.results,
+            ws_roots.as_ref(),
+            &change_scope,
+        );
+        // Reconciliation can add findings a syntactic pass never produced, so
+        // effective severities are resolved once more over the refined set.
+        // The pass removes findings and writes each gate severity again, so a
+        // run that reconciled nothing is unchanged. It also resets the
+        // --fail-on-issues promotion, which is applied again below. Mirrors
+        // EditorAnalysisSession, which keeps the CLI and the editor reporting
+        // the same set for an overridden path.
+        rules::apply_rules(&mut data.results, &config);
+        if opts.fail_on_issues {
+            rules::promote_finding_warns(&mut data.results);
+        }
+    }
+    // Type-aware refinement is analysis, not a filter: a finding it removes
+    // is gone. Only the baseline stage below counts as filtering again.
+    if let Some(trace) = finding_id_trace.as_mut() {
+        trace.start_stage(&mut data.results);
+    }
     let elapsed = start.elapsed();
     let analysis_identity = type_aware
         .as_ref()
         .and_then(|outcome| outcome.meta.identity.clone())
         .unwrap_or_default();
 
-    let baseline_matched = handle_baseline(
+    let baseline_staleness = handle_baseline(
         &mut data.results,
-        opts.save_baseline,
-        opts.baseline,
-        &config.root,
-        opts.quiet,
-        opts.output,
-        &analysis_identity,
+        &BaselineIo {
+            save_path: opts.save_baseline,
+            load_path: opts.baseline,
+            load_flag: opts.baseline_flag,
+            bare_run: opts.bare_run,
+            command: opts.surface.command(),
+            root: &config.root,
+            quiet: opts.quiet,
+            output: opts.output,
+            analysis_identity: &analysis_identity,
+            scope_reasons: baseline_scope_reasons(opts, &config, &change_scope),
+        },
     )?;
+
+    // The bare `--only architecture` / `--skip architecture` selection narrows
+    // the report only. Health keeps the findings a run without it would see.
+    let health_results = select_architecture_findings(opts.filters, &mut data.results);
 
     let regression_outcome =
         resolve_check_regression(opts, &config, &data.results, &analysis_identity)?;
 
+    let finding_id_query = finding_id_trace.map(|mut trace| {
+        trace.end_stage(&mut data.results);
+        trace.finish(
+            &mut data.results,
+            &config,
+            finding_id_run_reasons(opts, &config, &change_scope),
+        )
+    });
+
     Ok(complete_check_execution(CheckCompletionInput {
+        package_baselines: change_scope.package_baselines(),
         opts,
         config,
         data,
         elapsed,
         regression_outcome,
-        baseline_matched,
+        baseline_staleness,
         type_aware,
         type_coupling,
         syntactic_dead_code_keys,
+        finding_id_query,
+        health_results,
     }))
+}
+
+/// Split the type-aware outcome into the run metadata, with the required
+/// completeness of the config, and the warnings.
+fn split_type_aware_outcome(
+    type_aware: Option<fallow_api::TypeAwareOutcome>,
+    config: &ResolvedConfig,
+) -> (Option<fallow_types::envelope::TypeAwareMeta>, Vec<String>) {
+    type_aware.map_or_else(
+        || (None, Vec::new()),
+        |outcome| {
+            let mut meta = outcome.meta;
+            meta.required_completeness = Some(config.type_aware.require.into());
+            (Some(meta), outcome.warnings)
+        },
+    )
+}
+
+/// Apply the architecture selection of the run. Returns the results before the
+/// selection when it removed a finding type, for the health input.
+fn select_architecture_findings(
+    filters: &IssueFilters,
+    results: &mut AnalysisResults,
+) -> Option<AnalysisResults> {
+    if filters.architecture_selection == ArchitectureSelection::All {
+        return None;
+    }
+    let unselected = results.clone();
+    filters.architecture_selection.apply(results);
+    Some(unselected)
+}
+
+/// The options of this run that can hide a finding without a fix: every
+/// scope channel of the baseline note, plus the baseline itself.
+fn finding_id_run_reasons(
+    opts: &CheckOptions<'_>,
+    config: &ResolvedConfig,
+    change_scope: &fallow_engine::change_scope::ChangeScope,
+) -> Vec<fallow_output::FindingIdQueryReason> {
+    let mut reasons: Vec<fallow_output::FindingIdQueryReason> =
+        baseline_scope_reasons(opts, config, change_scope)
+            .iter()
+            .map(Into::into)
+            .collect();
+    if opts.baseline.is_some() {
+        reasons.push(fallow_output::FindingIdQueryReason::Baseline);
+    }
+    reasons
 }
 
 pub fn benchmark_dead_code_json(
@@ -1158,10 +1570,15 @@ pub fn benchmark_dead_code_json(
         fail_on_issues: false,
         filters: &filters,
         changed_since: None,
+        change_scope_owner: fallow_engine::change_scope::ChangeScopeOwner::Run,
+        no_package_baselines: false,
         diff_index: None,
         use_shared_diff_index: true,
         baseline: None,
+        baseline_flag: "--baseline",
+        bare_run: false,
         save_baseline: None,
+        fail_on_stale_baseline: false,
         sarif_file: None,
         production: false,
         production_override: Some(false),
@@ -1177,7 +1594,11 @@ pub fn benchmark_dead_code_json(
         explain: false,
         top: None,
         file: &[],
+        scope: None,
+        finding_ids: None,
         include_entry_exports: false,
+        show_cascade: false,
+        fail_on_parse_error: false,
         summary: false,
         regression_opts: RegressionOpts {
             fail_on_regression: false,
@@ -1191,14 +1612,19 @@ pub fn benchmark_dead_code_json(
         retain_modules_for_health: false,
         defer_performance: false,
         analysis_snapshot: fallow_config::AnalysisSnapshot::Current,
+        explain_skipped: false,
+        surface: CheckSurface::DeadCode,
     })?;
     let rendered = report::render_check_json(&report::CheckJsonRenderInput {
+        package_baselines: &result.package_baselines,
         results: &result.results,
         root: &result.config.root,
         elapsed: result.elapsed,
         type_aware: result.type_aware_meta.as_ref(),
         regression: result.regression.as_ref(),
         baseline_matched: result.baseline_matched,
+        baseline_staleness: envelope_baseline_staleness(&result),
+        gate_outcomes: None,
         config_fixable: result.config_fixable,
         workspace_diagnostics: &result.workspace_diagnostics,
         json_style: crate::json_style::JsonStyle::Compact,
@@ -1246,19 +1672,69 @@ pub struct PrintCheckOptions {
     pub show_explain_tip: bool,
     pub type_aware_scope: Option<&'static str>,
     pub json_style: crate::json_style::JsonStyle,
+    /// Evaluate the `parse-error` gate in this print. True only on the
+    /// standalone `dead-code` run when the gate is armed; `audit` and the bare
+    /// run evaluate the gate over all their sections themselves.
+    pub fail_on_parse_error: bool,
+    /// Print the stderr line that names the gates behind a non-zero exit. False
+    /// when the caller owns the exit code, as `audit` does, or prints one line
+    /// for all its sections, as the bare run does.
+    pub exit_reason: bool,
+    /// Where the human report renders the architecture findings.
+    pub architecture_layout: report::ArchitectureLayout,
 }
 
 struct PreparedPrintCheck<'a> {
-    effective_rules: RulesConfig,
+    /// The severity rule's verdict, evaluated once. Both the published
+    /// `error-severity-findings` entry and the exit code read this, so the
+    /// single-source claim is structural rather than two calls that happen to
+    /// agree, and the findings arrays are walked once instead of twice.
+    has_error_severity: bool,
+    /// The `parse-error` gate, when this print evaluates it. The envelope
+    /// entry and the exit code both read it.
+    parse_error: Option<fallow_output::GateOutcome>,
     report_ctx: report::ReportContext<'a>,
     regression_json: bool,
     quiet: bool,
+    exit_reason: bool,
 }
 
 fn prepare_print_check(result: &CheckResult, opts: PrintCheckOptions) -> PreparedPrintCheck<'_> {
+    let effective_rules = effective_check_rules(result);
+    let error_findings = rules::count_error_severity_issues(
+        &result.results,
+        &effective_rules,
+        Some(&result.config),
+        result.fail_on_issues,
+    );
+    let has_error_severity = error_findings > 0;
+    let baseline_staleness = envelope_baseline_staleness(result);
+    let degraded_files =
+        crate::gates::parse_degraded_files(&result.config.root, &result.workspace_diagnostics);
+    // The config holds the armed state on every route, also on `audit` and the
+    // bare run, which own the gate themselves. The status line reads it there
+    // too, so no route prints a clean line above a failed gate.
+    let failed_parse_files = if result.config.fail_on_parse_error {
+        degraded_files.len()
+    } else {
+        0
+    };
+    let parse_error =
+        crate::gates::parse_error_outcome(opts.fail_on_parse_error, true, &degraded_files);
+    let gate_outcomes = crate::gates::check_gate_outcomes(&crate::gates::CheckGateInputs {
+        error_findings,
+        regression: result.regression.as_ref(),
+        baseline_staleness: baseline_staleness.as_ref(),
+        fail_on_stale_baseline: result.fail_on_stale_baseline,
+        type_aware_require: result.config.type_aware.require,
+        type_aware_meta: result.type_aware_meta.as_ref(),
+        parse_error: parse_error.clone(),
+    });
     PreparedPrintCheck {
-        effective_rules: effective_check_rules(result),
+        has_error_severity,
+        parse_error,
         report_ctx: report::ReportContext {
+            package_baselines: &result.package_baselines,
             root: &result.config.root,
             rules: &result.config.rules,
             workspace_diagnostics: &result.workspace_diagnostics,
@@ -1273,17 +1749,24 @@ fn prepare_print_check(result: &CheckResult, opts: PrintCheckOptions) -> Prepare
             summary_heading: opts.summary_heading,
             show_explain_tip: opts.show_explain_tip,
             baseline_matched: result.baseline_matched,
+            baseline_staleness,
+            finding_id_query: result.finding_id_query.clone(),
+            gate_outcomes,
+            failed_parse_files,
             config_fixable: result.config_fixable,
             skip_score_and_trend: false,
             css_requested: false,
             json_style: opts.json_style,
+            include_fragments: true,
+            architecture_layout: opts.architecture_layout,
         },
         regression_json: opts.regression_json,
         quiet: opts.quiet,
+        exit_reason: opts.exit_reason,
     }
 }
 
-fn effective_check_rules(result: &CheckResult) -> RulesConfig {
+pub fn effective_check_rules(result: &CheckResult) -> RulesConfig {
     if result.fail_on_issues {
         let mut rules = result.config.rules.clone();
         rules::promote_warns_to_errors(&mut rules);
@@ -1311,31 +1794,76 @@ pub fn print_check_result(result: &CheckResult, opts: PrintCheckOptions) -> Exit
     }
 
     print_type_aware_summary(result);
-    print_type_aware_warnings(result);
+    print_type_aware_warnings(result, prepared.quiet);
 
-    if type_aware_completeness_failed(result, prepared.quiet) {
-        return ExitCode::from(1);
-    }
-
-    if let Some(exit) = check_regression_exit_code(result.regression.as_ref(), prepared.quiet) {
-        return exit;
-    }
+    // Every gate is evaluated before any of them returns, so none can swallow
+    // another's stderr line. The baseline gate is why: its condition appears in
+    // no output format, so a run that exits 1 for a type-aware or regression
+    // failure would otherwise leave an opted-in stale baseline unmentioned.
+    // Evaluation order, and with it the order the lines print, is unchanged,
+    // and so is exit precedence.
+    let type_aware_failed = type_aware_completeness_failed(result, prepared.quiet);
+    let regression_failed = check_regression_failed(result.regression.as_ref(), prepared.quiet);
 
     print_load_data_key_abstain_note(result, prepared.quiet);
     print_unused_component_props_exempted_note(result, prepared.quiet);
-    print_unmatched_ignore_findings_note(result, prepared.quiet);
-    issue_severity_exit_code(result, &prepared.effective_rules)
+    print_unmatched_config_pattern_notes(result, prepared.quiet);
+    print_finding_id_query_note(result, prepared.quiet);
+
+    let stale_baseline_failed = crate::baseline_gate::gate_failed(
+        result.baseline_staleness.as_ref(),
+        result.fail_on_stale_baseline,
+        fallow_engine::baseline::BaselineKind::DeadCode,
+    );
+    let parse_error_failed = prepared
+        .parse_error
+        .as_ref()
+        .is_some_and(fallow_output::GateOutcome::fails_run);
+    if let Some(outcome) = prepared.parse_error.as_ref().filter(|_| parse_error_failed) {
+        crate::gates::print_parse_error_gate_failure(&outcome.files);
+    }
+
+    let code = [
+        gate_failed_exit_code(GateName::TypeAwareRequire, type_aware_failed),
+        gate_failed_exit_code(GateName::Regression, regression_failed),
+        gate_failed_exit_code(GateName::StaleBaseline, stale_baseline_failed),
+        gate_failed_exit_code(GateName::ParseError, parse_error_failed),
+        gate_failed_exit_code(GateName::ErrorSeverityFindings, prepared.has_error_severity),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    if prepared.exit_reason {
+        crate::gates::print_exit_reason(&crate::gates::ExitReason {
+            gates: prepared.report_ctx.gate_outcomes.as_ref(),
+            code,
+            fail_on_issues: result.fail_on_issues,
+            quiet: prepared.quiet,
+            output: result.config.output,
+            own_lines: if prepared.quiet {
+                &[]
+            } else {
+                &crate::gates::LOUD_CHECK_GATES
+            },
+        });
+    }
+    crate::exit_codes::run_exit_code([code])
+}
+
+/// This run's view of the loaded baseline, in the shape the JSON envelope
+/// publishes as `baseline_staleness`.
+///
+/// `None` when no baseline was loaded, which is what keeps the key off the wire
+/// for every run that does not use one.
+fn envelope_baseline_staleness(result: &CheckResult) -> Option<fallow_output::BaselineStaleness> {
+    result
+        .baseline_staleness
+        .as_ref()
+        .map(|loaded| loaded.to_envelope(0))
 }
 
 fn type_aware_completeness_failed(result: &CheckResult, quiet: bool) -> bool {
-    if result.config.type_aware.require != fallow_config::TypeAwareRequire::Complete {
-        return false;
-    }
-    let Some(meta) = &result.type_aware_meta else {
-        return false;
-    };
-    let incomplete = crate::report::ci::required_type_aware_incomplete(Some(meta));
-    if !incomplete {
+    if !type_aware_completeness_incomplete(result) {
         return false;
     }
     if !quiet {
@@ -1350,11 +1878,28 @@ fn type_aware_completeness_failed(result: &CheckResult, quiet: bool) -> bool {
     true
 }
 
+/// Whether the type-aware completeness gate of this dead-code result fails.
+/// When the run is not quiet, the print states the failure on its own line.
+pub fn type_aware_completeness_incomplete(result: &CheckResult) -> bool {
+    result.config.type_aware.require == fallow_config::TypeAwareRequire::Complete
+        && result
+            .type_aware_meta
+            .as_ref()
+            .is_some_and(|meta| crate::report::ci::required_type_aware_incomplete(Some(meta)))
+}
+
 fn print_type_aware_summary(result: &CheckResult) {
     if !matches!(result.config.output, OutputFormat::Human) {
         return;
     }
     if let Some(meta) = &result.type_aware_meta {
+        // A pass that never ran has nothing to summarize: every count is zero
+        // because no query happened, not because the project is clean. The
+        // degradation warning already said what happened, so a second line of
+        // zeroes would only dispute it.
+        if !meta.executed && meta.warning_count > 0 {
+            return;
+        }
         println!(
             "{}",
             crate::report::human_status_line(
@@ -1400,7 +1945,10 @@ fn count_noun(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {noun}")
 }
 
-fn print_type_aware_warnings(result: &CheckResult) {
+fn print_type_aware_warnings(result: &CheckResult, quiet: bool) {
+    if quiet {
+        return;
+    }
     for warning in &result.type_aware_warnings {
         eprintln!(
             "{}",
@@ -1412,15 +1960,14 @@ fn print_type_aware_warnings(result: &CheckResult) {
     }
 }
 
-fn check_regression_exit_code(
-    outcome: Option<&RegressionOutcome>,
-    quiet: bool,
-) -> Option<ExitCode> {
-    let outcome = outcome?;
+fn check_regression_failed(outcome: Option<&RegressionOutcome>, quiet: bool) -> bool {
+    let Some(outcome) = outcome else {
+        return false;
+    };
     if !quiet {
         regression::print_regression_outcome(outcome);
     }
-    outcome.is_failure().then(|| ExitCode::from(1))
+    outcome.is_failure()
 }
 
 fn print_load_data_key_abstain_note(result: &CheckResult, quiet: bool) {
@@ -1456,42 +2003,76 @@ fn print_unused_component_props_exempted_note(result: &CheckResult, quiet: bool)
     );
 }
 
-/// Human-output note when an `ignoreFindings` pattern matched no candidate
-/// finding this run. A typo'd pattern is otherwise a silent no-op.
-fn print_unmatched_ignore_findings_note(result: &CheckResult, quiet: bool) {
-    if quiet || !matches!(result.config.output, OutputFormat::Human) {
-        return;
-    }
-    let unmatched = result.config.ignore_findings.unmatched_patterns();
-    if unmatched.is_empty() {
-        return;
-    }
-    let noun = if unmatched.len() == 1 {
-        "pattern"
-    } else {
-        "patterns"
-    };
-    eprintln!(
-        "Note: ignoreFindings {noun} matched no finding this run: {} (patterns are \
-         project-root-relative globs; check for typos).",
-        unmatched.join(", ")
+/// Stderr notes for config patterns that matched nothing this run
+/// (`ignoreFindings`, `ignoreDependencies`). A typo in a pattern is otherwise
+/// a silent no-op.
+///
+/// The notes read `workspace_diagnostics[]`, the same entries the JSON output
+/// carries, so the two outputs always name the same patterns. A format that
+/// carries the entries in its document gets no stderr note.
+fn print_unmatched_config_pattern_notes(result: &CheckResult, quiet: bool) {
+    crate::report::config_pattern_text::print_stderr_notes(
+        &result.workspace_diagnostics,
+        result.config.output,
+        quiet,
     );
 }
 
-fn issue_severity_exit_code(result: &CheckResult, effective_rules: &RulesConfig) -> ExitCode {
-    if rules::has_error_severity_issues(
-        &result.results,
-        effective_rules,
-        Some(&result.config),
-        result.fail_on_issues,
-    ) {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+/// Human output states the `--finding-id` answer, because an empty report
+/// alone does not say whether a missing id is resolved or only hidden.
+fn print_finding_id_query_note(result: &CheckResult, quiet: bool) {
+    if quiet || !matches!(result.config.output, OutputFormat::Human) {
+        return;
     }
+    let Some(query) = result.finding_id_query.as_ref() else {
+        return;
+    };
+    let verdict = if query.missing.is_empty() {
+        String::new()
+    } else if query.conclusive {
+        "; missing ids are no longer reported".to_owned()
+    } else {
+        let reasons: Vec<&str> = query
+            .inconclusive_reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        format!(
+            "; not conclusive ({}), so a missing id can still exist",
+            reasons.join(", ")
+        )
+    };
+    eprintln!(
+        "Finding ids: {} requested, {} found, {} missing{verdict}.",
+        query.requested.len(),
+        query.found.len(),
+        query.missing.len()
+    );
+}
+
+/// Point a human `fallow dead-code` run that reports an architecture finding at
+/// `fallow architecture`. The line goes to stderr, so stdout stays the same.
+fn print_architecture_hint(opts: &CheckOptions<'_>, results: &AnalysisResults) {
+    use colored::Colorize;
+
+    if opts.surface != CheckSurface::DeadCode
+        || opts.quiet
+        || !matches!(opts.output, OutputFormat::Human)
+        || !report::has_architecture_findings(results)
+    {
+        return;
+    }
+    eprintln!("{}", ARCHITECTURE_HINT.dimmed());
 }
 
 pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
+    if let Some(code) = crate::baseline_gate::refuse_save_before_analysis(
+        opts.save_baseline,
+        fallow_engine::baseline::BaselineKind::DeadCode,
+        opts.output,
+    ) {
+        return code;
+    }
     let result = match execute_check(opts) {
         Ok(r) => r,
         Err(code) => return code,
@@ -1500,16 +2081,32 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
     if !opts.quiet && matches!(opts.output, OutputFormat::Human) {
         crate::combined::print_entry_point_summary(&result.results);
     }
+    crate::discovery_note::print_all_source_excluded_warning(
+        &result.workspace_diagnostics,
+        result.discovered_file_count,
+        result.explain_skipped,
+        opts.quiet,
+        opts.output,
+    );
+    crate::discovery_note::print_default_ignore_exclusion_note(
+        opts.root,
+        &result.workspace_diagnostics,
+        result.explain_skipped,
+        opts.quiet,
+        opts.output,
+    );
 
     let resolver = match crate::build_ownership_resolver(
         opts.group_by,
         opts.root,
         result.config.codeowners.as_deref(),
+        &result.config.workspace_patterns,
         opts.output,
     ) {
         Ok(r) => r,
         Err(code) => return code,
     };
+    let output_timer = process_clock::start(ProcessSpan::Output);
     let exit = print_check_result(
         &result,
         PrintCheckOptions {
@@ -1523,8 +2120,15 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
             show_explain_tip: true,
             type_aware_scope: None,
             json_style: opts.json_style,
+            fail_on_parse_error: result.config.fail_on_parse_error,
+            exit_reason: true,
+            architecture_layout: match opts.surface {
+                CheckSurface::DeadCode => report::ArchitectureLayout::Embedded,
+                CheckSurface::Architecture => report::ArchitectureLayout::Only,
+            },
         },
     );
+    print_architecture_hint(opts, &result.results);
 
     if opts.include_dupes && result.config.duplicates.enabled {
         let Some(files) = result.retained_files.as_deref() else {
@@ -1536,49 +2140,118 @@ pub fn run_check(opts: &CheckOptions<'_>) -> ExitCode {
         };
         output::run_cross_reference(&result.config, &result.results, files, opts.quiet);
     }
+    drop(output_timer);
+
+    // Printed last, so the process clock covers the report output as well.
+    if opts.defer_performance
+        && opts.trace_opts.performance
+        && let Some(timings) = result.timings.as_ref()
+    {
+        report::print_performance(
+            timings,
+            process_clock::snapshot(),
+            false,
+            opts.output,
+            opts.json_style,
+        );
+    }
 
     exit
 }
 
-/// Save baseline and/or compare against an existing baseline.
-///
-/// Returns `Some(ExitCode)` on fatal errors (serialization/IO failure),
-/// `Ok(None)` when no baseline was loaded, `Ok(Some((entries, matched)))` when
-/// a baseline was loaded, or `Err(ExitCode)` on fatal errors.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "baseline I/O keeps scope, output, and semantic compatibility inputs explicit"
-)]
-fn handle_baseline(
-    results: &mut fallow_types::results::AnalysisResults,
-    save_path: Option<&std::path::Path>,
-    load_path: Option<&std::path::Path>,
-    root: &std::path::Path,
+/// Scope, output, and semantic compatibility inputs for baseline I/O.
+struct BaselineIo<'a> {
+    save_path: Option<&'a std::path::Path>,
+    load_path: Option<&'a std::path::Path>,
+    /// The argument that carried `load_path`, for the note about a baseline
+    /// another command saved. `fallow audit` reads this command's baseline through
+    /// `--dead-code-baseline`, so a fixed `--baseline` would name an argument that
+    /// run does not accept.
+    load_flag: &'a str,
+    /// True for the dead-code sub-pass of bare `fallow`, see
+    /// [`CheckOptions::bare_run`].
+    bare_run: bool,
+    /// The subcommand that runs, for the `recheck-baseline` next step and the
+    /// regenerate hint. The baseline file format stays `dead-code`.
+    command: &'static str,
+    root: &'a std::path::Path,
     quiet: bool,
     output: OutputFormat,
-    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
-) -> Result<Option<(usize, usize)>, ExitCode> {
-    if let Some(baseline_path) = save_path {
-        save_baseline_file(
-            results,
-            baseline_path,
-            root,
-            quiet,
-            output,
-            analysis_identity,
-        )?;
+    analysis_identity: &'a fallow_types::semantic::SemanticAnalysisIdentity,
+    /// Which channels narrowed this run, so a whole-project baseline matches
+    /// less of it for reasons that are not rot. Empty means whole-project.
+    scope_reasons: fallow_output::BaselineScopeReasons,
+}
+
+/// Which channels narrowed the run before the baseline comparison, so the
+/// current results cover less than the baseline ever described.
+///
+/// Mirrors the health side's `baseline_scope_reasons` and adds the
+/// dead-code-only filter channel, because `--unused-*` flags drop whole
+/// baseline categories. The diff channel is resolved exactly as
+/// `apply_scope_filters` resolves it: on these commands `--diff-file` and
+/// `--diff-stdin` never reach `opts.diff_index` and arrive through the shared
+/// index instead, so reading the field alone would miss every diff-scoped run.
+/// Production mode counts as narrowing too: it drops test, story and dev files
+/// before analysis, and the resolved config carries the effective flag whether
+/// it came from the CLI or from the project config. `includeEntryExports`
+/// counts for the same reason: it changes which exports the run judges, from
+/// the flag or from the config.
+///
+/// This is the only predicate on this command: `change_scoped` is derived from
+/// the returned set, so the boolean and the published array cannot disagree.
+/// It is also the command that can name every channel, because it reads the
+/// flags rather than a set already resolved from them.
+fn baseline_scope_reasons(
+    opts: &CheckOptions<'_>,
+    config: &ResolvedConfig,
+    change_scope: &fallow_engine::change_scope::ChangeScope,
+) -> fallow_output::BaselineScopeReasons {
+    use fallow_output::ScopeReason;
+
+    let diff_scoped = opts.diff_index.is_some()
+        || (opts.use_shared_diff_index
+            && crate::report::ci::diff_filter::shared_diff_index().is_some());
+    fallow_output::BaselineScopeReasons::empty()
+        .insert_if(diff_scoped, ScopeReason::Diff)
+        .insert_if(
+            change_scope.scope_reason() == Some(ScopeReason::ChangedSince),
+            ScopeReason::ChangedSince,
+        )
+        .insert_if(
+            change_scope.scope_reason() == Some(ScopeReason::PackageBaselines),
+            ScopeReason::PackageBaselines,
+        )
+        .insert_if(opts.workspace.is_some(), ScopeReason::Workspace)
+        .insert_if(
+            opts.changed_workspaces.is_some(),
+            ScopeReason::ChangedWorkspaces,
+        )
+        .insert_if(opts.scope.is_some(), ScopeReason::Scope)
+        .insert_if(!opts.file.is_empty(), ScopeReason::File)
+        .insert_if(opts.filters.any_active(), ScopeReason::IssueTypeFilter)
+        .insert_if(config.production, ScopeReason::Production)
+        .insert_if(
+            config.include_entry_exports,
+            ScopeReason::IncludeEntryExports,
+        )
+}
+
+/// Save baseline and/or compare against an existing baseline.
+///
+/// Returns `Ok(None)` when no baseline was loaded, `Ok(Some(_))` with this
+/// run's view of the loaded baseline, or `Err(ExitCode)` on fatal errors
+/// (serialization or IO failure).
+fn handle_baseline(
+    results: &mut fallow_types::results::AnalysisResults,
+    io: &BaselineIo<'_>,
+) -> Result<Option<LoadedBaselineStaleness>, ExitCode> {
+    if let Some(baseline_path) = io.save_path {
+        save_baseline_file(results, baseline_path, io)?;
     }
 
-    if let Some(baseline_path) = load_path {
-        return load_and_compare_baseline(
-            results,
-            baseline_path,
-            root,
-            quiet,
-            output,
-            analysis_identity,
-        )
-        .map(Some);
+    if let Some(baseline_path) = io.load_path {
+        return load_and_compare_baseline(results, baseline_path, io).map(Some);
     }
 
     Ok(None)
@@ -1588,92 +2261,203 @@ fn handle_baseline(
 fn save_baseline_file(
     results: &fallow_types::results::AnalysisResults,
     baseline_path: &std::path::Path,
-    root: &std::path::Path,
-    quiet: bool,
-    output: OutputFormat,
-    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
+    io: &BaselineIo<'_>,
 ) -> Result<(), ExitCode> {
+    if let Some(refusal) = fallow_engine::baseline::refuse_baseline_kind_overwrite(
+        baseline_path,
+        fallow_engine::baseline::BaselineKind::DeadCode,
+    ) {
+        return Err(emit_error(&refusal, 2, io.output));
+    }
     let baseline_data =
-        BaselineData::from_results_with_identity(results, root, analysis_identity.clone());
+        BaselineData::from_results_with_identity(results, io.root, io.analysis_identity.clone())
+            .with_scope_reasons(io.scope_reasons)
+            .with_node_modules(fallow_config::node_modules_state(io.root));
     let mut json = serde_json::to_string_pretty(&baseline_data)
-        .map_err(|e| emit_error(&format!("failed to serialize baseline: {e}"), 2, output))?;
+        .map_err(|e| emit_error(&format!("failed to serialize baseline: {e}"), 2, io.output))?;
     json.push('\n');
-    if let Some(parent) = baseline_path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Err(emit_error(
-            &format!("failed to create baseline directory: {e}"),
-            2,
-            output,
-        ));
+    match fallow_engine::write_guard::write_file(
+        baseline_path,
+        json.as_bytes(),
+        fallow_engine::write_guard::WriteTarget::Path,
+    ) {
+        Ok(()) => {}
+        Err(e) if e.is_directory() => {
+            return Err(emit_error(
+                &format!("failed to create baseline directory: {e}"),
+                2,
+                io.output,
+            ));
+        }
+        Err(e) => {
+            return Err(emit_error(
+                &format!("failed to save baseline: {e}"),
+                2,
+                io.output,
+            ));
+        }
     }
-    if let Err(e) = std::fs::write(baseline_path, json) {
-        return Err(emit_error(
-            &format!("failed to save baseline: {e}"),
-            2,
-            output,
-        ));
-    }
-    if !quiet {
+    if !io.quiet {
         eprintln!("Baseline saved to {}", baseline_path.display());
+    }
+    // The package map comes from the config and applies to every run, so a
+    // saved baseline is partial unless the run turned the map off. A later run
+    // that edits an unchanged package then reports its old findings as new.
+    if io
+        .scope_reasons
+        .contains(fallow_output::ScopeReason::PackageBaselines)
+    {
+        eprintln!(
+            "Warning: workspaces.changedSince narrowed this run, so the baseline {} holds only the \
+             findings in changed files of the mapped packages. Save it with \
+             --no-package-baselines to cover the whole project.",
+            baseline_path.display()
+        );
     }
     Ok(())
 }
 
-/// Load a baseline file, filter out matched issues, and return
-/// `(baseline_entries, matched)`.
+/// Load a baseline file, filter out matched issues, and return this run's view
+/// of the loaded baseline.
+///
+/// `fallow_engine::baseline::apply_dead_code_baseline` reads the file and
+/// removes the findings; this function owns the file read, the messages and
+/// the record for the `recheck-baseline` next step.
 fn load_and_compare_baseline(
     results: &mut fallow_types::results::AnalysisResults,
     baseline_path: &std::path::Path,
-    root: &std::path::Path,
-    quiet: bool,
-    output: OutputFormat,
-    analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
-) -> Result<(usize, usize), ExitCode> {
+    io: &BaselineIo<'_>,
+) -> Result<LoadedBaselineStaleness, ExitCode> {
+    use fallow_engine::baseline::{
+        DeadCodeBaselineError, DeadCodeBaselineOutcome, apply_dead_code_baseline,
+    };
+
     let content = std::fs::read_to_string(baseline_path)
-        .map_err(|e| emit_error(&format!("failed to read baseline: {e}"), 2, output))?;
-    let baseline_data = serde_json::from_str::<BaselineData>(&content)
-        .map_err(|e| emit_error(&format!("failed to parse baseline: {e}"), 2, output))?;
-    let incompatible = baseline_data
-        .analysis_identity()
-        .incompatible_fields(analysis_identity);
-    if !incompatible.is_empty() {
-        let type_aware_flag = if matches!(
-            analysis_identity.mode,
-            fallow_types::semantic::SemanticAnalysisMode::TypeAware
-        ) {
-            " --type-aware"
-        } else {
-            ""
-        };
-        return Err(emit_error(
-            &format!(
-                "baseline analysis identity is incompatible in: {}. Regenerate it with: fallow dead-code{type_aware_flag} --save-baseline {}",
-                incompatible.join(", "),
-                baseline_path.display(),
-            ),
+        .map_err(|e| emit_error(&format!("failed to read baseline: {e}"), 2, io.output))?;
+    baseline_notes::warn_about_a_narrower_saved_baseline(&content, baseline_path, io);
+    let install_state =
+        baseline_notes::warn_about_another_install_state(&content, baseline_path, io);
+    let outcome = apply_dead_code_baseline(
+        results,
+        &content,
+        io.root,
+        io.analysis_identity,
+        !io.scope_reasons.is_empty(),
+    )
+    .map_err(|err| match err {
+        DeadCodeBaselineError::Parse(message) => emit_error(
+            &format!("failed to parse baseline: {message}"),
             2,
-            output,
-        ));
-    }
-    let baseline_entries = baseline_data.total_entries();
-    let before = results.total_issues();
-    *results = filter_new_issues(std::mem::take(results), &baseline_data, root);
-    let matched = before.saturating_sub(results.total_issues());
-    if !quiet {
+            io.output,
+        ),
+        DeadCodeBaselineError::IncompatibleIdentity(fields) => {
+            let type_aware_flag = if matches!(
+                io.analysis_identity.mode,
+                fallow_types::semantic::SemanticAnalysisMode::TypeAware
+            ) {
+                " --type-aware"
+            } else {
+                ""
+            };
+            emit_error(
+                &format!(
+                    "baseline analysis identity is incompatible in: {}. Regenerate it with: fallow {}{type_aware_flag} --save-baseline {}",
+                    fields.join(", "),
+                    io.command,
+                    baseline_path.display(),
+                ),
+                2,
+                io.output,
+            )
+        }
+    })?;
+    let (staleness, unrecognised_format, saved_by, legacy_keys) = match outcome {
+        DeadCodeBaselineOutcome::Applied {
+            staleness,
+            legacy_keys,
+        } => (staleness, false, None, legacy_keys),
+        DeadCodeBaselineOutcome::NotDeadCode {
+            staleness,
+            saved_by,
+        } => (staleness, true, saved_by, false),
+    };
+    if !io.quiet {
         eprintln!("Comparing against baseline: {}", baseline_path.display());
+        if legacy_keys && matches!(io.output, OutputFormat::Human) {
+            eprintln!(
+                "Note: {} uses the old baseline key format. Run --save-baseline to rewrite it without line numbers.",
+                baseline_path.display()
+            );
+        }
+        if !unrecognised_format {
+            warn_on_baseline_staleness(staleness, baseline_path);
+        }
     }
-    if baseline_entries > 0 && matched == 0 && !quiet {
-        eprintln!(
+    if unrecognised_format {
+        // The file suppresses nothing, so every finding stays in the report and
+        // the counts say the baseline carried no entry (issue #2738).
+        if io.bare_run {
+            crate::baseline_gate::note_unrecognised_bare_run_baseline(
+                Some(baseline_path),
+                true,
+                saved_by,
+            );
+        } else {
+            crate::baseline_gate::note_unrecognised_baseline(
+                Some(baseline_path),
+                true,
+                saved_by,
+                fallow_engine::baseline::BaselineKind::DeadCode,
+                io.load_flag,
+            );
+        }
+    }
+    crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
+        command: io.command,
+        path: baseline_path.display().to_string(),
+        baseline_entries: staleness.entries,
+        scope_reasons: io.scope_reasons,
+    });
+    Ok(LoadedBaselineStaleness {
+        staleness,
+        path: baseline_path.to_path_buf(),
+        scope_reasons: io.scope_reasons,
+        unrecognised_format,
+        saved_by,
+        legacy_keys,
+        install_state,
+    })
+}
+
+/// Warn when a loaded baseline no longer describes the current project: either
+/// nothing in it matched, or a large enough share of it matched nothing.
+///
+/// Every guard lives in the shared decision, so `dead-code`, `dupes` and
+/// `health` are silent in the same situations: a run narrowed to part of the
+/// project (re-saving from one would drop every entry the run never looked at)
+/// and a run that produced no findings at all (where a cleaned project and a
+/// rotted baseline are indistinguishable from here).
+fn warn_on_baseline_staleness(staleness: BaselineStaleness, baseline_path: &std::path::Path) {
+    let baseline_entries = staleness.entries;
+    let stale_entries = staleness.stale_entries();
+    match staleness.warning() {
+        BaselineStalenessWarning::None => {}
+        BaselineStalenessWarning::ZeroOverlap => eprintln!(
             "Warning: baseline has {baseline_entries} entries but matched \
              0 current issues. Your paths may have changed, or the baseline \
              was saved on a different machine. Re-save with: \
              --save-baseline {}",
             baseline_path.display(),
-        );
+        ),
+        BaselineStalenessWarning::Partial => eprintln!(
+            "Warning: baseline is partially stale: {stale_entries} of \
+             {baseline_entries} entries matched no current issue, so the \
+             gate protects less than what was saved. Remove only the stale \
+             entries with: {}, or re-save with: --save-baseline {}",
+            fallow_engine::baseline::BaselineKind::DeadCode.prune_command(baseline_path),
+            baseline_path.display(),
+        ),
     }
-    Ok((baseline_entries, matched))
 }
 
 #[cfg(test)]
@@ -1735,6 +2519,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dependency_findings_are_reported_without_filters_or_with_a_dependency_filter() {
+        assert!(no_filters().reports_dependency_findings());
+        let mut files_only = no_filters();
+        files_only.unused_files = true;
+        assert!(!files_only.reports_dependency_findings());
+        let mut unlisted = files_only;
+        unlisted.unlisted_deps = true;
+        assert!(unlisted.reports_dependency_findings());
+        let mut unused = no_filters();
+        unused.unused_deps = true;
+        assert!(unused.reports_dependency_findings());
+    }
+
     fn no_filters() -> IssueFilters {
         IssueFilters {
             unused_files: false,
@@ -1742,16 +2540,21 @@ mod tests {
             unused_deps: false,
             unused_types: false,
             private_type_leaks: false,
+            deprecated_exports_in_use: false,
             unused_enum_members: false,
             unused_class_members: false,
             unused_store_members: false,
             unprovided_injects: false,
             unrendered_components: false,
             unused_component_props: false,
+            absent_component_props: false,
             unused_component_emits: false,
             unused_component_inputs: false,
             unused_component_outputs: false,
             unused_svelte_events: false,
+            unused_effect_layers: false,
+            unused_tagged_errors: false,
+            unproduced_catch_tags: false,
             unused_server_actions: false,
             unused_load_data_keys: false,
             unresolved_imports: false,
@@ -1759,6 +2562,7 @@ mod tests {
             duplicate_exports: false,
             circular_deps: false,
             re_export_cycles: false,
+            package_cycles: false,
             boundary_violations: false,
             policy_violations: false,
             stale_suppressions: false,
@@ -1772,6 +2576,7 @@ mod tests {
             misplaced_directives: false,
             route_collisions: false,
             dynamic_segment_name_conflicts: false,
+            architecture_selection: ArchitectureSelection::All,
         }
     }
 
@@ -1828,6 +2633,25 @@ mod tests {
         filters.activate_explicit_opt_ins(&mut rules);
 
         assert_eq!(rules.private_type_leaks, fallow_config::Severity::Warn);
+    }
+
+    #[test]
+    fn deprecated_exports_filter_opts_in_off_by_default_rule() {
+        let mut rules = fallow_config::RulesConfig::default();
+        assert_eq!(
+            rules.deprecated_exports_in_use,
+            fallow_config::Severity::Off
+        );
+
+        let mut filters = no_filters();
+        filters.deprecated_exports_in_use = true;
+        filters.activate_explicit_opt_ins(&mut rules);
+
+        assert_eq!(
+            rules.deprecated_exports_in_use,
+            fallow_config::Severity::Warn
+        );
+        assert_eq!(rules.private_type_leaks, fallow_config::Severity::Off);
     }
 
     fn type_aware_resolved_config() -> ResolvedConfig {
@@ -1923,6 +2747,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         r.unused_types
             .push(UnusedTypeFinding::with_actions(UnusedExport {
@@ -1933,6 +2759,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         r.unused_dependencies
             .push(UnusedDependencyFinding::with_actions(UnusedDependency {
@@ -1941,6 +2769,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.unused_dev_dependencies
             .push(UnusedDevDependencyFinding::with_actions(UnusedDependency {
@@ -1949,6 +2778,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.test_only_dependencies
             .push(TestOnlyDependencyFinding::with_actions(
@@ -2022,12 +2852,18 @@ mod tests {
 
         handle_baseline(
             &mut results,
-            Some(&baseline_path),
-            None,
-            std::path::Path::new("/project"),
-            true,
-            OutputFormat::Json,
-            &fallow_types::semantic::SemanticAnalysisIdentity::default(),
+            &BaselineIo {
+                save_path: Some(&baseline_path),
+                load_path: None,
+                load_flag: "--baseline",
+                bare_run: false,
+                command: "dead-code",
+                root: std::path::Path::new("/project"),
+                quiet: true,
+                output: OutputFormat::Json,
+                analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity::default(),
+                scope_reasons: fallow_output::BaselineScopeReasons::empty(),
+            },
         )
         .expect("baseline save succeeds");
 
@@ -2255,6 +3091,7 @@ mod tests {
                     import_specifier: "../lib/secret".to_string(),
                     line: 1,
                     col: 0,
+                    via_path: None,
                 },
             ),
         );
@@ -2297,6 +3134,7 @@ mod tests {
                     import_specifier: "../lib/y".to_string(),
                     line: 1,
                     col: 0,
+                    via_path: None,
                 },
             ),
         );
@@ -2307,16 +3145,21 @@ mod tests {
             unused_deps: true,
             unused_types: true,
             private_type_leaks: true,
+            deprecated_exports_in_use: true,
             unused_enum_members: true,
             unused_class_members: true,
             unused_store_members: true,
             unprovided_injects: true,
             unrendered_components: true,
             unused_component_props: true,
+            absent_component_props: true,
             unused_component_emits: true,
             unused_component_inputs: true,
             unused_component_outputs: true,
             unused_svelte_events: true,
+            unused_effect_layers: true,
+            unused_tagged_errors: true,
+            unproduced_catch_tags: true,
             unused_server_actions: true,
             unused_load_data_keys: true,
             unresolved_imports: true,
@@ -2324,6 +3167,7 @@ mod tests {
             duplicate_exports: true,
             circular_deps: true,
             re_export_cycles: true,
+            package_cycles: true,
             boundary_violations: true,
             policy_violations: true,
             stale_suppressions: true,
@@ -2337,6 +3181,7 @@ mod tests {
             misplaced_directives: true,
             route_collisions: true,
             dynamic_segment_name_conflicts: true,
+            architecture_selection: ArchitectureSelection::All,
         };
         let total_before = results.total_issues();
         f.apply(&mut results);
@@ -2355,6 +3200,7 @@ mod tests {
                     path: PathBuf::from("/project/package.json"),
                     line: 5,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         results.type_only_dependencies.push(

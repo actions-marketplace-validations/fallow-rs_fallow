@@ -6,8 +6,6 @@
 
 use serde_json::Value;
 
-const DOCS_BASE: &str = "https://docs.fallow.tools";
-
 /// Rule definition for SARIF `fullDescription` and JSON `_meta`.
 pub struct RuleDef {
     /// Canonical rule id, such as `fallow/unused-export` or
@@ -63,6 +61,14 @@ pub const CHECK_RULES: &[RuleDef] = &[
         short: "Exported signature references a private type",
         full: "Exported values or types whose public TypeScript signature references a same-file type declaration that is not exported. Consumers cannot name that private type directly, so the backing type should be exported or removed from the public signature.",
         docs_path: "explanations/dead-code#private-type-leaks",
+    },
+    RuleDef {
+        id: "fallow/deprecated-export-in-use",
+        category: "Dead code",
+        name: "Deprecated Exports in Use",
+        short: "Export marked @deprecated is still referenced",
+        full: "Exports whose leading JSDoc carries @deprecated and that still have at least one consumer in a reachable file. Each finding lists the exact consumer count, a sample of up to 10 consumers sorted by path and line, and the deprecation message. A deprecated export with no consumer is reported as an unused export instead, marked deprecated. A consumer in an unreachable file does not count, because that file is dead code itself. `public_api` is true when the export lives in an entry point or a re-export chain reaches one: external consumers are not visible, so the finding makes no removal claim. The rule is opt-in and defaults to off. A per-path override resolves on the file that declares the export, not on the consumer.",
+        docs_path: "explanations/dead-code#deprecated-exports-in-use",
     },
     RuleDef {
         id: "fallow/unused-dependency",
@@ -149,7 +155,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dependencies",
         name: "Unlisted Dependencies",
         short: "Dependency used but not in package.json",
-        full: "Packages that are imported in source code but not listed in package.json. These work by accident (hoisted from another workspace package or transitive dep) and will break in strict package managers.",
+        full: "Packages imported without an applicable dependency declaration in package.json. This includes workspace packages imported from the repository root: npm workspace links make a package resolvable, but do not declare a dependency. Package self-references are allowed. Private packages and tooling may use ancestor declarations; publishable runtime code must declare its own dependencies.",
         docs_path: "explanations/dead-code#unlisted-dependencies",
     },
     RuleDef {
@@ -175,6 +181,14 @@ pub const CHECK_RULES: &[RuleDef] = &[
         short: "Two or more barrel files re-export from each other in a loop",
         full: "A barrel file re-exports from another barrel that ultimately re-exports back. When this happens, imports from any file in the loop may silently come up empty, because the re-export chain has no terminating module to resolve names against. To fix this: open any one file in the loop and remove the `export * from` (or `export { ... } from`) statement that points back into the cycle. Any single removal will break the cycle and restore working re-exports. A self-loop (a single barrel re-exporting from itself, often a rename leftover) is reported under the same rule with kind `self-loop`.",
         docs_path: "explanations/dead-code#re-export-cycles",
+    },
+    RuleDef {
+        id: "fallow/package-cycle",
+        category: "Architecture",
+        name: "Package Cycles",
+        short: "Two or more workspace packages import each other in a loop",
+        full: "Workspace packages whose resolved imports form a cycle. Each workspace package is a node and each resolved import from one package to another is an edge, so a package cycle can exist when no file-level cycle exists. Imports from test, spec, story, fixture and tooling config files are not edges, because those files are not part of the package build. Packages in a cycle cannot be built in dependency order. Each hop shows one example import and a `type_only` flag; a type-only hop still matters for declaration builds. To fix this, remove the imports on one hop, for example by moving the shared code to a package that both packages import.",
+        docs_path: "explanations/dead-code#package-cycles",
     },
     RuleDef {
         id: "fallow/boundary-violation",
@@ -204,8 +218,8 @@ pub const CHECK_RULES: &[RuleDef] = &[
         id: "fallow/policy-violation",
         category: "Policy",
         name: "Policy Violation",
-        short: "Banned usage matched a rule-pack rule",
-        full: "A call site, import, or catalogue-derived effect matched a rule from a configured rule pack (the rulePacks config key). Packs are pure declarative data; the check is syntactic, call and effect matching use written plus import-resolved canonical callees, and import matching uses the raw specifier. Replace the banned usage per the rule's message, scope the rule with files/exclude globs, or adjust its severity.",
+        short: "Usage violates a configured rule-pack policy",
+        full: "A call, import, export, catalogue-derived effect, or graph-resolved GDP proof producer violates a configured rule pack (the rulePacks config key). Packs are pure declarative data. Call and effect rules use written plus import-resolved canonical callees; import rules match the raw specifier. GDP rules trace @gdp-ts/core proof producers through unambiguous re-exports and restrict which files may create proof factories, optionally by exact static proof kind. This is syntactic ownership analysis, not a runtime authorization guarantee. Follow the rule's message, move a producer into an allowed file, scope the rule with files/exclude globs, or adjust its severity.",
         docs_path: "explanations/dead-code#policy-violations",
     },
     RuleDef {
@@ -229,7 +243,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dependencies",
         name: "Unused catalog entry",
         short: "Catalog entry not referenced by any workspace package",
-        full: "An entry in a package manager catalog (`pnpm-workspace.yaml` `catalog:` / `catalogs:` or Bun root `package.json` `workspaces.catalog` / `workspaces.catalogs`) that no workspace package.json references via the `catalog:` protocol. Catalog entries are leftover dependency metadata once a package is removed from every consumer; delete the entry to keep the catalog truthful. See also: fallow/unresolved-catalog-reference (the inverse: consumer references a catalog that does not declare the package).",
+        full: "An entry in a package manager catalog (`pnpm-workspace.yaml` `catalog:` / `catalogs:` or Bun root `package.json` `workspaces.catalog` / `workspaces.catalogs`) that no workspace package.json dependency and no pnpm override (`pnpm-workspace.yaml` `overrides`, skipped when `packageManager` names a pnpm version that ignores it: pnpm before 10.5.1, or pnpm 10 or earlier when the root `package.json` declares non-empty `pnpm.overrides` or `resolutions`; root `package.json` `pnpm.overrides`, skipped when `packageManager` names pnpm 11 or later; root `package.json` `resolutions`, read only when `packageManager` names pnpm 10 or earlier) references via the `catalog:` protocol. Catalog entries are leftover dependency metadata once a package is removed from every consumer; delete the entry to keep the catalog truthful. See also: fallow/unresolved-catalog-reference (the inverse: consumer references a catalog that does not declare the package).",
         docs_path: "explanations/dead-code#unused-catalog-entries",
     },
     RuleDef {
@@ -245,7 +259,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dependencies",
         name: "Unresolved catalog reference",
         short: "package.json references a catalog that does not declare the package",
-        full: "A workspace package.json declares a dependency with the `catalog:` or `catalog:<name>` protocol, but the catalog has no entry for that package. The package manager install will fail until the catalog is fixed. To fix: add the package to the named catalog, switch the reference to a different catalog that does declare it, or remove the reference and pin a hardcoded version. Scope: the detector scans `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies` in every workspace `package.json`, using `pnpm-workspace.yaml` catalogs when present and Bun root `package.json` catalogs otherwise. See also: fallow/unused-catalog-entry (the inverse: catalog entries no consumer references).",
+        full: "A workspace package.json declares a dependency with the `catalog:` or `catalog:<name>` protocol, but the catalog has no entry for that package. The package manager install will fail until the catalog is fixed. To fix: add the package to the named catalog, switch the reference to a different catalog that does declare it, or remove the reference and pin a hardcoded version. Scope: the detector scans `dependencies`, `devDependencies`, `peerDependencies`, and `optionalDependencies` in every workspace `package.json`, plus the pnpm override values in `pnpm-workspace.yaml` `overrides` (skipped when `packageManager` names a pnpm version that ignores it: pnpm before 10.5.1, or pnpm 10 or earlier when the root `package.json` declares non-empty `pnpm.overrides` or `resolutions`), root `package.json` `pnpm.overrides` (skipped when `packageManager` names pnpm 11 or later, because pnpm 11 does not read it), and root `package.json` `resolutions` (read only when `packageManager` names pnpm 10 or earlier), using `pnpm-workspace.yaml` catalogs when present and Bun root `package.json` catalogs otherwise. See also: fallow/unused-catalog-entry (the inverse: catalog entries no consumer references).",
         docs_path: "explanations/dead-code#unresolved-catalog-references",
     },
     RuleDef {
@@ -253,7 +267,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dependencies",
         name: "Unused dependency override",
         short: "Package-manager override target is not declared or resolved",
-        full: "An entry in `pnpm-workspace.yaml`'s `overrides:` section, `package.json#pnpm.overrides`, npm or Bun's top-level `package.json#overrides`, or Bun's `package.json#resolutions` whose target package is not declared by any workspace package and is not present in the active readable lockfile (`pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, or `bun.lock`). Override entries linger after their target package leaves the resolved dependency tree. pnpm and npm projects without a readable lockfile fall back to workspace package manifests and keep a `hint` so transitive CVE pins can be reviewed before removal. Bun projects with only binary `bun.lockb` fail closed: fallow reports a workspace diagnostic and emits no unused-override finding until a readable `bun.lock` exists. To fix: delete the entry, refresh the active lockfile if it is stale, or add the entry to `ignoreDependencyOverrides` when the override is intentionally retained. See also: fallow/misconfigured-dependency-override.",
+        full: "An entry in `pnpm-workspace.yaml`'s `overrides:` section (skipped when `packageManager` names a pnpm version that ignores it: pnpm before 10.5.1, or pnpm 10 or earlier when the root `package.json` declares non-empty `pnpm.overrides` or `resolutions`), `package.json#pnpm.overrides` (skipped when `packageManager` names pnpm 11 or later, which does not read it), npm or Bun's top-level `package.json#overrides`, or Bun's `package.json#resolutions` whose target package is not declared by any workspace package and is not present in the active readable lockfile (`pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`, or `bun.lock`). Override entries linger after their target package leaves the resolved dependency tree. pnpm and npm projects without a readable lockfile fall back to workspace package manifests and keep a `hint` so transitive CVE pins can be reviewed before removal. Bun projects with only binary `bun.lockb` fail closed: fallow reports a workspace diagnostic and emits no unused-override finding until a readable `bun.lock` exists. To fix: delete the entry, refresh the active lockfile if it is stale, or add the entry to `ignoreDependencyOverrides` when the override is intentionally retained. See also: fallow/misconfigured-dependency-override.",
         docs_path: "explanations/dead-code#unused-dependency-overrides",
     },
     RuleDef {
@@ -261,7 +275,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dependencies",
         name: "Misconfigured dependency override",
         short: "Package-manager override has an unparsable key or value",
-        full: "An entry in `pnpm-workspace.yaml#overrides`, `package.json#pnpm.overrides`, npm or Bun's top-level `package.json#overrides`, or Bun's `package.json#resolutions` whose key or value cannot be interpreted in that source's override grammar. Common shapes include an empty key, an empty value, a malformed version selector (`@types/react@<<18`), or an unbalanced parent matcher (`react>`). The active package manager may reject or ignore the entry. To fix: correct the key or value according to that package manager's grammar, or remove the entry. See also: fallow/unused-dependency-override.",
+        full: "An entry in `pnpm-workspace.yaml#overrides` (skipped when `packageManager` names a pnpm version that ignores it: pnpm before 10.5.1, or pnpm 10 or earlier when the root `package.json` declares non-empty `pnpm.overrides` or `resolutions`), `package.json#pnpm.overrides` (skipped when `packageManager` names pnpm 11 or later, which does not read it), npm or Bun's top-level `package.json#overrides`, or Bun's `package.json#resolutions` whose key or value cannot be interpreted in that source's override grammar. Common shapes include an empty key, an empty value, a malformed version selector (`@types/react@<<18`), or an unbalanced parent matcher (`react>`). The active package manager may reject or ignore the entry. To fix: correct the key or value according to that package manager's grammar, or remove the entry. See also: fallow/unused-dependency-override.",
         docs_path: "explanations/dead-code#misconfigured-dependency-overrides",
     },
     RuleDef {
@@ -305,6 +319,14 @@ pub const CHECK_RULES: &[RuleDef] = &[
         docs_path: "explanations/dead-code#unrendered-components",
     },
     RuleDef {
+        id: "fallow/absent-component-prop",
+        category: "Dead code",
+        name: "Absent optional component props",
+        short: "Known reachable callers omit an optional prop consumed inside its component",
+        full: "A used optional component input is supplied by none of its inspected reachable callers. The finding includes the declaration, framework, default presence and caller locations. Enable absent-component-props explicitly; it defaults to off. Supported contracts cover React, Preact, Solid, Qwik, Vue, Svelte, Astro, Angular, Lit and Ember. Unknown spreads, dynamic or escaped component references, ambiguous bindings, incomplete contracts and externally exposed APIs abstain. Review defaults and API intent manually; static analysis does not prove runtime unreachability.",
+        docs_path: "explanations/dead-code#absent-component-props",
+    },
+    RuleDef {
         id: "fallow/unused-component-prop",
         category: "Dead code",
         name: "Unused component props",
@@ -345,6 +367,30 @@ pub const CHECK_RULES: &[RuleDef] = &[
         docs_path: "explanations/dead-code#unused-svelte-events",
     },
     RuleDef {
+        id: "fallow/unused-effect-layer",
+        category: "Dead code",
+        name: "Unused Effect layers",
+        short: "An Effect layer is composed only into layers that nothing uses",
+        full: "An Effect `Layer` definition (a module-scope const or a class static property such as `static layer = Layer.effect(this, make)`) whose every reference sits inside other layer definitions that are themselves unused. The layer never reaches `Effect.provide`, `ManagedRuntime.make`, `Layer.launch` or any other runtime use. fallow builds a layer graph from `Layer.*` initializers and `.pipe(Layer.*)` chains. Any value reference outside a layer definition is a root, including references in functions and tests. A layer with zero references is not reported here: `unused-export` or `unused-class-member` reports it, so the rule reports the tail of a dead composition and names the unused consumers. Default warn. The check runs only when the project declares `effect`.",
+        docs_path: "explanations/dead-code#unused-effect-layers",
+    },
+    RuleDef {
+        id: "fallow/unused-tagged-error",
+        category: "Dead code",
+        name: "Unused tagged errors",
+        short: "An Effect tagged error class is referenced only as a type or a catchTag string, and no code constructs or fails with it",
+        full: "A class that extends `Data.TaggedError(\"X\")` or `Schema.TaggedError<Self>()(\"X\", ...)` that type positions or `catchTag(\"X\")` handlers reference, but that no code reads as a value. Any value reference counts as a producer: `new X()`, `X.make`, `Schema.Union(X)`, an API or RPC error declaration that decodes the error at a boundary, or passing the class to a function. Only type positions and catch-tag strings do not count. A class with zero references is left to `unused-export`. The finding lists the `catchTag` handlers of the tag. Default warn. The check runs only when the project declares `effect`.",
+        docs_path: "explanations/dead-code#unused-tagged-errors",
+    },
+    RuleDef {
+        id: "fallow/unproduced-catch-tag",
+        category: "Dead code",
+        name: "Unproduced catch tags",
+        short: "A catchTag handler names a project error tag that no code produces",
+        full: "A `catchTag(\"X\", ...)` or `catchTags({ X: ... })` handler where every project class with tag `X` is never constructed or failed with, and no object literal `_tag: \"X\"` or tagged constructor produces the tag. A tag that no project class declares can come from a package, so the rule abstains. Effect built-in tags such as `TimeoutException` are never reported. The rule reports a handler only when no `unused-tagged-error` finding covers its classes: the error rule is off, or its finding is suppressed. Default warn. The check runs only when the project declares `effect`.",
+        docs_path: "explanations/dead-code#unproduced-catch-tags",
+    },
+    RuleDef {
         id: "fallow/unused-server-action",
         category: "Dead code",
         name: "Unused server actions",
@@ -365,7 +411,7 @@ pub const CHECK_RULES: &[RuleDef] = &[
         category: "Dead code",
         name: "Prop drilling",
         short: "A React/Preact prop is forwarded unchanged through 3+ pass-through components to a distant consumer",
-        full: "A React/Preact prop is received by a component, forwarded UNCHANGED to a child, and forwarded again through two or more intermediate \"pass-through\" components until a component that substantively uses it. The high-confidence signal is that the received identifier appears ONLY as the root of forwarded child-JSX attribute values (so `<Child userName={user.name}/>` counts: the prop `user` is projected forward), not the attribute name matching. fallow emits located per-chain records (the source, each pass-through hop, and the consumer with file + line + component name) so CI and an agent can act: colocate the consumer with the data, lift the value to a React context/provider at a mid-chain hop, or compose the component so the intermediates no longer thread the prop. This is a graph-derived health signal, not a correctness error. The rule defaults to OFF (opt-in), like private-type-leak and the security rules: enable it with `prop-drilling: \"warn\"` in `rules`. Zero false positives by construction: any `{...props}` spread, `cloneElement`, element-as-prop / render-prop / children-as-function, or context `*.Provider` anywhere in the chain abstains the whole chain, as does an ambiguous or unresolvable hop. The check runs only when the project declares `react` / `react-dom` / `next` / `preact`.",
+        full: "A React/Preact prop is received by a component, forwarded UNCHANGED to a child, and forwarded again through two or more intermediate \"pass-through\" components until a component that substantively uses it. The high-confidence signal is that the received identifier appears ONLY as the root of forwarded child-JSX attribute values (so `<Child userName={user.name}/>` counts: the prop `user` is projected forward), not the attribute name matching. fallow emits located per-chain records (the source, each pass-through hop, and the consumer with file + line + component name) so CI and an agent can act: colocate the consumer with the data, lift the value to a React context/provider at a mid-chain hop, or compose the component so the intermediates no longer thread the prop. This is a graph-derived health signal, not a correctness error. The rule defaults to OFF (opt-in), like private-type-leak and the security rules: enable it with `prop-drilling: \"warn\"` in `rules`. Set `prop-drilling: \"error\"` to enforce remaining chains in CI. Warnings remain advisory even with strict flags. File overrides resolve at the source hop and can activate the rule when the base setting is off. Suppressed or baselined chains do not gate. Zero false positives by construction: any `{...props}` spread, `cloneElement`, element-as-prop / render-prop / children-as-function, or context `*.Provider` anywhere in the chain abstains the whole chain, as does an ambiguous or unresolvable hop. The check runs only when the project declares `react` / `react-dom` / `next` / `preact`.",
         docs_path: "explanations/dead-code#prop-drilling",
     },
     RuleDef {
@@ -411,12 +457,13 @@ pub fn rule_by_id(id: &str) -> Option<&'static RuleDef> {
         .chain(DUPES_RULES.iter())
         .chain(FLAGS_RULES.iter())
         .chain(SECURITY_RULES.iter())
+        .chain(AUDIT_RULES.iter())
         .find(|r| r.id == id)
 }
 
 /// Every registered rule in registry order: dead-code, health, duplication,
-/// flags, then security. The order is the `fallow schema` `issue_types` order
-/// and the `fallow://issue-types` resource order.
+/// flags, security, then audit. The order is the `fallow schema`
+/// `issue_types` order and the `fallow://issue-types` resource order.
 pub fn all_rules() -> impl Iterator<Item = &'static RuleDef> {
     CHECK_RULES
         .iter()
@@ -424,10 +471,11 @@ pub fn all_rules() -> impl Iterator<Item = &'static RuleDef> {
         .chain(DUPES_RULES.iter())
         .chain(FLAGS_RULES.iter())
         .chain(SECURITY_RULES.iter())
+        .chain(AUDIT_RULES.iter())
 }
 
 /// The command family a rule reports under (`dead-code`, `health`, `dupes`,
-/// `flags`, or `security`), derived from the registry array that owns it.
+/// `flags`, `security`, or `audit`), derived from the registry array that owns it.
 /// Membership is by id (unique across registries); the registries are
 /// `const` slices, so pointer identity is not stable across uses.
 #[must_use]
@@ -441,6 +489,8 @@ pub fn rule_command(rule: &RuleDef) -> &'static str {
         "flags"
     } else if owns(SECURITY_RULES) {
         "security"
+    } else if owns(AUDIT_RULES) {
+        "audit"
     } else {
         "dead-code"
     }
@@ -488,7 +538,7 @@ pub fn rule_severity_key(rule: &RuleDef) -> Option<&'static str> {
 #[must_use]
 pub fn rule_docs_url(rule: &RuleDef) -> String {
     let docs_path = rule_result_meta(rule).map_or(rule.docs_path, |meta| meta.meta_docs_path);
-    format!("{DOCS_BASE}/{docs_path}")
+    fallow_output::rule_docs_url(docs_path)
 }
 
 fn rule_result_meta(rule: &RuleDef) -> Option<&'static fallow_types::issue_meta::IssueResultMeta> {
@@ -539,6 +589,9 @@ pub fn rule_by_token(token: &str) -> Option<&'static RuleDef> {
     if let Some(rule) = dead_code_registry_rule(&normalized) {
         return Some(rule);
     }
+    if let Some(rule) = rule_by_id(&format!("fallow/{normalized}")) {
+        return Some(rule);
+    }
     let alias = health_alias_id(&normalized).or_else(|| security_alias_id(&normalized));
     if let Some(id) = alias
         && let Some(rule) = rule_by_id(id)
@@ -567,6 +620,7 @@ pub fn rule_by_token(token: &str) -> Option<&'static RuleDef> {
             .chain(DUPES_RULES.iter())
             .chain(FLAGS_RULES.iter())
             .chain(SECURITY_RULES.iter())
+            .chain(AUDIT_RULES.iter())
             .find(|rule| {
                 rule.docs_path.ends_with(&normalized)
                     || rule.docs_path.ends_with(singular)
@@ -599,6 +653,9 @@ fn health_alias_id(normalized: &str) -> Option<&'static str> {
         "crap" | "high-crap" | "high-crap-score" => Some("fallow/high-crap-score"),
         "duplication" | "dupes" | "code-duplication" => Some("fallow/code-duplication"),
         "feature-flag" | "feature-flags" | "flags" => Some("fallow/feature-flag"),
+        "flag-retirement" | "flag-retirement-candidate" | "retirement" => {
+            Some("fallow/flag-retirement-candidate")
+        }
         _ => None,
     }
 }
@@ -633,7 +690,34 @@ pub fn rule_guide(rule: &RuleDef) -> RuleGuide {
         .or_else(|| health_runtime_rule_guide(rule.id))
         .or_else(|| duplication_rule_guide(rule.id))
         .or_else(|| security_rule_guide(rule.id))
+        .or_else(|| audit_rule_guide(rule.id))
         .unwrap_or_else(fallback_rule_guide)
+}
+
+fn audit_rule_guide(id: &str) -> Option<RuleGuide> {
+    Some(match id {
+        "fallow/weakened-tests" => RuleGuide {
+            example: "A change turns `it('charges tax', ...)` into `it.skip('charges tax', ...)`, or lowers `coverage.thresholds.lines` from 90 to 70.",
+            how_to_fix: "Decide if the weaker test or threshold is intended. If it is, suppress the finding with `// fallow-ignore-next-line weakened-tests` (or `fallow-ignore-file` for a file-level kind), or set the rule to `off` for the path in `overrides`.",
+        },
+        "fallow/added-suppression" => RuleGuide {
+            example: "A change adds `// @ts-expect-error` above a call instead of a correct type.",
+            how_to_fix: "Decide if the suppression is necessary. If it is, keep it and suppress the finding with `// fallow-ignore-next-line added-suppression`, or turn the rule off for the path.",
+        },
+        "fallow/test-only-branch" => RuleGuide {
+            example: "A change adds `if (process.env.NODE_ENV === 'test') return cached;` to `src/pricing.ts`.",
+            how_to_fix: "Prefer a seam that tests can inject, such as a parameter or a module mock. If the branch is intended, suppress it with `// fallow-ignore-next-line test-only-branch`.",
+        },
+        "fallow/diverged-clone-sibling" => RuleGuide {
+            example: "`src/a/total.ts` and `src/b/total.ts` held the same function. The change fixes a bug in the first copy only.",
+            how_to_fix: "Check the unchanged copies in `related`. Apply the same change there, or extract a shared function. If the copies must differ, suppress with `// fallow-ignore-next-line diverged-clone-sibling`.",
+        },
+        "fallow/added-dependency" => RuleGuide {
+            example: "A change adds `\"left-pad\": \"^1.3.0\"` to `dependencies`.",
+            how_to_fix: "Check that the package exists, is maintained, and is not already covered by a dependency of the project. Suppress through `overrides` because `package.json` cannot hold a comment.",
+        },
+        _ => return None,
+    })
 }
 
 fn source_dead_code_rule_guide(id: &str) -> Option<RuleGuide> {
@@ -653,6 +737,10 @@ fn source_dead_code_rule_guide(id: &str) -> Option<RuleGuide> {
         "fallow/private-type-leak" => RuleGuide {
             example: "export function makeUser(): InternalUser exposes InternalUser even though InternalUser is not exported.",
             how_to_fix: "Export the referenced type, change the public signature to an exported type, or keep the helper private.",
+        },
+        "fallow/deprecated-export-in-use" => RuleGuide {
+            example: "/** @deprecated Use formatMoney. */ export function formatPrice() is still imported by src/cart.ts and src/checkout.ts.",
+            how_to_fix: "Move each consumer to the replacement the message names, then remove the export. For the full consumer list, run `fallow dead-code --trace <file>:<export>`. Enable the rule with `deprecated-exports-in-use: \"warn\"` in `rules`, or pass `--deprecated-exports-in-use` for one run.",
         },
         "fallow/unused-dependency"
         | "fallow/unused-dev-dependency"
@@ -698,6 +786,10 @@ fn member_import_rule_guide(id: &str) -> Option<RuleGuide> {
             example: "components/Orphan.vue is re-exported from a barrel (export { default as Orphan } from './Orphan.vue') but no template, registration, h() call, or dynamic import ever renders it.",
             how_to_fix: "Render the component where it belongs, or delete it and remove the dead barrel re-export. If it is rendered reflectively (a dynamic <component :is> from a non-literal value), suppress the line with // fallow-ignore-next-line unrendered-component.",
         },
+        "fallow/absent-component-prop" => RuleGuide {
+            example: "Card declares highlight?: boolean with a false default, reads highlight in its render body, and every inspected reachable caller renders <Card /> without highlight.",
+            how_to_fix: "Review inspected callers, defaults and API intent. Keep intentional stable props, update the component manually, or add a declaration-line fallow-ignore-next-line absent-component-prop comment. This candidate has no automatic fix.",
+        },
         "fallow/unused-component-prop" => RuleGuide {
             example: "Widget.vue declares defineProps<{ size: string }>(), or a React Widget({ size }) destructures `size`, but `size` is referenced nowhere in the component (Vue: its script or template; React: its function body or JSX).",
             how_to_fix: "Remove the unused prop, or reference it in the component (Vue: the script / template; React: the function body or JSX). If the prop is part of a deliberately-stable public component API, suppress the line with // fallow-ignore-next-line unused-component-prop.",
@@ -717,6 +809,18 @@ fn member_import_rule_guide(id: &str) -> Option<RuleGuide> {
         "fallow/unused-svelte-event" => RuleGuide {
             example: "Child.svelte calls const dispatch = createEventDispatcher(); dispatch('dead'), but no parent listens for it (no <Child on:dead> anywhere in the project).",
             how_to_fix: "Remove the dispatched event, or listen for it on the component (<Child on:dead={...}> or forward it via <Child on:dead>). If the event is dispatched reflectively (a dynamic name) or is part of a deliberately-stable public component API, suppress the line with // fallow-ignore-next-line unused-svelte-event.",
+        },
+        "fallow/unused-effect-layer" => RuleGuide {
+            example: "services.ts defines const CacheLive = Cache.layer.pipe(Layer.provide(Db.layer)) and export const OrphanLive = Layer.mergeAll(CacheLive), but nothing provides OrphanLive.",
+            how_to_fix: "Remove the unused consumer layers first, then this layer, or compose the layer into a layer that reaches a runtime. If code outside the analyzed project composes it, suppress the line with // fallow-ignore-next-line unused-effect-layer.",
+        },
+        "fallow/unused-tagged-error" => RuleGuide {
+            example: "errors.ts declares class Expired extends Data.TaggedError(\"Expired\"), signatures list it in the error channel and a handler calls catchTag(\"Expired\"), but no code constructs Expired or fails with it.",
+            how_to_fix: "Fail with the error where the condition occurs, or remove the class, its type references and its catchTag handlers. If consumers outside the project construct or decode it, suppress the line with // fallow-ignore-next-line unused-tagged-error.",
+        },
+        "fallow/unproduced-catch-tag" => RuleGuide {
+            example: "main.ts calls Effect.catchTag(\"Expired\", ...), the only class with tag Expired is never constructed, and the unused-tagged-error finding for it is suppressed.",
+            how_to_fix: "Remove the handler, or fail with the error where the condition occurs. If a package or code outside the project produces the tag, suppress the line with // fallow-ignore-next-line unproduced-catch-tag.",
         },
         "fallow/unused-server-action" => RuleGuide {
             example: "app/actions.ts has \"use server\" and exports submitForm, but no component imports it, binds it via action={submitForm}, or uses it in <form action={submitForm}>.",
@@ -743,8 +847,8 @@ fn member_import_rule_guide(id: &str) -> Option<RuleGuide> {
             how_to_fix: "Fix the specifier, restore the missing file, install the package, or align tsconfig path aliases with the runtime resolver.",
         },
         "fallow/unlisted-dependency" => RuleGuide {
-            example: "src/api.ts imports undici, but the nearest package.json does not list undici.",
-            how_to_fix: "Add the package to dependencies/devDependencies in the workspace that imports it instead of relying on hoisting or transitive deps.",
+            example: "Root src/app.ts imports @acme/shared, an npm workspace package. The root package.json lists workspaces but does not list @acme/shared as a dependency, so the import is unlisted even when npm links it into node_modules.",
+            how_to_fix: "Declare the imported package in the owning package.json, including the root manifest for root code. Use dependencies for runtime needs or devDependencies for tooling/tests, with a version accepted by your package manager. Self-references need no declaration. For deliberately ambient packages, use ignoreDependencies as an explicit opt-out.",
         },
         "fallow/duplicate-export" => RuleGuide {
             example: "Button is exported from both src/ui/button.ts and src/components/button.ts.",
@@ -774,7 +878,7 @@ fn architecture_rule_guide(id: &str) -> Option<RuleGuide> {
         },
         "fallow/policy-violation" => RuleGuide {
             example: "src/app.ts imports moment while a rule pack bans the moment specifier with the message 'Use date-fns.'",
-            how_to_fix: "Replace the banned call, import, or effectful usage with the alternative named in the rule's message. To waive one rule, use `// fallow-ignore-next-line policy-violation:<pack>/<rule-id>` or the file-level form. Use bare `policy-violation` only when you intend to suppress every rule-pack finding at that scope.",
+            how_to_fix: "Follow the rule's message to replace banned usage or remove a banned export. For a GDP proof producer, move proof factory creation into an allowed file, or correct the rule's allowedFiles and optional proofKinds if the ownership policy was wrong. To waive one rule, use `// fallow-ignore-next-line policy-violation:<pack>/<rule-id>` or the file-level form. Use bare `policy-violation` only when you intend to suppress every rule-pack finding at that scope.",
         },
         "fallow/stale-suppression" => RuleGuide {
             example: "// fallow-ignore-next-line unused-export remains above an export that is now used.",
@@ -820,11 +924,11 @@ fn health_runtime_rule_guide(id: &str) -> Option<RuleGuide> {
         | "fallow/high-cognitive-complexity"
         | "fallow/high-complexity" => RuleGuide {
             example: "A function contains several nested conditionals, loops, and early exits, exceeding the configured complexity threshold. fallow also flags synthetic template-family findings on markup: Angular .html templates and inline `@Component({ template: ... })` literals, Vue SFC `<template>` blocks, Svelte markup, and Astro markup, plus each top-level Svelte `{#snippet name(...)}` block as its own `<snippet:NAME>` unit. `<component>` rollup findings combine the worst class method with its template.",
-            how_to_fix: "For function findings, extract named helpers, split independent branches, flatten guard clauses, and add tests around the behavior before refactoring. For `<template>` findings, flatten nested control flow and move branch selection out of the markup: Angular `@if`/`@for`/`@switch`/`@defer` and legacy `*ngIf`/`*ngFor` into computed signals on the component class, Vue `v-if`/`v-else-if`/`v-for` into computed properties, Svelte `{#if}`/`{:else if}`/`{#each}`/`{#await}`/`{#key}` into derived state, Astro control flow into props resolved in the frontmatter. In Svelte, moving a repeated or deeply nested block into a top-level `{#snippet}` gives it its own `<snippet:NAME>` unit with nesting rebased to zero, so the in-file extraction moves the score; splitting a large template into child components lowers the score in every dialect. For `<component>` rollup findings, attack the larger half first; the per-half breakdown lives in `component_rollup`.",
+            how_to_fix: "For function findings, extract named helpers, split independent branches, flatten guard clauses, and add tests around the behavior before refactoring. For `<template>` findings, flatten nested control flow and move branch selection out of the markup: Angular `@if`/`@for`/`@switch`/`@defer` and legacy `*ngIf`/`*ngFor` into computed signals on the component class, Vue `v-if`/`v-else-if`/`v-for` into computed properties, Svelte `{#if}`/`{:else if}`/`{#each}`/`{#await}`/`{#key}` into derived state, Astro control flow into props resolved in the frontmatter. In Svelte, moving a repeated or deeply nested block into a top-level `{#snippet}` gives it its own `<snippet:NAME>` unit with nesting rebased to zero, so the in-file extraction moves the score; splitting a large template into child components lowers the score in every dialect. For `<component>` rollup findings, attack the larger half first; the per-half breakdown lives in `component_rollup`. To report these findings without a failed run, set the `complexity-cyclomatic` or `complexity-cognitive` rule to `warn`.",
         },
         "fallow/high-crap-score" => RuleGuide {
             example: "A complex function has little or no matching Istanbul coverage, so its CRAP score crosses the configured gate. Synthetic template-family units (the `<template>` units on Angular, Vue, Svelte and Astro markup, and Svelte `<snippet:NAME>` units) are not scored on this dimension: a template carries no direct coverage of its own, so fallow gates templates on the cyclomatic and cognitive dimensions instead.",
-            how_to_fix: "Add focused tests for the risky branches first, then simplify the function if the score remains high. Template findings never carry this rule, so a `maxCrap` override scoped to a template unit buys nothing and can be removed.",
+            how_to_fix: "Add focused tests for the risky branches first, then simplify the function if the score remains high. Template findings never carry this rule, so a `maxCrap` override scoped to a template unit buys nothing and can be removed. To report these findings without a failed run, set the `complexity-crap` rule to `warn`.",
         },
         "fallow/refactoring-target" => RuleGuide {
             example: "A file combines high complexity density, churn, fan-in, and dead-code signals.",
@@ -917,11 +1021,10 @@ pub fn explain_issue_type(
 /// serialization failures.
 pub fn serialize_explain_programmatic_json(
     issue_type: &str,
-    mode: fallow_output::RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, crate::ProgrammaticError> {
     let output = explain_issue_type(issue_type)?;
-    fallow_output::serialize_explain_json_output(output, mode, analysis_run_id).map_err(|error| {
+    fallow_output::serialize_explain_json_output(output, analysis_run_id).map_err(|error| {
         crate::ProgrammaticError::new(format!("JSON serialization error: {error}"), 2)
             .with_code("json_serialization")
     })
@@ -931,6 +1034,14 @@ pub fn serialize_explain_programmatic_json(
 /// suggestions matched to whether the token looks security-related.
 #[must_use]
 pub fn unknown_explain_error(issue_type: &str) -> crate::ProgrammaticError {
+    if let Some(nearest) = nearest_explain_token(issue_type) {
+        return crate::ProgrammaticError::new(
+            format!("unknown issue type '{issue_type}'. Did you mean '{nearest}'?"),
+            2,
+        )
+        .with_code("unknown_issue_type")
+        .with_help(format!("fallow explain {nearest}"));
+    }
     let message = if looks_security_explain_token(issue_type) {
         format!(
             "unknown issue type '{issue_type}'. Try values like tainted-sink, client-server-leak, hardcoded-secret, sql-injection, or security/sql-injection"
@@ -941,6 +1052,23 @@ pub fn unknown_explain_error(issue_type: &str) -> crate::ProgrammaticError {
         )
     };
     crate::ProgrammaticError::new(message, 2).with_code("unknown_issue_type")
+}
+
+/// The registered token closest to an unrecognized one, over the same
+/// vocabulary [`rule_by_token`] accepts (bare ids and namespaced rule ids).
+/// A hardcoded example list cannot name the token that is one edit away, and
+/// that is the token the caller almost always meant.
+fn nearest_explain_token(issue_type: &str) -> Option<&'static str> {
+    let normalized = issue_type
+        .trim()
+        .strip_prefix("fallow/")
+        .unwrap_or_else(|| issue_type.trim())
+        .trim_start_matches("--")
+        .replace('_', "-");
+    let candidates: Vec<&'static str> = all_rules()
+        .flat_map(|rule| [bare_rule_id(rule), rule.id])
+        .collect();
+    fallow_config::levenshtein::closest_match(&normalized, candidates)
 }
 
 fn looks_security_explain_token(issue_type: &str) -> bool {
@@ -1131,19 +1259,73 @@ pub const DUPES_RULES: &[RuleDef] = &[RuleDef {
     category: "Duplication",
     name: "Code Duplication",
     short: "Duplicated code block",
-    full: "A block of code that appears in multiple locations with identical or near-identical token sequences. Clone detection uses normalized token comparison: identifier names and literals are abstracted away in non-strict modes.",
+    full: "A block of code that appears in multiple locations with identical or near-identical token sequences. Clone detection uses normalized token comparison, abstracting identifiers and literals in non-strict modes. Duplicated line counts and percentages include every instance, including the first. Overlapping line ranges in the same file count once. Redundant token counts exclude one retained copy per clone group.",
     docs_path: "explanations/duplication#clone-groups",
 }];
 
+/// Rule definitions for the diff-risk rules of `fallow audit`.
+pub const AUDIT_RULES: &[RuleDef] = &[
+    RuleDef {
+        id: "fallow/weakened-tests",
+        category: "Audit",
+        name: "Weakened Tests",
+        short: "The change weakens tests or a coverage threshold",
+        full: "`fallow audit` compares the base and head text of each changed file. The `kind` field tells how the change weakened the tests: `skip-only` (a new `.skip`, `.only`, `xit` or `fit` marker), `removed-tests` (fewer test cases in a file, while the total of all changed test files also dropped), `assertion-drop` (fewer `expect`, `assert` or `should` calls in a test file with no test case removed), or `coverage-threshold` (a coverage or quality threshold that is less strict). A drop does not report when the lost test lines name code that the change removed, such as a deleted function or a deleted fixture directory: the tests went with that code. A name of a deleted file that a changed file still holds, a name that a deleted file only imports, a directory that still exists, and a reserved word such as `import` do not count. An assertion drop reports only when assertions are at least half of the code lines that the file lost, so a test rewrite that moves setup checks into a helper does not report. The finding is a fact about the change, not a proof that coverage dropped. Defaults to `warn`.",
+        docs_path: "cli/audit#diff-risk-rules",
+    },
+    RuleDef {
+        id: "fallow/added-suppression",
+        category: "Audit",
+        name: "Added Suppressions",
+        short: "The change adds a suppression comment",
+        full: "`fallow audit` reports a comment line that the change adds with a lint, type-check, coverage or Fallow suppression: `eslint-disable`, `oxlint-disable`, `biome-ignore`, `deno-lint-ignore`, `@ts-ignore`, `@ts-expect-error`, `@ts-nocheck`, `istanbul ignore`, `c8 ignore`, `v8 ignore` or `fallow-ignore`. A moved comment is not added. A `fallow-ignore` comment that names only diff-risk rules does not count. Files below a fixture or generated directory (`fixture`, `fixtures`, `__fixtures__`, `__snapshots__`, `generated`, `__generated__`) do not report, because a tool writes them or a test reads them as data. Defaults to `warn`.",
+        docs_path: "cli/audit#diff-risk-rules",
+    },
+    RuleDef {
+        id: "fallow/test-only-branch",
+        category: "Audit",
+        name: "Test-Only Branches",
+        short: "The change adds a test-environment branch to source code",
+        full: "`fallow audit` reports a line that the change adds to a non-test source file and that checks the test environment: `process.env.NODE_ENV` compared with `'test'`, `process.env.VITEST` or `process.env.JEST_WORKER_ID`. Such a branch lets the tests take a path that production does not take. A Vitest in-source test block (`if (import.meta.vitest)`) is test code and is not reported. Tool config files are skipped. A check that only keeps `console` output quiet in tests (`if (process.env.NODE_ENV !== 'test') console.warn(...)`), and a check that picks an env file (`'.env.test'`), do not report. Defaults to `warn`.",
+        docs_path: "cli/audit#diff-risk-rules",
+    },
+    RuleDef {
+        id: "fallow/diverged-clone-sibling",
+        category: "Audit",
+        name: "Diverged Clone Siblings",
+        short: "The change edits one copy of duplicated code but not its siblings",
+        full: "`fallow audit` reports a base clone group where the change edited exactly one copy, the edit broke the clone, and every other copy kept its text. The siblings can need the same change. A cosmetic edit that keeps the clone, a removed copy, a change that edits every copy, and an edit to a test or story copy do not report. Needs the base snapshot of `--gate new-only`. Opt-in: defaults to `off`, because copies often differ on purpose, for example an input and an output type, or a legacy copy. Set it to `warn` or `error` to review every diverged copy.",
+        docs_path: "cli/audit#diff-risk-rules",
+    },
+    RuleDef {
+        id: "fallow/added-dependency",
+        category: "Audit",
+        name: "Added Dependencies",
+        short: "The change adds a dependency",
+        full: "`fallow audit` reports a dependency that the change adds to a `package.json`. A new dependency is often correct, so the rule defaults to `off`. Set it to `warn` or `error` to review every new package. An invented package name already fails as an unresolved import or an unlisted dependency.",
+        docs_path: "cli/audit#diff-risk-rules",
+    },
+];
+
 /// Rule definitions for feature-flag findings.
-pub const FLAGS_RULES: &[RuleDef] = &[RuleDef {
-    id: "fallow/feature-flag",
-    category: "Flags",
-    name: "Feature Flags",
-    short: "Detected feature flag pattern",
-    full: "A feature flag pattern detected by `fallow flags`: environment-variable checks, flag SDK calls (LaunchDarkly, Unleash, and similar), or config-object lookups. Long-lived flags accumulate dead branches; review old flags for retirement and pair with dead-code analysis to find branches that can no longer execute.",
-    docs_path: "cli/flags",
-}];
+pub const FLAGS_RULES: &[RuleDef] = &[
+    RuleDef {
+        id: "fallow/feature-flag",
+        category: "Flags",
+        name: "Feature Flags",
+        short: "Detected feature flag pattern",
+        full: "A feature flag pattern detected by `fallow flags`: environment-variable checks, flag SDK calls (LaunchDarkly, Unleash, and similar), or config-object lookups. Long-lived flags accumulate dead branches; review old flags for retirement and pair with dead-code analysis to find branches that can no longer execute.",
+        docs_path: "cli/flags",
+    },
+    RuleDef {
+        id: "fallow/flag-retirement-candidate",
+        category: "Flags",
+        name: "Flag Retirement Candidate",
+        short: "Feature flag is a retirement candidate",
+        full: "A feature flag that `fallow flags --retirement` lists with at least one retirement reason: one read site, reads only in tests, a literal constant, identical or empty guard branches, guarded dead code, a definition that no code reads, or a vendor state from `--flag-state` (rolled out, archived, missing in the vendor export, or in the export only). The report is advisory. A person decides to remove the flag; Fallow does not remove code.",
+        docs_path: "cli/flags#retirement-report",
+    },
+];
 
 macro_rules! security_catalogue_rule {
     ($id:literal, $name:literal, $cwe:literal) => {
@@ -1350,6 +1532,16 @@ mod tests {
     }
 
     #[test]
+    fn audit_rules_resolve_by_bare_token_and_report_under_audit() {
+        for rule in AUDIT_RULES {
+            let bare = bare_rule_id(rule);
+            assert_eq!(rule_by_token(bare).map(|found| found.id), Some(rule.id));
+            assert_eq!(rule_command(rule), "audit");
+            assert_eq!(rule_severity_key(rule), Some(bare));
+        }
+    }
+
+    #[test]
     fn all_rules_walks_every_registry_in_order() {
         let ids: Vec<&str> = all_rules().map(|rule| rule.id).collect();
         let expected: Vec<&str> = CHECK_RULES
@@ -1358,6 +1550,7 @@ mod tests {
             .chain(DUPES_RULES)
             .chain(FLAGS_RULES)
             .chain(SECURITY_RULES)
+            .chain(AUDIT_RULES)
             .map(|rule| rule.id)
             .collect();
         assert_eq!(ids, expected);
@@ -1450,6 +1643,12 @@ mod tests {
     }
 
     #[test]
+    fn rule_by_id_finds_flags_rule() {
+        let rule = rule_by_id("fallow/feature-flag").unwrap();
+        assert_eq!(rule.name, "Feature Flags");
+    }
+
+    #[test]
     fn rule_by_id_returns_none_for_unknown() {
         assert!(rule_by_id("fallow/nonexistent").is_none());
         assert!(rule_by_id("").is_none());
@@ -1459,7 +1658,7 @@ mod tests {
     fn rule_docs_url_format() {
         let rule = rule_by_id("fallow/unused-export").unwrap();
         let url = rule_docs_url(rule);
-        assert!(url.starts_with("https://docs.fallow.tools/"));
+        assert!(url.starts_with("https://fallow.tools/docs/"));
         assert!(url.contains("unused-exports"));
     }
 
@@ -1471,7 +1670,7 @@ mod tests {
         assert_eq!(output.summary, meta.sarif_description);
         assert_eq!(
             output.docs,
-            format!("https://docs.fallow.tools/{}", meta.meta_docs_path)
+            fallow_output::rule_docs_url(meta.meta_docs_path)
         );
     }
 
@@ -1906,7 +2105,7 @@ mod tests {
     fn rule_docs_url_health_rule() {
         let rule = rule_by_id("fallow/high-cyclomatic-complexity").unwrap();
         let url = rule_docs_url(rule);
-        assert!(url.starts_with("https://docs.fallow.tools/"));
+        assert!(url.starts_with("https://fallow.tools/docs/"));
         assert!(url.contains("health"));
     }
 
@@ -1914,7 +2113,7 @@ mod tests {
     fn rule_docs_url_dupes_rule() {
         let rule = rule_by_id("fallow/code-duplication").unwrap();
         let url = rule_docs_url(rule);
-        assert!(url.starts_with("https://docs.fallow.tools/"));
+        assert!(url.starts_with("https://fallow.tools/docs/"));
         assert!(url.contains("duplication"));
     }
 
@@ -1922,7 +2121,7 @@ mod tests {
     fn rule_docs_url_security_rule() {
         let rule = rule_by_id("security/sql-injection").unwrap();
         let url = rule_docs_url(rule);
-        assert_eq!(url, "https://docs.fallow.tools/cli/security");
+        assert_eq!(url, "https://fallow.tools/docs/cli/security/");
     }
 
     #[test]
@@ -1961,6 +2160,9 @@ mod tests {
             "fan_out",
             "score",
             "weighted_commits",
+            "median_files_per_commit",
+            "median_lines_per_commit",
+            "degree",
             "trend",
             "priority",
             "efficiency",
@@ -2046,52 +2248,8 @@ mod tests {
     }
 
     #[test]
-    fn rule_by_id_finds_all_check_rules() {
-        for rule in CHECK_RULES {
-            assert!(
-                rule_by_id(rule.id).is_some(),
-                "rule_by_id should find check rule {}",
-                rule.id
-            );
-        }
-    }
-
-    #[test]
-    fn rule_by_id_finds_all_health_rules() {
-        for rule in HEALTH_RULES {
-            assert!(
-                rule_by_id(rule.id).is_some(),
-                "rule_by_id should find health rule {}",
-                rule.id
-            );
-        }
-    }
-
-    #[test]
-    fn rule_by_id_finds_all_dupes_rules() {
-        for rule in DUPES_RULES {
-            assert!(
-                rule_by_id(rule.id).is_some(),
-                "rule_by_id should find dupes rule {}",
-                rule.id
-            );
-        }
-    }
-
-    #[test]
-    fn rule_by_id_finds_all_security_rules() {
-        for rule in SECURITY_RULES {
-            assert!(
-                rule_by_id(rule.id).is_some(),
-                "rule_by_id should find security rule {}",
-                rule.id
-            );
-        }
-    }
-
-    #[test]
     fn check_rules_count() {
-        assert_eq!(CHECK_RULES.len(), 46);
+        assert_eq!(CHECK_RULES.len(), 52);
     }
 
     #[test]
@@ -2106,7 +2264,7 @@ mod tests {
 
     #[test]
     fn flags_rules_count() {
-        assert_eq!(FLAGS_RULES.len(), 1);
+        assert_eq!(FLAGS_RULES.len(), 2);
     }
 
     #[test]
@@ -2257,5 +2415,29 @@ mod tests {
             .into_iter()
             .filter(|entry| seen.insert(entry.id))
             .collect()
+    }
+
+    /// A one-edit typo used to get the same hardcoded example list as a
+    /// completely novel token, so the caller never saw the token that was
+    /// actually one edit away.
+    #[test]
+    fn unknown_explain_error_names_the_token_one_edit_away() {
+        let error = unknown_explain_error("unused-exportz");
+        assert_eq!(error.code.as_deref(), Some("unknown_issue_type"));
+        assert!(error.message.contains("unused-export"), "{}", error.message);
+        assert_eq!(error.help.as_deref(), Some("fallow explain unused-export"));
+        assert!(
+            rule_by_token("unused-export").is_some(),
+            "suggestion must resolve"
+        );
+    }
+
+    /// A token that resembles nothing registered must stay silent rather than
+    /// point at an unrelated rule.
+    #[test]
+    fn unknown_explain_error_keeps_the_example_list_for_a_novel_token() {
+        let error = unknown_explain_error("banana-split-detector");
+        assert!(!error.message.contains("Did you mean"), "{}", error.message);
+        assert_eq!(error.help, None);
     }
 }

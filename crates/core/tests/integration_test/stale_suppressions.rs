@@ -2,8 +2,51 @@ use fallow_config::{PartialRulesConfig, Severity};
 use fallow_types::results::SuppressionOrigin;
 
 use super::common::{
-    create_config, create_config_with_overrides, create_config_with_rules, fixture_path,
+    copy_fixture_tree, create_config, create_config_with_overrides, create_config_with_rules,
+    create_production_config, fixture_path,
 };
+
+/// Issue #3825: an `unused-export` suppression on an export that only a test
+/// file imports is needed under `--production`, because production mode
+/// excludes the test. The run without `--production` must not report it stale.
+#[test]
+fn suppression_needed_only_in_production_is_not_stale() {
+    let root = fixture_path("stale-suppression-production-only");
+    let results =
+        fallow_core::analyze(&create_config(root.clone())).expect("analysis should succeed");
+
+    let stale_lines: Vec<u32> = results
+        .stale_suppressions
+        .iter()
+        .filter(|s| s.path.ends_with("src/math.ts"))
+        .map(|s| s.line)
+        .collect();
+    assert!(
+        !stale_lines.contains(&1),
+        "suppression for the test-only export must not be stale, found: {stale_lines:?}"
+    );
+    assert!(
+        stale_lines.contains(&10),
+        "suppression for an export that production code uses must stay stale, found: {stale_lines:?}"
+    );
+    assert!(
+        results
+            .stale_suppressions
+            .iter()
+            .any(|s| s.path.ends_with("src/exposed.ts") && s.line == 1),
+        "suppression for an export that the package entry re-exports must stay stale"
+    );
+
+    let production = fallow_core::analyze(&create_production_config(root))
+        .expect("production analysis should succeed");
+    assert!(
+        !production
+            .stale_suppressions
+            .iter()
+            .any(|s| s.path.ends_with("src/math.ts") && s.line == 1),
+        "suppression for the test-only export must not be stale under production mode"
+    );
+}
 
 #[test]
 fn stale_next_line_suppression_on_used_export() {
@@ -508,4 +551,174 @@ fn stale_respects_per_file_override_off() {
         stale_for_file_level,
         "file-level.ts is not covered by the override; its unused-file marker should still be stale"
     );
+}
+
+type FindingLocator = fn(&fallow_core::results::AnalysisResults) -> Vec<(std::path::PathBuf, u32)>;
+
+type ConfigBuilder = fn(std::path::PathBuf) -> fallow_config::ResolvedConfig;
+
+/// Copy `fixture`, put a `<directive> <token>` comment above the first
+/// finding that `locate` returns, and analyze the copy again.
+fn analyze_with_suppression(
+    fixture: &str,
+    directive: &str,
+    token: &str,
+    locate: FindingLocator,
+) -> fallow_core::results::AnalysisResults {
+    analyze_with_suppression_using(fixture, directive, token, create_config, locate)
+}
+
+/// Like [`analyze_with_suppression`], with a config from `config` for rules
+/// that are off by default.
+fn analyze_with_suppression_using(
+    fixture: &str,
+    directive: &str,
+    token: &str,
+    config: ConfigBuilder,
+    locate: FindingLocator,
+) -> fallow_core::results::AnalysisResults {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path().canonicalize().expect("canonicalize temp dir");
+    copy_fixture_tree(&fixture_path(fixture), &root);
+
+    let before = fallow_core::analyze(&config(root.clone())).expect("analysis should succeed");
+    let (path, line) = locate(&before)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{fixture}: expected a {token} finding before suppression"));
+
+    let source = std::fs::read_to_string(&path).expect("read finding file");
+    let mut lines: Vec<&str> = source.lines().collect();
+    let comment = format!("// {directive} {token}");
+    lines.insert(line as usize - 1, &comment);
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write suppressed file");
+
+    let after = fallow_core::analyze(&config(root)).expect("analysis should succeed");
+    let moved = (path.clone(), line + 1);
+    assert!(
+        !locate(&after).contains(&moved),
+        "{fixture}: the {directive} {token} suppression must drop the finding at {}:{}",
+        path.display(),
+        line + 1
+    );
+    assert!(
+        !after.stale_suppressions.iter().any(|s| matches!(
+            &s.origin,
+            SuppressionOrigin::Comment { issue_kind: Some(k), .. } if k == token
+        )),
+        "{fixture}: the consumed {directive} {token} suppression must not be stale: {:?}",
+        after.stale_suppressions
+    );
+    after
+}
+
+#[test]
+fn component_event_suppressions_drop_the_finding_and_are_not_stale() {
+    for directive in ["fallow-ignore-next-line", "fallow-ignore-file"] {
+        analyze_with_suppression(
+            "unused-component-emit",
+            directive,
+            "unused-component-emit",
+            |r| {
+                r.unused_component_emits
+                    .iter()
+                    .map(|f| (f.emit.path.clone(), f.emit.line))
+                    .collect()
+            },
+        );
+        analyze_with_suppression("svelte-dead-event", directive, "unused-svelte-event", |r| {
+            r.unused_svelte_events
+                .iter()
+                .map(|f| (f.event.path.clone(), f.event.line))
+                .collect()
+        });
+        analyze_with_suppression(
+            "angular-unused-component-io",
+            directive,
+            "unused-component-input",
+            |r| {
+                r.unused_component_inputs
+                    .iter()
+                    .map(|f| (f.input.path.clone(), f.input.line))
+                    .collect()
+            },
+        );
+        analyze_with_suppression(
+            "angular-unused-component-io",
+            directive,
+            "unused-component-output",
+            |r| {
+                r.unused_component_outputs
+                    .iter()
+                    .map(|f| (f.output.path.clone(), f.output.line))
+                    .collect()
+            },
+        );
+    }
+}
+
+#[test]
+fn component_prop_suppressions_drop_the_finding_and_are_not_stale() {
+    for directive in ["fallow-ignore-next-line", "fallow-ignore-file"] {
+        analyze_with_suppression(
+            "unused-react-prop",
+            directive,
+            "unused-component-prop",
+            |r| {
+                r.unused_component_props
+                    .iter()
+                    .map(|f| (f.prop.path.clone(), f.prop.line))
+                    .collect()
+            },
+        );
+        analyze_with_suppression_using(
+            "prop-drilling",
+            directive,
+            "prop-drilling",
+            |root| {
+                let mut config = create_config(root);
+                config.rules.prop_drilling = Severity::Warn;
+                config
+            },
+            |r| {
+                r.prop_drilling_chains
+                    .iter()
+                    .filter_map(|f| f.chain.hops.first())
+                    .map(|source| (source.file.clone(), source.line))
+                    .collect()
+            },
+        );
+        analyze_with_suppression_using(
+            "thin-wrapper",
+            directive,
+            "thin-wrapper",
+            |root| {
+                let mut config = create_config(root);
+                config.rules.thin_wrapper = Severity::Warn;
+                config
+            },
+            |r| {
+                r.thin_wrappers
+                    .iter()
+                    .map(|f| (f.wrapper.file.clone(), f.wrapper.line))
+                    .collect()
+            },
+        );
+        analyze_with_suppression_using(
+            "duplicate-prop-shape",
+            directive,
+            "duplicate-prop-shape",
+            |root| {
+                let mut config = create_config(root);
+                config.rules.duplicate_prop_shape = Severity::Warn;
+                config
+            },
+            |r| {
+                r.duplicate_prop_shapes
+                    .iter()
+                    .map(|f| (f.shape.file.clone(), f.shape.line))
+                    .collect()
+            },
+        );
+    }
 }

@@ -1,0 +1,727 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "tests use unwrap and expect to keep fixture setup concise"
+)]
+
+//! #2368: the `check_health` typed route reads `FALLOW_COVERAGE` and
+//! `FALLOW_COVERAGE_ROOT` from the real process environment.
+//!
+//! The in-crate typed-route tests inject the environment layer as a value so a
+//! shared process environment cannot make them flaky, which leaves the
+//! production read itself unpinned. This test drives the built `fallow-mcp`
+//! binary over stdio with the variables set for real, in its own process, and
+//! compares it against a control server started without them: the same call on
+//! the same project must score `branchy` from the Istanbul map in the first
+//! case and from the reachability estimate in the second.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
+
+/// Absolute prefix the Istanbul map records its files under, so
+/// `FALLOW_COVERAGE_ROOT` has to rebase them onto the project.
+const COVERAGE_ROOT: &str = "/ci/workspace";
+
+/// Project-relative location of the map, outside every auto-detected path, so
+/// only an explicit input can find it.
+const COVERAGE_FILE: &str = "artifacts/coverage-final.json";
+
+const RESPONSE_TIMEOUT: Duration = Duration::from_mins(3);
+
+#[test]
+fn check_health_typed_route_reads_coverage_from_the_process_environment() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_project(project.path());
+
+    let with_env = branchy_coverage_source(project.path(), true);
+    assert_eq!(
+        with_env.as_deref(),
+        Some("istanbul"),
+        "FALLOW_COVERAGE and FALLOW_COVERAGE_ROOT must reach the typed route"
+    );
+
+    let without_env = branchy_coverage_source(project.path(), false);
+    assert_eq!(
+        without_env.as_deref(),
+        Some("estimated"),
+        "the same call without the variables scores from the reachability estimate"
+    );
+}
+
+#[test]
+fn analyze_typed_route_reads_max_file_size_from_the_process_environment() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+
+    let mut with_env = McpServer::start_with_options(false, Some("1"), false, None, None, None);
+    let limited = with_env.analyze(project.path());
+    assert!(
+        limited["workspace_diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic["kind"] == "skipped-large-file" && diagnostic["path"] == "src/huge.ts"
+            })),
+        "FALLOW_MAX_FILE_SIZE must reach the typed analyze route: {limited}"
+    );
+
+    let mut without_env = McpServer::start_with_options(false, None, false, None, None, None);
+    let unlimited = without_env.analyze(project.path());
+    assert!(
+        unlimited["unused_files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"] == "src/huge.ts")),
+        "the same file stays analyzable under the default limit: {unlimited}"
+    );
+}
+
+/// `FALLOW_PACKAGE_BASELINES=false` reaches the typed `analyze` route through
+/// the engine config load, as it reaches the CLI.
+#[test]
+fn analyze_typed_route_reads_package_baselines_from_the_process_environment() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    init_git(project.path());
+    std::fs::write(
+        project.path().join(".fallowrc.json"),
+        r#"{"workspaces":{"changedSince":{"packages/missing":"HEAD"}}}"#,
+    )
+    .expect("package map");
+
+    let mut mapped = McpServer::start_with_options(false, None, false, None, None, None);
+    let stood_down = mapped.analyze(project.path());
+    assert_eq!(
+        stood_down["request_outcomes"]["package-baselines"]["status"], "not-applied",
+        "the map is read without the variable: {stood_down}"
+    );
+
+    let mut disabled = McpServer::start_with_env(&[("FALLOW_PACKAGE_BASELINES", "false")]);
+    let report = disabled.analyze(project.path());
+    assert!(
+        report.get("request_outcomes").is_none(),
+        "FALLOW_PACKAGE_BASELINES=false must keep the typed route from reading the map: {report}"
+    );
+}
+
+/// The typed `analyze` route writes the parse cache to `FALLOW_CACHE_DIR`,
+/// as the CLI does, and not to `.fallow/` in the project.
+#[test]
+fn analyze_typed_route_reads_cache_dir_from_the_process_environment() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    let cache = tempfile::tempdir().expect("cache dir");
+    let cache_dir = cache.path().join("fallow-cache");
+
+    let mut server =
+        McpServer::start_with_options(false, None, false, None, None, Some(&cache_dir));
+    let report = server.analyze_with_cache(project.path(), true);
+    assert!(
+        report["unused_files"].is_array(),
+        "the typed analyze route must answer: {report}"
+    );
+    assert!(
+        !project.path().join(".fallow").exists(),
+        "the typed analyze route wrote a cache into the project although FALLOW_CACHE_DIR points elsewhere"
+    );
+    assert!(
+        cache_dir.join("cache.bin").is_file(),
+        "the parse cache must land in the FALLOW_CACHE_DIR directory"
+    );
+}
+
+/// #2799: an unreadable `FALLOW_DIFF_FILE` stands down on the typed `analyze`
+/// route, as it does on the CLI route: the call succeeds, the report is at full
+/// scope, and `request_outcomes` says why. Before, the typed route returned
+/// `isError` with `FALLOW_INVALID_DIFF_FILE`.
+#[test]
+fn analyze_typed_route_stands_down_on_an_unreadable_ambient_diff() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    let missing = project.path().join("missing.diff");
+
+    let mut server = McpServer::start_with_diff_file(&missing);
+    let envelope = server.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "not-applied", "{envelope}");
+    assert_eq!(entry["affects"], "scope", "{entry}");
+    assert_eq!(entry["reason"], "unreadable", "{entry}");
+    assert!(
+        entry["requested"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("$FALLOW_DIFF_FILE ")),
+        "the label names the ambient channel as the CLI does: {entry}"
+    );
+    assert!(entry.get("scope_size").is_none(), "{entry}");
+}
+
+/// A readable `FALLOW_DIFF_FILE` applies on the typed route and states the
+/// added lines it left in scope, the same object the CLI route publishes.
+#[test]
+fn analyze_typed_route_states_the_scope_of_an_applied_ambient_diff() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    let diff = project.path().join("pr.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/src/index.ts b/src/index.ts\n\
+         --- a/src/index.ts\n\
+         +++ b/src/index.ts\n\
+         @@ -0,0 +1,1 @@\n\
+         +export const added = 1;\n",
+    )
+    .expect("write diff");
+
+    let mut server = McpServer::start_with_diff_file(&diff);
+    let envelope = server.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "applied", "{envelope}");
+    assert_eq!(entry["scope_size"], 1, "{entry}");
+}
+
+/// #2799: a `FALLOW_CHANGED_SINCE` ref that does not resolve stands down on
+/// the typed `analyze` route, as a bad `--changed-since` does on the CLI, and a
+/// ref that resolves publishes `changed-since` with its scope. A README-only
+/// change measures an empty scope.
+#[test]
+fn analyze_typed_route_reports_the_ambient_changed_since_ref() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(project.path())
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+    std::fs::write(project.path().join("README.md"), "# docs only\n").expect("readme");
+
+    let mut stood_down = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+    let envelope = stood_down.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["changed-since"];
+    assert_eq!(entry["status"], "not-applied", "{envelope}");
+    assert_eq!(entry["requested"], "refs/heads/does-not-exist", "{entry}");
+    assert!(entry["reason"].is_string(), "{entry}");
+
+    let mut applied = McpServer::start_with_changed_since("HEAD");
+    let envelope = applied.analyze(project.path());
+    let entry = &envelope["request_outcomes"]["changed-since"];
+    assert_eq!(entry["status"], "applied", "{envelope}");
+    assert_eq!(entry["scope_size"], 0, "a README-only change: {entry}");
+}
+
+/// The listing tools carry no `request_outcomes`, so a `FALLOW_CHANGED_SINCE`
+/// ref that stood down would widen their result with nothing to say so. They
+/// keep the hard error of an explicit ref.
+#[test]
+fn listing_tools_fail_on_an_ambient_ref_that_does_not_resolve() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    init_git(project.path());
+    let root = project.path().display().to_string();
+
+    for tool in ["project_info", "list_boundaries"] {
+        let mut server = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+        let result = server.call_raw(tool, &serde_json::json!({ "root": root, "no_cache": true }));
+        assert_eq!(result["isError"], true, "`{tool}` must fail: {result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("FALLOW_CHANGED_FILES_FAILED"),
+            "`{tool}` must name the changed-files error: {result}"
+        );
+    }
+}
+
+/// The trace tools pass the ref as an explicit one too, and, as before, do not
+/// narrow by it: a trace answers for one file or symbol, so a bad ref neither
+/// fails the call nor changes the answer.
+#[test]
+fn trace_tools_answer_the_same_with_a_bad_ambient_ref() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_large_file_project(project.path());
+    init_git(project.path());
+    let arguments = serde_json::json!({
+        "root": project.path().display().to_string(),
+        "file": "src/index.ts",
+        "no_cache": true
+    });
+
+    let mut with_ref = McpServer::start_with_changed_since("refs/heads/does-not-exist");
+    let traced = with_ref.call_raw("trace_file", &arguments);
+    let mut without_ref = McpServer::start(false);
+    let plain = without_ref.call_raw("trace_file", &arguments);
+    assert_ne!(traced["isError"], true, "{traced}");
+    assert_eq!(traced["content"], plain["content"]);
+}
+
+fn init_git(root: &Path) {
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    }
+}
+
+#[test]
+fn trace_symbol_typed_route_does_not_credit_an_unreachable_consumer() {
+    let project = tempfile::tempdir().expect("project dir");
+    write_type_aware_trace_project(project.path());
+
+    let mut server = McpServer::start_type_aware();
+    let trace = server.trace_symbol(project.path(), "src/lonely.ts", "helper");
+
+    assert_eq!(trace["is_used"], false);
+    assert_eq!(
+        trace["semantic"]["assertion"],
+        "references-only-in-unreachable-files"
+    );
+    assert_eq!(trace["semantic"]["status"], "partial");
+    assert_eq!(trace["semantic"]["references"][0]["path"], "src/orphan.ts");
+}
+
+/// `coverage_source` of the `branchy` finding from a `check_health` call on a
+/// server started with or without the coverage variables.
+#[expect(
+    clippy::unwrap_in_result,
+    reason = "test helper: a panic fails the test"
+)]
+fn branchy_coverage_source(root: &Path, with_env: bool) -> Option<String> {
+    let mut server = McpServer::start(with_env);
+    let health = server.check_health(root);
+    let finding = health["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .find(|finding| finding["name"].as_str() == Some("branchy"))
+        .unwrap_or_else(|| panic!("branchy stays above max_crap in both modes: {health}"));
+    finding["coverage_source"].as_str().map(str::to_string)
+}
+
+/// A project whose `branchy` function is complex enough to exceed `max_crap`
+/// under either scoring model, plus an Istanbul map that records it as never
+/// called under [`COVERAGE_ROOT`].
+fn write_project(root: &Path) {
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"mcp-env-coverage","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { used } from './utils';\n\
+         used();\n\
+         function branchy(n: number): number {\n\
+           if (n < 0) return -1;\n\
+           if (n === 0) return 0;\n\
+           if (n < 10) return 1;\n\
+           if (n < 100) return 2;\n\
+           if (n < 1000) return 3;\n\
+           if (n < 10000) return 4;\n\
+           return 5;\n\
+         }\n\
+         branchy(used());\n",
+    )
+    .expect("write source");
+    std::fs::write(root.join("src/utils.ts"), "export const used = () => 42;\n")
+        .expect("write utils");
+
+    let source = format!("{COVERAGE_ROOT}/src/index.ts");
+    let map = serde_json::json!({
+        &source: {
+            "path": source,
+            "statementMap": {},
+            "fnMap": {
+                "0": {
+                    "name": "branchy",
+                    "line": 3,
+                    "decl": {
+                        "start": { "line": 3, "column": 9 },
+                        "end": { "line": 3, "column": 16 }
+                    },
+                    "loc": {
+                        "start": { "line": 3, "column": 35 },
+                        "end": { "line": 11, "column": 10 }
+                    }
+                }
+            },
+            "branchMap": {},
+            "s": {},
+            "f": { "0": 0 },
+            "b": {}
+        }
+    });
+    let coverage = root.join(COVERAGE_FILE);
+    std::fs::create_dir_all(coverage.parent().expect("coverage parent")).expect("create artifacts");
+    std::fs::write(
+        coverage,
+        serde_json::to_string(&map).expect("serialize map"),
+    )
+    .expect("write coverage");
+}
+
+fn write_large_file_project(root: &Path) {
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"mcp-env-max-file-size","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n").expect("write entry");
+    let mut source = String::from("export const huge = '");
+    source.push_str(&"x".repeat(1_100_000));
+    source.push_str("';\n");
+    std::fs::write(root.join("src/huge.ts"), source).expect("write large source");
+}
+
+fn write_type_aware_trace_project(root: &Path) {
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"mcp-type-aware-trace","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"module":"ESNext","moduleResolution":"Bundler","target":"ES2022","noEmit":true},"include":["src/**/*.ts"]}"#,
+    )
+    .expect("write tsconfig");
+    std::fs::write(root.join("src/index.ts"), "export const entry = true;\n").expect("write entry");
+    std::fs::write(
+        root.join("src/lonely.ts"),
+        "export const helper = (): number => 1;\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        root.join("src/orphan.ts"),
+        "import { helper } from './lonely';\nexport const orphan = helper();\n",
+    )
+    .expect("write unreachable consumer");
+}
+
+/// The built `fallow-mcp` binary as a child process, spoken to over the stdio
+/// transport's newline-delimited JSON-RPC.
+struct McpServer {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+}
+
+impl McpServer {
+    fn start(with_coverage_env: bool) -> Self {
+        Self::start_with_options(with_coverage_env, None, false, None, None, None)
+    }
+
+    fn start_type_aware() -> Self {
+        Self::start_with_options(false, None, true, None, None, None)
+    }
+
+    fn start_with_diff_file(diff_file: &Path) -> Self {
+        Self::start_with_options(false, None, false, Some(diff_file), None, None)
+    }
+
+    fn start_with_changed_since(git_ref: &str) -> Self {
+        Self::start_with_options(false, None, false, None, Some(git_ref), None)
+    }
+
+    fn start_with_options(
+        with_coverage_env: bool,
+        max_file_size: Option<&str>,
+        with_type_aware_sidecar: bool,
+        diff_file: Option<&Path>,
+        changed_since: Option<&str>,
+        cache_dir: Option<&Path>,
+    ) -> Self {
+        Self::spawn(Self::command(
+            with_coverage_env,
+            max_file_size,
+            with_type_aware_sidecar,
+            diff_file,
+            changed_since,
+            cache_dir,
+        ))
+    }
+
+    /// Start the server with the default options and extra environment.
+    fn start_with_env(extra_env: &[(&str, &str)]) -> Self {
+        let mut command = Self::command(false, None, false, None, None, None);
+        for (name, value) in extra_env {
+            command.env(name, value);
+        }
+        Self::spawn(command)
+    }
+
+    fn command(
+        with_coverage_env: bool,
+        max_file_size: Option<&str>,
+        with_type_aware_sidecar: bool,
+        diff_file: Option<&Path>,
+        changed_since: Option<&str>,
+        cache_dir: Option<&Path>,
+    ) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fallow-mcp"));
+        command.env("FALLOW_BIN", crate::fallow_binary());
+        command.env_remove("FALLOW_PACKAGE_BASELINES");
+        if with_type_aware_sidecar {
+            configure_type_aware_sidecar(&mut command);
+        }
+        if with_coverage_env {
+            command
+                .env("FALLOW_COVERAGE", COVERAGE_FILE)
+                .env("FALLOW_COVERAGE_ROOT", COVERAGE_ROOT);
+        } else {
+            command
+                .env_remove("FALLOW_COVERAGE")
+                .env_remove("FALLOW_COVERAGE_ROOT");
+        }
+        if let Some(max_file_size) = max_file_size {
+            command.env("FALLOW_MAX_FILE_SIZE", max_file_size);
+        } else {
+            command.env_remove("FALLOW_MAX_FILE_SIZE");
+        }
+        if let Some(diff_file) = diff_file {
+            command.env("FALLOW_DIFF_FILE", diff_file);
+        } else {
+            command.env_remove("FALLOW_DIFF_FILE");
+        }
+        if let Some(git_ref) = changed_since {
+            command.env("FALLOW_CHANGED_SINCE", git_ref);
+        } else {
+            command.env_remove("FALLOW_CHANGED_SINCE");
+        }
+        if let Some(cache_dir) = cache_dir {
+            command.env("FALLOW_CACHE_DIR", cache_dir);
+        } else {
+            command.env_remove("FALLOW_CACHE_DIR");
+        }
+        command
+    }
+
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn fallow-mcp");
+
+        let stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let (sender, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut server = Self {
+            child,
+            stdin,
+            lines,
+        };
+        server.initialize();
+        server
+    }
+
+    fn initialize(&mut self) {
+        self.send(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"typed-route-env-coverage","version":"0"}}}"#,
+        );
+        let response = self.response(1);
+        assert!(
+            response["result"]["serverInfo"].is_object(),
+            "initialize must return server info: {response}"
+        );
+        self.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    }
+
+    /// Call `check_health` with parameters that stay on the typed route and
+    /// pass no coverage input of their own.
+    fn check_health(&mut self, root: &Path) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "check_health",
+                "arguments": {
+                    "root": root.display().to_string(),
+                    "complexity": true,
+                    "max_crap": 10.0,
+                    "no_cache": true
+                }
+            }
+        });
+        self.send(&serde_json::to_string(&request).expect("serialize request"));
+        let response = self.response(2);
+        let result = &response["result"];
+        assert_ne!(
+            result["isError"], true,
+            "check_health must succeed: {response}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("text content: {response}"));
+        serde_json::from_str(text).expect("health payload")
+    }
+
+    fn analyze(&mut self, root: &Path) -> serde_json::Value {
+        self.analyze_with_cache(root, false)
+    }
+
+    fn analyze_with_cache(&mut self, root: &Path, cache: bool) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "analyze",
+                "arguments": {
+                    "root": root.display().to_string(),
+                    "no_cache": !cache
+                }
+            }
+        });
+        self.send(&serde_json::to_string(&request).expect("serialize request"));
+        let response = self.response(2);
+        let result = &response["result"];
+        assert_ne!(result["isError"], true, "analyze must succeed: {response}");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("text content: {response}"));
+        serde_json::from_str(text).expect("analyze payload")
+    }
+
+    fn trace_symbol(&mut self, root: &Path, file: &str, export_name: &str) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "trace_symbol",
+                "arguments": {
+                    "root": root.display().to_string(),
+                    "file": file,
+                    "export_name": export_name,
+                    "no_cache": true
+                }
+            }
+        });
+        self.send(&serde_json::to_string(&request).expect("serialize request"));
+        let response = self.response(2);
+        let result = &response["result"];
+        assert_ne!(
+            result["isError"], true,
+            "trace_symbol must succeed: {response}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("text content: {response}"));
+        serde_json::from_str(text).expect("trace payload")
+    }
+
+    /// Call `name` with `arguments` and return the raw `result` object, error
+    /// or not.
+    fn call_raw(&mut self, name: &str, arguments: &serde_json::Value) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        self.send(&serde_json::to_string(&request).expect("serialize request"));
+        self.response(2)["result"].clone()
+    }
+
+    fn send(&mut self, message: &str) {
+        writeln!(self.stdin, "{message}").expect("write message");
+        self.stdin.flush().expect("flush message");
+    }
+
+    /// The response carrying `id`, skipping any notification the server emits
+    /// while the analysis runs.
+    fn response(&self, id: u64) -> serde_json::Value {
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(RESPONSE_TIMEOUT)
+                .unwrap_or_else(|err| panic!("no response for id {id}: {err}"));
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if message["id"].as_u64() == Some(id) {
+                return message;
+            }
+        }
+    }
+}
+
+fn configure_type_aware_sidecar(command: &mut Command) {
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    );
+    let repository_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("repository root");
+    let sidecar = repository_root.join("tools/type-aware-sidecar/fallow-type-aware.mjs");
+
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH").expect("PATH must contain Node.js");
+        let node = std::env::split_paths(&path)
+            .map(|entry| entry.join("node.exe"))
+            .find(|candidate| candidate.is_file())
+            .expect("Node.js executable");
+        command
+            .env("FALLOW_TYPE_AWARE_BIN", node)
+            .env("FALLOW_TYPE_AWARE_SCRIPT", sidecar);
+    }
+    #[cfg(not(windows))]
+    command.env("FALLOW_TYPE_AWARE_BIN", sidecar);
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

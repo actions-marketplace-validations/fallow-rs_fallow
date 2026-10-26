@@ -17,17 +17,20 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   checkerEvidenceRequest as createCheckerEvidenceRequest,
   digestSet,
   normalizedEvidenceResponseDigest,
+  assertBackendIsolation,
+  minimalEnvironment,
   requestDigest,
   runExactSidecarRequest as executeExactSidecarRequest,
 } from "./type-aware-corpus/runner.mjs";
 import {
   aggregatePhaseTimings,
   aggregateReasonCounts,
+  blockedProjects,
   percentile,
   pairedOverheads,
   renderSummaryMarkdown,
@@ -35,6 +38,8 @@ import {
   safeRatio,
   summaryChecks,
   summarizeAdjudicatedFeatureBuckets,
+  typeAwareResolutionCounts,
+  typeEvidenceCoverage,
 } from "./type-aware-corpus/summary.mjs";
 import {
   validateCapabilitiesArtifactData as validateCapabilitiesData,
@@ -53,7 +58,13 @@ import {
   parseArgs as parseCorpusArgs,
   validateManifest as validateCorpusManifest,
 } from "./type-aware-corpus/config.mjs";
+import {
+  assertArtifactDirectoryInWorkspace,
+  DEPENDENCY_DIRECTORY_NAMES,
+  fixtureDependencyEnvironment,
+} from "./type-aware-corpus/dependencies.mjs";
 import { WIRE_PROTOCOL_VERSION } from "../tools/type-aware-sidecar/src/generated-protocol.mjs";
+import { cargoFallowBin } from "./cargo-target.mjs";
 
 export { summarizeAdjudicatedFeatureBuckets };
 
@@ -62,7 +73,7 @@ const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const DEFAULT_MANIFEST = resolve(REPO_ROOT, "benchmarks/type-aware-corpus.json");
 const DEFAULT_ADJUDICATION = resolve(REPO_ROOT, "benchmarks/type-aware-adjudication.json");
 const DEFAULT_OUT_DIR = resolve(REPO_ROOT, "target/type-aware-corpus");
-const DEFAULT_FALLOW_BIN = resolve(REPO_ROOT, "target/release/fallow");
+const DEFAULT_FALLOW_BIN = cargoFallowBin(REPO_ROOT, "release");
 const SUPPLEMENTAL_VITEST_ROOT = resolve(DEFAULT_OUT_DIR, "supplemental/vitest");
 const SUPPLEMENTAL_VITEST_REPO = "https://github.com/vitest-dev/vitest.git";
 const SUPPLEMENTAL_VITEST_COMMIT = "8fbfcb054a07410e03bd37e6682d15ef5b240ad8";
@@ -82,7 +93,6 @@ const SEMANTIC_TIMEOUT_MS = 120_000;
 const SEMANTIC_PROTOCOL_VERSION = WIRE_PROTOCOL_VERSION;
 const SEMANTIC_QUERY_STATUSES = new Set(["complete", "partial", "unavailable"]);
 const TRUTH_STATUSES = new Set(["used", "preserved", "unused", "indeterminate"]);
-const DEPENDENCY_DIRECTORY_NAMES = new Set(["node_modules", ".pnpm-store"]);
 const FOCUSED_TEST_PATH = resolve(REPO_ROOT, "tools/type-aware-sidecar/test/sidecar.test.mjs");
 const REQUIRED_FOCUSED_CASES = [
   "confirms a nested generic class-member use",
@@ -109,13 +119,13 @@ const REQUIRED_SEMANTIC_CAPABILITIES = [
 ];
 const REQUIRED_PROJECTS = new Map([
   ["svelte", "accuracy-core"],
-  ["vue-core", "accuracy-core"],
+  ["vue-core", "zero-control"],
   ["astro", "accuracy-core"],
   ["typescript", "accuracy-core"],
   ["next.js", "accuracy-core"],
   ["preact", "accuracy-core"],
-  ["query", "zero-control"],
-  ["vite", "zero-control"],
+  ["query", "accuracy-core"],
+  ["vite", "accuracy-core"],
   ["fastify", "zero-control"],
   ["zod", "zero-control"],
 ]);
@@ -144,20 +154,11 @@ const normalizedRelativePath = (value, field) => {
 };
 
 export const validateManifest = (manifest) => {
-  const requiredGates = [
-    "minimum_confirmation_precision",
-    "minimum_confirmation_yield",
-    "minimum_correct_unused_retention",
-    "maximum_abstention",
-    "maximum_p95_marginal_overhead_ms",
-    "maximum_p95_refined_rss_kb",
-  ];
   return validateCorpusManifest(manifest, {
     fail,
     isObject,
     nonEmptyString,
     normalizedRelativePath,
-    requiredGates,
     requiredProjects: REQUIRED_PROJECTS,
   });
 };
@@ -270,9 +271,8 @@ export const validatePartialOutput = (options) => {
     new Set(["prepare", "discover", "measure"]).has(options.command),
     [!options.outDirExplicit, resolve(options.outDir) === DEFAULT_OUT_DIR].some(Boolean),
   ].every(Boolean);
-  if (partialCanonicalRun) {
-    fail("partial corpus runs require a non-canonical --out-dir");
-  }
+  if (partialCanonicalRun) fail("partial corpus runs require a non-canonical --out-dir");
+  assertBackendIsolation(options, DEFAULT_OUT_DIR);
 };
 
 const ensureFile = (path, description) => {
@@ -319,43 +319,8 @@ export const assertNoFixtureDependencyDirectories = (root, projectId, ignoredPat
   }
 };
 
-const ancestorDirectories = (root) => {
-  const directories = [];
-  let ancestor = dirname(resolve(root));
-  while (true) {
-    directories.push(ancestor);
-    const parent = dirname(ancestor);
-    if (parent === ancestor) return directories;
-    ancestor = parent;
-  }
-};
-
-const containsInstalledDependencies = (root) =>
-  [...DEPENDENCY_DIRECTORY_NAMES].some((name) => existsSync(resolve(root, name)));
-
 const existingDirectory = (path) => (existsSync(path) ? statSync(path).isDirectory() : false);
 const existingFile = (path) => (existsSync(path) ? statSync(path).isFile() : false);
-
-export const fixtureDependencyEnvironment = (
-  root,
-  projectId,
-  approvedDependencyRoot = REPO_ROOT,
-) => {
-  const dependencyRoots = ancestorDirectories(root).filter(containsInstalledDependencies);
-  if (dependencyRoots.length === 0) {
-    return { dependency_installation: "none", dependency_root: null };
-  }
-  const approved = resolve(approvedDependencyRoot);
-  if (dependencyRoots.some((dependencyRoot) => dependencyRoot !== approved)) {
-    fail(
-      `${projectId} resolves dependencies from an unapproved ancestor: ${dependencyRoots.join(", ")}`,
-    );
-  }
-  return {
-    dependency_installation: "ancestor-workspace",
-    dependency_root: approved,
-  };
-};
 
 const sourceFixtureRoot = (project) => {
   const root = resolve(REPO_ROOT, project.fixture);
@@ -432,23 +397,13 @@ const prepareProject = (project, outDir) => {
 };
 
 const prepare = (projects, outDir) => {
+  assertArtifactDirectoryInWorkspace(outDir);
   const prepared = projects.map((project) => prepareProject(project, outDir));
   writeJson(resolve(outDir, "fixtures.json"), { schema_version: 1, projects: prepared });
   return prepared;
 };
 
 const projectRoot = (project, outDir) => validatePreparedFixture(project, outDir).root;
-
-const minimalEnvironment = (sidecarBin) => {
-  const environment = {};
-  for (const key of ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "ComSpec", "PATHEXT"]) {
-    if (process.env[key]) environment[key] = process.env[key];
-  }
-  environment.FALLOW_FORMAT = "json";
-  environment.FALLOW_QUIET = "1";
-  if (sidecarBin) environment.FALLOW_TYPE_AWARE_BIN = sidecarBin;
-  return environment;
-};
 
 const processTreeIndexes = (rows) => {
   const children = new Map();
@@ -966,6 +921,7 @@ const compactTypeAwareMetadata = (metadata) => {
   return {
     protocol_version: metadata.protocol_version,
     sidecar_version: metadata.sidecar_version,
+    backend: metadata.backend,
     backend_version: metadata.backend_version,
     candidate_count: metadata.candidate_count,
     confirmed_used_count: metadata.confirmed_used_count,
@@ -2635,13 +2591,8 @@ const summarize = (manifest, options, publicationMode = "write") => {
   const correctContracts = contracts.filter(({ truth }) => truth === "preserved");
   const incorrectContracts = contracts.filter(({ truth }) => truth !== "preserved");
   const correctUnusedRetained = retained.filter(({ truth }) => truth === "unused");
-  const abstainedCount = discovery.projects.reduce(
-    (total, project) => total + (project.type_aware?.abstained_count ?? 0),
-    0,
-  );
-  const unresolvedCount = discovery.projects.reduce(
-    (total, project) => total + (project.type_aware?.unresolved_count ?? 0),
-    0,
+  const { abstainedCount, unresolvedCount, ...counts } = typeAwareResolutionCounts(
+    discovery.projects,
   );
   const baselineRuns = measuredRuns(measurements, "baseline");
   const refinedRuns = measuredRuns(measurements, "refined");
@@ -2668,7 +2619,11 @@ const summarize = (manifest, options, publicationMode = "write") => {
     .filter(({ role }) => role === "zero-control")
     .every(({ baseline_candidate_count }) => baseline_candidate_count === 0);
   const confirmationPrecision = safeRatio(correctConfirmed.length, confirmed.length);
-  const confirmationYield = safeRatio(correctConfirmed.length, entries.length);
+  const coverage = typeEvidenceCoverage(correctConfirmed.length, entries.length, {
+    abstainedCount,
+    unresolvedCount,
+    ...counts,
+  });
   const adjudicatedTruthCount = used.length + preserved.length + unused.length;
   const adjudicatedTruthCoverage = safeRatio(adjudicatedTruthCount, entries.length);
   const correctUnusedRetention = safeRatio(correctUnusedRetained.length, unused.length);
@@ -2685,7 +2640,7 @@ const summarize = (manifest, options, publicationMode = "write") => {
   const checks = summaryChecks({
     abstention,
     confirmationPrecision,
-    confirmationYield,
+    coverage,
     confirmedProjectCount: confirmedProjects.size,
     correctUnusedRetention,
     determinismRuns: discovery.determinism_runs,
@@ -2701,7 +2656,7 @@ const summarize = (manifest, options, publicationMode = "write") => {
     zeroControlsClean,
   });
   const summary = {
-    schema_version: 3,
+    schema_version: 4,
     gate: {
       go: Object.values(checks).every(Boolean),
       checks,
@@ -2723,7 +2678,8 @@ const summarize = (manifest, options, publicationMode = "write") => {
         indeterminate: entries.filter(({ truth }) => truth === "indeterminate").length,
       },
       confirmation_precision: confirmationPrecision,
-      confirmation_yield: confirmationYield,
+      ...coverage,
+      blocked_projects: blockedProjects(discovery.projects),
       safe_resolution_yield: safeRatio(
         correctConfirmed.length + correctContracts.length,
         entries.length,
@@ -2850,7 +2806,7 @@ export const main = async (argv = process.argv.slice(2)) => {
   return 0;
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then(
     (code) => {
       process.exitCode = code;

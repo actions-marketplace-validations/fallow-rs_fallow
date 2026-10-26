@@ -83,6 +83,8 @@ pub struct Annotation {
     pub(crate) col: Option<u64>,
     pub(crate) title: String,
     pub(crate) message: String,
+    /// Saved audit provenance, used only for new-only annotation ordering.
+    pub(crate) introduced: Option<bool>,
 }
 
 /// Render one annotation as a workflow-command line. Property order matches
@@ -385,7 +387,11 @@ pub(crate) fn fmt_num(value: &Value) -> String {
 /// Format a numeric field, or `"0"` when missing.
 #[must_use]
 pub(crate) fn num(value: &Value, key: &str) -> String {
-    value.get(key).map_or_else(|| "0".to_owned(), fmt_num)
+    // jq's `// 0` also replaces an explicit null, so the ports do the same.
+    value
+        .get(key)
+        .filter(|value| !value.is_null())
+        .map_or_else(|| "0".to_owned(), fmt_num)
 }
 
 #[cfg(test)]
@@ -466,6 +472,7 @@ mod tests {
             col: None,
             title: "T".to_owned(),
             message: "m".to_owned(),
+            introduced: None,
         }
     }
 
@@ -479,6 +486,7 @@ mod tests {
             col: Some(5),
             title: "Code duplication".to_owned(),
             message: "first\nsecond".to_owned(),
+            introduced: None,
         });
         assert_eq!(
             rendered,

@@ -1,9 +1,12 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use clap::Parser;
 use fallow_engine::validate;
+use fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 
 use crate::cli_format::{Format, FormatConfig, format_from_env, parse_format_arg, resolve_format};
 use crate::cli_telemetry::{TelemetryRun, record_run_epilogue};
@@ -18,31 +21,80 @@ use crate::{
 /// file or captured by an agent. Internal INFO-level tracing is therefore opt-in
 /// via `RUST_LOG`, while warnings remain visible. An explicitly empty `RUST_LOG`
 /// disables tracing entirely, which keeps the test harness deterministic.
-pub fn build_tracing_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
-    use tracing_subscriber::filter::LevelFilter;
-
-    let builder = tracing_subscriber::EnvFilter::builder();
+///
+/// The filter reads `target=level` and `level` directives. It skips a directive
+/// that it cannot read, such as a span or field filter, and keeps the others.
+///
+/// A quiet run (`--quiet`, `--ci` or `FALLOW_QUIET`) also hides the warnings
+/// under [`ANALYSIS_DIAGNOSTIC_LOG_TARGET`]. The JSON envelope carries those
+/// facts, and the stderr lines only add noise to a quiet run. Other warnings,
+/// such as an unknown rule key in the config, stay visible. An explicit
+/// `RUST_LOG` always wins.
+pub fn build_tracing_filter(rust_log: Option<&str>, quiet: bool) -> Targets {
     match rust_log.map(str::trim) {
-        Some("") => builder
-            .with_default_directive(LevelFilter::OFF.into())
-            .parse_lossy("off"),
-        Some(value) => builder
-            .with_default_directive(LevelFilter::OFF.into())
-            .parse_lossy(value),
-        None => builder
-            .with_default_directive(LevelFilter::WARN.into())
-            .parse_lossy(""),
+        Some(value) => parse_targets_lossy(value),
+        None if quiet => Targets::new()
+            .with_default(LevelFilter::WARN)
+            .with_target(ANALYSIS_DIAGNOSTIC_LOG_TARGET, LevelFilter::OFF),
+        None => Targets::new().with_default(LevelFilter::WARN),
     }
 }
 
-/// Set up tracing for the CLI.
-pub fn setup_tracing() {
+/// Parse comma-separated `RUST_LOG` directives, without the ones that do not
+/// parse. No directive gives a filter that disables every target.
+pub fn parse_targets_lossy(value: &str) -> Targets {
+    let readable: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty() && directive.parse::<Targets>().is_ok())
+        .collect();
+    // An empty string parses to a filter that enables every target.
+    if readable.is_empty() {
+        return Targets::new();
+    }
+    readable.join(",").parse().unwrap_or_default()
+}
+
+/// Decide whether tracing lines on stderr carry ANSI color codes.
+///
+/// The fmt layer colors by default, also when stderr is a file or a pipe. An
+/// agent or a log file then gets raw escape codes around each warning. Color
+/// stays on only for a terminal, and `NO_COLOR` with a value turns it off.
+/// `CLICOLOR_FORCE` with a value other than `0` turns it on, as it does for
+/// the report output, so a forced-color pipe gets colored warnings too.
+#[must_use]
+pub fn tracing_uses_ansi(
+    stderr_is_terminal: bool,
+    no_color: Option<&OsStr>,
+    clicolor_force: Option<&OsStr>,
+) -> bool {
+    if clicolor_force.is_some_and(|value| value != "0") {
+        return true;
+    }
+    stderr_is_terminal && no_color.is_none_or(OsStr::is_empty)
+}
+
+/// Set up tracing for the CLI. `quiet` is the resolved quiet mode of the run.
+pub fn setup_tracing(quiet: bool) {
+    use std::io::IsTerminal as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
     let rust_log = std::env::var("RUST_LOG").ok();
+    let ansi = tracing_uses_ansi(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("CLICOLOR_FORCE").as_deref(),
+    );
+    // The builder alone keeps INFO and above. The target filter decides.
     tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
         .with_writer(std::io::stderr)
-        .with_env_filter(build_tracing_filter(rust_log.as_deref()))
+        .with_ansi(ansi)
         .with_target(false)
         .with_timer(tracing_subscriber::fmt::time::uptime())
+        .finish()
+        .with(build_tracing_filter(rust_log.as_deref(), quiet))
         .init();
 }
 
@@ -59,7 +111,9 @@ pub fn validate_inputs(
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, std::num::NonZero::get));
 
-    rayon_pool::configure_global_pool(threads);
+    crate::process_clock::time(crate::process_clock::ProcessSpan::ThreadPool, || {
+        rayon_pool::configure_global_pool(threads);
+    });
 
     Ok((root, threads))
 }
@@ -101,6 +155,39 @@ fn validate_input_flags(
         return Err(validation_failure(&format!(
             "{flag} is not valid with `fallow security`."
         )));
+    }
+
+    // The parse-error gate reads the dead-code and health sections. `dupes`
+    // and `fix` have neither, so the flag would pass with no gate and no
+    // message.
+    if cli.fail_on_parse_error
+        && let Some(command) = match &cli.command {
+            Some(Command::Dupes { .. }) => Some("dupes"),
+            Some(Command::Fix { .. }) => Some("fix"),
+            _ => None,
+        }
+    {
+        return Err(validation_failure(&format!(
+            "--fail-on-parse-error is not valid with `fallow {command}`. Use it with dead-code, architecture, health, audit or the bare run."
+        )));
+    }
+
+    // The group selector is only built into the health grouping. Other
+    // commands would accept it and report every group.
+    if let Some(patterns) = cli.group.as_deref() {
+        if !matches!(&cli.command, Some(Command::Health { .. })) {
+            return Err(validation_failure(
+                "--group is valid with `fallow health --group-by` only.",
+            ));
+        }
+        for pattern in patterns {
+            if let Err(e) = validate::validate_no_control_chars(pattern, "--group") {
+                return Err(validation_failure(&e));
+            }
+        }
+        if let Err(e) = fallow_engine::health::validate_group_filter(patterns) {
+            return Err(validation_failure(&e));
+        }
     }
 
     if matches!(&cli.command, Some(Command::SimilarCode { .. }))
@@ -230,49 +317,35 @@ where
 }
 
 fn global_flag_consumes_next(arg: &str) -> bool {
-    let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
-    !arg.contains('=') && global_value_options().contains(&option_name)
+    !arg.contains('=') && global_value_options().iter().any(|name| name == arg)
 }
 
-fn global_value_options() -> &'static [&'static str] {
-    &[
-        "-r",
-        "--root",
-        "-c",
-        "--config",
-        "-f",
-        "--format",
-        "--output",
-        "--threads",
-        "--changed-since",
-        "--base",
-        "--diff-file",
-        "--baseline",
-        "--parent-run",
-        "--save-baseline",
-        "-w",
-        "--workspace",
-        "--changed-workspaces",
-        "--group-by",
-        "--file",
-        "--sarif-file",
-        "--report-path-prefix",
-        "--annotations-path-prefix",
-        "--only",
-        "--skip",
-        "--dupes-mode",
-        "--dupes-threshold",
-        "--dupes-min-tokens",
-        "--dupes-min-lines",
-        "--dupes-min-occurrences",
-        "--dupes-skip-local",
-        "--dupes-cross-language",
-        "--dupes-ignore-imports",
-        "--save-snapshot",
-        "--regression-baseline",
-        "--tolerance",
-        "--save-regression-baseline",
-    ]
+/// Every spelling (long, short, and aliases) of a top-level `Cli` option that
+/// takes a value. The list comes from the clap definition, so a boolean flag
+/// never makes the scan skip the subcommand name that follows it.
+fn global_value_options() -> &'static [String] {
+    static OPTIONS: OnceLock<Vec<String>> = OnceLock::new();
+    OPTIONS.get_or_init(|| {
+        <Cli as clap::CommandFactory>::command()
+            .get_arguments()
+            .filter(|arg| !arg.is_positional() && arg.get_action().takes_values())
+            .flat_map(option_spellings)
+            .collect()
+    })
+}
+
+fn option_spellings(arg: &clap::Arg) -> Vec<String> {
+    let longs = arg
+        .get_long()
+        .into_iter()
+        .chain(arg.get_all_aliases().unwrap_or_default())
+        .map(|long| format!("--{long}"));
+    let shorts = arg
+        .get_short()
+        .into_iter()
+        .chain(arg.get_all_short_aliases().unwrap_or_default())
+        .map(|short| format!("-{short}"));
+    longs.chain(shorts).collect()
 }
 
 fn args_use_legacy_check_alias<I>(args: I) -> bool
@@ -343,7 +416,13 @@ pub fn run_pre_dispatch_checks(
     telemetry_run: TelemetryRun,
 ) -> Result<regression::Tolerance, ExitCode> {
     let fail = |code: ExitCode, reason: telemetry::FailureReason| {
-        record_run_epilogue(telemetry_run, code, Some(reason), cli.parent_run.as_deref())
+        record_run_epilogue(
+            telemetry_run,
+            code,
+            Some(reason),
+            cli.parent_run.as_deref(),
+            None,
+        )
     };
 
     if let Err(code) = init_cli_diff_filter(cli, root, output, quiet) {
@@ -354,7 +433,29 @@ pub fn run_pre_dispatch_checks(
         && command_rejects_output_gate(cli.command.as_ref())
     {
         let code = emit_known_failure_with_style(
-            "--ci, --fail-on-issues, --sarif-file, and --output-file are only valid with dead-code, dupes, health, security, or bare invocation",
+            "--ci, --fail-on-issues, --sarif-file, and --output-file are only valid with dead-code, architecture, dupes, health, security, or bare invocation",
+            2,
+            output,
+            json_style,
+            telemetry::FailureReason::Validation,
+        );
+        return Err(fail(code, telemetry::FailureReason::Validation));
+    }
+
+    if let Some(message) = sarif_file_without_sarif_error(cli) {
+        let code = emit_known_failure_with_style(
+            &message,
+            2,
+            output,
+            json_style,
+            telemetry::FailureReason::Validation,
+        );
+        return Err(fail(code, telemetry::FailureReason::Validation));
+    }
+
+    if let Some(message) = crate::write_scope::write_path_error(cli, root) {
+        let code = emit_known_failure_with_style(
+            &message,
             2,
             output,
             json_style,
@@ -415,8 +516,18 @@ pub fn run_pre_dispatch_checks(
         report::github::init_report_prefix(root);
     }
 
+    if defers_tolerance_parse(cli.command.as_ref()) {
+        return Ok(regression::Tolerance::Absolute(0));
+    }
     parse_cli_tolerance(cli, output)
         .map_err(|code| fail(code, telemetry::FailureReason::Validation))
+}
+
+/// `fallow list` reads `--tolerance` only for the `--entry-weight` gate, so
+/// the list dispatcher parses the value there. A plain listing never fails on
+/// a value that it does not use.
+fn defers_tolerance_parse(command: Option<&Command>) -> bool {
+    matches!(command, Some(Command::List { .. } | Command::Workspaces))
 }
 
 fn handle_cli_parse_error(err: &clap::Error) -> ExitCode {
@@ -508,6 +619,141 @@ pub fn bare_coverage_subcommand_error_message() -> &'static str {
     "`--coverage` and `--coverage-root` are bare combined-mode flags. Use `fallow health --coverage <coverage-final.json>` for standalone health analysis, or omit the subcommand to run combined mode."
 }
 
+/// Return the first combined-mode baseline flag on the command line.
+///
+/// These flags configure bare `fallow` only. Before a subcommand they would
+/// have no effect, so the caller rejects them.
+pub fn cli_bare_combined_baseline_flag(cli: &Cli) -> Option<&'static str> {
+    if cli.dupes_baseline.is_some() {
+        return Some("--dupes-baseline");
+    }
+    if cli.health_baseline.is_some() {
+        return Some("--health-baseline");
+    }
+    None
+}
+
+pub fn bare_combined_baseline_subcommand_error_message(flag: &str) -> String {
+    format!(
+        "`{flag}` is a bare combined-mode flag and has no effect before a subcommand. Use `fallow audit {flag} <file>`, `fallow dupes --baseline <file>` or `fallow health --baseline <file>`, or omit the subcommand to run combined mode."
+    )
+}
+
+/// Reject `--sarif-file` on `dupes` and `health`, and on a bare run that
+/// leaves out the dead-code analysis. They write no SARIF file, so the flag
+/// had no effect and the run wrote nothing.
+fn sarif_file_without_sarif_error(cli: &Cli) -> Option<String> {
+    cli.sarif_file.as_ref()?;
+    let command = match cli.command.as_ref() {
+        None => {
+            let (run_check, _, _) = crate::combined::resolve_analyses(&cli.only, &cli.skip);
+            return (!run_check).then(|| {
+                "This run does not include the dead-code analysis, which writes the SARIF file, so `--sarif-file` has no effect. Use `--format sarif` with `--output-file`, or include dead-code in the run.".to_string()
+            });
+        }
+        Some(Command::Dupes { .. }) => "dupes",
+        Some(Command::Health { .. }) => "health",
+        Some(_) => return None,
+    };
+    Some(format!(
+        "`fallow {command}` does not write a SARIF file, so `--sarif-file` has no effect. Use `--format sarif` with `--output-file`, or use `--sarif-file` with bare `fallow`, `fallow dead-code`, `fallow architecture` or `fallow security`."
+    ))
+}
+
+/// Return the global baseline flag (`--baseline`, `--save-baseline`,
+/// `--fail-on-baseline-growth` or `--baseline-base`) on the command line, if
+/// any.
+pub fn cli_global_baseline_flag(cli: &Cli) -> Option<&'static str> {
+    if cli.baseline.is_some() {
+        Some("--baseline")
+    } else if cli.save_baseline.is_some() {
+        Some("--save-baseline")
+    } else if cli.fail_on_baseline_growth {
+        Some("--fail-on-baseline-growth")
+    } else if cli.baseline_base.is_some() {
+        Some("--baseline-base")
+    } else {
+        None
+    }
+}
+
+/// Return the name of a subcommand that loads and saves no baseline.
+///
+/// The global `--baseline` and `--save-baseline` flags have no effect on these
+/// subcommands, so the caller rejects them instead of a silent exit 0. The
+/// match has no wildcard arm, so a new subcommand must take a side.
+pub fn command_without_global_baseline(command: &Command) -> Option<&'static str> {
+    match command {
+        // These use the flags, or reject them with their own message.
+        Command::Check { .. }
+        | Command::Architecture { .. }
+        | Command::Dupes { .. }
+        | Command::Health { .. }
+        | Command::Audit { .. }
+        | Command::Security { .. }
+        | Command::Doctor
+        | Command::Baselines { .. }
+        | Command::SimilarCode { .. } => None,
+        Command::Watch { .. } => Some("watch"),
+        Command::TypeAware { .. } => Some("type-aware"),
+        Command::Inspect { .. } => Some("inspect"),
+        Command::Trace { .. } => Some("trace"),
+        Command::TraceError { .. } => Some("trace-error"),
+        Command::Fix { .. } => Some("fix"),
+        Command::Init { .. } => Some("init"),
+        Command::Hooks { .. } => Some("hooks"),
+        Command::Agent { .. } => Some("agent"),
+        Command::Ci { .. } => Some("ci"),
+        Command::ConfigSchema => Some("config-schema"),
+        Command::PluginSchema => Some("plugin-schema"),
+        Command::PluginCheck => Some("plugin-check"),
+        Command::RulePackSchema => Some("rule-pack-schema"),
+        Command::RulePack { .. } => Some("rule-pack"),
+        Command::Guard { .. } => Some("guard"),
+        Command::Config { .. } => Some("config"),
+        Command::Recommend => Some("recommend"),
+        Command::List { .. } => Some("list"),
+        Command::Workspaces => Some("workspaces"),
+        Command::Flags { .. } => Some("flags"),
+        Command::Suppressions { .. } => Some("suppressions"),
+        Command::Explain { .. } => Some("explain"),
+        Command::AuditCache { .. } => Some("audit-cache"),
+        Command::DecisionSurface { .. } => Some("decision-surface"),
+        Command::Impact { .. } => Some("impact"),
+        Command::Report { .. } => Some("report"),
+        Command::Schema => Some("schema"),
+        Command::CiTemplate { .. } => Some("ci-template"),
+        Command::Migrate { .. } => Some("migrate"),
+        Command::License { .. } => Some("license"),
+        Command::Telemetry { .. } => Some("telemetry"),
+        Command::Coverage { .. } => Some("coverage"),
+        Command::SetupHooks { .. } => Some("setup-hooks"),
+        Command::Viz { .. } => Some("viz"),
+        Command::Mutation { .. } => Some("mutation"),
+    }
+}
+
+pub fn global_baseline_subcommand_error_message(command: &str, flag: &str) -> String {
+    format!(
+        "`fallow {command}` does not load or save a baseline, so `{flag}` has no effect. Use `{flag}` with bare `fallow`, `fallow dead-code`, `fallow architecture`, `fallow dupes` or `fallow health`, or use `fallow audit --dead-code-baseline`, `--health-baseline` or `--dupes-baseline`."
+    )
+}
+
+/// Reject the global baseline flags on a subcommand that has no baseline.
+pub fn reject_global_baseline_flags(cli: &Cli, format: &FormatConfig) -> Option<ExitCode> {
+    let name = cli
+        .command
+        .as_ref()
+        .and_then(command_without_global_baseline)?;
+    let flag = cli_global_baseline_flag(cli)?;
+    Some(crate::error::emit_error_with_style(
+        &global_baseline_subcommand_error_message(name, flag),
+        2,
+        format.output,
+        format.json_style,
+    ))
+}
+
 fn command_rejects_output_gate(command: Option<&Command>) -> bool {
     matches!(
         command,
@@ -538,7 +784,9 @@ fn command_rejects_output_gate(command: Option<&Command>) -> bool {
 
 fn global_filter_error(cli: &Cli) -> Option<&'static str> {
     if (!cli.only.is_empty() || !cli.skip.is_empty()) && cli.command.is_some() {
-        return Some("--only and --skip can only be used without a subcommand");
+        return Some(
+            "--only and --skip can only be used without a subcommand. For audit, pass them after `audit`",
+        );
     }
     if (cli.production_dead_code || cli.production_health || cli.production_dupes)
         && cli.command.is_some()
@@ -567,47 +815,6 @@ fn parse_cli_tolerance(
     })
 }
 
-/// Directories a supplied unified diff's paths might be relative to, most
-/// preferred first.
-///
-/// `git diff` writes paths relative to the repository toplevel, while
-/// `git diff --relative` writes them relative to the invoking directory. Both
-/// reach fallow through `--diff-file` / `--diff-stdin`, and a unified diff does
-/// not say which one it is, so the caller offers both and the paths decide (see
-/// `choose_diff_base`). The two coincide for a single-package repo, which is why
-/// keying against `--root` alone went unnoticed until `--root` addressed a
-/// package inside a monorepo.
-///
-/// The toplevel is only used to measure how far `root` sits below it; the
-/// returned base is that many components popped off `root` itself, so it keeps
-/// `root`'s spelling. Finding paths are built from `root`, and a canonicalized
-/// base would fail to prefix them wherever the two disagree (`/tmp` vs
-/// `/private/tmp` on macOS).
-fn diff_base_candidates(root: &Path) -> Vec<PathBuf> {
-    let Some(toplevel) = git_toplevel_base(root) else {
-        return vec![root.to_path_buf()];
-    };
-    if toplevel == root {
-        return vec![root.to_path_buf()];
-    }
-    vec![toplevel, root.to_path_buf()]
-}
-
-/// `root` with its offset below the git toplevel popped off, preserving
-/// `root`'s spelling. `None` outside a git repo.
-fn git_toplevel_base(root: &Path) -> Option<PathBuf> {
-    let toplevel = crate::base_worktree::git_toplevel(root)?;
-    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let offset = canonical_root.strip_prefix(&toplevel).ok()?;
-    let mut base = root.to_path_buf();
-    for _ in offset.components() {
-        if !base.pop() {
-            return None;
-        }
-    }
-    Some(base)
-}
-
 fn init_cli_diff_filter(
     cli: &Cli,
     root: &Path,
@@ -632,10 +839,16 @@ fn init_cli_diff_filter(
             diff_source,
             Some(report::ci::diff_filter::DiffSource::EnvVar(_)) | None
         );
+    // The candidates cost a `git rev-parse`, and only placing a diff reads
+    // them, so a run without a diff source skips the call.
+    let candidate_bases = diff_source
+        .as_ref()
+        .map(|_| fallow_engine::diff_source::diff_base_candidates(root))
+        .unwrap_or_default();
     let _ = report::ci::diff_filter::init_shared_diff(
         diff_source.as_ref(),
         root,
-        &diff_base_candidates(root),
+        &candidate_bases,
         suppress_warnings,
     );
     Ok(())
@@ -644,6 +857,90 @@ fn init_cli_diff_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracing_filter_defaults_to_warn_without_env() {
+        let filter = build_tracing_filter(None, false);
+        assert!(filter.would_enable("fallow_core", &tracing::Level::WARN));
+        assert!(!filter.would_enable("fallow_core", &tracing::Level::INFO));
+        assert!(filter.would_enable(ANALYSIS_DIAGNOSTIC_LOG_TARGET, &tracing::Level::WARN));
+    }
+
+    #[test]
+    fn a_quiet_run_hides_only_analysis_diagnostic_warnings() {
+        let filter = build_tracing_filter(None, true);
+        assert!(!filter.would_enable(ANALYSIS_DIAGNOSTIC_LOG_TARGET, &tracing::Level::WARN));
+        assert!(!filter.would_enable(ANALYSIS_DIAGNOSTIC_LOG_TARGET, &tracing::Level::ERROR));
+        assert!(filter.would_enable("fallow_config", &tracing::Level::WARN));
+        assert!(!filter.would_enable("fallow_core", &tracing::Level::INFO));
+    }
+
+    #[test]
+    fn an_explicit_env_filter_wins_over_quiet() {
+        let filter = build_tracing_filter(Some("warn"), true);
+        assert!(filter.would_enable(ANALYSIS_DIAGNOSTIC_LOG_TARGET, &tracing::Level::WARN));
+    }
+
+    #[test]
+    fn tracing_filter_respects_explicit_env_directives() {
+        let filter = build_tracing_filter(Some("info"), false);
+        assert!(filter.would_enable("fallow_core", &tracing::Level::INFO));
+        assert!(!filter.would_enable("fallow_core", &tracing::Level::DEBUG));
+
+        let filter = build_tracing_filter(Some("fallow=debug"), false);
+        assert!(filter.would_enable("fallow_core::lib", &tracing::Level::DEBUG));
+        assert!(!filter.would_enable("oxc_resolver", &tracing::Level::ERROR));
+    }
+
+    #[test]
+    fn tracing_filter_skips_a_directive_that_it_cannot_read() {
+        let directives = "fallow[span{id=1}]=trace,fallow_graph=debug,warn";
+        let filter = build_tracing_filter(Some(directives), false);
+        assert!(filter.would_enable("fallow_graph", &tracing::Level::DEBUG));
+        assert!(filter.would_enable("oxc_resolver", &tracing::Level::WARN));
+        assert!(!filter.would_enable("fallow_core", &tracing::Level::TRACE));
+    }
+
+    #[test]
+    fn tracing_filter_treats_empty_env_as_off() {
+        for value in ["", "   "] {
+            let filter = build_tracing_filter(Some(value), false);
+            assert!(!filter.would_enable("fallow_core", &tracing::Level::ERROR));
+        }
+    }
+
+    /// Tracing color follows the terminal, so a pipe or a log file gets
+    /// plain warnings.
+    #[test]
+    fn tracing_color_needs_a_terminal_and_no_no_color() {
+        assert!(tracing_uses_ansi(true, None, None));
+        assert!(tracing_uses_ansi(true, Some(OsStr::new("")), None));
+        assert!(!tracing_uses_ansi(false, None, None));
+        assert!(!tracing_uses_ansi(true, Some(OsStr::new("1")), None));
+        // CLICOLOR_FORCE wins, as it does for the report output.
+        assert!(tracing_uses_ansi(false, None, Some(OsStr::new("1"))));
+        assert!(tracing_uses_ansi(
+            true,
+            Some(OsStr::new("1")),
+            Some(OsStr::new("1"))
+        ));
+        assert!(!tracing_uses_ansi(false, None, Some(OsStr::new("0"))));
+    }
+
+    /// The hint names every subcommand that loads and saves the global
+    /// baseline.
+    #[test]
+    fn global_baseline_hint_names_every_baseline_command() {
+        let message = global_baseline_subcommand_error_message("inspect", "--baseline");
+        for command in [
+            "`fallow dead-code`",
+            "`fallow architecture`",
+            "`fallow dupes`",
+            "`fallow health`",
+        ] {
+            assert!(message.contains(command), "{command}: {message}");
+        }
+    }
 
     #[test]
     fn legacy_check_alias_detection_ignores_option_values() {
@@ -664,5 +961,54 @@ mod tests {
             "--file".to_string(),
             "check".to_string(),
         ]));
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("fallow")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn boolean_global_flags_do_not_hide_the_subcommand() {
+        for flag in [
+            "--dupes-skip-local",
+            "--dupes-cross-language",
+            "--dupes-ignore-imports",
+        ] {
+            assert!(
+                args_use_legacy_check_alias(argv(&[flag, "check"])),
+                "{flag} check"
+            );
+            assert!(
+                args_invoked_review_alias(argv(&[flag, "review"])),
+                "{flag} review"
+            );
+        }
+    }
+
+    #[test]
+    fn subcommand_scan_matches_every_top_level_clap_option() {
+        let command = <Cli as clap::CommandFactory>::command();
+        for arg in command.get_arguments().filter(|arg| !arg.is_positional()) {
+            for flag in option_spellings(arg) {
+                if arg.get_action().takes_values() {
+                    assert!(
+                        !args_use_legacy_check_alias(argv(&[&flag, "check", "dead-code"])),
+                        "{flag} takes a value, so `check` after it is that value"
+                    );
+                    assert!(
+                        args_use_legacy_check_alias(argv(&[&flag, "value", "check"])),
+                        "{flag} value check"
+                    );
+                } else {
+                    assert!(
+                        args_use_legacy_check_alias(argv(&[&flag, "check"])),
+                        "{flag} takes no value, so `check` after it is the subcommand"
+                    );
+                }
+            }
+        }
     }
 }

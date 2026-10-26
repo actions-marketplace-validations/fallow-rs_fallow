@@ -29,6 +29,7 @@ export const ISSUE_TYPE_DEFAULTS = {
   "dev-dependencies-in-production": true,
   "circular-dependencies": true,
   "re-export-cycle": true,
+  "package-cycle": true,
   "boundary-violation": true,
   "policy-violation": true,
   "invalid-client-export": true,
@@ -37,12 +38,16 @@ export const ISSUE_TYPE_DEFAULTS = {
   "unprovided-injects": true,
   "unrendered-components": true,
   "unused-component-props": true,
+  "absent-component-props": true,
   "unused-component-emits": true,
   "unused-component-inputs": true,
   "unused-component-outputs": true,
   "unused-svelte-events": true,
   "unused-server-actions": true,
   "unused-load-data-keys": true,
+  "unused-effect-layers": true,
+  "unused-tagged-errors": true,
+  "unproduced-catch-tags": true,
   "route-collision": true,
   "dynamic-segment-name-conflict": true,
   "stale-suppressions": true,
@@ -50,7 +55,10 @@ export const ISSUE_TYPE_DEFAULTS = {
   "empty-catalog-groups": true,
   "unresolved-catalog-references": true,
   "unused-dependency-overrides": true,
-  "misconfigured-dependency-overrides": true
+  "misconfigured-dependency-overrides": true,
+  "prop-drilling": true,
+  "thin-wrapper": true,
+  "duplicate-prop-shape": true
 } as const;
 
 export type IssueTypeKey = keyof typeof ISSUE_TYPE_DEFAULTS;
@@ -58,6 +66,7 @@ export type IssueTypeKey = keyof typeof ISSUE_TYPE_DEFAULTS;
 export type IssueTypeConfig = Readonly<Record<IssueTypeKey, boolean>>;
 
 export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
+  "absent-component-prop": "absent-component-props",
   "boundary-call-violation": "boundary-violation",
   "boundary-call-violations": "boundary-violation",
   "boundary-calls": "boundary-violation",
@@ -67,6 +76,7 @@ export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
   "circular-dependency": "circular-dependencies",
   "dev-dependency-in-production": "dev-dependencies-in-production",
   "duplicate-export": "duplicate-exports",
+  "duplicate-prop-shapes": "duplicate-prop-shape",
   "dynamic-segment-name-conflicts": "dynamic-segment-name-conflict",
   "empty-catalog": "empty-catalog-groups",
   "empty-catalog-group": "empty-catalog-groups",
@@ -76,6 +86,7 @@ export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
   "misconfigured-overrides": "misconfigured-dependency-overrides",
   "misplaced-directives": "misplaced-directive",
   "mixed-client-server-barrels": "mixed-client-server-barrel",
+  "package-cycles": "package-cycle",
   "policy-violations": "policy-violation",
   "private-type-leak": "private-type-leaks",
   "re-export-cycles": "re-export-cycle",
@@ -84,8 +95,10 @@ export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
   "route-collisions": "route-collision",
   "stale-suppression": "stale-suppressions",
   "test-only-dependency": "test-only-dependencies",
+  "thin-wrappers": "thin-wrapper",
   "type-only-dependency": "type-only-dependencies",
   "unlisted-dependency": "unlisted-dependencies",
+  "unproduced-catch-tag": "unproduced-catch-tags",
   "unprovided-inject": "unprovided-injects",
   "unrendered-component": "unrendered-components",
   "unresolved-catalog": "unresolved-catalog-references",
@@ -101,6 +114,7 @@ export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
   "unused-dependency-override": "unused-dependency-overrides",
   "unused-dev-dependency": "unused-dev-dependencies",
   "unused-dev-deps": "unused-dev-dependencies",
+  "unused-effect-layer": "unused-effect-layers",
   "unused-enum-member": "unused-enum-members",
   "unused-export": "unused-exports",
   "unused-file": "unused-files",
@@ -112,6 +126,7 @@ export const ISSUE_TYPE_ALIASES: Readonly<Record<string, IssueTypeKey>> = {
   "unused-server-action": "unused-server-actions",
   "unused-store-member": "unused-store-members",
   "unused-svelte-event": "unused-svelte-events",
+  "unused-tagged-error": "unused-tagged-errors",
   "unused-type": "unused-types"
 };
 
@@ -198,6 +213,10 @@ export const DIAGNOSTIC_CATEGORIES: ReadonlyArray<DiagnosticCategory> = [
     "label": "Re-Export Cycles"
   },
   {
+    "code": "package-cycle",
+    "label": "Package Cycles"
+  },
+  {
     "code": "boundary-violation",
     "label": "Boundary Violations"
   },
@@ -230,6 +249,10 @@ export const DIAGNOSTIC_CATEGORIES: ReadonlyArray<DiagnosticCategory> = [
     "label": "Unused Component Props"
   },
   {
+    "code": "absent-component-prop",
+    "label": "Absent Optional Component Props"
+  },
+  {
     "code": "unused-component-emit",
     "label": "Unused Component Emits"
   },
@@ -252,6 +275,18 @@ export const DIAGNOSTIC_CATEGORIES: ReadonlyArray<DiagnosticCategory> = [
   {
     "code": "unused-load-data-key",
     "label": "Unused Load Data Keys"
+  },
+  {
+    "code": "unused-effect-layer",
+    "label": "Unused Effect Layers"
+  },
+  {
+    "code": "unused-tagged-error",
+    "label": "Unused Tagged Errors"
+  },
+  {
+    "code": "unproduced-catch-tag",
+    "label": "Unproduced Catch Tags"
   },
   {
     "code": "route-collision",
@@ -284,5 +319,17 @@ export const DIAGNOSTIC_CATEGORIES: ReadonlyArray<DiagnosticCategory> = [
   {
     "code": "misconfigured-dependency-override",
     "label": "Misconfigured Dependency Overrides"
+  },
+  {
+    "code": "prop-drilling",
+    "label": "Prop Drilling"
+  },
+  {
+    "code": "thin-wrapper",
+    "label": "Thin Wrappers"
+  },
+  {
+    "code": "duplicate-prop-shape",
+    "label": "Duplicate Prop Shapes"
   }
 ];

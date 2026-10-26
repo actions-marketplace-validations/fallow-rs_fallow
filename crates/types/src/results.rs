@@ -12,12 +12,13 @@ use crate::output::{
     FixAction, FixActionType, IssueAction, SuppressLineAction, SuppressLineKind, SuppressLineScope,
 };
 use crate::output_dead_code::{
-    BoundaryCallViolationFinding, BoundaryCoverageViolationFinding, BoundaryViolationFinding,
-    CircularDependencyFinding, DevDependencyInProductionFinding, DuplicateExportFinding,
-    DuplicatePropShapeFinding, DynamicSegmentNameConflictFinding, EmptyCatalogGroupFinding,
-    InvalidClientExportFinding, MisconfiguredDependencyOverrideFinding, MisplacedDirectiveFinding,
-    MixedClientServerBarrelFinding, PolicyViolationFinding, PrivateTypeLeakFinding,
-    PropDrillingChainFinding, ReExportCycleFinding, RouteCollisionFinding,
+    AbsentComponentPropFinding, BoundaryCallViolationFinding, BoundaryCoverageViolationFinding,
+    BoundaryViolationFinding, CircularDependencyFinding, DeprecatedExportInUseFinding,
+    DevDependencyInProductionFinding, DuplicateExportFinding, DuplicatePropShapeFinding,
+    DynamicSegmentNameConflictFinding, EmptyCatalogGroupFinding, InvalidClientExportFinding,
+    MisconfiguredDependencyOverrideFinding, MisplacedDirectiveFinding,
+    MixedClientServerBarrelFinding, PackageCycleFinding, PolicyViolationFinding,
+    PrivateTypeLeakFinding, PropDrillingChainFinding, ReExportCycleFinding, RouteCollisionFinding,
     TestOnlyDependencyFinding, ThinWrapperFinding, TypeOnlyDependencyFinding,
     UnlistedDependencyFinding, UnprovidedInjectFinding, UnrenderedComponentFinding,
     UnresolvedCatalogReferenceFinding, UnresolvedImportFinding, UnusedCatalogEntryFinding,
@@ -28,8 +29,11 @@ use crate::output_dead_code::{
     UnusedOptionalDependencyFinding, UnusedServerActionFinding, UnusedStoreMemberFinding,
     UnusedSvelteEventFinding, UnusedTypeFinding,
 };
+pub use crate::output_dead_code::{
+    UnproducedCatchTagFinding, UnusedEffectLayerFinding, UnusedTaggedErrorFinding,
+};
 use crate::serde_path;
-use crate::suppress::{IssueKind, closest_known_kind_name};
+use crate::suppress::closest_known_kind_name;
 
 /// Summary of detected entry points, grouped by discovery source.
 ///
@@ -252,6 +256,11 @@ pub struct AnalysisResults {
     /// types. Wrapped in [`PrivateTypeLeakFinding`] so each entry carries a
     /// typed `actions` array natively.
     pub private_type_leaks: Vec<PrivateTypeLeakFinding>,
+    /// Exports marked `@deprecated` that still have at least one consumer in
+    /// a reachable file. Wrapped in [`DeprecatedExportInUseFinding`]. Opt-in: the
+    /// `deprecated-exports-in-use` rule defaults to `off`.
+    #[serde(default)]
+    pub deprecated_exports_in_use: Vec<DeprecatedExportInUseFinding>,
     /// Dependencies listed in package.json but never imported. Wrapped in
     /// [`UnusedDependencyFinding`] so each entry carries a typed `actions`
     /// array natively. The fix action swaps from `remove-dependency` to
@@ -322,6 +331,11 @@ pub struct AnalysisResults {
     /// suppression breaks the cycle).
     #[serde(default)]
     pub re_export_cycles: Vec<ReExportCycleFinding>,
+    /// Dependency cycles between workspace packages, built from resolved
+    /// cross-package imports. Wrapped in [`PackageCycleFinding`] so each
+    /// entry carries a typed `actions` array natively.
+    #[serde(default)]
+    pub package_cycles: Vec<PackageCycleFinding>,
     /// Imports that cross architecture boundary rules. Wrapped in
     /// [`BoundaryViolationFinding`] so each entry carries a typed `actions`
     /// array natively.
@@ -436,6 +450,9 @@ pub struct AnalysisResults {
     /// array natively. Default severity is `warn`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unused_component_props: Vec<UnusedComponentPropFinding>,
+    /// Used optional component inputs absent from inspected reachable callers. Off by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent_component_props: Vec<AbsentComponentPropFinding>,
     /// Vue `<script setup>` `defineEmits` events emitted nowhere in their own SFC
     /// (no `emit('<name>')` call). Wrapped in [`UnusedComponentEmitFinding`] so
     /// each entry carries a typed `actions` array natively. Default severity is
@@ -461,6 +478,20 @@ pub struct AnalysisResults {
     /// `warn`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unused_svelte_events: Vec<UnusedSvelteEventFinding>,
+    /// Effect layers composed only into other layers that nothing uses.
+    /// Gated on the project declaring `effect`. Default severity is `warn`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unused_effect_layers: Vec<UnusedEffectLayerFinding>,
+    /// Effect tagged error classes that only type positions or `catchTag`
+    /// handlers reference. Gated on the project declaring `effect`. Default
+    /// severity is `warn`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unused_tagged_errors: Vec<UnusedTaggedErrorFinding>,
+    /// `catchTag` / `catchTags` handlers for a project tag that no code
+    /// produces and that no `unused_tagged_errors` entry covers. Gated on the
+    /// project declaring `effect`. Default severity is `warn`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproduced_catch_tags: Vec<UnproducedCatchTagFinding>,
     /// Next.js Server Actions (exports of `"use server"` files) that no code in
     /// the project references. Reclassified out of `unused_exports` for
     /// `"use server"` files. Wrapped in [`UnusedServerActionFinding`] so each
@@ -505,6 +536,21 @@ pub struct AnalysisResults {
     /// enables it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duplicate_prop_shapes: Vec<DuplicatePropShapeFinding>,
+    /// Number of `unused_exports`, `unused_types`, `unused_class_members` and
+    /// `unused_enum_members` findings that this run did not report because
+    /// their file is an unused file. Deleting the file removes them, so they
+    /// add no information. `--show-cascade` or the `showCascade` config key
+    /// keeps them in the report, and then this count is zero. The count is
+    /// taken after the scope and the rules and before a baseline. Serialized
+    /// only when not zero, so a run without such findings keeps its JSON.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cascade_hidden: usize,
+    /// In-process state of the unused-file cascade filter: the unused-file
+    /// candidates of the detector and the findings that the filter removed.
+    /// Skipped in machine output; [`Self::cascade_hidden`] is the public count.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub cascade: CascadeState,
     /// Number of suppression entries that matched an issue during analysis.
     /// Human output uses this for the suppression footer; it is skipped in
     /// machine output to avoid changing the public JSON issue contract.
@@ -593,11 +639,101 @@ pub struct AnalysisResults {
     pub semantic_framework_contracts: Vec<crate::semantic::SemanticFrameworkContract>,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` passes the field by reference"
+)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// In-process state of the unused-file cascade filter.
+///
+/// An unused file in the report makes every export and member finding in it
+/// redundant: deleting the file removes them. The filter needs the files that
+/// a suppression comment removed from the report, and it keeps the findings
+/// that it removed, because a baseline entry for such a finding still
+/// describes the project and must not count as stale.
+#[derive(Debug, Default, Clone)]
+pub struct CascadeState {
+    /// Unused files whose finding an inline `fallow-ignore-file unused-file`
+    /// comment suppressed. The cascade filter treats them as reported, so a
+    /// suppression comment never makes a hidden finding visible again. An
+    /// issue-type selection without unused files clears this list.
+    pub suppressed_unused_files: Vec<PathBuf>,
+    /// The findings that the filter removed from the report.
+    pub hidden: CascadeHiddenFindings,
+}
+
+/// Findings that the unused-file cascade filter removed from the report.
+#[derive(Debug, Default, Clone)]
+pub struct CascadeHiddenFindings {
+    /// Hidden `unused_exports` findings.
+    pub unused_exports: Vec<UnusedExportFinding>,
+    /// Hidden `unused_types` findings.
+    pub unused_types: Vec<UnusedTypeFinding>,
+    /// Hidden `unused_enum_members` findings.
+    pub unused_enum_members: Vec<UnusedEnumMemberFinding>,
+    /// Hidden `unused_class_members` findings.
+    pub unused_class_members: Vec<UnusedClassMemberFinding>,
+}
+
+impl CascadeHiddenFindings {
+    /// Number of hidden findings.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.unused_exports.len()
+            + self.unused_types.len()
+            + self.unused_enum_members.len()
+            + self.unused_class_members.len()
+    }
+
+    /// Whether the filter removed no finding.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The hidden findings as a result set, for a baseline comparison.
+    #[must_use]
+    pub fn to_results(&self) -> AnalysisResults {
+        AnalysisResults {
+            unused_exports: self.unused_exports.clone(),
+            unused_types: self.unused_types.clone(),
+            unused_enum_members: self.unused_enum_members.clone(),
+            unused_class_members: self.unused_class_members.clone(),
+            ..AnalysisResults::default()
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.unused_exports.extend(other.unused_exports);
+        self.unused_types.extend(other.unused_types);
+        self.unused_enum_members.extend(other.unused_enum_members);
+        self.unused_class_members.extend(other.unused_class_members);
+    }
+}
+
+/// Move each finding that `covered` selects from `findings` to `hidden`.
+fn move_covered<T>(
+    findings: &mut Vec<T>,
+    hidden: &mut Vec<T>,
+    path_of: impl Fn(&T) -> &Path,
+    covered: &dyn Fn(&Path) -> bool,
+) {
+    let (moved, kept): (Vec<T>, Vec<T>) = std::mem::take(findings)
+        .into_iter()
+        .partition(|finding| covered(path_of(finding)));
+    *findings = kept;
+    hidden.extend(moved);
+}
+
 struct AnalysisResultsCoreMergeParts {
     unused_files: Vec<UnusedFileFinding>,
     unused_exports: Vec<UnusedExportFinding>,
     unused_types: Vec<UnusedTypeFinding>,
     private_type_leaks: Vec<PrivateTypeLeakFinding>,
+    deprecated_exports_in_use: Vec<DeprecatedExportInUseFinding>,
     unused_enum_members: Vec<UnusedEnumMemberFinding>,
     unused_class_members: Vec<UnusedClassMemberFinding>,
     unused_store_members: Vec<UnusedStoreMemberFinding>,
@@ -620,6 +756,7 @@ struct AnalysisResultsGraphMergeParts {
     dev_dependencies_in_production: Vec<DevDependencyInProductionFinding>,
     circular_dependencies: Vec<CircularDependencyFinding>,
     re_export_cycles: Vec<ReExportCycleFinding>,
+    package_cycles: Vec<PackageCycleFinding>,
 }
 
 struct AnalysisResultsWorkspaceMergeParts {
@@ -639,10 +776,14 @@ struct AnalysisResultsFrameworkMergeParts {
     route_collisions: Vec<RouteCollisionFinding>,
     dynamic_segment_name_conflicts: Vec<DynamicSegmentNameConflictFinding>,
     unused_component_props: Vec<UnusedComponentPropFinding>,
+    absent_component_props: Vec<AbsentComponentPropFinding>,
     unused_component_emits: Vec<UnusedComponentEmitFinding>,
     unused_component_inputs: Vec<UnusedComponentInputFinding>,
     unused_component_outputs: Vec<UnusedComponentOutputFinding>,
     unused_svelte_events: Vec<UnusedSvelteEventFinding>,
+    unused_effect_layers: Vec<UnusedEffectLayerFinding>,
+    unused_tagged_errors: Vec<UnusedTaggedErrorFinding>,
+    unproduced_catch_tags: Vec<UnproducedCatchTagFinding>,
     unused_server_actions: Vec<UnusedServerActionFinding>,
     unused_load_data_keys: Vec<UnusedLoadDataKeyFinding>,
     unused_load_data_keys_global_abstain: bool,
@@ -652,6 +793,8 @@ struct AnalysisResultsFrameworkMergeParts {
 }
 
 struct AnalysisResultsMetadataMergeParts {
+    cascade_hidden: usize,
+    cascade: CascadeState,
     suppression_count: usize,
     unused_component_props_exempted: usize,
     active_suppressions: Vec<ActiveSuppression>,
@@ -691,6 +834,7 @@ fn split_merge_parts(
         unused_exports,
         unused_types,
         private_type_leaks,
+        deprecated_exports_in_use,
         unused_dependencies,
         unused_dev_dependencies,
         unused_optional_dependencies,
@@ -705,6 +849,7 @@ fn split_merge_parts(
         dev_dependencies_in_production,
         circular_dependencies,
         re_export_cycles,
+        package_cycles,
         boundary_violations,
         boundary_coverage_violations,
         boundary_call_violations,
@@ -723,16 +868,22 @@ fn split_merge_parts(
         route_collisions,
         dynamic_segment_name_conflicts,
         unused_component_props,
+        absent_component_props,
         unused_component_emits,
         unused_component_inputs,
         unused_component_outputs,
         unused_svelte_events,
+        unused_effect_layers,
+        unused_tagged_errors,
+        unproduced_catch_tags,
         unused_server_actions,
         unused_load_data_keys,
         unused_load_data_keys_global_abstain,
         prop_drilling_chains,
         thin_wrappers,
         duplicate_prop_shapes,
+        cascade_hidden,
+        cascade,
         suppression_count,
         unused_component_props_exempted,
         active_suppressions,
@@ -754,6 +905,7 @@ fn split_merge_parts(
             unused_exports,
             unused_types,
             private_type_leaks,
+            deprecated_exports_in_use,
             unused_enum_members,
             unused_class_members,
             unused_store_members,
@@ -775,6 +927,7 @@ fn split_merge_parts(
             dev_dependencies_in_production,
             circular_dependencies,
             re_export_cycles,
+            package_cycles,
         },
         AnalysisResultsWorkspaceMergeParts {
             unused_catalog_entries,
@@ -792,10 +945,14 @@ fn split_merge_parts(
             route_collisions,
             dynamic_segment_name_conflicts,
             unused_component_props,
+            absent_component_props,
             unused_component_emits,
             unused_component_inputs,
             unused_component_outputs,
             unused_svelte_events,
+            unused_effect_layers,
+            unused_tagged_errors,
+            unproduced_catch_tags,
             unused_server_actions,
             unused_load_data_keys,
             unused_load_data_keys_global_abstain,
@@ -804,6 +961,8 @@ fn split_merge_parts(
             duplicate_prop_shapes,
         },
         AnalysisResultsMetadataMergeParts {
+            cascade_hidden,
+            cascade,
             suppression_count,
             unused_component_props_exempted,
             active_suppressions,
@@ -829,6 +988,7 @@ macro_rules! counted_analysis_result_fields {
             unused_exports => "unused_exports",
             unused_types => "unused_types",
             private_type_leaks => "private_type_leaks",
+            deprecated_exports_in_use => "deprecated_exports_in_use",
             unused_dependencies => "unused_dependencies",
             unused_dev_dependencies => "unused_dev_dependencies",
             unused_optional_dependencies => "unused_optional_dependencies",
@@ -843,6 +1003,7 @@ macro_rules! counted_analysis_result_fields {
             dev_dependencies_in_production => "dev_dependencies_in_production",
             circular_dependencies => "circular_dependencies",
             re_export_cycles => "re_export_cycles",
+            package_cycles => "package_cycles",
             boundary_violations => "boundary_violations",
             boundary_coverage_violations => "boundary_coverage_violations",
             boundary_call_violations => "boundary_call_violations",
@@ -861,10 +1022,14 @@ macro_rules! counted_analysis_result_fields {
             route_collisions => "route_collisions",
             dynamic_segment_name_conflicts => "dynamic_segment_name_conflicts",
             unused_component_props => "unused_component_props",
+            absent_component_props => "absent_component_props",
             unused_component_emits => "unused_component_emits",
             unused_component_inputs => "unused_component_inputs",
             unused_component_outputs => "unused_component_outputs",
             unused_svelte_events => "unused_svelte_events",
+            unused_effect_layers => "unused_effect_layers",
+            unused_tagged_errors => "unused_tagged_errors",
+            unproduced_catch_tags => "unproduced_catch_tags",
             unused_server_actions => "unused_server_actions",
             unused_load_data_keys => "unused_load_data_keys",
         }
@@ -895,6 +1060,7 @@ impl_single_source_dead_code! {
     UnusedExportFinding => export.path,
     UnusedTypeFinding => export.path,
     PrivateTypeLeakFinding => leak.path,
+    DeprecatedExportInUseFinding => export.path,
     UnusedEnumMemberFinding => member.path,
     UnusedClassMemberFinding => member.path,
     UnusedStoreMemberFinding => member.path,
@@ -902,10 +1068,14 @@ impl_single_source_dead_code! {
     UnprovidedInjectFinding => inject.path,
     UnrenderedComponentFinding => component.path,
     UnusedComponentPropFinding => prop.path,
+    AbsentComponentPropFinding => prop.path,
     UnusedComponentEmitFinding => emit.path,
     UnusedComponentInputFinding => input.path,
     UnusedComponentOutputFinding => output.path,
     UnusedSvelteEventFinding => event.path,
+    UnusedEffectLayerFinding => layer.path,
+    UnusedTaggedErrorFinding => error.path,
+    UnproducedCatchTagFinding => catch_tag.path,
     UnusedServerActionFinding => action.path,
     UnusedLoadDataKeyFinding => key.path,
     ThinWrapperFinding => wrapper.file,
@@ -991,18 +1161,22 @@ impl FindingIgnorePolicy for ReExportCycleFinding {
     }
 }
 
+impl FindingIgnorePolicy for PackageCycleFinding {
+    fn should_ignore(&self, predicate: &mut impl FnMut(&Path) -> bool) -> bool {
+        all_nonempty_paths_match(self.cycle.edges.iter().map(|edge| &edge.path), predicate)
+    }
+}
+
 impl FindingIgnorePolicy for PropDrillingChainFinding {
     fn should_ignore(&self, predicate: &mut impl FnMut(&Path) -> bool) -> bool {
         all_nonempty_paths_match(self.chain.hops.iter().map(|hop| &hop.file), predicate)
     }
 }
 
-/// Source-owned result families that are excluded from
-/// [`AnalysisResults::total_issues`] but still hidden by `ignoreFindings`.
+/// Source-owned health families hidden by `ignoreFindings`.
 ///
-/// They live outside [`counted_analysis_result_fields`] because they are opt-in
-/// health signals rather than counted issues; ownership-wise they behave exactly
-/// like the counted dead-code families.
+/// These live outside the unconditional counted table: only enforced error prop
+/// chains contribute to `total_issues`; the other families remain advisory.
 macro_rules! uncounted_source_owned_result_fields {
     ($callback:ident $(, $arg:expr)? ) => {
         $callback! {
@@ -1027,7 +1201,7 @@ macro_rules! remove_configured_ignored_findings {
 
 macro_rules! counted_result_key_slice {
     ($($field:ident => $key:literal,)+) => {
-        &[$($key),+]
+        &[$($key),+, "prop_drilling_chains"]
     };
 }
 
@@ -1055,6 +1229,7 @@ fn classify_ignore_findings_fields(results: &AnalysisResults) {
         unused_exports: _unused_exports,
         unused_types: _unused_types,
         private_type_leaks: _private_type_leaks,
+        deprecated_exports_in_use: _deprecated_exports_in_use,
         unused_enum_members: _unused_enum_members,
         unused_class_members: _unused_class_members,
         unused_store_members: _unused_store_members,
@@ -1063,13 +1238,18 @@ fn classify_ignore_findings_fields(results: &AnalysisResults) {
         duplicate_exports: _duplicate_exports,
         circular_dependencies: _circular_dependencies,
         re_export_cycles: _re_export_cycles,
+        package_cycles: _package_cycles,
         unprovided_injects: _unprovided_injects,
         unrendered_components: _unrendered_components,
         unused_component_props: _unused_component_props,
+        absent_component_props: _absent_component_props,
         unused_component_emits: _unused_component_emits,
         unused_component_inputs: _unused_component_inputs,
         unused_component_outputs: _unused_component_outputs,
         unused_svelte_events: _unused_svelte_events,
+        unused_effect_layers: _unused_effect_layers,
+        unused_tagged_errors: _unused_tagged_errors,
+        unproduced_catch_tags: _unproduced_catch_tags,
         unused_server_actions: _unused_server_actions,
         unused_load_data_keys: _unused_load_data_keys,
         // Hideable: uncounted source-owned React health signals.
@@ -1109,6 +1289,8 @@ fn classify_ignore_findings_fields(results: &AnalysisResults) {
         security_unresolved_callee_diagnostics: _security_unresolved_callee_diagnostics,
         // Not findings: counters, metadata, and descriptive carriers.
         unused_load_data_keys_global_abstain: _unused_load_data_keys_global_abstain,
+        cascade_hidden: _cascade_hidden,
+        cascade: _cascade,
         suppression_count: _suppression_count,
         unused_component_props_exempted: _unused_component_props_exempted,
         active_suppressions: _active_suppressions,
@@ -1122,6 +1304,59 @@ fn classify_ignore_findings_fields(results: &AnalysisResults) {
 }
 
 impl AnalysisResults {
+    /// Remove the export and member findings whose file `covered` selects.
+    ///
+    /// Only `unused_exports`, `unused_types`, `unused_enum_members` and
+    /// `unused_class_members` change. A removed finding moves to
+    /// [`CascadeState::hidden`] and [`Self::cascade_hidden`] counts it. A second
+    /// call removes only findings that a later stage added, so the pass is
+    /// idempotent.
+    pub fn hide_cascade_findings(&mut self, covered: &dyn Fn(&Path) -> bool) {
+        let mut hidden = CascadeHiddenFindings::default();
+        move_covered(
+            &mut self.unused_exports,
+            &mut hidden.unused_exports,
+            |finding| finding.export.path.as_path(),
+            covered,
+        );
+        move_covered(
+            &mut self.unused_types,
+            &mut hidden.unused_types,
+            |finding| finding.export.path.as_path(),
+            covered,
+        );
+        move_covered(
+            &mut self.unused_enum_members,
+            &mut hidden.unused_enum_members,
+            |finding| finding.member.path.as_path(),
+            covered,
+        );
+        move_covered(
+            &mut self.unused_class_members,
+            &mut hidden.unused_class_members,
+            |finding| finding.member.path.as_path(),
+            covered,
+        );
+        self.cascade_hidden += hidden.len();
+        self.cascade.hidden.extend(hidden);
+    }
+
+    /// Move the findings that [`Self::hide_cascade_findings`] removed back
+    /// into the report and reset [`Self::cascade_hidden`].
+    ///
+    /// Metrics that measure the code, such as the vital signs, read the
+    /// result set after this call, so their value does not depend on
+    /// `showCascade`.
+    pub fn restore_cascade_findings(&mut self) {
+        let hidden = std::mem::take(&mut self.cascade.hidden);
+        self.unused_exports.extend(hidden.unused_exports);
+        self.unused_types.extend(hidden.unused_types);
+        self.unused_enum_members.extend(hidden.unused_enum_members);
+        self.unused_class_members
+            .extend(hidden.unused_class_members);
+        self.cascade_hidden = 0;
+    }
+
     /// Remove dead-code findings whose complete, non-empty source-owner set
     /// matches `is_ignored`.
     ///
@@ -1174,6 +1409,25 @@ impl AnalysisResults {
     #[must_use]
     pub const fn total_issues(&self) -> usize {
         counted_analysis_result_fields!(counted_result_field_sum, self)
+            + self.enforced_prop_drilling_count()
+    }
+
+    /// Prop-drilling chains that explicitly enforce the error policy.
+    /// Advisory warnings stay outside totals used by strict CI count gates.
+    #[must_use]
+    pub const fn enforced_prop_drilling_count(&self) -> usize {
+        let mut count = 0;
+        let mut index = 0;
+        while index < self.prop_drilling_chains.len() {
+            if matches!(
+                self.prop_drilling_chains.as_slice()[index].effective_severity,
+                Some(crate::output_dead_code::EffectiveSeverity::Error)
+            ) {
+                count += 1;
+            }
+            index += 1;
+        }
+        count
     }
 
     /// Whether any issues were found.
@@ -1208,6 +1462,8 @@ impl AnalysisResults {
         self.unused_exports.extend(parts.unused_exports);
         self.unused_types.extend(parts.unused_types);
         self.private_type_leaks.extend(parts.private_type_leaks);
+        self.deprecated_exports_in_use
+            .extend(parts.deprecated_exports_in_use);
         self.unused_enum_members.extend(parts.unused_enum_members);
         self.unused_class_members.extend(parts.unused_class_members);
         self.unused_store_members.extend(parts.unused_store_members);
@@ -1239,6 +1495,7 @@ impl AnalysisResults {
         self.circular_dependencies
             .extend(parts.circular_dependencies);
         self.re_export_cycles.extend(parts.re_export_cycles);
+        self.package_cycles.extend(parts.package_cycles);
     }
 
     fn merge_workspace_findings(&mut self, parts: AnalysisResultsWorkspaceMergeParts) {
@@ -1267,6 +1524,8 @@ impl AnalysisResults {
             .extend(parts.dynamic_segment_name_conflicts);
         self.unused_component_props
             .extend(parts.unused_component_props);
+        self.absent_component_props
+            .extend(parts.absent_component_props);
         self.unused_component_emits
             .extend(parts.unused_component_emits);
         self.unused_component_inputs
@@ -1274,6 +1533,10 @@ impl AnalysisResults {
         self.unused_component_outputs
             .extend(parts.unused_component_outputs);
         self.unused_svelte_events.extend(parts.unused_svelte_events);
+        self.unused_effect_layers.extend(parts.unused_effect_layers);
+        self.unused_tagged_errors.extend(parts.unused_tagged_errors);
+        self.unproduced_catch_tags
+            .extend(parts.unproduced_catch_tags);
         self.unused_server_actions
             .extend(parts.unused_server_actions);
         self.unused_load_data_keys
@@ -1295,6 +1558,11 @@ impl AnalysisResults {
         self.export_usages.extend(parts.export_usages);
         self.active_suppressions.extend(parts.active_suppressions);
         self.suppression_count += parts.suppression_count;
+        self.cascade_hidden += parts.cascade_hidden;
+        self.cascade
+            .suppressed_unused_files
+            .extend(parts.cascade.suppressed_unused_files);
+        self.cascade.hidden.extend(parts.cascade.hidden);
         self.unused_component_props_exempted += parts.unused_component_props_exempted;
         if self.entry_point_summary.is_none() {
             self.entry_point_summary = parts.entry_point_summary;
@@ -1361,6 +1629,14 @@ impl AnalysisResults {
                 .then(a.leak.line.cmp(&b.leak.line))
                 .then(a.leak.export_name.cmp(&b.leak.export_name))
                 .then(a.leak.type_name.cmp(&b.leak.type_name))
+        });
+
+        self.deprecated_exports_in_use.sort_by(|a, b| {
+            a.export
+                .path
+                .cmp(&b.export.path)
+                .then(a.export.line.cmp(&b.export.line))
+                .then(a.export.export_name.cmp(&b.export.export_name))
         });
 
         self.unused_dependencies.sort_by(|a, b| {
@@ -1496,6 +1772,13 @@ impl AnalysisResults {
     }
 
     fn sort_core_component_prop_and_emit_findings(&mut self) {
+        self.absent_component_props.sort_by(|a, b| {
+            a.prop
+                .path
+                .cmp(&b.prop.path)
+                .then(a.prop.line.cmp(&b.prop.line))
+                .then(a.prop.prop_name.cmp(&b.prop.prop_name))
+        });
         self.unused_component_props.sort_by(|a, b| {
             a.prop
                 .path
@@ -1518,6 +1801,32 @@ impl AnalysisResults {
                 .cmp(&b.event.path)
                 .then(a.event.line.cmp(&b.event.line))
                 .then(a.event.event_name.cmp(&b.event.event_name))
+        });
+        self.sort_effect_findings();
+    }
+
+    fn sort_effect_findings(&mut self) {
+        self.unused_effect_layers.sort_by(|a, b| {
+            a.layer
+                .path
+                .cmp(&b.layer.path)
+                .then(a.layer.line.cmp(&b.layer.line))
+                .then(a.layer.name.cmp(&b.layer.name))
+        });
+        self.unused_tagged_errors.sort_by(|a, b| {
+            a.error
+                .path
+                .cmp(&b.error.path)
+                .then(a.error.line.cmp(&b.error.line))
+                .then(a.error.name.cmp(&b.error.name))
+        });
+        self.unproduced_catch_tags.sort_by(|a, b| {
+            a.catch_tag
+                .path
+                .cmp(&b.catch_tag.path)
+                .then(a.catch_tag.line.cmp(&b.catch_tag.line))
+                .then(a.catch_tag.col.cmp(&b.catch_tag.col))
+                .then(a.catch_tag.tag.cmp(&b.catch_tag.tag))
         });
     }
 
@@ -1654,6 +1963,13 @@ impl AnalysisResults {
 
         self.re_export_cycles
             .sort_by(|a, b| a.cycle.files.cmp(&b.cycle.files));
+
+        self.package_cycles.sort_by(|a, b| {
+            a.cycle
+                .length
+                .cmp(&b.cycle.length)
+                .then_with(|| a.cycle.packages.cmp(&b.cycle.packages))
+        });
 
         self.boundary_violations.sort_by(|a, b| {
             a.violation
@@ -1854,6 +2170,114 @@ pub struct UnusedExport {
     pub span_start: u32,
     /// Whether this finding comes from a barrel/index re-export rather than the source definition.
     pub is_re_export: bool,
+    /// Whether the export's leading JSDoc carries `@deprecated`. Absent from
+    /// the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deprecated: bool,
+    /// Plain-text message of the `@deprecated` tag, capped at
+    /// [`DEPRECATED_REASON_MAX_CHARS`] characters. Absent when the export is
+    /// not deprecated or the tag carries no text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated_reason: Option<String>,
+}
+
+/// Maximum number of consumers a [`DeprecatedExportInUse`] finding carries in
+/// its `consumers` sample. The exact total is in `consumer_count`; the full
+/// list is available through `fallow dead-code --trace <file>:<export>`.
+pub const DEPRECATED_CONSUMER_SAMPLE_CAP: usize = 10;
+
+/// Maximum number of characters kept from a `@deprecated` tag message. A
+/// longer message is cut at a character boundary and ends with an ellipsis.
+pub const DEPRECATED_REASON_MAX_CHARS: usize = 200;
+
+/// How a consumer references a deprecated export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum DeprecatedConsumerKind {
+    /// A named import (`import { foo }`).
+    NamedImport,
+    /// A default import (`import Foo`).
+    DefaultImport,
+    /// A namespace import (`import * as ns`): a member access, or a use of
+    /// the whole namespace object.
+    NamespaceImport,
+    /// A re-export (`export { foo } from './bar'`).
+    ReExport,
+    /// A dynamic import (`import('./foo')`).
+    DynamicImport,
+    /// A side-effect import (`import './foo'`).
+    SideEffectImport,
+}
+
+/// One file location that references a deprecated export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DeprecatedExportConsumer {
+    /// File that references the deprecated export.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// 1-based line number of the import or re-export statement.
+    pub line: u32,
+    /// 0-based byte column offset of the import or re-export statement.
+    pub col: u32,
+    /// How the file references the export.
+    pub kind: DeprecatedConsumerKind,
+}
+
+/// An export whose leading JSDoc carries `@deprecated` and that still has at
+/// least one consumer in a reachable file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DeprecatedExportInUse {
+    /// File that declares the deprecated export.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// Name of the deprecated export.
+    pub export_name: String,
+    /// Whether this is a type-only export.
+    pub is_type_only: bool,
+    /// 1-based line number of the export.
+    pub line: u32,
+    /// 0-based byte column offset of the export.
+    pub col: u32,
+    /// Byte offset of the export in the source file.
+    pub span_start: u32,
+    /// Plain-text message of the `@deprecated` tag, capped at
+    /// [`DEPRECATED_REASON_MAX_CHARS`] characters. Absent when the tag
+    /// carries no text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated_reason: Option<String>,
+    /// Exact number of distinct consumers: reference sites in reachable
+    /// files, one per path, line, column and kind. `consumers` holds the
+    /// first [`DEPRECATED_CONSUMER_SAMPLE_CAP`] of them, so the sample is
+    /// complete when this count is at most the cap.
+    pub consumer_count: usize,
+    /// Consumer sample sorted by path, line, column and kind, capped at
+    /// [`DEPRECATED_CONSUMER_SAMPLE_CAP`] entries.
+    pub consumers: Vec<DeprecatedExportConsumer>,
+    /// True when the export is part of the public API: it lives in an entry
+    /// point, or a re-export chain reaches an entry point. External consumers
+    /// are not visible, so the finding makes no removal claim.
+    pub public_api: bool,
+}
+
+impl DeprecatedExportInUse {
+    /// One-line plain-text description shared by the SARIF and CodeClimate
+    /// formats.
+    #[must_use]
+    pub fn description(&self) -> String {
+        let count = self.consumer_count;
+        let noun = if count == 1 { "consumer" } else { "consumers" };
+        let reason = self
+            .deprecated_reason
+            .as_deref()
+            .map_or_else(String::new, |reason| format!(": {reason}"));
+        format!(
+            "Deprecated export '{}' is still used by {count} {noun}{reason}",
+            self.export_name
+        )
+    }
 }
 
 /// A public export signature that references a same-file private type.
@@ -2066,6 +2490,44 @@ pub struct UnusedComponentProp {
     pub col: u32,
 }
 
+/// One inspected reachable component invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ComponentPropCallSite {
+    /// Caller source path.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// 1-based opening-tag line.
+    pub line: u32,
+    /// 0-based original-source byte column.
+    pub col: u32,
+}
+
+/// A used optional input that no inspected reachable caller supplies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AbsentComponentProp {
+    /// Source path of the input declaration.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// Semantic declaration name, or SFC filename stem.
+    pub component_name: String,
+    /// Public framework token.
+    pub framework: String,
+    /// Public optional input name.
+    pub prop_name: String,
+    /// 1-based declaration line.
+    pub line: u32,
+    /// 0-based declaration byte column.
+    pub col: u32,
+    /// Whether omission has a declared default.
+    pub has_default: bool,
+    /// Every inspected reachable caller, deterministically ordered.
+    pub inspected_call_sites: Vec<ComponentPropCallSite>,
+    /// Manual-review meaning and limits of static evidence.
+    pub explanation: String,
+}
+
 /// A Vue `<script setup>` `defineEmits` declared event that is EMITTED nowhere
 /// inside its own single-file component (no `emit('<name>')` call). Single-file
 /// finding, zero-FP doctrine: the whole file abstains on any
@@ -2106,6 +2568,94 @@ pub struct UnusedSvelteEvent {
     pub line: u32,
     /// 0-based byte column offset of the `dispatch('<name>')` call.
     pub col: u32,
+}
+
+/// Kind of an Effect layer definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum EffectLayerKind {
+    /// A module-scope `const` whose initializer is a layer.
+    TopLevel,
+    /// A class static property whose initializer is a layer.
+    StaticMember,
+}
+
+/// An Effect layer whose every reference sits inside other layers that
+/// nothing in the project uses. The layer is reachable only through a dead
+/// composition, so it never reaches a runtime. A layer with zero references
+/// is not reported here: `unused-export` or `unused-class-member` owns it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnusedEffectLayer {
+    /// The module that defines the layer.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// `FooLive`, or `FooService.layer` for a static member.
+    pub name: String,
+    /// Whether the layer is a module-scope const or a class static member.
+    pub kind: EffectLayerKind,
+    /// 1-based line number of the layer name.
+    pub line: u32,
+    /// 0-based byte column offset of the layer name.
+    pub col: u32,
+    /// The unused layers that compose this layer, sorted by name.
+    pub dead_consumers: Vec<String>,
+}
+
+/// A source location of a `catchTag` or `catchTags` handler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EffectCatchSite {
+    /// The module that contains the handler.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// 1-based line number of the handled tag.
+    pub line: u32,
+    /// 0-based byte column offset of the handled tag.
+    pub col: u32,
+}
+
+/// An Effect tagged error class that type positions or `catchTag` handlers
+/// reference, but that no code constructs, fails with, or reads as a value.
+/// Any value reference counts as a producer, including a schema union or an
+/// API error declaration that decodes the error at a boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnusedTaggedError {
+    /// The module that declares the class.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// The class name.
+    pub name: String,
+    /// The `_tag` value of the class.
+    pub tag: String,
+    /// 1-based line number of the class name.
+    pub line: u32,
+    /// 0-based byte column offset of the class name.
+    pub col: u32,
+    /// The `catchTag` / `catchTags` handlers that name the tag.
+    pub catch_sites: Vec<EffectCatchSite>,
+}
+
+/// A `catchTag("X")` / `catchTags({ X })` handler whose tag `X` belongs to
+/// project classes that no code produces. Reported only when no
+/// `unused-tagged-error` finding covers those classes (the rule is off, or
+/// the class finding is suppressed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnproducedCatchTag {
+    /// The module that contains the handler.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// The handled tag.
+    pub tag: String,
+    /// 1-based line number of the handled tag.
+    pub line: u32,
+    /// 0-based byte column offset of the handled tag.
+    pub col: u32,
+    /// The project classes that declare the tag, sorted by name.
+    pub candidate_classes: Vec<String>,
 }
 
 /// One hop in a prop-drilling chain: a component that received the prop and
@@ -2343,6 +2893,16 @@ pub struct UnusedDependency {
     )]
     #[cfg_attr(feature = "schema", schemars(default))]
     pub used_in_workspaces: Vec<PathBuf>,
+    /// Workspace roots whose package.json declares this package for the files
+    /// that import it. Only a root finding fills this field: these imports use
+    /// the nearer workspace declaration, so the root declaration stays unused.
+    #[serde(
+        default,
+        serialize_with = "serde_path::serialize_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub declared_and_imported_in: Vec<PathBuf>,
 }
 
 /// Where in package.json a dependency is listed.
@@ -2876,7 +3436,9 @@ pub enum SecuritySeverity {
     Low,
 }
 
-/// Defensive control found on an attack-surface path.
+/// Control pattern observed in a file on an attack-surface import trace.
+/// Its presence does not prove that it executes before the sink or protects
+/// the same input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityDefensiveControl {
@@ -2897,7 +3459,8 @@ pub struct SecurityDefensiveControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityDefensiveBoundary {
-    /// Known controls detected along this path.
+    /// Control patterns observed in files on this import trace. These are
+    /// verification hints, not proof of sink protection or value-level data flow.
     pub controls: Vec<SecurityDefensiveControl>,
     /// Verification question for the consuming agent. It is a prompt, not a
     /// missing-guard verdict.
@@ -2928,10 +3491,10 @@ pub struct SecurityAttackSurfaceEntry {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SecurityFinding {
     /// Stable per-finding correlation id, identical across runs for the same
-    /// rule + anchor path + line. An autonomous agent that triaged this
+    /// rule + anchor path + line + column. An autonomous agent that triaged this
     /// candidate on a prior run uses it to correlate the candidate after a
-    /// rebase. Equal to the SARIF `partialFingerprints` value for the same
-    /// finding (one shared helper computes both).
+    /// rebase. Equal to the SARIF `partialFingerprints["fallowSecurity/v2"]`
+    /// value for the same finding (one shared helper computes both).
     pub finding_id: String,
     /// The rule that produced this candidate.
     pub kind: SecurityFindingKind,
@@ -3377,6 +3940,85 @@ pub enum ReExportCycleKind {
     SelfLoop,
 }
 
+/// One package hop in a [`PackageCycle`]: `from_package` imports
+/// `to_package`, and `path` holds one example import for that hop.
+///
+/// The example import is the first runtime import by `(path, line)`. When
+/// every import on the hop is type-only, it is the first type-only import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PackageCycleEdge {
+    /// Label of the importing workspace package, as in
+    /// [`PackageCycle::packages`].
+    pub from_package: String,
+    /// Label of the imported workspace package, as in
+    /// [`PackageCycle::packages`].
+    pub to_package: String,
+    /// File in `from_package` that holds the example import.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub path: PathBuf,
+    /// File in `to_package` that the example import resolves to.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub target_path: PathBuf,
+    /// 1-based line number of the example import.
+    pub line: u32,
+    /// 0-based byte column offset of the example import.
+    pub col: u32,
+    /// True when every import from `from_package` to `to_package` is
+    /// type-only. A type-only hop has no runtime effect, but it can still
+    /// force a build order (for example with declaration builds).
+    pub type_only: bool,
+}
+
+/// A dependency cycle between workspace packages.
+///
+/// Each workspace package is a node. A resolved import from a file in one
+/// package to a file in another package is an edge. Declared `package.json`
+/// dependencies are not edges, and imports from test, spec, story, fixture
+/// and tooling config files are not edges. A package cycle can exist when no
+/// file-level cycle exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PackageCycle {
+    /// Workspace package labels in cycle order. The first entry is the
+    /// lexicographically smallest label; the last entry imports the first.
+    /// A label is the package name. When two or more workspace packages
+    /// share a name, the label is `name (root)` with the project-relative
+    /// package root, so that each label names one package.
+    pub packages: Vec<String>,
+    /// Package root directories in cycle order: `package_roots[i]` is the
+    /// root of `packages[i]`.
+    #[serde(serialize_with = "serde_path::serialize_vec")]
+    pub package_roots: Vec<PathBuf>,
+    /// Number of packages in the cycle.
+    pub length: usize,
+    /// One example import per hop, in cycle order: `edges[i]` goes from
+    /// `packages[i]` to `packages[(i + 1) % length]`.
+    pub edges: Vec<PackageCycleEdge>,
+    /// True when the group of packages that holds this cycle has more
+    /// cycles than fallow lists. The listing stops at 20 cycles per group,
+    /// or earlier on a very dense package graph. Break a listed cycle and
+    /// run again to see the rest.
+    pub group_truncated: bool,
+}
+
+impl PackageCycle {
+    /// The note that every output format shows for a cycle with
+    /// [`PackageCycle::group_truncated`] set.
+    pub const GROUP_TRUNCATED_NOTE: &'static str = "this package group has more cycles than listed";
+
+    /// The package labels in cycle order, with the first label repeated at
+    /// the end, joined with `separator`.
+    #[must_use]
+    pub fn chain(&self, separator: &str) -> String {
+        let mut chain: Vec<&str> = self.packages.iter().map(String::as_str).collect();
+        if let Some(first) = chain.first().copied() {
+            chain.push(first);
+        }
+        chain.join(separator)
+    }
+}
+
 /// An import that crosses an architecture boundary rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -3384,7 +4026,9 @@ pub struct BoundaryViolation {
     /// The file making the disallowed import.
     #[serde(serialize_with = "serde_path::serialize")]
     pub from_path: PathBuf,
-    /// The file being imported that violates the boundary.
+    /// The file being imported that violates the boundary. When the import
+    /// goes through a re-export chain, this is the origin module that
+    /// declares the imported symbol, not the barrel.
     #[serde(serialize_with = "serde_path::serialize")]
     pub to_path: PathBuf,
     /// The zone the importing file belongs to.
@@ -3397,6 +4041,14 @@ pub struct BoundaryViolation {
     pub line: u32,
     /// 0-based byte column offset of the import statement.
     pub col: u32,
+    /// The barrel file that the source file imports directly, when the
+    /// violation comes from a re-export chain. Absent for a direct import.
+    #[serde(
+        default,
+        serialize_with = "serde_path::serialize_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub via_path: Option<PathBuf>,
 }
 
 /// A source file that does not match any configured architecture boundary zone.
@@ -3447,6 +4099,8 @@ pub enum PolicyRuleKind {
     BannedEffect,
     /// An exported name matched a `banned-export` rule.
     BannedExport,
+    /// A resolved gdp-ts proof factory call occurred outside allowed modules.
+    GdpProofProducer,
 }
 
 /// Effective severity of a single [`PolicyViolation`]. Per-rule `severity`
@@ -3457,9 +4111,10 @@ pub enum PolicyRuleKind {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyViolationSeverity {
-    /// Fails CI (non-zero exit code).
+    /// Sets a non-zero exit code.
     Error,
-    /// Reported without failing CI.
+    /// Reported without an effect on the exit code. The dead-code count gate
+    /// of the GitHub Action counts it unless `fail-on-issues` is `false`.
     Warn,
 }
 
@@ -3489,7 +4144,8 @@ pub struct PolicyViolation {
     /// What matched: the written callee path for `banned-call` (e.g.
     /// `cp.exec`), the raw import specifier for `banned-import` (e.g.
     /// `moment/locale/nl`), `<effect>: <callee>` for `banned-effect`, or the
-    /// exported name for `banned-export`.
+    /// exported name for `banned-export`. For `gdp-proof-producer`, the canonical
+    /// factory with its JSON-quoted literal label or `...` for a dynamic label.
     pub matched: String,
     /// Effective severity for this finding (per-rule `severity`, else the
     /// `rules."policy-violation"` master).
@@ -3570,8 +4226,25 @@ pub struct StaleSuppression {
     /// comment or tag that has no reason.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub missing_reason: bool,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted.
     pub actions: Vec<IssueAction>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::output_dead_code::deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<crate::output_dead_code::EffectiveSeverity>,
 }
 
 impl StaleSuppression {
@@ -3692,22 +4365,6 @@ impl StaleSuppression {
         }
     }
 
-    /// The suppressed `IssueKind`, if this was a comment suppression with a specific known kind.
-    ///
-    /// Returns `None` for unknown-kind comments (`kind_known == false`) and
-    /// for JSDoc tags.
-    #[must_use]
-    pub fn suppressed_kind(&self) -> Option<IssueKind> {
-        match &self.origin {
-            SuppressionOrigin::Comment {
-                issue_kind,
-                kind_known: true,
-                ..
-            } => issue_kind.as_deref().and_then(IssueKind::parse),
-            SuppressionOrigin::Comment { .. } | SuppressionOrigin::JsdocTag { .. } => None,
-        }
-    }
-
     /// Per-format display message combining `description()` and `explanation()`
     /// for the unknown-kind case so SARIF, CodeClimate, and compact consumers
     /// surface the typo-fix copy and Levenshtein hint without needing to
@@ -3781,9 +4438,11 @@ pub enum FlagKind {
 pub enum FlagConfidence {
     /// Low confidence: heuristic match (config object patterns).
     Low,
-    /// Medium confidence: pattern match with some ambiguity.
+    /// Medium confidence: a generic SDK name, such as `isEnabled`, in a file
+    /// that imports no flag SDK or flag module.
     Medium,
-    /// High confidence: unambiguous pattern (env vars, direct SDK calls).
+    /// High confidence: unambiguous pattern (env vars, specific SDK calls,
+    /// generic SDK calls in a file that imports a flag SDK or flag module).
     High,
 }
 
@@ -3830,7 +4489,7 @@ pub struct FeatureFlag {
 const _: () = assert!(std::mem::size_of::<FeatureFlag>() <= 160);
 
 /// Usage count for an export symbol. Used by the LSP Code Lens to show
-/// reference counts above each export declaration.
+/// the number of importing files above each export declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ExportUsage {
@@ -3843,10 +4502,14 @@ pub struct ExportUsage {
     pub line: u32,
     /// 0-based byte column offset.
     pub col: u32,
-    /// Number of files that reference this export.
+    /// Number of distinct files that import this export. Two imports in one
+    /// file count as one file.
     pub reference_count: usize,
-    /// Locations where this export is referenced. Used by the LSP Code Lens
-    /// to enable click-to-navigate via `editor.action.showReferences`.
+    /// Import sites that reference this export, one entry per physical import.
+    /// A file with two imports gives two entries, so this list can be longer
+    /// than `reference_count`. An import without a source span has no entry.
+    /// Used by the LSP Code Lens to enable click-to-navigate via
+    /// `editor.action.showReferences`.
     pub reference_locations: Vec<ReferenceLocation>,
 }
 
@@ -3904,6 +4567,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         assert_eq!(results.total_issues(), 1);
         assert!(results.has_issues());
@@ -3985,6 +4650,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -3998,6 +4665,7 @@ mod tests {
             path: PathBuf::from("package.json"),
             line: 5,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         }
     }
 
@@ -4105,6 +4773,7 @@ mod tests {
                 import_specifier: "../db/queries".to_string(),
                 line: 3,
                 col: 0,
+                via_path: None,
             })],
             ..Default::default()
         };
@@ -4112,16 +4781,6 @@ mod tests {
         // 15 categories, one of each
         assert_eq!(results.total_issues(), 15);
         assert!(results.has_issues());
-    }
-
-    // ── total_issues / has_issues consistency ──────────────────
-
-    #[test]
-    fn total_issues_and_has_issues_are_consistent() {
-        let results = AnalysisResults::default();
-        assert_eq!(results.total_issues(), 0);
-        assert!(!results.has_issues());
-        assert_eq!(results.total_issues() > 0, results.has_issues());
     }
 
     // ── total_issues counts each category independently ─────────
@@ -4153,61 +4812,6 @@ mod tests {
                 specifier_col: 0,
             }));
         assert_eq!(results.total_issues(), 3);
-    }
-
-    // ── default is truly empty ──────────────────────────────────
-
-    #[test]
-    fn default_results_all_fields_empty() {
-        let r = AnalysisResults::default();
-        assert!(r.unused_files.is_empty());
-        assert!(r.unused_exports.is_empty());
-        assert!(r.unused_types.is_empty());
-        assert!(r.unused_dependencies.is_empty());
-        assert!(r.unused_dev_dependencies.is_empty());
-        assert!(r.unused_optional_dependencies.is_empty());
-        assert!(r.unused_enum_members.is_empty());
-        assert!(r.unused_class_members.is_empty());
-        assert!(r.unresolved_imports.is_empty());
-        assert!(r.unlisted_dependencies.is_empty());
-        assert!(r.duplicate_exports.is_empty());
-        assert!(r.type_only_dependencies.is_empty());
-        assert!(r.test_only_dependencies.is_empty());
-        assert!(r.circular_dependencies.is_empty());
-        assert!(r.boundary_violations.is_empty());
-        assert!(r.unused_catalog_entries.is_empty());
-        assert!(r.unresolved_catalog_references.is_empty());
-        assert!(r.export_usages.is_empty());
-    }
-
-    // ── EntryPointSummary ────────────────────────────────────────
-
-    #[test]
-    fn entry_point_summary_default() {
-        let summary = EntryPointSummary::default();
-        assert_eq!(summary.total, 0);
-        assert!(summary.by_source.is_empty());
-    }
-
-    #[test]
-    fn entry_point_summary_not_in_default_results() {
-        let r = AnalysisResults::default();
-        assert!(r.entry_point_summary.is_none());
-    }
-
-    #[test]
-    fn entry_point_summary_some_preserves_data() {
-        let r = AnalysisResults {
-            entry_point_summary: Some(EntryPointSummary {
-                total: 5,
-                by_source: vec![("package.json".to_string(), 2), ("plugin".to_string(), 3)],
-            }),
-            ..AnalysisResults::default()
-        };
-        let summary = r.entry_point_summary.as_ref().unwrap();
-        assert_eq!(summary.total, 5);
-        assert_eq!(summary.by_source.len(), 2);
-        assert_eq!(summary.by_source[0], ("package.json".to_string(), 2));
     }
 
     // ── sort: unused_files by path ──────────────────────────────
@@ -4250,6 +4854,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             })
         };
         r.unused_exports.push(mk("b.ts", 5, "beta"));
@@ -4294,6 +4900,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             })
         };
         r.unused_types.push(mk("z.ts", 1, "Z"));
@@ -4315,6 +4923,7 @@ mod tests {
                 path: PathBuf::from(path),
                 line,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             })
         };
         r.unused_dependencies.push(mk("b/package.json", 3, "zlib"));
@@ -4341,6 +4950,7 @@ mod tests {
                 path: PathBuf::from("package.json"),
                 line: 10,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.unused_dev_dependencies
             .push(UnusedDevDependencyFinding::with_actions(UnusedDependency {
@@ -4349,6 +4959,7 @@ mod tests {
                 path: PathBuf::from("package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.sort();
         assert_eq!(r.unused_dev_dependencies[0].dep.package_name, "jest");
@@ -4368,6 +4979,7 @@ mod tests {
                     path: PathBuf::from("package.json"),
                     line: 3,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         r.unused_optional_dependencies
@@ -4378,6 +4990,7 @@ mod tests {
                     path: PathBuf::from("package.json"),
                     line: 2,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         r.sort();
@@ -4660,6 +5273,7 @@ mod tests {
                 import_specifier: to.to_string(),
                 line,
                 col,
+                via_path: None,
             })
         };
         r.boundary_violations.push(mk("z.ts", 1, 0, "a.ts"));
@@ -4731,28 +5345,6 @@ mod tests {
         assert_eq!(refs, vec!["a.ts", "c.ts"]);
     }
 
-    // ── sort: empty results does not panic ──────────────────────
-
-    #[test]
-    fn sort_empty_results_is_noop() {
-        let mut r = AnalysisResults::default();
-        r.sort(); // should not panic
-        assert_eq!(r.total_issues(), 0);
-    }
-
-    // ── sort: single-element lists remain stable ────────────────
-
-    #[test]
-    fn sort_single_element_lists_stable() {
-        let mut r = AnalysisResults::default();
-        r.unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: PathBuf::from("only.ts"),
-            }));
-        r.sort();
-        assert_eq!(r.unused_files[0].file.path, PathBuf::from("only.ts"));
-    }
-
     // ── serialization ──────────────────────────────────────────
 
     #[test]
@@ -4787,6 +5379,7 @@ mod tests {
             path: PathBuf::from("package.json"),
             line: 5,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         };
         let json = serde_json::to_value(&dep).unwrap();
         assert_eq!(json["location"], "devDependencies");
@@ -4797,6 +5390,7 @@ mod tests {
             path: PathBuf::from("package.json"),
             line: 3,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         };
         let json2 = serde_json::to_value(&dep2).unwrap();
         assert_eq!(json2["location"], "dependencies");
@@ -4807,6 +5401,7 @@ mod tests {
             path: PathBuf::from("package.json"),
             line: 7,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         };
         let json3 = serde_json::to_value(&dep3).unwrap();
         assert_eq!(json3["location"], "optionalDependencies");
@@ -4851,6 +5446,8 @@ mod tests {
             col: 7,
             span_start: 100,
             is_re_export: true,
+            deprecated: false,
+            deprecated_reason: None,
         };
         let json = serde_json::to_value(&e).unwrap();
         assert_eq!(json["path"], "src/mod.ts");
@@ -4872,6 +5469,7 @@ mod tests {
             import_specifier: "../db/queries".to_string(),
             line: 3,
             col: 0,
+            via_path: None,
         };
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["from_path"], "src/ui/button.tsx");
@@ -5011,23 +5609,6 @@ mod tests {
 
     // ── clone produces independent copies ───────────────────────
 
-    #[test]
-    fn clone_results_are_independent() {
-        let mut r = AnalysisResults::default();
-        r.unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: PathBuf::from("a.ts"),
-            }));
-        let mut cloned = r.clone();
-        cloned
-            .unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: PathBuf::from("b.ts"),
-            }));
-        assert_eq!(r.total_issues(), 1);
-        assert_eq!(cloned.total_issues(), 2);
-    }
-
     fn protected_architecture_findings(path: &Path) -> AnalysisResults {
         AnalysisResults {
             boundary_violations: vec![BoundaryViolationFinding::with_actions(BoundaryViolation {
@@ -5038,6 +5619,7 @@ mod tests {
                 import_specifier: "../target".to_string(),
                 line: 1,
                 col: 0,
+                via_path: None,
             })],
             boundary_coverage_violations: vec![BoundaryCoverageViolationFinding::with_actions(
                 BoundaryCoverageViolation {
@@ -5068,6 +5650,7 @@ mod tests {
                 message: None,
             })],
             stale_suppressions: vec![StaleSuppression {
+                finding_id: None,
                 path: path.to_path_buf(),
                 line: 1,
                 col: 0,
@@ -5079,6 +5662,7 @@ mod tests {
                 },
                 missing_reason: false,
                 actions: StaleSuppression::actions_for(false),
+                effective_severity: None,
             }],
             ..AnalysisResults::default()
         }
@@ -5204,6 +5788,7 @@ mod tests {
                 path: PathBuf::from("ignored/package.json"),
                 line: 3,
                 used_in_workspaces: vec![],
+                declared_and_imported_in: Vec::new(),
             })],
             ..AnalysisResults::default()
         };

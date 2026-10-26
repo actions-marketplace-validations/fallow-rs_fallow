@@ -201,13 +201,11 @@ fn warning_value(warning: &CheckWarning) -> Value {
 /// direct stat.
 fn entry_path_exists(root: &Path, entry: &str) -> bool {
     expand_braces(entry).iter().any(|pattern| {
-        let full = root.join(pattern);
         if pattern.contains(['*', '?', '[']) {
-            glob::glob(&full.to_string_lossy())
-                .ok()
+            fallow_config::glob_validation::expand_disk_glob(root, pattern)
                 .is_some_and(|mut paths| paths.next().is_some())
         } else {
-            full.exists()
+            root.join(pattern).exists()
         }
     })
 }
@@ -551,32 +549,34 @@ mod tests {
         );
     }
 
-    fn kibana_fixture() -> std::path::PathBuf {
+    fn manifest_fixture() -> std::path::PathBuf {
         // Canonicalize to mirror how `main.rs` resolves `--root` before dispatch
         // (a `..`-relative root would make every seeded entry fail the
         // under-root check and spuriously warn `entry-outside-root`).
         std::fs::canonicalize(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/manifest-entries-kibana"),
+            std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+            )
+            .join("../../tests/fixtures/manifest-entries-external"),
         )
         .unwrap()
     }
 
     #[test]
-    fn doc_reports_active_kibana_plugin_seeded_entries() {
-        let doc = build_plugin_check_doc(&kibana_fixture()).expect("build doc");
+    fn doc_reports_active_manifest_plugin_seeded_entries() {
+        let doc = build_plugin_check_doc(&manifest_fixture()).expect("build doc");
         assert_eq!(doc["kind"], "plugin-check");
         let plugins = doc["plugins"].as_array().unwrap();
-        let kibana = plugins.iter().find(|p| p["name"] == "kibana").unwrap();
-        assert_eq!(kibana["active"], true);
-        let rule = &kibana["manifest_rules"][0];
+        let acme = plugins.iter().find(|p| p["name"] == "acme").unwrap();
+        assert_eq!(acme["active"], true);
+        let rule = &acme["manifest_rules"][0];
         assert_eq!(rule["warnings"].as_array().unwrap().len(), 0);
 
         let beta = rule["matched"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["path"] == "plugins/beta/kibana.jsonc")
+            .find(|m| m["path"] == "plugins/beta/acme.jsonc")
             .unwrap();
         // beta has server:false, so only public is seeded.
         let seeded: Vec<&str> = beta["seeded"]

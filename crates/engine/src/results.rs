@@ -19,14 +19,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{duplicates, module_graph, trace};
 
-pub use crate::security::{derive_security_severity, security_catalogue_title};
+pub use crate::security::{
+    derive_security_severity, enable_security_rules, resolve_security_finding_severity,
+    security_catalogue_title, security_rule_id, security_rules_can_error,
+};
 pub use fallow_types::output_dead_code::{
-    BoundaryCallViolationFinding, BoundaryCoverageViolationFinding, BoundaryViolationFinding,
-    CircularDependencyFinding, DuplicateExportFinding, DuplicatePropShapeFinding,
-    DynamicSegmentNameConflictFinding, EmptyCatalogGroupFinding, InvalidClientExportFinding,
-    MisconfiguredDependencyOverrideFinding, MisplacedDirectiveFinding,
-    MixedClientServerBarrelFinding, PolicyViolationFinding, PrivateTypeLeakFinding,
-    PropDrillingChainFinding, ReExportCycleFinding, RouteCollisionFinding,
+    AbsentComponentPropFinding, BoundaryCallViolationFinding, BoundaryCoverageViolationFinding,
+    BoundaryViolationFinding, CircularDependencyFinding, DuplicateExportFinding,
+    DuplicatePropShapeFinding, DynamicSegmentNameConflictFinding, EmptyCatalogGroupFinding,
+    InvalidClientExportFinding, MisconfiguredDependencyOverrideFinding, MisplacedDirectiveFinding,
+    MixedClientServerBarrelFinding, PackageCycleFinding, PolicyViolationFinding,
+    PrivateTypeLeakFinding, PropDrillingChainFinding, ReExportCycleFinding, RouteCollisionFinding,
     TestOnlyDependencyFinding, ThinWrapperFinding, TypeOnlyDependencyFinding,
     UnlistedDependencyFinding, UnprovidedInjectFinding, UnrenderedComponentFinding,
     UnresolvedCatalogReferenceFinding, UnresolvedImportFinding, UnusedCatalogEntryFinding,
@@ -37,18 +40,22 @@ pub use fallow_types::output_dead_code::{
     UnusedOptionalDependencyFinding, UnusedServerActionFinding, UnusedStoreMemberFinding,
     UnusedSvelteEventFinding, UnusedTypeFinding,
 };
+pub use fallow_types::output_dead_code::{
+    UnproducedCatchTagFinding, UnusedEffectLayerFinding, UnusedTaggedErrorFinding,
+};
 pub use fallow_types::results::{
-    ActiveSuppression, AnalysisResults, BoundaryCallViolation, BoundaryCoverageViolation,
-    BoundaryViolation, CircularDependency, CircularDependencyEdge, DependencyLocation,
-    DependencyOverrideMisconfigReason, DependencyOverrideSource, DuplicateExport,
-    DuplicateLocation, DuplicatePropShape, DuplicatePropShapeMember, DynamicSegmentNameConflict,
-    EmptyCatalogGroup, EntryPointSummary, ExportUsage, FeatureFlag, FlagConfidence, FlagKind,
-    ImportSite, InvalidClientExport, MisconfiguredDependencyOverride, MisplacedDirective,
-    MixedClientServerBarrel, PolicyRuleKind, PolicyViolation, PolicyViolationSeverity,
-    PrivateTypeLeak, PropDrillHop, PropDrillingChain, ReExportCycle, ReExportCycleKind,
-    ReactComponentIntel, ReactHookSummary, ReactPropDrill, ReactPropIntel, ReferenceLocation,
-    RenderFanInComponent, RenderFanInMetric, RouteCollision, SecurityAttackSurfaceEntry,
-    SecurityCandidate, SecurityCandidateBoundary, SecurityCandidateSink, SecurityDeadCodeContext,
+    AbsentComponentProp, ActiveSuppression, AnalysisResults, BoundaryCallViolation,
+    BoundaryCoverageViolation, BoundaryViolation, CircularDependency, CircularDependencyEdge,
+    ComponentPropCallSite, DependencyLocation, DependencyOverrideMisconfigReason,
+    DependencyOverrideSource, DuplicateExport, DuplicateLocation, DuplicatePropShape,
+    DuplicatePropShapeMember, DynamicSegmentNameConflict, EmptyCatalogGroup, EntryPointSummary,
+    ExportUsage, FeatureFlag, FlagConfidence, FlagKind, ImportSite, InvalidClientExport,
+    MisconfiguredDependencyOverride, MisplacedDirective, MixedClientServerBarrel, PackageCycle,
+    PackageCycleEdge, PolicyRuleKind, PolicyViolation, PolicyViolationSeverity, PrivateTypeLeak,
+    PropDrillHop, PropDrillingChain, ReExportCycle, ReExportCycleKind, ReactComponentIntel,
+    ReactHookSummary, ReactPropDrill, ReactPropIntel, ReferenceLocation, RenderFanInComponent,
+    RenderFanInMetric, RouteCollision, SecurityAttackSurfaceEntry, SecurityCandidate,
+    SecurityCandidateBoundary, SecurityCandidateSink, SecurityDeadCodeContext,
     SecurityDeadCodeKind, SecurityDefensiveBoundary, SecurityDefensiveControl, SecurityFinding,
     SecurityFindingKind, SecurityNetworkContext, SecurityReachability, SecurityRuntimeContext,
     SecurityRuntimeState, SecuritySeverity, SecurityTaintFlow, SecurityUnresolvedCalleeDiagnostic,
@@ -59,6 +66,9 @@ pub use fallow_types::results::{
     UnusedComponentOutput, UnusedComponentProp, UnusedDependency, UnusedDependencyOverride,
     UnusedExport, UnusedFile, UnusedLoadDataKey, UnusedMember, UnusedServerAction,
     UnusedSvelteEvent,
+};
+pub use fallow_types::results::{
+    EffectCatchSite, EffectLayerKind, UnproducedCatchTag, UnusedEffectLayer, UnusedTaggedError,
 };
 
 /// Typed dead-code analysis result.
@@ -104,6 +114,9 @@ pub struct DeadCodeAnalysisArtifacts {
     /// Package names referenced from package.json scripts, which keeps those
     /// dependencies from being reported unused.
     pub script_used_packages: FxHashSet<String>,
+    /// Which configs name which files and dependency names, for the trace
+    /// output.
+    pub trace_provenance: trace::TraceProvenance,
     /// Per-file source content hashes for cache invalidation.
     pub file_hashes: FxHashMap<PathBuf, u64>,
 }
@@ -122,6 +135,7 @@ pub struct SharedDeadCodeAnalysisArtifacts {
     pub modules: Option<Arc<[ModuleInfo]>>,
     pub files: Option<Vec<DiscoveredFile>>,
     pub script_used_packages: FxHashSet<String>,
+    pub trace_provenance: trace::TraceProvenance,
     pub file_hashes: FxHashMap<PathBuf, u64>,
 }
 
@@ -143,6 +157,7 @@ impl SharedDeadCodeAnalysisArtifacts {
             modules,
             files: self.files,
             script_used_packages: self.script_used_packages,
+            trace_provenance: self.trace_provenance,
             file_hashes: self.file_hashes,
         }
     }
@@ -202,6 +217,13 @@ pub struct HealthAnalysisResult<GroupResolver = ()> {
     pub report: HealthReport,
     /// Optional TypeScript semantic metadata for advisory health overlays.
     pub type_aware_meta: Option<fallow_types::envelope::TypeAwareMeta>,
+    /// Per-file branching totals, keyed by absolute path.
+    ///
+    /// Threshold-blind and suppression-blind, unlike `report`, which holds only
+    /// units that breached a threshold. The audit compares this map across the
+    /// base and head revisions; nothing else reads it, and it is not
+    /// serialized, so it carries no schema version.
+    pub branching_by_file: crate::health::BranchingByFile,
     /// Per-group health output when grouping is active.
     ///
     /// `None` for the default run; `Some` for any grouped invocation. The
@@ -224,6 +246,11 @@ pub struct HealthAnalysisResult<GroupResolver = ()> {
     /// True when coverage gap findings should fail the run (the gate is
     /// enforced rather than advisory).
     pub should_fail_on_coverage_gaps: bool,
+    /// The changed files the run analyzed, when a changed-file set narrowed
+    /// it: the files of that set that discovery kept. `None` when the run was
+    /// not narrowed by changed files. Callers size a `changed-since` scope
+    /// from it.
+    pub changed_files_analyzed: Option<Vec<std::path::PathBuf>>,
 }
 
 impl<GroupResolver> HealthAnalysisResult<GroupResolver> {
@@ -234,6 +261,7 @@ impl<GroupResolver> HealthAnalysisResult<GroupResolver> {
         HealthAnalysisResult {
             report: self.report,
             type_aware_meta: self.type_aware_meta,
+            branching_by_file: self.branching_by_file,
             grouping: self.grouping,
             group_resolver: None,
             config: self.config,
@@ -242,6 +270,7 @@ impl<GroupResolver> HealthAnalysisResult<GroupResolver> {
             timings: self.timings,
             coverage_gaps_has_findings: self.coverage_gaps_has_findings,
             should_fail_on_coverage_gaps: self.should_fail_on_coverage_gaps,
+            changed_files_analyzed: self.changed_files_analyzed,
         }
     }
 }
@@ -273,6 +302,7 @@ mod tests {
         .expect("project config loads");
         let result = HealthAnalysisResult {
             report: HealthReport::default(),
+            branching_by_file: crate::health::BranchingByFile::default(),
             grouping: None,
             group_resolver: Some("resolver"),
             config: project_config.config,
@@ -282,6 +312,7 @@ mod tests {
             coverage_gaps_has_findings: true,
             should_fail_on_coverage_gaps: true,
             type_aware_meta: None,
+            changed_files_analyzed: None,
         };
 
         let neutral = result.without_group_resolver();

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "rolldown -c rolldown.config.mjs && cp src/styles.css ../crates/cli/viz-assets/viz.css",
+    "build": "rolldown -c rolldown.config.mjs && node build-css.mjs && cp src/shell.html ../crates/cli/viz-assets/shell.html",
     "lint": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -17,11 +17,11 @@
   },
   "devDependencies": {
     "@types/d3-force": "^3.0.10",
-    "@types/d3-selection": "^3.0.11",
+    "@types/d3-selection": "^3.0.12",
     "@types/d3-transition": "^3.0.9",
-    "@types/d3-zoom": "^3.0.8",
-    "rolldown": "1.2.5",
+    "@types/d3-zoom": "^3.0.9",
+    "rolldown": "1.2.14",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.5"
   }
 }

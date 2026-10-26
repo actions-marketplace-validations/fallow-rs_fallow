@@ -55,6 +55,7 @@ pub(super) struct HealthFinalizeInput<'a, R> {
 struct HealthResultInput<R> {
     config: ResolvedConfig,
     report: HealthReport,
+    branching_by_file: super::BranchingByFile,
     grouping: Option<HealthGrouping>,
     group_resolver: Option<R>,
     elapsed: Duration,
@@ -87,6 +88,32 @@ pub(super) fn finalize_health_result<R>(
         coverage_gaps_has_findings,
     } = output;
 
+    // The caller captured `workspace_diagnostics` before the analysis started,
+    // so the pipeline's own degraded inputs (scoring, churn, ownership, trend,
+    // coverage provenance) are only in the registry at this point. One merge
+    // here reaches every route, CLI and programmatic, rather than threading a
+    // mutable list through five call chains (issue #2689).
+    //
+    // A registry read is safe for these and not for the walk-recorded kinds the
+    // comments in this crate warn about: health-stage entries have a single
+    // writer per run and are not produced under `rayon::join`, so the read
+    // cannot answer "whichever pass wrote last".
+    //
+    // The capture happens before `clear_health_stage_diagnostics` runs, on every
+    // route, so in a long-lived process (watch mode, the engine session, the MCP
+    // server) it still holds the PREVIOUS run's health-stage entries. Dropping
+    // them here makes the registry read the single source for these kinds, so a
+    // coverage file that has since been deleted or a CODEOWNERS that has since
+    // been fixed stops being reported for the life of the process. Nothing else
+    // records them, and the pipeline records this run's after the capture, so
+    // the filter can take nothing this run produced.
+    let mut captured = workspace_diagnostics;
+    captured.retain(|diagnostic| !diagnostic.kind.is_health_stage());
+    let workspace_diagnostics = fallow_types::workspace::merge_workspace_diagnostics(
+        captured,
+        fallow_config::health_stage_workspace_diagnostics(&config.root),
+    );
+
     finalize_health_report_side_effects(&mut HealthReportSideEffectsInput {
         opts,
         report: &mut report,
@@ -103,6 +130,7 @@ pub(super) fn finalize_health_result<R>(
     build_health_result(HealthResultInput {
         config,
         report,
+        branching_by_file: super::branching_by_file(files, modules),
         grouping,
         group_resolver: scope.group_resolver,
         elapsed,
@@ -1222,6 +1250,7 @@ fn build_health_result<R>(input: HealthResultInput<R>) -> HealthAnalysisResult<R
     let HealthResultInput {
         config,
         report,
+        branching_by_file,
         grouping,
         group_resolver,
         elapsed,
@@ -1234,6 +1263,7 @@ fn build_health_result<R>(input: HealthResultInput<R>) -> HealthAnalysisResult<R
     HealthAnalysisResult {
         report,
         type_aware_meta: None,
+        branching_by_file,
         grouping,
         group_resolver,
         config,
@@ -1242,5 +1272,6 @@ fn build_health_result<R>(input: HealthResultInput<R>) -> HealthAnalysisResult<R
         timings,
         coverage_gaps_has_findings,
         should_fail_on_coverage_gaps,
+        changed_files_analyzed: None,
     }
 }

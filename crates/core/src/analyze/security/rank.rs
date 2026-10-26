@@ -32,8 +32,8 @@ use fallow_security::{catalogue, derive_security_severity};
 
 const UNUSED_FILE_GUIDANCE: &str = "This sink sits in a file fallow also reports as unused. Verify the dead-code finding, then delete the file instead of hardening the sink.";
 const UNUSED_EXPORT_GUIDANCE: &str = "This sink sits on an export fallow also reports as unused. Verify the dead-code finding, then remove the export instead of hardening the sink.";
-const ZERO_CONTROL_PROMPT: &str = "No known control library was detected on this path. Should validation, sanitization, or auth be required before this sink?";
-const CONTROL_PRESENT_PROMPT: &str = "Known defensive controls were detected on this path. Are they sufficient for this sink and untrusted input?";
+const ZERO_CONTROL_PROMPT: &str = "No recognized control pattern was observed in files on this import trace. What controls does this sink require?";
+const CONTROL_PRESENT_PROMPT: &str = "Control patterns were observed in files on this import trace. Do they apply to the same input before this sink? Their presence alone does not establish protection.";
 
 /// Annotate tainted-sink candidates that overlap dead-code findings from the same
 /// analysis run. Client-server leak findings stay unchanged because #884 was
@@ -553,20 +553,20 @@ impl UntrustedSourceIndex {
             let Some(source_id) = source_for.get(current.0 as usize).copied().flatten() else {
                 continue;
             };
-            for (target, all_type_only, span) in graph.outgoing_edge_summaries(current) {
-                if all_type_only {
+            for edge in graph.outgoing_edge_summaries(current) {
+                if edge.all_type_only {
                     continue;
                 }
-                let idx = target.0 as usize;
+                let idx = edge.target.0 as usize;
                 if idx >= source_for.len() || source_for[idx].is_some() {
                     continue;
                 }
                 source_for[idx] = Some(source_id);
                 parent[idx] = Some(SourceParent {
                     previous: current,
-                    import_span_start: span,
+                    import_span_start: edge.span_start,
                 });
-                queue.push_back(target);
+                queue.push_back(edge.target);
             }
         }
 
@@ -827,6 +827,7 @@ mod tests {
                     exported_factory_returns: std::sync::Arc::default(),
                     exported_factory_return_object_shapes: std::sync::Arc::default(),
                     type_member_types: std::sync::Arc::default(),
+                    missing_export_targets: vec![],
                 }
             })
             .collect();
@@ -1023,7 +1024,7 @@ mod tests {
             surface
                 .defensive_boundary
                 .verification_prompt
-                .contains("Are they sufficient")
+                .contains("Their presence alone does not establish protection")
         );
     }
 
@@ -1042,7 +1043,7 @@ mod tests {
             .defensive_boundary
             .verification_prompt;
         assert!(prompt.ends_with('?'));
-        assert!(prompt.contains("No known control library"));
+        assert!(prompt.contains("No recognized control pattern"));
     }
 
     #[test]
@@ -1146,6 +1147,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         })];
         let line_offsets = FxHashMap::default();
 

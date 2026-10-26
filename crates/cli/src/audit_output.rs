@@ -6,7 +6,7 @@ use fallow_api::{
     AuditCodeClimateOutputInput, AuditJsonHeaderInput, AuditJsonOutputInput, AuditSarifOutputInput,
     DupesReportPayload,
 };
-use fallow_config::{AuditGate, OutputFormat, RulesConfig, Severity};
+use fallow_config::{AuditGate, AuditWorsened, OutputFormat, RulesConfig, Severity};
 use fallow_output::{
     AUDIT_SCHEMA_VERSION, AuditDisplayGate, AuditDisplaySeverity, AuditStylingContextLabelInput,
     PrDecisionConclusion,
@@ -25,6 +25,10 @@ use super::keys::{
     styling_finding_key,
 };
 use super::{AuditResult, AuditSummary, AuditVerdict, DupeDemotionDiffSource};
+use complexity_notes::worsened_class_label;
+
+#[path = "audit_complexity_notes.rs"]
+mod complexity_notes;
 
 /// Print audit results and return the appropriate exit code.
 #[must_use]
@@ -49,10 +53,88 @@ pub fn print_audit_result_with_style(
         return format_exit;
     }
 
-    match result.verdict {
-        AuditVerdict::Fail => ExitCode::from(1),
-        AuditVerdict::Pass | AuditVerdict::Warn => ExitCode::SUCCESS,
+    let parse_error = audit_parse_error_outcome(result);
+    let parse_error_failed = parse_error
+        .as_ref()
+        .is_some_and(fallow_output::GateOutcome::fails_run);
+    if let Some(outcome) = parse_error.as_ref().filter(|_| parse_error_failed) {
+        crate::gates::print_parse_error_gate_failure(&outcome.files);
     }
+
+    crate::exit_codes::run_exit_code([
+        crate::exit_codes::gate_exit_code(
+            fallow_output::GateName::AuditVerdict,
+            audit_verdict_status(result.verdict),
+        ),
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::ParseError,
+            parse_error_failed,
+        ),
+    ])
+}
+
+/// The audit's `parse-error` gate over its dead-code and health sub-passes,
+/// shared by the exit path and the `gate_outcomes` entry. `None` unless the
+/// flag or the config key armed it.
+///
+/// The gate reads every file the sub-passes parsed, not only the changed
+/// files: a file that does not parse hides the imports of the whole run.
+fn audit_parse_error_outcome(result: &AuditResult) -> Option<fallow_output::GateOutcome> {
+    let sections: Vec<_> = result
+        .check
+        .as_ref()
+        .map(|check| (&check.config, check.workspace_diagnostics.as_slice()))
+        .into_iter()
+        .chain(
+            result
+                .health
+                .as_ref()
+                .map(|health| (&health.config, health.workspace_diagnostics.as_slice())),
+        )
+        .collect();
+    crate::gates::sections_parse_error_outcome(&sections)
+}
+
+/// The gate status of an audit verdict.
+const fn audit_verdict_status(verdict: AuditVerdict) -> fallow_output::GateStatus {
+    match verdict {
+        AuditVerdict::Pass => fallow_output::GateStatus::Pass,
+        AuditVerdict::Warn => fallow_output::GateStatus::Warn,
+        AuditVerdict::Fail => fallow_output::GateStatus::Fail,
+    }
+}
+
+/// The audit run's rule-severity verdict, for the envelope's `gate_outcomes`.
+fn audit_gate_outcomes(result: &AuditResult) -> Option<fallow_output::GateOutcomes> {
+    crate::gates::audit_gate_outcomes(
+        audit_verdict_status(result.verdict),
+        audit_loaded_any_baseline(result),
+        result
+            .check
+            .as_ref()
+            .and_then(|check| check.type_aware_meta.as_ref()),
+        audit_parse_error_outcome(result),
+    )
+}
+
+/// Whether this audit loaded any of its three baselines.
+///
+/// Read from the sub-pass results rather than from the options, because audit
+/// resolves all three from project config as well as from flags, so an audit
+/// can load a baseline with no flag at all.
+fn audit_loaded_any_baseline(result: &AuditResult) -> bool {
+    result
+        .check
+        .as_ref()
+        .is_some_and(|check| check.baseline_staleness.is_some())
+        || result
+            .dupes
+            .as_ref()
+            .is_some_and(|dupes| dupes.baseline_staleness.is_some())
+        || result
+            .health
+            .as_ref()
+            .is_some_and(|health| health.report.summary.baseline_staleness.is_some())
 }
 
 fn audit_decision_conclusion(verdict: AuditVerdict) -> PrDecisionConclusion {
@@ -69,6 +151,19 @@ fn print_audit_format(
     explain: bool,
     json_style: crate::json_style::JsonStyle,
 ) -> ExitCode {
+    // Human, compact and markdown go through the dead-code printer, which
+    // prints its own config pattern notes.
+    if !matches!(
+        result.output,
+        OutputFormat::Human | OutputFormat::Compact | OutputFormat::Markdown
+    ) && let Some(check) = result.check.as_ref()
+    {
+        report::config_pattern_text::print_stderr_notes(
+            &check.workspace_diagnostics,
+            result.output,
+            quiet,
+        );
+    }
     match result.output {
         OutputFormat::Json => print_audit_json(result, json_style),
         OutputFormat::Human | OutputFormat::Compact | OutputFormat::Markdown => {
@@ -143,7 +238,7 @@ fn print_audit_pr_comment(
     result: &AuditResult,
     provider: report::ci::pr_comment::Provider,
 ) -> ExitCode {
-    let value = build_audit_codeclimate(result);
+    let issues = build_audit_codeclimate_issues(result);
     let incomplete = report::ci::required_type_aware_incomplete(
         result
             .check
@@ -155,12 +250,29 @@ fn print_audit_pr_comment(
     } else {
         audit_decision_conclusion(result.verdict)
     };
-    report::ci::pr_comment::print_pr_comment_with_status(
+    let gates = audit_gate_outcomes(result);
+    let advisory = audit_baseline_advisory(result);
+    let note = report::ci_status_note(
+        incomplete.then_some(report::ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        advisory.as_deref(),
+        gates.as_ref(),
+        // Audit publishes no `request_outcomes`: it exits 2 rather than widen
+        // when its base ref will not resolve, and it states its own scope
+        // through `base_ref` and `base_description`. It has no `--group-by`
+        // either.
+        None,
+        None,
+    );
+    report::ci::pr_comment::print_pr_comment_from_codeclimate_issues(
         "audit",
         provider,
-        &value,
-        conclusion,
-        incomplete.then_some(report::ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        &issues,
+        Some(conclusion),
+        report::ci::pr_comment::PrCommentStatus {
+            message: note.as_deref(),
+            gates: &report::gate_outcome_text::gate_rows_for_gates(gates.as_ref()),
+            config_patterns: audit_config_patterns(result),
+        },
     )
 }
 
@@ -168,7 +280,7 @@ fn print_audit_review(
     result: &AuditResult,
     provider: report::ci::pr_comment::Provider,
 ) -> ExitCode {
-    let value = build_audit_codeclimate(result);
+    let issues = build_audit_codeclimate_issues(result);
     let incomplete = report::ci::required_type_aware_incomplete(
         result
             .check
@@ -180,13 +292,81 @@ fn print_audit_review(
     } else {
         audit_decision_conclusion(result.verdict)
     };
-    report::ci::review::print_review_envelope_with_conclusion(
+    let note = report::ci_status_note(
+        incomplete.then_some(report::ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        audit_baseline_advisory(result).as_deref(),
+        audit_gate_outcomes(result).as_ref(),
+        // Audit publishes no `request_outcomes`: it exits 2 rather than
+        // widen when its base ref will not resolve, and it states its own
+        // scope through `base_ref` and `base_description`. It has no
+        // `--group-by` either.
+        None,
+        None,
+    );
+    report::ci::review::print_review_envelope_from_codeclimate_issues_with_conclusion(
         "audit",
         provider,
-        &value,
+        &issues,
         conclusion,
-        incomplete.then_some(report::ci::TYPE_AWARE_INCOMPLETE_MESSAGE),
+        report::ci::review::ReviewSummaryNotes {
+            message: note.as_deref(),
+            config_patterns: audit_config_patterns(result),
+        },
     )
+}
+
+/// The dead-code diagnostics of an audit, which hold its unmatched config
+/// patterns. Empty when the dead-code section did not run.
+fn audit_config_patterns(result: &AuditResult) -> &[fallow_config::WorkspaceDiagnostic] {
+    result
+        .check
+        .as_ref()
+        .map_or(&[], |check| check.workspace_diagnostics.as_slice())
+}
+
+/// The advisory for the baselines this audit loaded, rendered off the same
+/// section shape its JSON envelope publishes.
+///
+/// Built as that shape rather than passed object by object, because
+/// `fallow report --from` renders the saved audit envelope through the shared
+/// reader and the two must not each decide how three baselines read. Every
+/// audit narrows to the files that changed against its base, so in practice
+/// all three objects are change-scoped and this stays silent; building the
+/// shape rather than trusting that keeps the two paths identical if one ever
+/// is not.
+fn audit_baseline_advisory(result: &AuditResult) -> Option<String> {
+    let mut sections = serde_json::Map::new();
+    if let Some(staleness) = result
+        .check
+        .as_ref()
+        .and_then(|check| check.baseline_staleness.as_ref())
+    {
+        sections.insert(
+            "dead_code".to_owned(),
+            serde_json::json!({ "baseline_staleness": staleness.to_envelope(0) }),
+        );
+    }
+    if let Some(staleness) = result
+        .dupes
+        .as_ref()
+        .and_then(|dupes| dupes.baseline_staleness.as_ref())
+    {
+        sections.insert(
+            "duplication".to_owned(),
+            serde_json::json!({ "baseline_staleness": staleness.to_envelope(0) }),
+        );
+    }
+    if let Some(staleness) = result
+        .health
+        .as_ref()
+        .and_then(|health| health.report.summary.baseline_staleness.as_ref())
+    {
+        sections.insert(
+            "complexity".to_owned(),
+            serde_json::json!({ "summary": { "baseline_staleness": staleness } }),
+        );
+    }
+    report::baseline_advisory_text::advisory_line(&serde_json::Value::Object(sections))
 }
 
 fn print_audit_human(result: &AuditResult, quiet: bool, explain: bool, output: OutputFormat) {
@@ -196,6 +376,28 @@ fn print_audit_human(result: &AuditResult, quiet: bool, explain: bool, output: O
         let scope = format_scope_line(result);
         eprintln!();
         eprintln!("{scope}");
+    }
+
+    // Preamble, not epilogue: check and the combined run both print these
+    // before their findings, and wedged between audit's two result lines it was
+    // the same note in the least scannable place on the page. Audit prints the
+    // discovery note, so it prints the unflagged line too: a green verdict over
+    // a tree nothing was read from is most expensive on the CI-gating surface.
+    if let Some(ref check) = result.check {
+        crate::discovery_note::print_all_source_excluded_warning(
+            &check.workspace_diagnostics,
+            check.discovered_file_count,
+            check.explain_skipped,
+            quiet,
+            check.config.output,
+        );
+        crate::discovery_note::print_default_ignore_exclusion_note(
+            &check.config.root,
+            &check.workspace_diagnostics,
+            check.explain_skipped,
+            quiet,
+            check.config.output,
+        );
     }
 
     let has_check_issues = result.summary.dead_code_issues > 0;
@@ -212,13 +414,15 @@ fn print_audit_human(result: &AuditResult, quiet: bool, explain: bool, output: O
                 .is_some_and(|c| fallow_output::styling_candidate_count(&c.summary) > 0)
     });
 
-    if has_check_issues || has_health_findings || has_dupe_groups || has_styling {
+    let has_diff_risk = !result.diff_risk.is_empty();
+
+    if has_check_issues || has_health_findings || has_dupe_groups || has_styling || has_diff_risk {
         print_audit_findings(result, quiet, explain, show_headers);
     }
 
     if !has_dupe_groups && let Some(ref dupes) = result.dupes {
         crate::dupes::print_default_ignore_note(dupes, quiet);
-        crate::dupes::print_min_occurrences_note(dupes, quiet);
+        crate::dupes::print_audit_min_occurrences_note(dupes, quiet);
     }
 
     if !quiet {
@@ -254,9 +458,65 @@ pub fn print_audit_findings(result: &AuditResult, quiet: bool, explain: bool, sh
         && let Some(ref health) = result.health
     {
         print_audit_complexity_section(health, quiet, explain, show_headers);
+        complexity_notes::print_audit_worsened_section(result, health, show_headers);
+        complexity_notes::print_audit_test_file_section(result, health, show_headers);
     }
 
     print_audit_styling_summary(result, show_headers);
+    print_audit_diff_risk_section(result, show_headers);
+}
+
+/// Diff-risk section: one line for each finding, with its rule, location and
+/// evidence. The rules report facts about the change itself.
+fn print_audit_diff_risk_section(result: &AuditResult, show_headers: bool) {
+    if result.diff_risk.is_empty() {
+        return;
+    }
+    match result.output {
+        OutputFormat::Compact => {
+            for line in fallow_api::build_diff_risk_compact_lines(&result.diff_risk) {
+                outln!("{line}");
+            }
+        }
+        OutputFormat::Markdown => {
+            outln!(
+                "{}",
+                fallow_api::build_diff_risk_markdown(&result.diff_risk)
+            );
+        }
+        _ => {
+            print_audit_section_header(
+                show_headers,
+                "── Diff risk ──────────────────────────────────────",
+            );
+            for line in diff_risk_lines(&result.diff_risk) {
+                outln!("{line}");
+            }
+        }
+    }
+}
+
+/// The human lines of the diff-risk section, without color.
+fn diff_risk_lines(report: &fallow_output::DiffRiskReport) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .map(|finding| {
+            let location = finding.line.map_or_else(
+                || finding.path.clone(),
+                |line| format!("{}:{line}", finding.path),
+            );
+            let label = finding.kind.map_or_else(
+                || finding.rule.code().to_owned(),
+                |kind| format!("{} ({})", finding.rule.code(), kind.code()),
+            );
+            format!(
+                "  {location}  {label} [{}]  {}",
+                finding.severity.code(),
+                finding.evidence
+            )
+        })
+        .collect()
 }
 
 fn print_audit_dead_code_section(
@@ -282,6 +542,9 @@ fn print_audit_dead_code_section(
             show_explain_tip: false,
             type_aware_scope: None,
             json_style: crate::json_style::JsonStyle::Compact,
+            fail_on_parse_error: false,
+            exit_reason: false,
+            architecture_layout: crate::report::ArchitectureLayout::Embedded,
         },
     );
 }
@@ -296,15 +559,15 @@ fn print_audit_duplication_section(
         show_headers,
         "── Duplication ────────────────────────────────────",
     );
-    crate::dupes::print_dupes_result(
-        dupes,
+    crate::dupes::print_audit_dupes_result(&crate::dupes::DupesRenderOptions {
+        result: dupes,
         quiet,
         explain,
-        false,
-        true,
-        false,
-        crate::json_style::JsonStyle::Compact,
-    );
+        summary: false,
+        summary_heading: true,
+        show_explain_tip: false,
+        json_style: crate::json_style::JsonStyle::Compact,
+    });
 }
 
 /// Per-group demotion detail under `--explain`: one line per introduced clone
@@ -393,6 +656,7 @@ fn print_audit_complexity_section(
             quiet,
             explain,
             gates: fallow_engine::health::HealthGateOptions::default(),
+            baseline_path: None,
             summary: false,
             summary_heading: true,
             show_explain_tip: false,
@@ -400,6 +664,7 @@ fn print_audit_complexity_section(
             skip_score_and_trend: false,
             css_requested: false,
             json_style: crate::json_style::JsonStyle::Compact,
+            exit_reason: false,
         },
     );
 }
@@ -478,7 +743,7 @@ fn build_audit_styling_groups<'a>(
     sort_audit_styling_findings(rules, &mut sorted);
     let gated_count = sorted
         .iter()
-        .filter(|finding| styling_finding_is_error_gated(rules, &finding.code))
+        .filter(|finding| fallow_api::audit_run::styling_finding_gates(rules, &finding.code))
         .count();
     let fix_confidently = sorted
         .iter()
@@ -503,8 +768,10 @@ fn sort_audit_styling_findings(
     findings: &mut [&fallow_output::StylingFinding],
 ) {
     findings.sort_by(|a, b| {
-        styling_finding_is_error_gated(rules, &b.code)
-            .cmp(&styling_finding_is_error_gated(rules, &a.code))
+        fallow_api::audit_run::styling_finding_gates(rules, &b.code)
+            .cmp(&fallow_api::audit_run::styling_finding_gates(
+                rules, &a.code,
+            ))
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
             .then_with(|| a.code.cmp(&b.code))
@@ -528,7 +795,7 @@ fn print_audit_styling_group(
     }
     let gated_count = findings
         .iter()
-        .filter(|finding| styling_finding_is_error_gated(rules, &finding.code))
+        .filter(|finding| fallow_api::audit_run::styling_finding_gates(rules, &finding.code))
         .count();
     let visible_count = top_n.max(gated_count);
     let indent = if show_label { "    " } else { "  " };
@@ -563,21 +830,11 @@ fn styling_finding_is_fix_confidently(finding: &fallow_output::StylingFinding) -
     )
 }
 
-fn styling_finding_is_error_gated(rules: &RulesConfig, code: &str) -> bool {
-    let (_, severity) = styling_finding_rule_context(rules, code);
-    severity == Severity::Error
-}
-
 fn styling_finding_rule_context(rules: &RulesConfig, code: &str) -> (String, Severity) {
-    let severity = match code {
-        "css-token-drift" => rules.css_token_drift,
-        "css-duplicate-block" => rules.css_duplicate_block,
-        "css-selector-complexity" => rules.css_selector_complexity,
-        "css-dead-surface" => rules.css_dead_surface,
-        "css-broken-reference" => rules.css_broken_reference,
-        _ => Severity::Warn,
-    };
-    (format!("rules.{code}"), severity)
+    (
+        format!("rules.{code}"),
+        fallow_api::audit_run::styling_rule_severity(rules, code),
+    )
 }
 
 fn styling_finding_audit_context(
@@ -715,8 +972,15 @@ fn print_audit_vital_signs(result: &AuditResult) {
 
 fn build_vital_sign_parts(summary: &AuditSummary) -> Vec<String> {
     let mut parts = Vec::new();
-    parts.push(format!("dead code {}", summary.dead_code_issues));
-    if let Some(max) = summary.max_cyclomatic {
+    // A skipped pass reports 0 issues, which must not read as a clean result.
+    if summary.dead_code_skipped {
+        parts.push("dead code skipped".to_string());
+    } else {
+        parts.push(format!("dead code {}", summary.dead_code_issues));
+    }
+    if summary.complexity_skipped {
+        parts.push("complexity skipped".to_string());
+    } else if let Some(max) = summary.max_cyclomatic {
         parts.push(format!(
             "complexity {} (warn, max cyclomatic: {max})",
             summary.complexity_findings
@@ -724,12 +988,19 @@ fn build_vital_sign_parts(summary: &AuditSummary) -> Vec<String> {
     } else {
         parts.push(format!("complexity {}", summary.complexity_findings));
     }
-    parts.push(format!("duplication {}", summary.duplication_clone_groups));
+    if summary.duplication_skipped {
+        parts.push("duplication skipped".to_string());
+    } else {
+        parts.push(format!("duplication {}", summary.duplication_clone_groups));
+    }
     parts
 }
 
 /// Build summary parts for the status line (shared between warn and fail).
-fn build_status_parts(summary: &AuditSummary) -> Vec<String> {
+fn build_status_parts(
+    summary: &AuditSummary,
+    diff_risk: &fallow_output::DiffRiskReport,
+) -> Vec<String> {
     let mut parts = Vec::new();
     if summary.dead_code_issues > 0 {
         let n = summary.dead_code_issues;
@@ -743,6 +1014,10 @@ fn build_status_parts(summary: &AuditSummary) -> Vec<String> {
         let n = summary.duplication_clone_groups;
         parts.push(format!("duplication: {n} clone group{}", plural(n)));
     }
+    if !diff_risk.is_empty() {
+        let n = diff_risk.findings.len();
+        parts.push(format!("diff risk: {n} finding{}", plural(n)));
+    }
     parts
 }
 
@@ -752,6 +1027,40 @@ fn print_audit_status_line(result: &AuditResult) {
     let n = result.changed_files_count;
     let files_str = format!("{n} changed file{}", plural(n));
 
+    // The verdict judges findings only. A failed parse-error gate still exits
+    // 1, so the line says so and never shows a check mark above it.
+    let failed_parse_files = audit_parse_error_outcome(result)
+        .filter(fallow_output::GateOutcome::fails_run)
+        .map_or(0, |outcome| outcome.files.len());
+    if failed_parse_files > 0 {
+        let noun = if failed_parse_files == 1 {
+            "file did"
+        } else {
+            "files did"
+        };
+        let findings = match result.verdict {
+            AuditVerdict::Pass => format!("0 issues in {files_str}"),
+            AuditVerdict::Warn | AuditVerdict::Fail => format!(
+                "{} \u{00b7} {files_str}",
+                build_status_parts(&result.summary, &result.diff_risk).join(" \u{00b7} ")
+            ),
+        };
+        eprintln!(
+            "{}",
+            format!(
+                "\u{2717} {findings}, parse-error gate failed: {failed_parse_files} {noun} not parse ({elapsed_str})"
+            )
+            .red()
+            .bold()
+        );
+    } else {
+        print_audit_verdict_line(result, &files_str, &elapsed_str);
+    }
+    print_audit_inherited_note(result);
+}
+
+/// The status line of an audit whose exit follows its verdict alone.
+fn print_audit_verdict_line(result: &AuditResult, files_str: &str, elapsed_str: &str) {
     match result.verdict {
         AuditVerdict::Pass => {
             eprintln!(
@@ -762,16 +1071,16 @@ fn print_audit_status_line(result: &AuditResult) {
             );
         }
         AuditVerdict::Warn => {
-            let summary = build_status_parts(&result.summary).join(" \u{00b7} ");
+            let summary = build_status_parts(&result.summary, &result.diff_risk).join(" \u{00b7} ");
             eprintln!(
                 "{}",
-                format!("\u{2713} {summary} (warn) \u{00b7} {files_str} ({elapsed_str})")
-                    .green()
+                format!("\u{26a0} {summary} (warn) \u{00b7} {files_str} ({elapsed_str})")
+                    .yellow()
                     .bold()
             );
         }
         AuditVerdict::Fail => {
-            let summary = build_status_parts(&result.summary).join(" \u{00b7} ");
+            let summary = build_status_parts(&result.summary, &result.diff_risk).join(" \u{00b7} ");
             eprintln!(
                 "{}",
                 format!("\u{2717} {summary} \u{00b7} {files_str} ({elapsed_str})")
@@ -780,11 +1089,37 @@ fn print_audit_status_line(result: &AuditResult) {
             );
         }
     }
+}
 
+/// The dimmed note about inherited findings that the audit gate left out.
+fn print_audit_inherited_note(result: &AuditResult) {
     if !matches!(result.attribution.gate, AuditGate::All) {
-        let inherited = result.attribution.dead_code_inherited
+        // The same classification gives `complexity_worsened` and
+        // `complexity_inherited`, and every worsened finding is also counted
+        // as inherited. Under `--worsened error` the worsened findings take
+        // part in the gate, so the note does not count them as excluded.
+        let worsened = result.attribution.complexity_worsened;
+        let gated_worsened = if result.attribution.worsened == AuditWorsened::Error {
+            worsened
+        } else {
+            0
+        };
+        let inherited = (result.attribution.dead_code_inherited
             + result.attribution.complexity_inherited
-            + result.attribution.duplication_inherited;
+            + result.attribution.duplication_inherited)
+            .saturating_sub(gated_worsened);
+        if worsened > 0 {
+            eprintln!(
+                "  {}",
+                format!(
+                    "{worsened} inherited complexity finding{} got worse since {} ({})",
+                    plural(worsened),
+                    short_base_ref(&result.base_ref),
+                    worsened_class_label(result.attribution.worsened),
+                )
+                .yellow()
+            );
+        }
         if inherited > 0 {
             eprintln!(
                 "  {}",
@@ -869,6 +1204,7 @@ pub(super) fn build_audit_json_output(result: &AuditResult) -> Result<serde_json
 
     fallow_api::serialize_audit_json(
         AuditJsonOutputInput {
+            gate_outcomes: audit_gate_outcomes(result),
             header: audit_json_header_input(result),
             meta: result
                 .check
@@ -881,9 +1217,9 @@ pub(super) fn build_audit_json_output(result: &AuditResult) -> Result<serde_json
             dead_code,
             duplication,
             complexity,
+            diff_risk: result.diff_risk.clone(),
             next_steps: audit_next_steps(result),
         },
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .map_err(|err| {
@@ -947,6 +1283,10 @@ fn build_audit_dead_code_json_with_results(
         check.elapsed,
         check.config_fixable,
         &check.workspace_diagnostics,
+        check
+            .baseline_staleness
+            .as_ref()
+            .map(|loaded| loaded.to_envelope(0)),
     ) {
         Ok(mut json) => {
             if let Some(ref base) = result.base_snapshot {
@@ -995,6 +1335,7 @@ fn build_audit_duplication_json(
         Ok(mut json) => {
             let root_prefix = format!("{}/", dupes.config.root.display());
             report::strip_root_prefix(&mut json, &root_prefix);
+            insert_duplication_baseline_staleness(&mut json, dupes);
             if let Some(ref base) = result.base_snapshot {
                 if let Some(comparison) = result.comparison.as_ref() {
                     annotate_domain_json(&mut json, "clone_groups", comparison.dupes.introduced());
@@ -1015,6 +1356,31 @@ fn build_audit_duplication_json(
             2,
             OutputFormat::Json,
         )),
+    }
+}
+
+/// Publish the duplication sub-pass's view of its loaded baseline at the audit
+/// `duplication` section root, where the standalone `dupes` envelope carries
+/// the same key.
+///
+/// Inserted into the serialized value rather than added to
+/// `DupesReportPayload`, because that payload is `serde(flatten)`ed into
+/// `DupesOutput`, which owns a `baseline_staleness` of its own: a typed member
+/// would put two keys of that name at the standalone envelope root. The audit
+/// section is built from the payload alone and never flows through the
+/// envelope, so this is the only carrier it has.
+fn insert_duplication_baseline_staleness(
+    json: &mut serde_json::Value,
+    dupes: &crate::dupes::DupesResult,
+) {
+    let Some(loaded) = dupes.baseline_staleness.as_ref() else {
+        return;
+    };
+    let Some(object) = json.as_object_mut() else {
+        return;
+    };
+    if let Ok(staleness) = serde_json::to_value(loaded.to_envelope(0)) {
+        object.insert("baseline_staleness".into(), staleness);
     }
 }
 
@@ -1045,7 +1411,8 @@ fn build_audit_health_json_with_report(
             let root_prefix = format!("{}/", health.config.root.display());
             report::strip_root_prefix(&mut json, &root_prefix);
             if let Some(ref base) = result.base_snapshot {
-                let mut base_health = base.health.clone();
+                let mut base_health =
+                    fallow_api::audit_keys::complexity_baseline_keys(&base.health);
                 base_health.extend(base.styling.iter().cloned());
                 annotate_health_json(&mut json, report, &health.config.root, &base_health);
             }
@@ -1076,6 +1443,7 @@ fn print_audit_sarif(result: &AuditResult) -> ExitCode {
         let mut sarif =
             report::api_sarif_document(&check.results, &check.config.root, &check.config.rules);
         report::sarif::annotate_type_aware_sarif(&mut sarif, check.type_aware_meta.as_ref());
+        report::sarif::annotate_config_pattern_sarif(&mut sarif, &check.workspace_diagnostics);
         sarif
     });
     let health_sarif = result
@@ -1086,6 +1454,7 @@ fn print_audit_sarif(result: &AuditResult) -> ExitCode {
         dead_code: check_sarif.as_ref(),
         duplication: result.dupes.as_ref().map(|dupes| &dupes.report),
         health: health_sarif.as_ref(),
+        diff_risk: Some(&result.diff_risk),
     });
 
     report::emit_json(&combined, "SARIF audit")
@@ -1097,7 +1466,13 @@ fn print_audit_codeclimate(result: &AuditResult) -> ExitCode {
 }
 
 fn build_audit_codeclimate(result: &AuditResult) -> serde_json::Value {
-    fallow_api::build_audit_codeclimate(AuditCodeClimateOutputInput {
+    fallow_output::codeclimate_issues_to_value(&build_audit_codeclimate_issues(result))
+}
+
+/// Typed audit CodeClimate issues. The CI comment and review renderers take
+/// these, so the legacy fingerprint of a dead-code issue reaches them.
+fn build_audit_codeclimate_issues(result: &AuditResult) -> Vec<fallow_output::CodeClimateIssue> {
+    fallow_api::build_audit_codeclimate_issues(AuditCodeClimateOutputInput {
         dead_code: result.check.as_ref().map_or_else(Vec::new, |check| {
             fallow_api::build_codeclimate(&check.results, &check.config.root, &check.config.rules)
         }),
@@ -1107,6 +1482,7 @@ fn build_audit_codeclimate(result: &AuditResult) -> serde_json::Value {
         health: result.health.as_ref().map_or_else(Vec::new, |health| {
             fallow_api::build_health_codeclimate(&health.report, &health.config.root)
         }),
+        diff_risk: fallow_api::build_diff_risk_codeclimate(&result.diff_risk),
     })
 }
 
@@ -1122,8 +1498,8 @@ mod tests {
 
     use super::{
         audit_decision_conclusion, build_audit_codeclimate, build_audit_json_output,
-        build_status_parts, build_vital_sign_parts, format_scope_line_parts, print_audit_result,
-        short_base_ref, styling_finding_audit_context_label,
+        build_status_parts, build_vital_sign_parts, diff_risk_lines, format_scope_line_parts,
+        print_audit_result, short_base_ref, styling_finding_audit_context_label,
     };
 
     fn audit_result(verdict: AuditVerdict, output: OutputFormat) -> AuditResult {
@@ -1132,6 +1508,9 @@ mod tests {
             summary: AuditSummary {
                 dead_code_issues: 0,
                 dead_code_has_errors: false,
+                dead_code_skipped: false,
+                complexity_skipped: false,
+                duplication_skipped: false,
                 complexity_findings: 0,
                 max_cyclomatic: None,
                 duplication_clone_groups: 0,
@@ -1157,7 +1536,9 @@ mod tests {
             elapsed: Duration::ZERO,
             review_deltas: None,
             weakening_signals: Vec::new(),
+            diff_risk: fallow_output::DiffRiskReport::default(),
             routing: None,
+            ownership: None,
             decision_surface: None,
             graph_snapshot_hash: None,
             change_anchors: Vec::new(),
@@ -1240,13 +1621,17 @@ mod tests {
         let summary = AuditSummary {
             dead_code_issues: 1,
             dead_code_has_errors: true,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: 2,
             max_cyclomatic: Some(12),
             duplication_clone_groups: 3,
         };
 
+        let no_diff_risk = fallow_output::DiffRiskReport::default();
         assert_eq!(
-            build_status_parts(&summary),
+            build_status_parts(&summary, &no_diff_risk),
             vec![
                 "dead code: 1 issue".to_string(),
                 "complexity: 2 findings".to_string(),
@@ -1257,11 +1642,54 @@ mod tests {
         let empty = AuditSummary {
             dead_code_issues: 0,
             dead_code_has_errors: false,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: 0,
             max_cyclomatic: None,
             duplication_clone_groups: 0,
         };
-        assert!(build_status_parts(&empty).is_empty());
+        assert!(build_status_parts(&empty, &no_diff_risk).is_empty());
+    }
+
+    #[test]
+    fn build_status_parts_names_diff_risk_when_it_is_the_only_signal() {
+        let empty = AuditSummary {
+            dead_code_issues: 0,
+            dead_code_has_errors: false,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
+            complexity_findings: 0,
+            max_cyclomatic: None,
+            duplication_clone_groups: 0,
+        };
+        let finding = fallow_output::DiffRiskFinding {
+            rule: fallow_output::DiffRiskRule::AddedSuppression,
+            kind: None,
+            path: "src/b.ts".to_owned(),
+            line: Some(2),
+            message: "m".to_owned(),
+            evidence: "@ts-ignore".to_owned(),
+            severity: fallow_output::DiffRiskSeverity::Warn,
+            introduced: true,
+            related: Vec::new(),
+            actions: Vec::new(),
+        };
+        let one = fallow_output::DiffRiskReport {
+            findings: vec![finding.clone()],
+        };
+        assert_eq!(
+            build_status_parts(&empty, &one),
+            vec!["diff risk: 1 finding".to_string()]
+        );
+        let two = fallow_output::DiffRiskReport {
+            findings: vec![finding.clone(), finding],
+        };
+        assert_eq!(
+            build_status_parts(&empty, &two),
+            vec!["diff risk: 2 findings".to_string()]
+        );
     }
 
     #[test]
@@ -1269,6 +1697,9 @@ mod tests {
         let summary = AuditSummary {
             dead_code_issues: 0,
             dead_code_has_errors: false,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: 2,
             max_cyclomatic: Some(18),
             duplication_clone_groups: 1,
@@ -1289,6 +1720,9 @@ mod tests {
         let summary = AuditSummary {
             dead_code_issues: 3,
             dead_code_has_errors: false,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: 0,
             max_cyclomatic: None,
             duplication_clone_groups: 0,
@@ -1300,6 +1734,37 @@ mod tests {
                 "dead code 3".to_string(),
                 "complexity 0".to_string(),
                 "duplication 0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_vital_sign_parts_marks_skipped_sub_analyses() {
+        let summary = |dead_code_skipped, complexity_skipped, duplication_skipped| AuditSummary {
+            dead_code_issues: 0,
+            dead_code_has_errors: false,
+            dead_code_skipped,
+            complexity_skipped,
+            duplication_skipped,
+            complexity_findings: 1,
+            max_cyclomatic: None,
+            duplication_clone_groups: 0,
+        };
+
+        assert_eq!(
+            build_vital_sign_parts(&summary(true, false, false)),
+            vec![
+                "dead code skipped".to_string(),
+                "complexity 1".to_string(),
+                "duplication 0".to_string(),
+            ]
+        );
+        assert_eq!(
+            build_vital_sign_parts(&summary(false, true, true)),
+            vec![
+                "dead code 0".to_string(),
+                "complexity skipped".to_string(),
+                "duplication skipped".to_string(),
             ]
         );
     }
@@ -1346,6 +1811,9 @@ mod tests {
         result.summary = AuditSummary {
             dead_code_issues: 2,
             dead_code_has_errors: true,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: 1,
             max_cyclomatic: Some(14),
             duplication_clone_groups: 3,
@@ -1458,5 +1926,44 @@ mod tests {
 
         // Fail maps to exit 1 and renders the red status line via build_status_parts.
         assert_eq!(print_audit_result(&result, false, false), ExitCode::from(1));
+    }
+
+    #[test]
+    fn diff_risk_lines_show_location_rule_kind_and_evidence() {
+        let report = fallow_output::DiffRiskReport {
+            findings: vec![
+                fallow_output::DiffRiskFinding {
+                    rule: fallow_output::DiffRiskRule::WeakenedTests,
+                    kind: Some(fallow_output::WeakenedTestsKind::SkipOnly),
+                    path: "src/a.test.ts".to_owned(),
+                    line: Some(4),
+                    message: "m".to_owned(),
+                    evidence: "it.skip".to_owned(),
+                    severity: fallow_output::DiffRiskSeverity::Warn,
+                    introduced: true,
+                    related: Vec::new(),
+                    actions: Vec::new(),
+                },
+                fallow_output::DiffRiskFinding {
+                    rule: fallow_output::DiffRiskRule::AddedSuppression,
+                    kind: None,
+                    path: "src/b.ts".to_owned(),
+                    line: None,
+                    message: "m".to_owned(),
+                    evidence: "@ts-ignore".to_owned(),
+                    severity: fallow_output::DiffRiskSeverity::Error,
+                    introduced: true,
+                    related: Vec::new(),
+                    actions: Vec::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            diff_risk_lines(&report),
+            vec![
+                "  src/a.test.ts:4  weakened-tests (skip-only) [warn]  it.skip".to_owned(),
+                "  src/b.ts  added-suppression [error]  @ts-ignore".to_owned(),
+            ]
+        );
     }
 }

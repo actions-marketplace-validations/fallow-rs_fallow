@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use crate::params::HealthParams;
 
 use fallow_api::{
@@ -10,13 +13,11 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::{
     api_runtime::{
-        changed_since_from_param, env_diff_file, json_success, non_empty_path, non_empty_string,
-        programmatic_error_body, resolve_typed_coverage_inputs, run_api_blocking,
-        workspace_patterns_from_param,
+        EnvScope, call_cancellation, non_empty_path, non_empty_string,
+        resolve_typed_coverage_inputs, run_api_blocking, shared_analysis_options, shared_params,
+        typed_tool_result, typed_type_aware, workspace_patterns_from_param,
     },
-    fallback_policy::{
-        CliFallbackReason, baseline_fallback_reason, filled, grouped_fallback_reason,
-    },
+    fallback_policy::{baseline_requested, filled, grouped_requested, type_aware_requested},
     push_baseline, push_global, push_remote_extends, push_scope, push_str_flag, run_tool,
     validation_error_body,
 };
@@ -24,35 +25,44 @@ use super::{
 /// Run `check_health` through the typed API when parameters map cleanly to the
 /// programmatic contract, falling back to the CLI for CLI-only surfaces.
 pub async fn run_health(binary: &str, params: HealthParams) -> Result<CallToolResult, McpError> {
-    if requires_cli_fallback(&params) {
-        let args = build_health_args(&params);
-        return run_tool(binary, "check_health", &args).await;
+    if !requires_cli_fallback(&params) {
+        let cancellation = call_cancellation();
+        let options = match health_options_from_params(&params, Some(Arc::clone(&cancellation))) {
+            Ok(options) => options,
+            Err(msg) => return Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
+        };
+        let result = run_api_blocking("check_health", cancellation, move || {
+            health_typed_value(options, None)
+        })
+        .await?;
+        if let Some(result) = typed_tool_result(result) {
+            return Ok(result);
+        }
     }
 
-    let options = match health_options_from_params(&params) {
-        Ok(options) => options,
-        Err(msg) => return Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
-    };
-
-    let result = run_api_blocking("check_health", move || {
-        let options = with_resolved_coverage(options, None)?;
-        run_api_health(&options).and_then(serialize_health_programmatic_json)
-    })
-    .await?
-    .map_or_else(
-        |err| CallToolResult::error(vec![ContentBlock::text(programmatic_error_body(&err))]),
-        |value| json_success(&value),
-    );
-    Ok(result)
+    let args = build_health_args(&params);
+    run_tool(binary, "check_health", &args).await
 }
 
-pub fn run_health_api_value(params: &HealthParams) -> Result<Option<serde_json::Value>, String> {
-    run_health_api_value_with_env(params, None)
+/// The typed route's blocking body: resolve the coverage inputs with the CLI's
+/// precedence (#2368), run the health analysis, and serialize it. `env`
+/// supplies the environment coverage layer, with `None` reading the process
+/// environment as [`run_health`] does. Production and the precedence tests both
+/// call this, so the tests hold the shipping code rather than a parallel copy
+/// of it.
+fn health_typed_value(
+    options: ComplexityOptions,
+    env: Option<CoverageInputs>,
+) -> Result<serde_json::Value, ProgrammaticError> {
+    let options = with_resolved_coverage(options, env)?;
+    run_api_health(&options).and_then(serialize_health_programmatic_json)
 }
 
-/// [`run_health_api_value`] with the environment coverage layer injected, so
-/// the typed route can be exercised without mutating the process environment.
-/// `None` reads the process environment, as the production entry points do.
+/// [`health_typed_value`] reached the way [`run_health`] reaches it: through
+/// the CLI-fallback decision and the same parameter mapping, without the async
+/// rmcp shell. `env` is injected so the precedence can be exercised without
+/// mutating the process environment.
+#[cfg(test)]
 fn run_health_api_value_with_env(
     params: &HealthParams,
     env: Option<CoverageInputs>,
@@ -61,13 +71,8 @@ fn run_health_api_value_with_env(
         return Ok(None);
     }
 
-    let options = health_options_from_params(params)?;
-    let value = with_resolved_coverage(options, env)
-        .and_then(|options| run_api_health(&options))
-        .and_then(serialize_health_programmatic_json)
-        .map_err(|err| programmatic_error_body(&err))?;
-
-    Ok(Some(value))
+    let options = health_options_from_params(params, None)?;
+    super::api_runtime::typed_api_value(health_typed_value(options, env))
 }
 
 /// Fill the typed route's coverage inputs from the explicit parameters, the
@@ -125,6 +130,7 @@ impl HealthArgsBuilder<'_> {
             "--group-by",
             self.params.group_by.as_deref(),
         );
+        push_str_flag(&mut self.args, "--group", self.params.group.as_deref());
         self.args
     }
 
@@ -269,6 +275,11 @@ impl HealthArgsBuilder<'_> {
         if self.params.trend == Some(true) {
             self.args.push("--trend".to_string());
         }
+        push_str_flag(
+            &mut self.args,
+            "--trend-from",
+            self.params.trend_from.as_deref(),
+        );
         push_str_flag(&mut self.args, "--effort", self.params.effort.as_deref());
         if self.params.summary == Some(true) {
             self.args.push("--summary".to_string());
@@ -316,65 +327,41 @@ impl HealthArgsBuilder<'_> {
 }
 
 fn requires_cli_fallback(params: &HealthParams) -> bool {
-    params.type_aware == Some(true)
-        || params.type_coupling == Some(true)
-        || params
-            .type_aware_projects
-            .as_ref()
-            .is_some_and(|projects| !projects.is_empty())
-        || params.type_aware_require.is_some()
-        || cli_fallback_reason(params).is_some()
-}
-
-fn cli_fallback_reason(params: &HealthParams) -> Option<CliFallbackReason> {
-    if params.min_score.is_some() {
-        return Some(CliFallbackReason::HealthMinScoreGate);
-    }
-    if filled(params.min_severity.as_deref()) {
-        return Some(CliFallbackReason::HealthMinSeverity);
-    }
-    if filled(params.churn_file.as_deref()) {
-        return Some(CliFallbackReason::HealthChurnFile);
-    }
-    if params.save_snapshot.is_some() {
-        return Some(CliFallbackReason::HealthSnapshot);
-    }
-    if let Some(reason) =
-        baseline_fallback_reason(params.baseline.as_deref(), params.save_baseline.as_deref())
-    {
-        return Some(reason);
-    }
-    if params.trend == Some(true) {
-        return Some(CliFallbackReason::HealthTrend);
-    }
-    if params.summary == Some(true) {
-        return Some(CliFallbackReason::HealthSummary);
-    }
-    if filled(params.runtime_coverage.as_deref())
+    params.type_coupling == Some(true)
+        || type_aware_requested(
+            params.type_aware,
+            params.type_aware_projects.as_deref(),
+            params.type_aware_require.as_ref(),
+        )
+        || params.min_score.is_some()
+        || filled(params.min_severity.as_deref())
+        || filled(params.churn_file.as_deref())
+        || params.save_snapshot.is_some()
+        || baseline_requested(params.baseline.as_deref(), params.save_baseline.as_deref())
+        || params.trend == Some(true)
+        || filled(params.trend_from.as_deref())
+        || filled(params.group.as_deref())
+        || params.summary == Some(true)
+        || filled(params.runtime_coverage.as_deref())
         || params.min_invocations_hot.is_some()
         || params.min_observation_volume.is_some()
         || params.low_traffic_threshold.is_some()
-    {
-        return Some(CliFallbackReason::HealthRuntimeCoverage);
-    }
-    grouped_fallback_reason(params.group_by.as_deref())
+        || grouped_requested(params.group_by.as_deref())
 }
 
-fn health_options_from_params(params: &HealthParams) -> Result<ComplexityOptions, String> {
+fn health_options_from_params(
+    params: &HealthParams,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<ComplexityOptions, String> {
     Ok(ComplexityOptions {
         analysis: AnalysisOptions {
-            root: non_empty_path(params.root.as_deref()),
-            config_path: non_empty_path(params.config.as_deref()),
-            allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
-            no_cache: params.no_cache.unwrap_or(false),
-            threads: params.threads,
             production: params.production.unwrap_or(false),
             production_override: params.production,
-            changed_since: changed_since_from_param(params.changed_since.as_deref()),
-            diff_file: env_diff_file(),
+            changed_since: non_empty_string(params.changed_since.as_deref()),
             workspace: workspace_patterns_from_param(params.workspace.as_deref()),
             explain: true,
-            ..AnalysisOptions::default()
+            type_aware: typed_type_aware(params.type_aware),
+            ..shared_analysis_options(shared_params!(params), EnvScope::Ambient, cancellation)
         },
         max_cyclomatic: params.max_cyclomatic,
         max_cognitive: params.max_cognitive,
@@ -405,7 +392,7 @@ fn health_options_from_params(params: &HealthParams) -> Result<ComplexityOptions
 
 fn complexity_sort_from_param(value: Option<&str>) -> Result<ComplexitySort, String> {
     match value {
-        None | Some("") | Some("cyclomatic") => Ok(ComplexitySort::Cyclomatic),
+        None | Some("" | "cyclomatic") => Ok(ComplexitySort::Cyclomatic),
         Some("cognitive") => Ok(ComplexitySort::Cognitive),
         Some("lines") => Ok(ComplexitySort::Lines),
         Some("severity") => Ok(ComplexitySort::Severity),
@@ -455,7 +442,7 @@ mod tests {
         };
 
         assert!(!requires_cli_fallback(&params));
-        let options = health_options_from_params(&params).expect("options");
+        let options = health_options_from_params(&params, None).expect("options");
         assert_eq!(
             options.analysis.workspace,
             Some(vec!["web".to_string(), "admin".to_string()])
@@ -496,7 +483,7 @@ mod tests {
         };
 
         assert!(!requires_cli_fallback(&params));
-        let options = health_options_from_params(&params).expect("options");
+        let options = health_options_from_params(&params, None).expect("options");
         assert!(options.analysis.root.is_none());
         assert!(options.analysis.config_path.is_none());
         assert_eq!(options.analysis.changed_since.as_deref(), Some("main"));
@@ -541,14 +528,14 @@ mod tests {
             sort: Some("weighted".to_string()),
             ..HealthParams::default()
         };
-        let err = health_options_from_params(&bad_sort).expect_err("invalid sort");
+        let err = health_options_from_params(&bad_sort, None).expect_err("invalid sort");
         assert!(err.contains("Invalid sort"));
 
         let bad_effort = HealthParams {
             effort: Some("extreme".to_string()),
             ..HealthParams::default()
         };
-        let err = health_options_from_params(&bad_effort).expect_err("invalid effort");
+        let err = health_options_from_params(&bad_effort, None).expect_err("invalid effort");
         assert!(err.contains("Invalid effort"));
     }
 
@@ -781,5 +768,76 @@ mod tests {
             no_cache: Some(true),
             ..HealthParams::default()
         }
+    }
+
+    /// `typeAware.enabled` in config makes `fallow health` without a section
+    /// add type coupling. The typed route cannot run that, so the tool runs
+    /// the CLI. With a section selected, the CLI skips type coupling and the
+    /// typed route answers.
+    #[tokio::test]
+    async fn config_type_aware_falls_back_to_the_cli() {
+        use super::super::api_runtime::{
+            MISSING_FALLBACK_BINARY, assert_cli_fallback_ran, write_type_aware_config,
+        };
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("index.ts"),
+            "export function score(value: number) {\n  return value;\n}\n",
+        )
+        .expect("write source");
+        write_type_aware_config(project.path(), r#"{"typeAware":{"enabled":true}}"#);
+        let params = || HealthParams {
+            root: Some(project.path().display().to_string()),
+            no_cache: Some(true),
+            ..HealthParams::default()
+        };
+        assert!(!requires_cli_fallback(&params()));
+        assert_eq!(
+            run_health_api_value_with_env(&params(), Some(CoverageInputs::default())),
+            Ok(None)
+        );
+        assert_cli_fallback_ran(run_health(MISSING_FALLBACK_BINARY, params()).await);
+
+        // `type_aware: false` keeps the run syntactic on both routes.
+        let off = || HealthParams {
+            type_aware: Some(false),
+            ..params()
+        };
+        assert!(
+            run_health_api_value_with_env(&off(), Some(CoverageInputs::default()))
+                .expect("typed health")
+                .is_some(),
+            "`type_aware: false` stays on the typed route"
+        );
+        assert!(build_health_args(&off()).contains(&"--no-type-aware".to_string()));
+
+        let section = HealthParams {
+            complexity: Some(true),
+            ..params()
+        };
+        let value = run_health_api_value_with_env(&section, Some(CoverageInputs::default()))
+            .expect("typed health")
+            .expect("a health section stays on the typed route");
+        assert_eq!(value["kind"], "health");
+    }
+}
+
+#[cfg(test)]
+mod route_parity_tests {
+    use super::*;
+
+    /// Both routes of `health` express the same shared settings.
+    #[test]
+    fn typed_and_cli_routes_agree_on_shared_settings() {
+        super::super::route_parity::assert_routes_agree(
+            "check_health",
+            &serde_json::json!({}),
+            |params: HealthParams| build_health_args(&params),
+            |params: HealthParams| {
+                health_options_from_params(&params, None)
+                    .expect("options")
+                    .analysis
+            },
+        );
     }
 }

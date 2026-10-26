@@ -31,6 +31,11 @@ use crate::exit_codes::{
     RESOURCE_UNAVAILABLE_EXIT_CODE, RUNTIME_COVERAGE_INPUT_EXIT_CODE,
     RUNTIME_COVERAGE_INTERNAL_EXIT_CODE, RUNTIME_COVERAGE_SIDECAR_EXIT_CODE,
 };
+use crate::health::optimization_target::{
+    FunctionStart, InnerIterationIndex, InnerIterations, StaticCost, StaticTarget,
+    attach_optimization_targets,
+};
+use crate::health::runtime_static_signals::{StaticSignalIndex, build_static_signal_index};
 use crate::health::scoring::IstanbulCoverage;
 use crate::license::verifying_key;
 use fallow_engine::health::RuntimeCoverageOptions;
@@ -43,20 +48,19 @@ use fallow_output::{
     RuntimeCoverageVerdict, RuntimeCoverageWatermark,
 };
 
-/// Ed25519 public key used to verify the fallow-cov sidecar binary at every
-/// spawn. Intentionally SEPARATE from the license-signing pubkey at
-/// `crate::license::PUBLIC_KEY_BYTES` so binary and license keys can rotate
-/// independently; see `fallow-cloud/decisions/008-sidecar-key-rotation.md`.
+/// Ed25519 public key that verifies the `fallow-cov` sidecar binary at every
+/// spawn.
 ///
-/// The constant name deliberately avoids the substring `PUBLIC_KEY_BYTES` so
-/// the `fallow-cloud/.github/workflows/public-key-parity.yml` Python regex
-/// (which matches the first `PUBLIC_KEY_BYTES: [u8; 32]` in the file) never
-/// misidentifies it as the license pubkey.
+/// This key is separate from the license key at `crate::license::PUBLIC_KEY_BYTES`,
+/// so each key can rotate on its own schedule. It is also separate from the
+/// release binary key in `editors/vscode/src/download.ts`.
 ///
-/// Must match the `ED25519_BINARY_SIGNING_PUBLIC_KEY` repository variable on
-/// `fallow-rs/fallow-cloud` byte-for-byte; the `binary-signing-parity.yml`
-/// workflow on fallow-cloud asserts this daily. If you rotate the key, update
-/// both sides in the same release cycle per the procedure in ADR 008.
+/// The constant name must not contain `PUBLIC_KEY_BYTES`. A key-parity check
+/// matches the first `PUBLIC_KEY_BYTES: [u8; 32]` in a file, and this key must
+/// not match as the license key.
+///
+/// The bytes must match the sidecar signing key byte for byte. When you rotate
+/// the key, change both sides in the same release.
 #[cfg(not(feature = "test-sidecar-key"))]
 const BINARY_SIGNING_VERIFY_KEY: [u8; 32] = [
     19, 101, 100, 202, 175, 194, 21, 42, 215, 158, 125, 99, 218, 176, 85, 44, 62, 175, 122, 137,
@@ -64,7 +68,7 @@ const BINARY_SIGNING_VERIFY_KEY: [u8; 32] = [
 ];
 
 /// Test-only sidecar binary-signing pubkey, derived from the deterministic
-/// seed `[0xAA; 32]` at `crates/cli/tests/common/test_signing_keys.rs`. Enabled
+/// seed `TEST_SIDECAR_SEED` in `crates/cli/tests/common/sign.rs`. Enabled
 /// only by the `test-sidecar-key` cargo feature. A `compile_error!` below
 /// refuses to let this feature coexist with a release build so it cannot ship
 /// to users by accident.
@@ -83,18 +87,8 @@ type FunctionLocations = FxHashMap<(String, String), Option<u32>>;
 
 struct PreparedCoverageSources {
     sources: Vec<CoverageSource>,
+    inner_iterations: InnerIterationIndex,
     _temp_dir: Option<TempDir>,
-}
-
-#[derive(Default)]
-struct StaticSignalIndex {
-    unused_files: FxHashSet<PathBuf>,
-    exported_names: FxHashMap<PathBuf, FxHashSet<String>>,
-    exported_lines: FxHashMap<PathBuf, FxHashSet<u32>>,
-    unused_export_names: FxHashMap<PathBuf, FxHashSet<String>>,
-    unused_export_lines: FxHashMap<PathBuf, FxHashSet<u32>>,
-    test_referenced_export_names: FxHashMap<PathBuf, FxHashSet<String>>,
-    test_referenced_export_lines: FxHashMap<PathBuf, FxHashSet<u32>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,7 +102,7 @@ struct SourceMapCacheEntry {
 
 enum GeneratedPositionLookup<'a> {
     SourceText {
-        source: &'a str,
+        offsets: Utf16OffsetIndex,
         lookup: GeneratedOffsetLookup<'a>,
     },
     V8LineOffsets(fallow_v8_coverage::LineOffsetTable),
@@ -117,8 +111,8 @@ enum GeneratedPositionLookup<'a> {
 impl GeneratedPositionLookup<'_> {
     fn generated_position_for_offset(&self, v8_source_offset: u32) -> Option<GeneratedLocation> {
         match self {
-            Self::SourceText { source, lookup } => {
-                let byte_offset = utf16_source_offset_to_byte_offset(source, v8_source_offset)?;
+            Self::SourceText { offsets, lookup } => {
+                let byte_offset = offsets.byte_offset(v8_source_offset)?;
                 lookup.byte_offset_to_position(byte_offset)
             }
             Self::V8LineOffsets(line_offsets) => {
@@ -147,7 +141,16 @@ struct RemappedFunction {
     name: String,
     decl: Location,
     loc: Location,
+    /// Invocation count, saturated at `u32::MAX` (4,294,967,295).
+    ///
+    /// V8 reports a `u64` count, and the runtime report carries `u64`
+    /// invocations. The remap writes an Istanbul file through
+    /// `oxc_coverage_instrument::FileCoverage`, whose per-function `f` counts
+    /// are `u32`, so a function called more often than the ceiling reports the
+    /// ceiling. Only very hot helpers in long runs reach it. A wider count needs
+    /// a coordinated release of the Istanbul type and `fallow-cov-protocol`.
     hits: u32,
+    inner: Option<InnerIterations>,
 }
 
 struct RemappedScript {
@@ -158,6 +161,8 @@ struct RemappedScript {
 #[derive(Debug, Clone)]
 struct AccumulatedFunction {
     entry: FnEntry,
+    /// Sum of the remapped hits across scripts. It saturates at the same
+    /// `u32::MAX` ceiling as [`RemappedFunction::hits`].
     hits: u32,
 }
 
@@ -273,6 +278,8 @@ pub(super) struct RuntimeCoverageAnalysisInput<'a> {
     pub codeowners_path: Option<&'a str>,
     pub quiet: bool,
     pub output: OutputFormat,
+    /// Full-project graph for test reachability in production mode.
+    pub test_reach: Option<&'a fallow_engine::health::TestReachGraph>,
 }
 
 /// Emit the CLI error document (byte-identical to [`emit_error`]) and return the
@@ -303,9 +310,13 @@ pub(super) fn analyze_with_transport(
     let prepared_sources = prepare_coverage_sources(&options.path).map_err(|message| {
         emit_printed(&message, RUNTIME_COVERAGE_INPUT_EXIT_CODE, input.output)
     })?;
-    let static_signals =
-        build_static_signal_index(input.modules, input.analysis_output, input.file_paths)
-            .map_err(|message| emit_printed(&message, 2, input.output))?;
+    let static_signals = build_static_signal_index(
+        input.modules,
+        input.analysis_output,
+        input.file_paths,
+        input.test_reach,
+    )
+    .map_err(|message| emit_printed(&message, 2, input.output))?;
     let (request, locations) =
         build_request(options, input, &static_signals, prepared_sources.sources);
     let response = transport(&request, input.quiet, input.output)?;
@@ -326,6 +337,8 @@ pub(super) fn analyze_with_transport(
         low_traffic_threshold,
     );
     apply_top_limit(&mut report, input.top);
+    let mut inner_iterations = prepared_sources.inner_iterations;
+    attach_local_optimization_targets(&mut report, input, &mut inner_iterations);
     Ok(report)
 }
 
@@ -865,8 +878,17 @@ fn build_static_files(
         let functions = module
             .complexity
             .iter()
+            // The synthetic module-scope unit has no runtime identity: it would
+            // be a phantom function per file that never matches a runtime
+            // sample and only depresses the reported match rate.
+            .filter(|function| !fallow_types::extract::is_synthetic_module_unit(&function.name))
             .map(|function| {
-                mark_ambiguous_function_line(&mut locations, path, &function.name, function.line);
+                mark_ambiguous_function_line(
+                    &mut locations,
+                    path,
+                    function.identity_name(),
+                    function.line,
+                );
                 build_static_function(&BuildStaticFunctionInput {
                     function,
                     path,
@@ -934,7 +956,7 @@ fn build_static_function(input: &BuildStaticFunctionInput<'_>) -> StaticFunction
     );
     static_function(StaticFunctionInput {
         relative_posix: input.relative_posix,
-        name: &input.function.name,
+        name: input.function.identity_name(),
         start_line: input.function.line,
         end_line: input
             .function
@@ -978,96 +1000,6 @@ fn assemble_request(
     }
 }
 
-fn build_static_signal_index(
-    modules: &[fallow_types::extract::ModuleInfo],
-    analysis_output: &fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
-    file_paths: &FxHashMap<fallow_types::discover::FileId, &PathBuf>,
-) -> Result<StaticSignalIndex, String> {
-    let graph = analysis_output
-        .graph
-        .as_ref()
-        .ok_or_else(|| "analysis graph not available for runtime coverage".to_owned())?;
-    let mut index = StaticSignalIndex::default();
-    index_dead_code_signals(&mut index, analysis_output);
-
-    let module_by_id: FxHashMap<_, _> = modules
-        .iter()
-        .map(|module| (module.file_id, module))
-        .collect();
-    for export in fallow_engine::module_graph::module_value_exports(graph) {
-        let Some(&path) = file_paths.get(&export.file_id) else {
-            continue;
-        };
-        index_graph_value_export(
-            &mut index,
-            &export,
-            module_by_id.get(&export.file_id).copied(),
-            path,
-        );
-    }
-
-    Ok(index)
-}
-
-/// Seed the signal index with unused-file and unused-export dead-code signals.
-fn index_dead_code_signals(
-    index: &mut StaticSignalIndex,
-    analysis_output: &fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
-) {
-    for file in &analysis_output.results.unused_files {
-        index.unused_files.insert(file.file.path.clone());
-    }
-    for export in &analysis_output.results.unused_exports {
-        index
-            .unused_export_names
-            .entry(export.export.path.clone())
-            .or_default()
-            .insert(export.export.export_name.clone());
-        index
-            .unused_export_lines
-            .entry(export.export.path.clone())
-            .or_default()
-            .insert(export.export.line);
-    }
-}
-
-/// Index one graph value export, including test-referenced state.
-fn index_graph_value_export(
-    index: &mut StaticSignalIndex,
-    export: &fallow_engine::module_graph::ModuleValueExport,
-    module: Option<&fallow_types::extract::ModuleInfo>,
-    path: &Path,
-) {
-    index
-        .exported_names
-        .entry(path.to_path_buf())
-        .or_default()
-        .insert(export.name.clone());
-
-    if let Some(module) = module {
-        let (line, _) =
-            fallow_types::extract::byte_offset_to_line_col(&module.line_offsets, export.span_start);
-        index
-            .exported_lines
-            .entry(path.to_path_buf())
-            .or_default()
-            .insert(line);
-
-        if export.test_referenced {
-            index
-                .test_referenced_export_names
-                .entry(path.to_path_buf())
-                .or_default()
-                .insert(export.name.clone());
-            index
-                .test_referenced_export_lines
-                .entry(path.to_path_buf())
-                .or_default()
-                .insert(line);
-        }
-    }
-}
-
 fn function_static_used(
     path: &Path,
     function: &fallow_types::extract::FunctionComplexity,
@@ -1082,7 +1014,7 @@ fn function_static_used(
     !static_signals
         .unused_export_names
         .get(path)
-        .is_some_and(|names| names.contains(function.name.as_str()))
+        .is_some_and(|names| names.contains(function.identity_name()))
         && !static_signals
             .unused_export_lines
             .get(path)
@@ -1108,7 +1040,7 @@ fn function_test_covered(
     static_signals
         .test_referenced_export_names
         .get(path)
-        .is_some_and(|names| names.contains(function.name.as_str()))
+        .is_some_and(|names| names.contains(function.identity_name()))
         || static_signals
             .test_referenced_export_lines
             .get(path)
@@ -1123,7 +1055,7 @@ fn function_matches_export(
     static_signals
         .exported_names
         .get(path)
-        .is_some_and(|names| names.contains(function.name.as_str()))
+        .is_some_and(|names| names.contains(function.identity_name()))
         || static_signals
             .exported_lines
             .get(path)
@@ -1154,11 +1086,19 @@ fn mark_ambiguous_function_line(
 
 fn prepare_coverage_sources(path: &Path) -> Result<PreparedCoverageSources, String> {
     let mut temp_dir = None;
+    let mut inner_iterations = InnerIterationIndex::default();
     if !path.is_dir() {
         let mut sources = Vec::new();
-        prepare_single_coverage_source(path, &mut sources, &mut temp_dir, 0)?;
+        prepare_single_coverage_source(
+            path,
+            &mut sources,
+            &mut temp_dir,
+            &mut inner_iterations,
+            0,
+        )?;
         return Ok(PreparedCoverageSources {
             sources,
+            inner_iterations,
             _temp_dir: temp_dir,
         });
     }
@@ -1181,17 +1121,25 @@ fn prepare_coverage_sources(path: &Path) -> Result<PreparedCoverageSources, Stri
             sources: vec![CoverageSource::V8Dir {
                 path: path.to_string_lossy().into_owned(),
             }],
+            inner_iterations,
             _temp_dir: None,
         });
     }
 
     let mut sources = Vec::with_capacity(json_files.len());
     for (index, file) in json_files.iter().enumerate() {
-        prepare_single_coverage_source(file, &mut sources, &mut temp_dir, index)?;
+        prepare_single_coverage_source(
+            file,
+            &mut sources,
+            &mut temp_dir,
+            &mut inner_iterations,
+            index,
+        )?;
     }
 
     Ok(PreparedCoverageSources {
         sources,
+        inner_iterations,
         _temp_dir: temp_dir,
     })
 }
@@ -1200,6 +1148,7 @@ fn prepare_single_coverage_source(
     path: &Path,
     sources: &mut Vec<CoverageSource>,
     temp_dir: &mut Option<TempDir>,
+    inner_iterations: &mut InnerIterationIndex,
     index: usize,
 ) -> Result<(), String> {
     if looks_like_istanbul(path) {
@@ -1209,7 +1158,8 @@ fn prepare_single_coverage_source(
         return Ok(());
     }
 
-    let Some((remapped_path, residual_path)) = preprocess_v8_coverage_file(path, temp_dir, index)?
+    let Some((remapped_path, residual_path)) =
+        preprocess_v8_coverage_file(path, temp_dir, inner_iterations, index)?
     else {
         sources.push(CoverageSource::V8 {
             path: path.to_string_lossy().into_owned(),
@@ -1232,6 +1182,7 @@ fn prepare_single_coverage_source(
 fn preprocess_v8_coverage_file(
     path: &Path,
     temp_dir: &mut Option<TempDir>,
+    inner_iterations: &mut InnerIterationIndex,
     index: usize,
 ) -> Result<Option<(PathBuf, Option<PathBuf>)>, String> {
     let json = fs::read_to_string(path)
@@ -1239,10 +1190,13 @@ fn preprocess_v8_coverage_file(
     let dump: V8CoverageDump = serde_json::from_str(&json)
         .map_err(|err| format!("failed to parse v8 coverage file {}: {err}", path.display()))?;
     let Some(cache) = parse_source_map_cache(&dump) else {
+        record_raw_scripts(inner_iterations, &dump.result);
         return Ok(None);
     };
 
-    let (remapped_files, residual_scripts) = remap_dump_scripts(dump.result, &cache);
+    let (remapped_files, residual_scripts) =
+        remap_dump_scripts(dump.result, &cache, inner_iterations);
+    record_raw_scripts(inner_iterations, &residual_scripts);
 
     if remapped_files.is_empty() {
         return Ok(None);
@@ -1262,6 +1216,7 @@ fn preprocess_v8_coverage_file(
 fn remap_dump_scripts(
     scripts: Vec<fallow_v8_coverage::ScriptCoverage>,
     cache: &BTreeMap<String, SourceMapCacheEntry>,
+    inner_iterations: &mut InnerIterationIndex,
 ) -> (
     BTreeMap<PathBuf, BTreeMap<RemappedFnKey, AccumulatedFunction>>,
     Vec<fallow_v8_coverage::ScriptCoverage>,
@@ -1279,6 +1234,20 @@ fn remap_dump_scripts(
             residual_scripts.push(script);
             continue;
         };
+        inner_iterations.record_function_starts(
+            mapped
+                .functions
+                .iter()
+                .filter_map(|function| {
+                    function.inner.map(|inner| FunctionStart {
+                        path: function.path.clone(),
+                        line: function.decl.start.line,
+                        column: function.decl.start.column,
+                        inner,
+                    })
+                })
+                .collect(),
+        );
         merge_remapped_functions(&mut remapped_files, mapped.functions);
         if let Some(residual_script) = mapped.residual_script {
             residual_scripts.push(residual_script);
@@ -1286,6 +1255,18 @@ fn remap_dump_scripts(
     }
 
     (remapped_files, residual_scripts)
+}
+
+/// Keep the block totals of scripts without a usable source map.
+fn record_raw_scripts(
+    inner_iterations: &mut InnerIterationIndex,
+    scripts: &[fallow_v8_coverage::ScriptCoverage],
+) {
+    for script in scripts {
+        if let Some(path) = file_url_to_path(&script.url) {
+            inner_iterations.record_raw_script(&path, &script.functions);
+        }
+    }
 }
 
 /// Write the residual (non-remapped) V8 scripts to a temp file, if any.
@@ -1350,7 +1331,7 @@ fn remap_script_with_source_map(
     let generated_source = generated_source_for_script(script);
     let positions = match generated_source.as_deref() {
         Some(source) => GeneratedPositionLookup::SourceText {
-            source,
+            offsets: Utf16OffsetIndex::new(source),
             lookup: GeneratedOffsetLookup::new(source),
         },
         None => GeneratedPositionLookup::V8LineOffsets(
@@ -1392,9 +1373,103 @@ fn generated_source_for_script(script: &fallow_v8_coverage::ScriptCoverage) -> O
     None
 }
 
+/// Maps V8 UTF-16 source offsets to UTF-8 byte offsets for one script.
+///
+/// The index walks the source once. Each lookup is then a binary search over
+/// the non-ASCII characters, so a remap of many functions costs the source
+/// length plus a logarithm for each function, not the offset for each
+/// function. An ASCII source keeps no table, because each UTF-16 offset is
+/// equal to its byte offset.
+struct Utf16OffsetIndex {
+    /// The non-ASCII characters in source order. Between two entries, and
+    /// before the first and after the last one, the text is ASCII.
+    non_ascii: Vec<NonAsciiChar>,
+    /// UTF-16 length of the whole source.
+    utf16_len: u32,
+}
+
+#[derive(Clone, Copy)]
+struct NonAsciiChar {
+    utf16_start: u32,
+    byte_start: u32,
+    utf16_width: u8,
+    byte_width: u8,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source characters that the UTF-16 offset lookups walked on this thread,
+    /// so a test can pin one walk for each remapped script.
+    static UTF16_CHARS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_utf16_chars_walked(chars: usize) {
+    UTF16_CHARS_WALKED.with(|walked| walked.set(walked.get() + chars));
+}
+
+impl Utf16OffsetIndex {
+    fn new(source: &str) -> Self {
+        #[cfg(test)]
+        note_utf16_chars_walked(source.chars().count());
+        if source.is_ascii() {
+            return Self {
+                non_ascii: Vec::new(),
+                utf16_len: u32::try_from(source.len()).unwrap_or(u32::MAX),
+            };
+        }
+        let mut non_ascii = Vec::new();
+        let mut utf16_offset = 0u32;
+        for (byte_offset, ch) in source.char_indices() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a char is at most 2 UTF-16 units and 4 UTF-8 bytes"
+            )]
+            let (utf16_width, byte_width) = (ch.len_utf16() as u8, ch.len_utf8() as u8);
+            if !ch.is_ascii() {
+                non_ascii.push(NonAsciiChar {
+                    utf16_start: utf16_offset,
+                    byte_start: u32::try_from(byte_offset).unwrap_or(u32::MAX),
+                    utf16_width,
+                    byte_width,
+                });
+            }
+            utf16_offset = utf16_offset.saturating_add(u32::from(utf16_width));
+        }
+        Self {
+            non_ascii,
+            utf16_len: utf16_offset,
+        }
+    }
+
+    /// The byte offset of a UTF-16 offset, or `None` for an offset past the
+    /// end or inside a surrogate pair.
+    fn byte_offset(&self, target: u32) -> Option<u32> {
+        if target > self.utf16_len {
+            return None;
+        }
+        let preceding = self
+            .non_ascii
+            .partition_point(|ch| ch.utf16_start <= target);
+        let Some(ch) = preceding.checked_sub(1).map(|index| self.non_ascii[index]) else {
+            return Some(target);
+        };
+        if target == ch.utf16_start {
+            return Some(ch.byte_start);
+        }
+        let past_char = ch.utf16_start + u32::from(ch.utf16_width);
+        if target < past_char {
+            return None;
+        }
+        Some(ch.byte_start + u32::from(ch.byte_width) + (target - past_char))
+    }
+}
+
+#[cfg(test)]
 fn utf16_source_offset_to_byte_offset(source: &str, target_offset: u32) -> Option<u32> {
     let mut utf16_offset = 0u32;
     for (byte_offset, ch) in source.char_indices() {
+        note_utf16_chars_walked(1);
         if utf16_offset == target_offset {
             return u32::try_from(byte_offset).ok();
         }
@@ -1464,7 +1539,10 @@ fn remap_function(
                 column: end_column,
             },
         },
+        // Saturate at the u32 ceiling of the Istanbul `f` map. See
+        // `RemappedFunction::hits`.
         hits: outer.count.min(u64::from(u32::MAX)) as u32,
+        inner: InnerIterations::from_v8_function(function),
     })
 }
 
@@ -2139,6 +2217,7 @@ fn map_runtime_hot_paths(entries: Vec<ProtocolHotPath>) -> Vec<RuntimeCoverageHo
             invocations: entry.invocations,
             percentile: entry.percentile,
             actions: Vec::new(),
+            optimization_target: None,
         })
         .collect::<Vec<_>>();
     hot_paths.sort_by(|left, right| {
@@ -2212,6 +2291,69 @@ fn map_runtime_importance(
     importance
 }
 
+/// Join each hot path with its static function and the V8 block totals, and
+/// report the hot paths that have no static counterpart. Runs after the
+/// `--top` limit, so only the hot paths in the output read a source file.
+fn attach_local_optimization_targets(
+    report: &mut RuntimeCoverageReport,
+    input: &RuntimeCoverageAnalysisInput<'_>,
+    inner_iterations: &mut InnerIterationIndex,
+) {
+    if report.hot_paths.is_empty() {
+        return;
+    }
+    let statics = build_static_targets(input);
+    attach_optimization_targets(&mut report.hot_paths, &statics, inner_iterations);
+    report.set_optimization_target_warning();
+}
+
+/// Static cost of every eligible function, keyed by `stable_id`.
+fn build_static_targets(
+    input: &RuntimeCoverageAnalysisInput<'_>,
+) -> FxHashMap<String, StaticTarget> {
+    let mut targets = FxHashMap::default();
+    let mut line_counts: FxHashMap<(&Path, u32), u32> = FxHashMap::default();
+    for module in input.modules {
+        let Some(&path) = input.file_paths.get(&module.file_id) else {
+            continue;
+        };
+        let relative = path.strip_prefix(input.root).unwrap_or(path);
+        if !module_is_eligible(input, module, path, relative) {
+            continue;
+        }
+        let relative_posix = relative.to_string_lossy().replace('\\', "/");
+        for function in module
+            .complexity
+            .iter()
+            .filter(|function| !fallow_types::extract::is_synthetic_module_unit(&function.name))
+        {
+            *line_counts
+                .entry((path.as_path(), function.line))
+                .or_default() += 1;
+            targets.insert(
+                function_identity_id(&relative_posix, function.identity_name(), function.line),
+                StaticTarget {
+                    path: path.clone(),
+                    line: function.line,
+                    name: function.identity_name().to_owned(),
+                    cost: StaticCost {
+                        cognitive: function.cognitive,
+                        cyclomatic: function.cyclomatic,
+                        line_count: function.line_count,
+                    },
+                    shares_line: false,
+                },
+            );
+        }
+    }
+    for target in targets.values_mut() {
+        target.shares_line = line_counts
+            .get(&(target.path.as_path(), target.line))
+            .is_some_and(|count| *count > 1);
+    }
+    targets
+}
+
 fn apply_top_limit(report: &mut RuntimeCoverageReport, top: Option<usize>) {
     let Some(top) = top else {
         return;
@@ -2264,6 +2406,7 @@ fn map_evidence(evidence: Evidence) -> RuntimeCoverageEvidence {
     RuntimeCoverageEvidence {
         static_status: evidence.static_status,
         test_coverage: evidence.test_coverage,
+        test_only_reference: None,
         v8_tracking: evidence.v8_tracking,
         untracked_reason: evidence.untracked_reason,
         observation_days: evidence.observation_days,
@@ -2313,10 +2456,10 @@ const fn verdict_rank(verdict: RuntimeCoverageVerdict) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccumulatedFunction, BINARY_SIGNING_VERIFY_KEY, PackageManagerOutput, RemappedFnKey,
-        RemappedFunction, RuntimeCoverageAnalysisInput, StaticFunctionInput, StaticSignalIndex,
-        build_request, build_static_signal_index, convert_response, discover_sidecar,
-        looks_like_istanbul, merge_remapped_functions, path_binary_candidates,
+        AccumulatedFunction, BINARY_SIGNING_VERIFY_KEY, InnerIterations, PackageManagerOutput,
+        RemappedFnKey, RemappedFunction, RuntimeCoverageAnalysisInput, StaticFunctionInput,
+        StaticSignalIndex, build_request, build_static_signal_index, convert_response,
+        discover_sidecar, looks_like_istanbul, merge_remapped_functions, path_binary_candidates,
         prepare_coverage_sources, resolve_original_source_path, resolve_sidecar_from_output,
         resolve_sidecar_via_command, sidecar_binary_name, static_function, tracking_state_label,
         verify_sidecar_signature, write_istanbul_coverage_file,
@@ -2345,6 +2488,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: FxHashSet::default(),
+            trace_provenance: fallow_engine::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         }
     }
@@ -2360,15 +2504,10 @@ mod tests {
     }
 
     #[test]
-    fn binary_signing_verify_key_is_32_bytes() {
-        assert_eq!(BINARY_SIGNING_VERIFY_KEY.len(), 32);
-    }
-
-    #[test]
     fn binary_signing_verify_key_must_not_be_placeholder() {
         assert_ne!(
             BINARY_SIGNING_VERIFY_KEY, [0u8; 32],
-            "BINARY_SIGNING_VERIFY_KEY is the all-zeros placeholder. Generate a real keypair per fallow-cloud/decisions/008-sidecar-key-rotation.md and paste the public bytes here before cutting a release."
+            "BINARY_SIGNING_VERIFY_KEY is the all-zeros placeholder. Paste the real sidecar signing public key here before a release."
         );
     }
 
@@ -2490,7 +2629,7 @@ mod tests {
         let prepared = prepare_coverage_sources(&coverage)
             .unwrap_or_else(|err| panic!("failed to collect coverage sources: {err}"));
         assert!(matches!(
-            &prepared.sources[..],
+            &*prepared.sources,
             [CoverageSource::Istanbul { path }] if path.ends_with("prod-coverage.json")
         ));
 
@@ -2512,7 +2651,7 @@ mod tests {
         let prepared = prepare_coverage_sources(&coverage)
             .unwrap_or_else(|err| panic!("failed to collect coverage sources: {err}"));
         assert!(matches!(
-            &prepared.sources[..],
+            &*prepared.sources,
             [CoverageSource::V8 { path }] if path.ends_with("coverage-final.json")
         ));
 
@@ -2588,7 +2727,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("failed to collect coverage sources: {err}"));
 
         assert!(matches!(
-            &prepared.sources[..],
+            &*prepared.sources,
             [CoverageSource::V8Dir { path }] if path == &root.to_string_lossy()
         ));
 
@@ -3352,6 +3491,7 @@ mod tests {
                 codeowners_path: None,
                 quiet: true,
                 output: OutputFormat::Json,
+                test_reach: None,
             },
             &StaticSignalIndex::default(),
             vec![],
@@ -3404,8 +3544,9 @@ mod tests {
         let analysis_output = session
             .analyze_dead_code_with_parsed_modules(&modules)
             .unwrap_or_else(|err| panic!("failed to analyze temp project: {err}"));
-        let static_signals = build_static_signal_index(&modules, &analysis_output, &file_paths)
-            .unwrap_or_else(|err| panic!("failed to build static signal index: {err}"));
+        let static_signals =
+            build_static_signal_index(&modules, &analysis_output, &file_paths, None)
+                .unwrap_or_else(|err| panic!("failed to build static signal index: {err}"));
         let app_path = src_dir.join("app.ts");
         let tested_line = modules
             .iter()
@@ -3462,6 +3603,7 @@ mod tests {
                 codeowners_path: None,
                 quiet: true,
                 output: OutputFormat::Json,
+                test_reach: None,
             },
             &static_signals,
             vec![],
@@ -3573,6 +3715,7 @@ mod tests {
                 codeowners_path: None,
                 quiet: true,
                 output: OutputFormat::Json,
+                test_reach: None,
             },
             &StaticSignalIndex::default(),
             vec![],
@@ -3833,6 +3976,67 @@ mod tests {
     }
 
     #[test]
+    fn source_mapped_block_coverage_records_inner_iterations_at_the_original_line() {
+        let root = make_temp_dir("coverage-remap-inner-iterations");
+        let src_dir = root.join("src");
+        let dist_dir = root.join("dist");
+        std::fs::create_dir_all(&src_dir)
+            .unwrap_or_else(|err| panic!("failed to create {}: {err}", src_dir.display()));
+        std::fs::create_dir_all(&dist_dir)
+            .unwrap_or_else(|err| panic!("failed to create {}: {err}", dist_dir.display()));
+        let original = src_dir.join("app.ts");
+        std::fs::write(&original, "export function alpha() {}\n")
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", original.display()));
+
+        let v8_file = root.join("coverage-v8.json");
+        let v8_json = serde_json::json!({
+            "result": [{
+                "scriptId": "1",
+                "url": file_url(&dist_dir.join("bundle.js")),
+                "functions": [{
+                    "functionName": "alpha",
+                    "ranges": [
+                        {"startOffset": 0, "endOffset": 18, "count": 3},
+                        {"startOffset": 5, "endOffset": 10, "count": 12}
+                    ],
+                    "isBlockCoverage": true
+                }]
+            }],
+            "source-map-cache": {
+                file_url(&dist_dir.join("bundle.js")): {
+                    "url": "bundle.js.map",
+                    "data": {
+                        "version": 3,
+                        "sources": ["../src/app.ts"],
+                        "names": [],
+                        "mappings": "AAAA"
+                    },
+                    "lineLengths": [18]
+                }
+            }
+        });
+        std::fs::write(&v8_file, serde_json::to_vec(&v8_json).unwrap())
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", v8_file.display()));
+
+        let prepared = prepare_coverage_sources(&v8_file)
+            .unwrap_or_else(|err| panic!("failed to preprocess coverage: {err}"));
+        let canonical = dunce::canonicalize(&original)
+            .unwrap_or_else(|err| panic!("failed to canonicalize {}: {err}", original.display()));
+
+        let mut inner_iterations = prepared.inner_iterations;
+        assert_eq!(
+            inner_iterations.lookup(&canonical, 1, "alpha"),
+            Some(InnerIterations {
+                calls: 3,
+                peak_block_executions: 12,
+            })
+        );
+
+        std::fs::remove_dir_all(&root)
+            .unwrap_or_else(|err| panic!("failed to clean temp dir {}: {err}", root.display()));
+    }
+
+    #[test]
     fn remaps_webpack_virtual_source_map_sources() {
         let root = make_temp_dir("coverage-remap-webpack");
         let src_dir = root.join("src");
@@ -4053,6 +4257,7 @@ mod tests {
                     decl: location(1, 0, 1, 0),
                     loc: location(1, 0, 1, 4),
                     hits: 1,
+                    inner: None,
                 },
                 RemappedFunction {
                     path: file.clone(),
@@ -4060,6 +4265,7 @@ mod tests {
                     decl: location(1, 8, 1, 8),
                     loc: location(1, 8, 1, 12),
                     hits: 2,
+                    inner: None,
                 },
             ],
         );
@@ -4372,6 +4578,115 @@ mod tests {
             super::utf16_source_offset_to_byte_offset("a😀b\nc", 6),
             Some(8)
         );
+    }
+
+    /// Every offset of a string maps through the index exactly as through
+    /// the char walk, including offsets inside a surrogate pair and past the
+    /// end.
+    fn assert_index_matches_char_walk(source: &str) {
+        let index = super::Utf16OffsetIndex::new(source);
+        let utf16_len = u32::try_from(source.encode_utf16().count()).unwrap_or(u32::MAX);
+        for offset in 0..=utf16_len.saturating_add(2) {
+            assert_eq!(
+                index.byte_offset(offset),
+                super::utf16_source_offset_to_byte_offset(source, offset),
+                "offset {offset} in {source:?}"
+            );
+        }
+    }
+
+    /// Remaps one generated script with `functions` functions and one
+    /// non-ASCII character, and returns the remapped function count and the
+    /// source characters that the UTF-16 offset lookups walked.
+    fn remap_chars_walked(root: &Path, functions: usize) -> (usize, usize, usize) {
+        let mut generated = String::from("const smile = \"é\";\n");
+        let mut starts = Vec::with_capacity(functions);
+        let mut utf16_len = generated.encode_utf16().count();
+        for i in 0..functions {
+            starts.push(utf16_len);
+            let line = format!("function f{i}() {{}}\n");
+            utf16_len += line.len();
+            generated.push_str(&line);
+        }
+        let generated_path = root.join(format!("bundle-{functions}.js"));
+        std::fs::write(&generated_path, &generated)
+            .unwrap_or_else(|err| panic!("failed to write {}: {err}", generated_path.display()));
+        let ranges: Vec<serde_json::Value> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                serde_json::json!({
+                    "functionName": format!("f{i}"),
+                    "ranges": [{"startOffset": start, "endOffset": start + 10, "count": 1}],
+                    "isBlockCoverage": false
+                })
+            })
+            .collect();
+        let script: fallow_v8_coverage::ScriptCoverage =
+            serde_json::from_value(serde_json::json!({
+                "scriptId": "1",
+                "url": file_url(&generated_path),
+                "functions": ranges,
+            }))
+            .unwrap_or_else(|err| panic!("failed to build script coverage: {err}"));
+        // Each generated function line maps to the next line of the original.
+        let mappings = format!(";AAAA{}", ";AACA".repeat(functions.saturating_sub(1)));
+        let entry: super::SourceMapCacheEntry = serde_json::from_value(serde_json::json!({
+            "url": "bundle.js.map",
+            "data": {
+                "version": 3,
+                "sources": ["../src/app.ts"],
+                "names": [],
+                "mappings": mappings
+            }
+        }))
+        .unwrap_or_else(|err| panic!("failed to build source map entry: {err}"));
+
+        super::UTF16_CHARS_WALKED.with(|walked| walked.set(0));
+        let remapped = super::remap_script_with_source_map(&script, &entry)
+            .map_or(0, |mapped| mapped.functions.len());
+        let walked = super::UTF16_CHARS_WALKED.with(std::cell::Cell::get);
+        (remapped, walked, generated.chars().count())
+    }
+
+    #[test]
+    fn source_map_remap_walks_each_script_once() {
+        let root = make_temp_dir("coverage-remap-walk");
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|err| panic!("failed to create {}: {err}", root.display()));
+        for functions in [1000, 2000] {
+            let (remapped, walked, chars) = remap_chars_walked(&root, functions);
+            assert_eq!(remapped, functions);
+            // A char walk for each lookup reads about functions * chars / 2
+            // characters.
+            assert_eq!(walked, chars, "{functions} functions");
+        }
+        std::fs::remove_dir_all(&root)
+            .unwrap_or_else(|err| panic!("failed to remove {}: {err}", root.display()));
+    }
+
+    #[test]
+    fn utf16_offset_index_matches_the_char_walk() {
+        for source in [
+            "",
+            "alpha\nbeta",
+            "å",
+            "a😀b",
+            "😀",
+            "😀😀",
+            "a😀b\nc",
+            "é😀ü\n// 日本語 😀\nconst x = 'ß';",
+            "function f() {}\n/* ñ */ function g() { return '😀'; }\n",
+        ] {
+            assert_index_matches_char_walk(source);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn utf16_offset_index_matches_the_char_walk_on_any_text(source in "\\PC{0,40}") {
+            assert_index_matches_char_walk(&source);
+        }
     }
 
     #[test]

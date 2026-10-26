@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { validateKnowledgeArchitecture } from "./check-knowledge-architecture.mjs";
@@ -266,17 +266,37 @@ test("checks canonical skills and generated adapters for private references", ()
   );
 });
 
-test("checks classified host rules for stale source paths", () => {
+test("rejects unclassified shared review rules", () => {
   const fixture = setup();
-  const changed = structuredClone(manifest);
-  changed.hostRules = [{ client: "claude", root: ".claude/rules", mode: "scoped-router" }];
-  write(fixture.root, "scripts/knowledge-surfaces.json", `${JSON.stringify(changed, null, 2)}\n`);
-  write(fixture.root, ".claude/rules/rust.md", "# Rust\n\nRead `crates/missing/src/lib.rs`.\n");
-  fixture.visibleFiles.push(".claude/rules/rust.md");
+  write(fixture.root, ".agents/rules/rust.md", "# Rust\n\nRead `crates/missing/src/lib.rs`.\n");
+  fixture.visibleFiles.push(".agents/rules/rust.md");
 
   const errors = validateKnowledgeArchitecture(fixture);
-  assert.ok(errors.some((error) => error.includes("missing repository path")));
+  assert.ok(
+    errors.some((error) => error.includes("host rule is not classified: .agents/rules/rust.md")),
+  );
 });
+
+for (const [client, root] of [
+  ["claude", ".claude/rules"],
+  ["shared", ".agents/rules"],
+]) {
+  test(`checks ${client} rules for stale source paths`, () => {
+    const fixture = setup();
+    const changed = structuredClone(manifest);
+    changed.hostRules.push({ client, root, mode: "scoped-router" });
+    write(fixture.root, "scripts/knowledge-surfaces.json", `${JSON.stringify(changed, null, 2)}\n`);
+    write(fixture.root, `${root}/rust.md`, "# Rust\n\nRead `crates/missing/src/lib.rs`.\n");
+    fixture.visibleFiles.push(`${root}/rust.md`);
+
+    const errors = validateKnowledgeArchitecture(fixture);
+    assert.ok(
+      errors.some(
+        (error) => error.includes(`${root}/rust.md`) && error.includes("missing repository path"),
+      ),
+    );
+  });
+}
 
 test("requires executable external source contracts", () => {
   const fixture = setup();
@@ -345,4 +365,133 @@ test("requires generated path setup docs to contain the path and command", () =>
   const errors = validateKnowledgeArchitecture(fixture);
   assert.ok(errors.some((error) => error.includes("does not document generated path command")));
   assert.ok(errors.some((error) => error.includes("does not document generated path: benchmarks")));
+});
+
+test("the script starts as CI runs it and checks the repository", () => {
+  const repoRoot = resolve(import.meta.dirname, "..");
+  const result = spawnSync(process.execPath, ["scripts/check-knowledge-architecture.mjs"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Knowledge architecture is consistent.\n");
+});
+
+test("reports every manifest contract error in a stable order", () => {
+  const fixture = setup();
+  const changed = structuredClone(manifest);
+  changed.schemaVersion = 1;
+  changed.trustBoundary.automatedPrivateToPublic = true;
+  changed.entryPoints[0].routes.push("/absolute/route", "../outside");
+  changed.maintainerDocs.documents.push(
+    { path: "docs/README.md", section: "entry-point" },
+    { path: "docs/phantom.md", section: "development" },
+    { path: "docs/development/unindexed.md", section: "development" },
+  );
+  changed.maintainerDocs.rootDocuments = [
+    { path: "CHANGELOG.md", section: "release-history" },
+    { path: "CHANGELOG.md", section: "release-history" },
+    { path: "MISSING.md", section: "project" },
+  ];
+  changed.hostRules.push(
+    { client: "broken", root: "", mode: "scoped-router" },
+    { root: ".agents/rules", mode: "flat" },
+    { client: "empty", root: ".empty/rules", mode: "scoped-router" },
+  );
+  changed.generatedPathContracts = [
+    { path: "../generated", setupDocument: "/absolute/setup.md" },
+    { path: "generated", setupDocument: "docs/development/guide.md", setupCommand: [] },
+  ];
+  changed.externalSources = [
+    {
+      repository: "example/broken",
+      role: "public-contract",
+      direction: "private-to-public",
+      revisionSource: "lock.json#commit",
+      allowedRoot: "public",
+      processor: { kind: "generator" },
+      checkCommand: ["node", "scripts/check.mjs"],
+    },
+    {
+      role: "",
+      direction: "public-to-consumer",
+      revisionSource: "lock.json#commit",
+      allowedRoot: "public",
+      processor: { kind: "none" },
+      checkCommand: [""],
+    },
+  ];
+  write(fixture.root, "scripts/knowledge-surfaces.json", `${JSON.stringify(changed, null, 2)}\n`);
+  write(fixture.root, "CHANGELOG.md", "# Changelog\n\nSee `/Users/example/history`.\n");
+  write(fixture.root, "docs/development/unindexed.md", "# Unindexed\n");
+  write(fixture.root, "docs/superpowers/plan.md", "# Plan\n");
+  write(fixture.root, "editors/AGENTS.md", "# Editors\n\nSee `/Users/example/editor`.\n");
+  write(fixture.root, ".agents/skills/extra/SKILL.md", "---\nname: extra\n---\n# Extra\n");
+  write(fixture.root, ".claude/skills/review/SKILL.md", "---\nname: review\n---\n# Review\n");
+  fixture.visibleFiles.push(
+    "CHANGELOG.md",
+    "docs/development/unindexed.md",
+    "docs/superpowers/plan.md",
+    "editors/AGENTS.md",
+    ".agents/skills/extra/SKILL.md",
+  );
+
+  assert.deepEqual(validateKnowledgeArchitecture(fixture), [
+    "unsupported knowledge manifest schema: 1",
+    "trust boundary must forbid automated private-to-public publication",
+    "AGENTS.md has a non-repository route: /absolute/route",
+    "AGENTS.md has a non-repository route: ../outside",
+    "knowledge manifest contains duplicate maintainer document paths",
+    "classified maintainer document is not tracked: docs/phantom.md",
+    "knowledge manifest contains duplicate root document paths",
+    "classified root document is not tracked: MISSING.md",
+    "root document is missing: MISSING.md",
+    "maintainer document is missing: docs/phantom.md",
+    "docs/README.md does not index docs/phantom.md",
+    "docs/README.md does not index docs/development/unindexed.md",
+    "docs/superpowers/ must remain ignored, but Git can see docs/superpowers/plan.md",
+    "editors/AGENTS.md references non-portable knowledge: /Users/",
+    "invalid broken host rule contract",
+    "invalid <unknown> host rule contract",
+    "empty host rule tree is empty: .empty/rules",
+    "claude generated adapters do not match canonical skills: canonical=[extra, review], adapters=[review]",
+    ".claude/skills/review/SKILL.md is missing the generated adapter marker",
+    "generated path contract is unsafe: ../generated",
+    "generated path setup document is unsafe: /absolute/setup.md",
+    "generated path contract has no executable setupCommand: generated",
+    "external source example/broken has invalid direction: private-to-public",
+    "external source example/broken is missing processor entrypoint",
+    "external source <unknown> is missing repository",
+    "external source <unknown> is missing role",
+    "external source <unknown> has no executable checkCommand",
+  ]);
+});
+
+test("reports an unclassified docs index", () => {
+  const fixture = setup();
+  const changed = structuredClone(manifest);
+  changed.maintainerDocs.index = "docs/INDEX.md";
+  write(fixture.root, "scripts/knowledge-surfaces.json", `${JSON.stringify(changed, null, 2)}\n`);
+
+  assert.deepEqual(validateKnowledgeArchitecture(fixture), [
+    "maintainer docs index is not classified: docs/INDEX.md",
+  ]);
+});
+
+test("requires host rules, canonical skills, and external sources", () => {
+  const fixture = setup();
+  const changed = structuredClone(manifest);
+  changed.hostRules = [];
+  changed.externalSources = [];
+  write(fixture.root, "scripts/knowledge-surfaces.json", `${JSON.stringify(changed, null, 2)}\n`);
+  const visibleFiles = fixture.visibleFiles.filter(
+    (path) => !path.endsWith("/SKILL.md") && !path.startsWith(".claude/rules/"),
+  );
+
+  assert.deepEqual(validateKnowledgeArchitecture({ root: fixture.root, visibleFiles }), [
+    "knowledge manifest must classify host rule trees",
+    "canonical skill tree is empty: .agents/skills",
+    "knowledge manifest must declare external source contracts",
+  ]);
 });

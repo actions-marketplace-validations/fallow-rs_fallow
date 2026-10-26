@@ -2,9 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fallow_engine::duplicates::{
-    CloneFingerprintSet, clone_fingerprint, dominant_identifier, fingerprint_for_fragment,
-};
+use fallow_engine::duplicates::{CloneFingerprintSet, dominant_identifier};
 use fallow_output::{
     CloneFamilyAction, CloneGroupAction, CodeClimateIssue, CodeClimateIssueInput,
     CodeClimateSeverity, clone_family_actions, clone_group_actions, codeclimate_fingerprint_hash,
@@ -93,20 +91,6 @@ pub struct AttributedCloneGroupFinding {
 }
 
 impl AttributedCloneGroupFinding {
-    /// Build the wrapper from an [`AttributedCloneGroup`].
-    #[allow(
-        dead_code,
-        reason = "kept for focused wrapper tests and non-report construction paths"
-    )]
-    #[must_use]
-    pub fn with_actions(group: AttributedCloneGroup) -> Self {
-        let fingerprint = group.instances.first().map_or_else(
-            || fingerprint_for_fragment(""),
-            |ai| fingerprint_for_fragment(&ai.instance.fragment),
-        );
-        Self::with_fingerprint(group, fingerprint)
-    }
-
     /// Build the wrapper with a precomputed report-scoped fingerprint.
     #[must_use]
     pub fn with_fingerprint(group: AttributedCloneGroup, fingerprint: String) -> Self {
@@ -146,6 +130,23 @@ pub struct DuplicationGroup {
     /// Clone families overlapping this bucket, each wrapped with the typed
     /// `actions[]` array.
     pub clone_families: Vec<CloneFamilyFinding>,
+}
+
+impl DuplicationGroup {
+    /// Drop the verbatim source text from every clone instance in this bucket,
+    /// including the copies nested in `clone_families[].groups[]`.
+    pub fn strip_fragments(&mut self) {
+        for finding in &mut self.clone_groups {
+            for instance in &mut finding.group.instances {
+                instance.instance.fragment.clear();
+            }
+        }
+        for family in &mut self.clone_families {
+            for finding in &mut family.groups {
+                finding.group.strip_fragments();
+            }
+        }
+    }
 }
 
 /// Wrapper carrying the resolver mode label and grouped buckets.
@@ -228,17 +229,6 @@ pub struct CloneGroupFinding {
 }
 
 impl CloneGroupFinding {
-    /// Build the wrapper from a raw [`CloneGroup`].
-    #[allow(
-        dead_code,
-        reason = "kept for focused wrapper tests and non-report construction paths"
-    )]
-    #[must_use]
-    pub fn with_actions(group: CloneGroup) -> Self {
-        let fingerprint = clone_fingerprint(&group.instances);
-        Self::with_fingerprint(group, fingerprint)
-    }
-
     /// Build the wrapper with a precomputed report-scoped fingerprint.
     #[must_use]
     pub fn with_fingerprint(group: CloneGroup, fingerprint: String) -> Self {
@@ -291,17 +281,6 @@ pub struct CloneFamilyFinding {
 }
 
 impl CloneFamilyFinding {
-    /// Build the wrapper from a raw [`CloneFamily`].
-    #[allow(
-        dead_code,
-        reason = "kept for focused wrapper tests and non-report construction paths"
-    )]
-    #[must_use]
-    pub fn with_actions(family: CloneFamily) -> Self {
-        let fingerprints = CloneFingerprintSet::from_groups(&family.groups);
-        Self::with_fingerprints(family, &fingerprints)
-    }
-
     /// Build the wrapper using the report-scoped fingerprint assignment shared
     /// by all duplication output surfaces.
     #[must_use]
@@ -372,6 +351,25 @@ pub struct DupesReportPayload {
     pub stats: DuplicationStats,
 }
 
+/// Wire shape of the `dupes` section inside the bare combined envelope.
+///
+/// The section is the standalone payload plus the view of the loaded
+/// duplication baseline. The standalone `dupes` envelope carries the same
+/// `baseline_staleness` key at its root.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CombinedDupesSection {
+    /// The duplication payload, flattened into the section.
+    #[serde(flatten)]
+    pub payload: DupesReportPayload,
+    /// This run's view of the loaded duplication baseline, present only when
+    /// `--dupes-baseline` loaded one. Read `change_scoped` before dividing
+    /// `matched_entries` by `baseline_entries`: a narrowed run can report
+    /// `matched_entries: 0` on a healthy baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_staleness: Option<fallow_output::BaselineStaleness>,
+}
+
 impl DupesReportPayload {
     /// Build the payload from a bare [`DuplicationReport`].
     #[must_use]
@@ -397,6 +395,34 @@ impl DupesReportPayload {
             stats: report.stats.clone(),
         }
     }
+
+    /// Build the payload and drop the verbatim source text when the caller
+    /// asked for a location-only body.
+    ///
+    /// Fingerprints, suggested names and actions are computed by
+    /// [`Self::from_report`], so the text is only removed after every consumer
+    /// that reads it has run.
+    #[must_use]
+    pub fn from_report_with_fragments(report: &DuplicationReport, include_fragments: bool) -> Self {
+        let mut payload = Self::from_report(report);
+        if !include_fragments {
+            payload.strip_fragments();
+        }
+        payload
+    }
+
+    /// Drop the verbatim source text from every clone instance, including the
+    /// copies nested in `clone_families[].groups[]`.
+    pub fn strip_fragments(&mut self) {
+        for finding in &mut self.clone_groups {
+            finding.group.strip_fragments();
+        }
+        for family in &mut self.clone_families {
+            for finding in &mut family.groups {
+                finding.group.strip_fragments();
+            }
+        }
+    }
 }
 
 /// Build CodeClimate issues from duplication analysis results.
@@ -414,8 +440,10 @@ pub fn build_duplication_codeclimate(
     root: &Path,
 ) -> Vec<CodeClimateIssue> {
     let mut issues = Vec::new();
+    let fingerprints = CloneFingerprintSet::from_groups(&report.clone_groups);
 
-    for (i, group) in report.clone_groups.iter().enumerate() {
+    for group in &report.clone_groups {
+        let clone_fingerprint = fingerprints.fingerprint_for_group(group);
         let token_str = group.token_count.to_string();
         let line_count_str = group.line_count.to_string();
         let fragment_prefix: String = group
@@ -424,7 +452,7 @@ pub fn build_duplication_codeclimate(
             .map(|inst| inst.fragment.chars().take(64).collect())
             .unwrap_or_default();
 
-        for instance in &group.instances {
+        for (instance_index, instance) in group.instances.iter().enumerate() {
             let path = codeclimate_path(&instance.file, root);
             let start_str = instance.start_line.to_string();
             let fp = codeclimate_fingerprint_hash(&[
@@ -435,22 +463,37 @@ pub fn build_duplication_codeclimate(
                 &line_count_str,
                 &fragment_prefix,
             ]);
-            issues.push(fallow_output::build_codeclimate_issue(
-                CodeClimateIssueInput {
-                    check_name: "fallow/code-duplication",
-                    description: &format!(
-                        "Code clone group {} ({} lines, {} instances)",
-                        i + 1,
-                        group.line_count,
-                        group.instances.len()
-                    ),
-                    severity: CodeClimateSeverity::Minor,
-                    category: "Duplication",
-                    path: &path,
-                    begin_line: Some(instance.start_line as u32),
-                    fingerprint: &fp,
-                },
-            ));
+            let mut issue = fallow_output::build_codeclimate_issue(CodeClimateIssueInput {
+                check_name: "fallow/code-duplication",
+                description: &format!(
+                    "Code clone {clone_fingerprint} ({} lines, {} instances)",
+                    group.line_count,
+                    group.instances.len()
+                ),
+                severity: CodeClimateSeverity::Minor,
+                category: "Duplication",
+                path: &path,
+                begin_line: Some(instance.start_line as u32),
+                fingerprint: &fp,
+            });
+            issue.location.lines.end = Some(instance.end_line as u32);
+            issue.other_locations = group
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(peer_index, _)| *peer_index != instance_index)
+                .map(|(_, peer)| fallow_output::CodeClimateLocation {
+                    path: codeclimate_path(&peer.file, root),
+                    lines: fallow_output::CodeClimateLines {
+                        begin: peer.start_line as u32,
+                        end: Some(peer.end_line as u32),
+                    },
+                })
+                .collect();
+            issue.other_locations.sort_by(|a, b| {
+                (&a.path, a.lines.begin, a.lines.end).cmp(&(&b.path, b.lines.begin, b.lines.end))
+            });
+            issues.push(issue);
         }
     }
 
@@ -478,8 +521,11 @@ mod tests {
 
     use super::*;
 
+    const TEST_FINGERPRINT: &str = "dup:00000000";
+
     fn instance(path: &str) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(path),
             start_line: 1,
             end_line: 10,
@@ -502,7 +548,7 @@ mod tests {
 
     #[test]
     fn clone_group_finding_position_0_is_extract_shared() {
-        let finding = CloneGroupFinding::with_actions(group(2));
+        let finding = CloneGroupFinding::with_fingerprint(group(2), TEST_FINGERPRINT.to_string());
         assert_eq!(finding.actions.len(), 2);
         assert_eq!(finding.actions[0].kind, CloneGroupActionType::ExtractShared);
         assert_eq!(finding.actions[1].kind, CloneGroupActionType::SuppressLine);
@@ -514,10 +560,58 @@ mod tests {
     fn clone_group_finding_omits_audit_only_fields_outside_audit() {
         // `fallow dupes --format json` serializes findings straight from Rust;
         // the audit-only `introduced` / `demotion_reason` keys must not appear.
-        let finding = CloneGroupFinding::with_actions(group(2));
+        let finding = CloneGroupFinding::with_fingerprint(group(2), TEST_FINGERPRINT.to_string());
         let value = serde_json::to_value(&finding).expect("finding serializes");
         assert!(value.get("introduced").is_none());
         assert!(value.get("demotion_reason").is_none());
+    }
+
+    #[test]
+    fn suppressed_fragments_leave_locations_and_fingerprints_intact() {
+        let mut with_text = group(2);
+        for (index, instance) in with_text.instances.iter_mut().enumerate() {
+            instance.fragment = format!("const shared{index} = compute(input);");
+        }
+        let family = CloneFamily {
+            files: vec![PathBuf::from("/root/file_0.ts")],
+            groups: vec![with_text.clone()],
+            total_duplicated_lines: 20,
+            total_duplicated_tokens: 100,
+            suggestions: Vec::new(),
+        };
+        let report = DuplicationReport {
+            clone_groups: vec![with_text],
+            clone_families: vec![family],
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats::default(),
+        };
+
+        let kept = DupesReportPayload::from_report_with_fragments(&report, true);
+        let dropped = DupesReportPayload::from_report_with_fragments(&report, false);
+
+        assert_eq!(
+            kept.clone_groups[0].fingerprint, dropped.clone_groups[0].fingerprint,
+            "fingerprints are computed before the text is dropped"
+        );
+
+        let kept_value = serde_json::to_value(&kept).expect("payload serializes");
+        assert!(kept_value["clone_groups"][0]["instances"][0]["fragment"].is_string());
+
+        let value = serde_json::to_value(&dropped).expect("payload serializes");
+        let instance = &value["clone_groups"][0]["instances"][0];
+        assert!(
+            instance.get("fragment").is_none(),
+            "the verbatim source text must be absent, not empty"
+        );
+        assert!(instance.get("file").is_some());
+        assert!(instance.get("start_line").is_some());
+        assert!(instance.get("end_col").is_some());
+        assert!(
+            value["clone_families"][0]["groups"][0]["instances"][0]
+                .get("fragment")
+                .is_none(),
+            "nested clone-family copies carry the same text and must be dropped too"
+        );
     }
 
     #[test]
@@ -548,7 +642,8 @@ mod tests {
                 },
             ],
         };
-        let finding = AttributedCloneGroupFinding::with_actions(attributed);
+        let finding =
+            AttributedCloneGroupFinding::with_fingerprint(attributed, TEST_FINGERPRINT.to_string());
         assert_eq!(finding.actions.len(), 2);
         assert_eq!(finding.actions[0].kind, CloneGroupActionType::ExtractShared);
         assert_eq!(finding.actions[1].kind, CloneGroupActionType::SuppressLine);
@@ -560,6 +655,7 @@ mod tests {
         let g = CloneGroup {
             instances: vec![
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("/root/a.ts"),
                     start_line: 1,
                     end_line: 3,
@@ -568,6 +664,7 @@ mod tests {
                     fragment: fragment.to_string(),
                 },
                 CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("/root/b.ts"),
                     start_line: 1,
                     end_line: 3,
@@ -580,22 +677,22 @@ mod tests {
             line_count: 3,
             similarity: None,
         };
-        let finding = CloneGroupFinding::with_actions(g);
+        let finding = CloneGroupFinding::with_fingerprint(g, TEST_FINGERPRINT.to_string());
         assert_eq!(finding.suggested_name.as_deref(), Some("parseCsv"));
     }
 
     #[test]
     fn clone_group_finding_suggested_name_none_for_unnamed_fragment() {
-        let finding = CloneGroupFinding::with_actions(group(2));
+        let finding = CloneGroupFinding::with_fingerprint(group(2), TEST_FINGERPRINT.to_string());
         assert!(finding.suggested_name.is_none());
     }
 
     #[test]
     fn clone_group_finding_description_pluralises_instance_count() {
-        let single = CloneGroupFinding::with_actions(group(1));
+        let single = CloneGroupFinding::with_fingerprint(group(1), TEST_FINGERPRINT.to_string());
         assert!(single.actions[0].description.contains("1 instance"));
         assert!(!single.actions[0].description.contains("1 instances"));
-        let multi = CloneGroupFinding::with_actions(group(3));
+        let multi = CloneGroupFinding::with_fingerprint(group(3), TEST_FINGERPRINT.to_string());
         assert!(multi.actions[0].description.contains("3 instances"));
     }
 
@@ -619,7 +716,8 @@ mod tests {
                 },
             ],
         };
-        let finding = CloneFamilyFinding::with_actions(family);
+        let fingerprints = CloneFingerprintSet::from_groups(&family.groups);
+        let finding = CloneFamilyFinding::with_fingerprints(family, &fingerprints);
         assert_eq!(finding.actions.len(), 4);
         assert_eq!(
             finding.actions[0].kind,
@@ -653,7 +751,8 @@ mod tests {
             total_duplicated_tokens: 100,
             suggestions: Vec::new(),
         };
-        let finding = CloneFamilyFinding::with_actions(family);
+        let fingerprints = CloneFingerprintSet::from_groups(&family.groups);
+        let finding = CloneFamilyFinding::with_fingerprints(family, &fingerprints);
         assert_eq!(finding.actions.len(), 2);
         assert_eq!(
             finding.actions[0].kind,
@@ -690,6 +789,7 @@ mod tests {
         let report = DuplicationReport {
             clone_groups: vec![CloneGroup {
                 instances: vec![CloneInstance {
+                    is_symlink: false,
                     file: PathBuf::from("/root/app/[id]/page.tsx"),
                     start_line: 4,
                     end_line: 8,
@@ -714,6 +814,7 @@ mod tests {
         assert_eq!(issue.location.path, "app/%5Bid%5D/page.tsx");
         assert_eq!(issue.location.lines.begin, 4);
         assert_eq!(issue.categories, vec!["Duplication"]);
-        assert!(issue.description.contains("Code clone group 1"));
+        assert!(issue.description.starts_with("Code clone dup:"));
+        assert_eq!(issue.location.lines.end, Some(8));
     }
 }

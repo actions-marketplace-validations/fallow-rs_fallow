@@ -16,12 +16,14 @@ import {
   getAutoDownload,
   getIssueTypes,
   getChangedSince,
+  getPackageBaselines,
   getResolvedConfigPath,
   getAllowRemoteExtends,
   getProductionOverride,
   getTypeAwareSettings,
   getDuplicationCrossLanguageOverride,
   getDuplicationIgnoreImportsOverride,
+  getDuplicationIgnoreSymlinksOverride,
   getDuplicationMinLinesOverride,
   getDuplicationMinOccurrencesOverride,
   getDuplicationMinTokensOverride,
@@ -40,7 +42,6 @@ import {
 } from "./binary-utils.js";
 import { compareVersions } from "./cli-args-utils.js";
 import type { DiagnosticFilter } from "./diagnosticFilter.js";
-// fallow-ignore-next-line unresolved-import
 import type { LspInitializationOptions } from "./generated/lsp-initialization-options.js";
 import type { AnalysisCompleteParams } from "./statusBar-utils.js";
 import {
@@ -70,6 +71,7 @@ export const createInitializationOptions = (
   return {
     issueTypes: getIssueTypes(),
     changedSince: getChangedSince(),
+    packageBaselines: getPackageBaselines(),
     configPath: getResolvedConfigPath(),
     allowRemoteExtends: getAllowRemoteExtends(),
     production: getProductionOverride(),
@@ -91,6 +93,7 @@ export const createInitializationOptions = (
       skipLocal: getDuplicationSkipLocalOverride(),
       crossLanguage: getDuplicationCrossLanguageOverride(),
       ignoreImports: getDuplicationIgnoreImportsOverride(),
+      ignoreSymlinks: getDuplicationIgnoreSymlinksOverride(),
     },
   };
 };
@@ -167,7 +170,7 @@ const resolveBinaryPath = async (
   }
 
   if (getAutoDownload()) {
-    const downloaded = await downloadBinary(context);
+    const downloaded = await downloadBinary(context, outputChannel);
     return downloaded ? bareLsp(downloaded) : null;
   }
 
@@ -179,7 +182,7 @@ const resolveBinaryPath = async (
   );
 
   if (choice === "Download") {
-    const downloaded = await downloadBinary(context);
+    const downloaded = await downloadBinary(context, outputChannel);
     return downloaded ? bareLsp(downloaded) : null;
   }
 

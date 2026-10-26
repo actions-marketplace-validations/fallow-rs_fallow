@@ -31,6 +31,12 @@ pub struct RegressionBaseline {
     /// Duplication counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dupes: Option<DupesCounts>,
+    /// Startup import weight per runtime entry, from `list --entry-weight`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_weight: Option<super::entry_weight::EntryWeightCounts>,
+    /// Feature flag counts, from `fallow flags --retirement`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<FlagsCounts>,
 }
 
 pub const REGRESSION_SCHEMA_VERSION: u32 = 2;
@@ -69,6 +75,8 @@ pub struct CheckCounts {
     #[serde(default)]
     pub unused_component_props: usize,
     #[serde(default)]
+    pub absent_component_props: usize,
+    #[serde(default)]
     pub unused_component_emits: usize,
     #[serde(default)]
     pub unused_component_inputs: usize,
@@ -76,6 +84,12 @@ pub struct CheckCounts {
     pub unused_component_outputs: usize,
     #[serde(default)]
     pub unused_svelte_events: usize,
+    #[serde(default)]
+    pub unused_effect_layers: usize,
+    #[serde(default)]
+    pub unused_tagged_errors: usize,
+    #[serde(default)]
+    pub unproduced_catch_tags: usize,
     #[serde(default)]
     pub unused_server_actions: usize,
     #[serde(default)]
@@ -90,6 +104,8 @@ pub struct CheckCounts {
     pub circular_dependencies: usize,
     #[serde(default)]
     pub re_export_cycles: usize,
+    #[serde(default)]
+    pub package_cycles: usize,
     #[serde(default)]
     pub type_only_dependencies: usize,
     #[serde(default)]
@@ -123,10 +139,14 @@ impl CheckCounts {
             unprovided_injects: results.unprovided_injects.len(),
             unrendered_components: results.unrendered_components.len(),
             unused_component_props: results.unused_component_props.len(),
+            absent_component_props: results.absent_component_props.len(),
             unused_component_emits: results.unused_component_emits.len(),
             unused_component_inputs: results.unused_component_inputs.len(),
             unused_component_outputs: results.unused_component_outputs.len(),
             unused_svelte_events: results.unused_svelte_events.len(),
+            unused_effect_layers: results.unused_effect_layers.len(),
+            unused_tagged_errors: results.unused_tagged_errors.len(),
+            unproduced_catch_tags: results.unproduced_catch_tags.len(),
             unused_server_actions: results.unused_server_actions.len(),
             unused_load_data_keys: results.unused_load_data_keys.len(),
             unresolved_imports: results.unresolved_imports.len(),
@@ -134,6 +154,7 @@ impl CheckCounts {
             duplicate_exports: results.duplicate_exports.len(),
             circular_dependencies: results.circular_dependencies.len(),
             re_export_cycles: results.re_export_cycles.len(),
+            package_cycles: results.package_cycles.len(),
             type_only_dependencies: results.type_only_dependencies.len(),
             test_only_dependencies: results.test_only_dependencies.len(),
             dev_dependencies_in_production: results.dev_dependencies_in_production.len(),
@@ -169,6 +190,7 @@ impl CheckCounts {
             // `fallow_config::RegressionBaseline` has no `unused_component_props`
             // field; default to 0 until the config baseline schema gains one.
             unused_component_props: 0,
+            absent_component_props: b.absent_component_props,
             // `fallow_config::RegressionBaseline` has no `unused_component_emits`
             // field; default to 0 until the config baseline schema gains one.
             unused_component_emits: 0,
@@ -181,6 +203,15 @@ impl CheckCounts {
             // `fallow_config::RegressionBaseline` has no `unused_svelte_events`
             // field; default to 0 until the config baseline schema gains one.
             unused_svelte_events: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_effect_layers`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_effect_layers: 0,
+            // `fallow_config::RegressionBaseline` has no `unused_tagged_errors`
+            // field; default to 0 until the config baseline schema gains one.
+            unused_tagged_errors: 0,
+            // `fallow_config::RegressionBaseline` has no `unproduced_catch_tags`
+            // field; default to 0 until the config baseline schema gains one.
+            unproduced_catch_tags: 0,
             // `fallow_config::RegressionBaseline` has no `unused_server_actions`
             // field; default to 0 until the config baseline schema gains one.
             unused_server_actions: 0,
@@ -192,6 +223,7 @@ impl CheckCounts {
             duplicate_exports: b.duplicate_exports,
             circular_dependencies: b.circular_dependencies,
             re_export_cycles: b.re_export_cycles,
+            package_cycles: b.package_cycles,
             type_only_dependencies: b.type_only_dependencies,
             test_only_dependencies: b.test_only_dependencies,
             dev_dependencies_in_production: b.dev_dependencies_in_production,
@@ -208,6 +240,7 @@ impl CheckCounts {
         fallow_config::RegressionBaseline {
             analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
             total_issues: self.total_issues,
+            absent_component_props: self.absent_component_props,
             unused_files: self.unused_files,
             unused_exports: self.unused_exports,
             unused_types: self.unused_types,
@@ -221,6 +254,7 @@ impl CheckCounts {
             duplicate_exports: self.duplicate_exports,
             circular_dependencies: self.circular_dependencies,
             re_export_cycles: self.re_export_cycles,
+            package_cycles: self.package_cycles,
             type_only_dependencies: self.type_only_dependencies,
             test_only_dependencies: self.test_only_dependencies,
             dev_dependencies_in_production: self.dev_dependencies_in_production,
@@ -232,7 +266,7 @@ impl CheckCounts {
     }
 
     /// Per-type deltas (current - baseline) for display. Only includes types with changes.
-    pub fn deltas(&self, current: &Self) -> Vec<(&'static str, isize)> {
+    pub fn deltas(&self, current: &Self) -> Vec<(&'static str, i64)> {
         let mut deltas = Vec::new();
         macro_rules! push_delta {
             ($field:ident) => {
@@ -252,10 +286,14 @@ impl CheckCounts {
         push_delta!(unprovided_injects);
         push_delta!(unrendered_components);
         push_delta!(unused_component_props);
+        push_delta!(absent_component_props);
         push_delta!(unused_component_emits);
         push_delta!(unused_component_inputs);
         push_delta!(unused_component_outputs);
         push_delta!(unused_svelte_events);
+        push_delta!(unused_effect_layers);
+        push_delta!(unused_tagged_errors);
+        push_delta!(unproduced_catch_tags);
         push_delta!(unused_server_actions);
         push_delta!(unused_load_data_keys);
         push_delta!(unresolved_imports);
@@ -263,6 +301,7 @@ impl CheckCounts {
         push_delta!(duplicate_exports);
         push_delta!(circular_dependencies);
         push_delta!(re_export_cycles);
+        push_delta!(package_cycles);
         push_delta!(type_only_dependencies);
         push_delta!(test_only_dependencies);
         push_delta!(dev_dependencies_in_production);
@@ -275,15 +314,30 @@ impl CheckCounts {
 }
 
 fn push_count_delta(
-    deltas: &mut Vec<(&'static str, isize)>,
+    deltas: &mut Vec<(&'static str, i64)>,
     name: &'static str,
     baseline: usize,
     current: usize,
 ) {
-    let delta = current as isize - baseline as isize;
+    let delta = crate::count_delta::signed_delta(current, baseline);
     if delta != 0 {
         deltas.push((name, delta));
     }
+}
+
+/// Feature flag counts for the regression baseline of
+/// `fallow flags --retirement`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FlagsCounts {
+    /// Per-site flag findings in `feature_flags[]`.
+    #[serde(default)]
+    pub total_flags: usize,
+    /// Distinct flags in the retirement report.
+    #[serde(default)]
+    pub distinct_flags: usize,
+    /// Number of flags per retirement reason code.
+    #[serde(default)]
+    pub by_reason: std::collections::BTreeMap<String, usize>,
 }
 
 /// Duplication counts for regression baseline.
@@ -320,12 +374,69 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let counts = CheckCounts::from_results(&results);
         assert_eq!(counts.total_issues, 2);
         assert_eq!(counts.unused_files, 1);
         assert_eq!(counts.unused_exports, 1);
         assert_eq!(counts.unused_types, 0);
+    }
+
+    #[test]
+    fn absent_prop_counts_survive_saved_config_baselines_and_report_delta() {
+        let mut results = AnalysisResults::default();
+        let finding = AbsentComponentPropFinding::with_actions(AbsentComponentProp {
+            path: PathBuf::from("src/Card.tsx"),
+            component_name: "Card".into(),
+            framework: "react".into(),
+            prop_name: "flag".into(),
+            line: 3,
+            col: 0,
+            has_default: true,
+            inspected_call_sites: vec![ComponentPropCallSite {
+                path: PathBuf::from("src/main.tsx"),
+                line: 5,
+                col: 0,
+            }],
+            explanation: "Review known callers and API intent.".into(),
+        });
+        results.absent_component_props.push(finding.clone());
+        let counts = CheckCounts::from_results(&results);
+        assert_eq!(counts.absent_component_props, 1);
+        assert_eq!(counts.total_issues, 1);
+        let saved = RegressionBaseline {
+            schema_version: REGRESSION_SCHEMA_VERSION,
+            fallow_version: "3.31.0".into(),
+            timestamp: "2026-10-05T12:00:00Z".into(),
+            git_sha: None,
+            analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
+            check: Some(counts),
+            dupes: None,
+            entry_weight: None,
+            flags: None,
+        };
+        let saved_json = serde_json::to_string(&saved).unwrap();
+        let loaded: RegressionBaseline = serde_json::from_str(&saved_json).unwrap();
+        let loaded_counts = loaded.check.unwrap();
+        assert_eq!(loaded_counts.absent_component_props, 1);
+        let config_json = serde_json::to_string(&loaded_counts.to_config_baseline()).unwrap();
+        let config: fallow_config::RegressionBaseline = serde_json::from_str(&config_json).unwrap();
+        let config_counts = CheckCounts::from_config_baseline(&config);
+        assert_eq!(config_counts.absent_component_props, 1);
+        assert_eq!(config_counts.total_issues, 1);
+        let mut second = finding;
+        second.prop.component_name = "Other".into();
+        results.absent_component_props.push(second);
+        let current = CheckCounts::from_results(&results);
+        assert_eq!(current.total_issues, 2);
+        assert_eq!(
+            config_counts.deltas(&current),
+            vec![("absent_component_props", 1)]
+        );
+        let legacy_counts: CheckCounts = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy_counts.absent_component_props, 0);
     }
 
     #[test]
@@ -344,10 +455,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -355,6 +470,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -397,10 +513,14 @@ mod tests {
                 unprovided_injects: 0,
                 unrendered_components: 0,
                 unused_component_props: 0,
+                absent_component_props: 0,
                 unused_component_emits: 0,
                 unused_component_inputs: 0,
                 unused_component_outputs: 0,
                 unused_svelte_events: 0,
+                unused_effect_layers: 0,
+                unused_tagged_errors: 0,
+                unproduced_catch_tags: 0,
                 unused_server_actions: 0,
                 unused_load_data_keys: 0,
                 unresolved_imports: 0,
@@ -408,6 +528,7 @@ mod tests {
                 duplicate_exports: 0,
                 circular_dependencies: 1,
                 re_export_cycles: 0,
+                package_cycles: 0,
                 type_only_dependencies: 0,
                 test_only_dependencies: 0,
                 dev_dependencies_in_production: 0,
@@ -420,6 +541,8 @@ mod tests {
                 clone_groups: 12,
                 duplication_percentage: 4.2,
             }),
+            entry_weight: None,
+            flags: None,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         let loaded: RegressionBaseline = serde_json::from_str(&json).unwrap();
@@ -444,10 +567,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -455,6 +582,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -498,10 +626,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -509,6 +641,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -539,10 +672,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -550,6 +687,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -578,10 +716,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -589,6 +731,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -611,10 +754,14 @@ mod tests {
             unprovided_injects: 1,
             unrendered_components: 1,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 1,
@@ -622,6 +769,7 @@ mod tests {
             duplicate_exports: 1,
             circular_dependencies: 1,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 1,
             test_only_dependencies: 1,
             dev_dependencies_in_production: 0,
@@ -653,10 +801,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 0,
@@ -664,6 +816,7 @@ mod tests {
             duplicate_exports: 0,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -720,6 +873,8 @@ mod tests {
                 clone_groups: 3,
                 duplication_percentage: 1.0,
             }),
+            entry_weight: None,
+            flags: None,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         let loaded: RegressionBaseline = serde_json::from_str(&json).unwrap();
@@ -741,6 +896,8 @@ mod tests {
                 ..CheckCounts::from_config_baseline(&fallow_config::RegressionBaseline::default())
             }),
             dupes: None,
+            entry_weight: None,
+            flags: None,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         let loaded: RegressionBaseline = serde_json::from_str(&json).unwrap();
@@ -759,6 +916,8 @@ mod tests {
             git_sha: None,
             check: None,
             dupes: None,
+            entry_weight: None,
+            flags: None,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         assert!(!json.contains("git_sha"));

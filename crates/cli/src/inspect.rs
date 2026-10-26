@@ -696,7 +696,6 @@ fn emit_inspect_bundle(bundle: InspectOutput, opts: &InspectOptions<'_>) -> Exit
         OutputFormat::Json => {
             let value = match fallow_output::serialize_inspect_json_output(
                 bundle,
-                crate::output_runtime::current_root_envelope_mode(),
                 crate::output_runtime::telemetry_analysis_run_id().as_deref(),
             ) {
                 Ok(value) => value,
@@ -1363,7 +1362,6 @@ pub fn benchmark_inspect_file_evidence_bundle_json(
     validate_inspect_benchmark_bundle(&bundle)?;
     let value = fallow_output::serialize_inspect_json_output(
         bundle,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .map_err(|error| format!("failed to serialize inspect benchmark output: {error}"))?;
@@ -1393,6 +1391,10 @@ mod tests {
     }
 
     impl ChildJsonTransport for StubTransport {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "test helper: a panic fails the test"
+        )]
         fn run(&self, args: &[String]) -> Result<ChildProcessOutput, String> {
             self.calls.lock().unwrap().push(args.to_vec());
             let is_required = args.ends_with(&trace_file_args("src/api.ts"));

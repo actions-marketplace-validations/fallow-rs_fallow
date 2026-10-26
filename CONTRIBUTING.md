@@ -1,6 +1,6 @@
 # Contributing to Fallow
 
-Thanks for your interest in contributing to fallow! This guide covers everything you need to get started.
+Thanks for contributing to fallow. This guide covers setup, development, and pull requests.
 
 ## Getting started
 
@@ -10,11 +10,29 @@ require Node.js 22 or later.
 ```bash
 git clone https://github.com/fallow-rs/fallow.git
 cd fallow
-git config core.hooksPath .githooks    # Enable commit-msg/pre-commit/pre-push hooks
+mise install                           # Optional: install pinned tools, including hk
+hk install --mise                      # Enable hooks (without mise: hk install)
 npm install                            # Install repo tooling such as commitlint
+pnpm --dir editors/vscode install      # Tooling that verify:fast needs
 cargo build --workspace
 npm run verify:fast                   # Canonical local feedback loop
 ```
+
+[hk](https://hk.jdx.dev) runs the git hooks. `hk.pkl` defines them. With
+[mise](https://mise.jdx.dev) installed, `mise install` gets the pinned versions
+of hk, pkl, Node.js and the cargo tools that the hooks call (`typos`,
+`cargo-shear` and others). Without mise, install `hk` and `pkl` at the versions
+in `mise.toml`. See
+[quality gates](docs/development/quality-gates.md#pinned-tools-with-mise-optional).
+The hooks skip a check with a hint when its tool is missing.
+
+`hk install --mise` starts the hooks through `mise x`, so they find hk and the
+pinned tools also when your shell does not activate mise. To skip the hooks
+for one command, use `HK=0 git commit` or `HK=0 git push`.
+
+If you set `core.hooksPath` to `.githooks` in an earlier clone, remove it
+before `hk install`: `git config --unset core.hooksPath`. While it is set, git
+runs the old folder and hk does not take over.
 
 On Windows, enable symlink checkout support before cloning. If you already
 cloned the repo, enable it and check out the repo again:
@@ -88,10 +106,34 @@ cargo +nightly fuzz list
 cargo +nightly fuzz run fuzz_sfc -- -max_total_time=30 -timeout=10
 ```
 
-Each target uses seed inputs from `fuzz/corpus/<target-name>/`. Pull requests
-and pushes that affect the parser pipeline run every target for 30 seconds.
-The scheduled workflow runs every target for five minutes each week and can
-also be started manually. Crashing inputs are retained as workflow artifacts.
+Each target uses seed inputs from `fuzz/corpus/<target-name>/`. Pushes to
+`main` that affect the parser pipeline run every target for 30 seconds. The
+scheduled workflow runs every target for five minutes each week and can also
+be started manually. Crashing inputs are retained as workflow artifacts.
+
+Most targets check that a parser does not panic or hang. Some targets also
+check a property:
+
+- `fuzz_config_glob` and `fuzz_config_files`: when glob validation accepts a
+  pattern, the pattern cannot name a path outside the project root.
+- `fuzz_extract_cache`: two parses of one source give the same cache bytes,
+  and a cache save and load cycle does not change a module.
+
+To add a target, add a `[[bin]]` entry to `fuzz/Cargo.toml`, add seed inputs
+to `fuzz/corpus/<target-name>/`, and add the name to the target list in
+`.github/workflows/fuzz-smoke.yml`. A target can have a libFuzzer dictionary
+at `fuzz/dicts/<target-name>.dict`; the smoke workflow and OSS-Fuzz use it.
+`node scripts/fuzz-seed-extract.mjs` writes the `fixture_*` seeds of the
+extraction targets from `tests/fixtures/`.
+
+When you run a target locally, give a scratch directory as the first corpus
+argument, so that new inputs do not go into the committed seed corpus. With
+`-O`, also pass `-a`: the `bitcode` crate reads past the end of a buffer for
+speed when debug assertions are off, and the sanitizer reports that read.
+
+```bash
+cargo +nightly fuzz run -O -a fuzz_extract /tmp/fuzz-extract fuzz/corpus/fuzz_extract -- -dict=fuzz/dicts/fuzz_extract.dict
+```
 
 ### Running locally
 
@@ -107,9 +149,9 @@ cargo run --bin fallow -- list --plugins  # Show detected plugins
 
 ```bash
 cargo bench --bench analysis                                    # Criterion benchmarks
-cd benchmarks && npm run generate && npm run bench              # Comparative vs knip
-cd benchmarks && npm run generate:dupes && npm run bench:dupes  # vs jscpd
-cd benchmarks && npm run generate:circular && npm run bench:circular  # vs madge/dpdm
+cd benchmarks && npm run generate && npm run bench              # Dead code, end to end
+cd benchmarks && npm run generate:dupes && npm run bench:dupes  # Duplication, end to end
+cd benchmarks && npm run generate:circular && npm run bench:circular  # Circular dependencies, end to end
 ```
 
 ## Project structure
@@ -126,6 +168,7 @@ The workspace follows the ownership boundaries in
 | `crates/graph/` | Module graph construction, import resolution, dependency traversal, cycles, and impact facts. |
 | `crates/security/` | Shared security matcher catalogue and candidate helpers. |
 | `crates/core/` | Internal detector backend used by `fallow-engine` for private detector phases. Product adapters use the workspace facade instead. |
+| `crates/mutation/` | Mutant site discovery and mutation-switching instrumentation used by the mutation engine. |
 | `crates/engine/` | Analysis sessions, discovery, parsing, graph construction, and typed analysis orchestration. |
 | `crates/output/` | Shared output contracts, action builders, summaries, SARIF builders, and reusable formatter pieces. |
 | `crates/api/` | Workspace Rust facade and programmatic workflow adapters. Its crate API is not an external semver contract. |
@@ -161,10 +204,11 @@ The most common contribution is adding support for a new framework. Each plugin 
    `crates/core/src/plugins/registry/builtin.rs`.
 5. Add focused plugin tests and an end-to-end fixture.
 
-A minimal plugin needs:
-- `name()` — framework name
-- `enablers()` — package.json dependencies that activate the plugin
-- `entry_patterns()` — glob patterns for entry point files
+A minimal plugin needs these methods:
+
+- `name()`: framework name
+- `enablers()`: package.json dependencies that activate the plugin
+- `entry_patterns()`: glob patterns for entry point files
 - Optionally: `resolve_config()` for AST-based config parsing
 
 See the [Plugin Authoring Guide](docs/plugin-authoring.md) for external plugin
@@ -179,7 +223,7 @@ before adding a new issue kind or framework-specific analyzer.
 
 ## Adding a known tooling dependency
 
-Some dev tools are used through the CLI or config rather than imported in source (`typescript`, `prettier`, `husky`, `@types/*`), so they should never be reported as unused devDependencies. These live in a data-driven catalogue at `crates/core/data/tooling.toml`. Adding one is a single-file, one-entry change with no regeneration step:
+Some dev tools are used through the CLI or config rather than imported in source (`typescript`, `prettier`, `husky`, `@types/*`), so an import is not what makes them used. These live in a data-driven catalogue at `crates/core/data/tooling.toml`. Adding one is a single-file, one-entry change with no regeneration step:
 
 ```toml
 # A whole package family (every member is tooling):
@@ -194,6 +238,8 @@ ecosystem = "core"
 ```
 
 - Use `[[prefix]]` when every package under a scope or name family is tooling (matched with `name.starts_with(pattern)`); use `[[exact]]` for a single package name. `notes` / `ecosystem` are optional, for human context only.
+- Add `cli = true` to an entry for a command-line tool. A command-line tool in `devDependencies` is credited only when a package.json script, a CI workflow or a git hook runs it, when a plugin credits it, or when its own config file exists. List the config files of a tool that no plugin covers in `config = ["..."]`, relative to the package root (for example `config = [".jscpd.json"]`). An entry without `cli` is a library and is credited by name.
+- A `@types/X` package is not credited by the `@types/` prefix alone. In `devDependencies` it is credited when the project declares `X`, imports `X` or names `X` in a tsconfig `types` entry. A type package that declares globals and is never imported (`@types/node`, `@types/jest`, `bun-types`) goes under `[[ambient_types]]` with its exact `name`; keep that list short.
 - Do **not** add framework-plugin packages (`vite-plugin-*`, `prettier-plugin-*`, `eslint-plugin-*`, `@rollup/plugin-*`, or scoped forms like `@ianvs/prettier-plugin-sort-imports`). Those must be credited by the relevant plugin's config parser when they actually appear in the config file; listing them here would hide a declared-but-unused plugin. The catalogue's parse tests reject such entries.
 - Run `cargo test -p fallow-core plugins::tooling` to validate the catalogue (it checks the TOML parses, has no empty/whitespace prefixes, no duplicates, and no framework-plugin entries). The file is embedded into the binary via `include_str!`, so a passing test means a working release.
 
@@ -256,19 +302,19 @@ To regenerate `docs/output-schema.json` against the Rust source of truth:
 cargo run -p fallow-cli --features schema-emit --bin fallow-schema-emit > docs/output-schema.json
 ```
 
-Phase 8 closed the prose-and-shape escape hatch: every type in `derived_definition_names()` is regenerated from Rust, with descriptions sourced from `///` doc comments and per-envelope titles from `#[schemars(title = "...")]`. Editing the committed schema by hand on any in-scope definition will fail the strict gate on the next `cargo test`.
+Every type in `derived_definition_names()` is regenerated from Rust. Descriptions come from `///` doc comments, and per-envelope titles come from `#[schemars(title = "...")]`. Hand edits to these committed definitions fail the strict gate on the next `cargo test`.
 
 ### Layer 2: hand-written sections
 
-The following surfaces of `docs/output-schema.json` stay hand-maintained today:
+The following metadata and registration rules apply to `docs/output-schema.json`:
 
 - **Top-level metadata** (`$schema`, `$id`, `$comment`, `title`); the `merge_with_committed` step in `crates/cli/src/bin/schema_emit.rs` preserves them verbatim. `$id` is the canonical raw GitHub URL and is used by consumers to SHA-pin a schema revision (see `docs/backwards-compatibility.md`). `description` is now overwritten by `rewrite_document_root_one_of` to keep it in sync with the typed root.
-- **Definitions in `HAND_MAINTAINED_ALLOW_LIST`** inside `drift_tests` in `crates/cli/src/bin/schema_emit.rs`: today this is `CloneFamilyAction`, `CloneGroupAction`, and `CoverageAnalyzeOutput`. Each entry carries a reason linking it to the meta-issue ladder rung that retires it. The strict drift gate's orphan check fires on any other hand-maintained definition, so the allow-list is the canonical record of what stays hand-written and why.
-- **`CoverageAnalyzeOutput`** is also listed in `HAND_MAINTAINED_ROOT_ENVELOPES` so it remains reachable from the document root; the `hand_maintained_root_envelopes_appear_in_root_one_of` drift test fires if the entry is silently dropped from the root `oneOf`.
+- **Definition exceptions**: `HAND_MAINTAINED_ALLOW_LIST` inside `drift_tests` in `crates/cli/src/bin/schema_emit.rs` is empty. `CloneFamilyAction`, `CloneGroupAction`, and `CoverageAnalyzeOutput` are derived from Rust. The strict drift gate rejects any committed definition that is absent from the derived schema.
+- **Root registration**: `HAND_MAINTAINED_ROOT_ENVELOPES` contains `ErrorOutput`, the derived JSON failure document. It has no `kind` discriminator and uses `error: true` instead. The `hand_maintained_root_envelopes_appear_in_root_one_of` drift test checks that it remains in the root `oneOf`.
 
 The `committed_property_refs_match_derived_property_refs` drift test catches `$ref`-value drift between derived and committed property shapes (e.g. if a future change repoints `CombinedOutput.dupes` away from `DuplicationReport`); this is a check, not a hand-maintained section.
 
-The document-root `oneOf` is now derived from Rust as of #384 item 6: the typed `FallowOutput` enum in `crates/output/src/root_envelopes.rs` wraps every object-shaped envelope and emits the root union via the `rewrite_document_root_one_of` step in `crates/cli/src/bin/schema_emit.rs`. Editing the root `oneOf` by hand will be reverted on the next regeneration. The root union is `[FallowOutput, CodeClimateOutput, ...HAND_MAINTAINED_ROOT_ENVELOPES]`: `CodeClimateOutput` (a bare JSON array via `#[serde(transparent)]`) is a sibling branch because the planned future move to `#[serde(tag = "kind")]` requires every variant of `FallowOutput` to serialize as an object, which the Code Climate / GitLab Code Quality spec forbids for that one envelope.
+The document-root `oneOf` is generated by `rewrite_document_root_one_of` in `crates/cli/src/bin/schema_emit.rs`. Its object-analysis branch is the typed `FallowOutput` enum in `crates/output/src/root_envelopes.rs`. Hand edits to the root `oneOf` are overwritten on regeneration. The root union is `[FallowOutput, CodeClimateOutput, ...HAND_MAINTAINED_ROOT_ENVELOPES]`. `CodeClimateOutput` uses `#[serde(transparent)]` to serialize as a bare JSON array, as required by Code Climate and GitLab Code Quality. It stays outside `FallowOutput`, whose `#[serde(tag = "kind")]` variants serialize as objects.
 
 If you add a new finding type or utility shape, derive `JsonSchema` on the matching Rust struct, register it in `derived_definition_names()`, and the drift gate forces the schema to follow. **Adding a new top-level envelope** also requires adding a new variant to `FallowOutput` in `crates/output/src/root_envelopes.rs` so the document root keeps documenting every wire shape.
 
@@ -292,13 +338,41 @@ npm run generate:contracts:check
 
 - **Conventional commits**: `feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`
 - **Commit linting**: `npm run commitlint -- --last --verbose` uses the same rule set as CI
-- **Signed commits**: `git commit -S`
+- **Signed commits**: `git commit -S` (or `git commit -S -s` to add the sign-off too)
+- **Sign-off**: `git commit -s` (see [Developer Certificate of Origin](#developer-certificate-of-origin))
 - Pre-commit hooks run `cargo fmt` and `cargo clippy` automatically
+
+## Developer Certificate of Origin
+
+Fallow uses the [Developer Certificate of Origin](https://developercertificate.org/) (DCO). With a sign-off, you confirm that you wrote the change or have the right to submit it under the project license.
+
+Add a `Signed-off-by` line to every commit with the `-s` flag:
+
+```bash
+git commit -s -m "fix: describe the change"
+```
+
+The line uses your `user.name` and `user.email` from git config:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+The email must match the commit author. The sign-off is separate from `-S`, which adds a cryptographic signature. You can use both: `git commit -S -s`.
+
+To add a sign-off to the commits you already made:
+
+```bash
+git rebase --signoff origin/main
+git push --force-with-lease
+```
+
+The `Commit messages` check fails a pull request that has a commit without a sign-off. Pull requests from bots are exempt. After `hk install`, the `commit-msg` hook runs the same check on each commit, so a missing sign-off stops the commit before the push.
 
 ## Code style
 
-- Follow existing patterns — the codebase is consistent
-- `cargo clippy --workspace -- -D warnings` must pass (pedantic lints enabled)
+- Follow existing code patterns
+- `cargo clippy --workspace --all-targets -- -D warnings` must pass (pedantic, nursery and selected restriction lints enabled)
 - `cargo fmt --all -- --check` must pass
 - No `unsafe` without justification
 - Prefer early returns with guard clauses
@@ -308,8 +382,13 @@ npm run generate:contracts:check
 1. Fork the repository
 2. Create a feature branch from `main`
 3. Make your changes with conventional commit messages
-4. Ensure `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` pass
-5. Open a pull request against `main`
+4. Every feature or fix must add or update automated tests. Ensure `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` pass
+5. For a user-visible change, add a changelog fragment: a new file in
+   [`changelog.d/`](changelog.d/README.md). Do not edit `CHANGELOG.md`. The
+   release collects the fragments into it.
+6. Open a pull request against `main`
+
+When the description leaves work for later ("Not in this change", "a separate change", "out of scope"), link an issue that describes each deferred task. For an intentional non-goal, write "No follow-up planned." instead. CI verifies that references to this repository identify existing issues; pull request references do not qualify. CI accepts a reference to another repository on its syntax. Reviewers check that each linked issue covers the deferred work.
 
 ## Reporting issues
 
@@ -320,7 +399,7 @@ npm run generate:contracts:check
 ## Documentation
 
 Public user documentation lives at
-[docs.fallow.tools](https://docs.fallow.tools) and is authored in the public
+[fallow.tools/docs](https://fallow.tools/docs/) and is authored in the public
 [`fallow-rs/docs`](https://github.com/fallow-rs/docs) repository.
 
 Maintainer documentation for this codebase starts at

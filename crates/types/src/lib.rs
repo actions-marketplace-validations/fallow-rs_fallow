@@ -13,10 +13,24 @@
     )
 )]
 
+/// Atomic cache-file replacement, shared by the extraction cache and the graph
+/// cache so concurrent fallow processes never interleave a write.
+pub mod atomic_file;
 /// Typed audit cache-key inputs.
 pub mod audit_cache;
+/// Why a persisted cache was refused, shared by the extraction cache, the
+/// graph cache, the perf table, and `fallow doctor`.
+pub mod cache_rejection;
 /// Shared churn output contracts.
 pub mod churn;
+/// Cross-surface strings for the cloud runtime-coverage path, shared by the
+/// CLI's cloud `coverage` commands and the MCP cloud tools.
+pub mod cloud;
+/// One row per analysis subcommand: its JSON kinds and the surfaces that must
+/// know about it. Drift tests across the workspace read this table.
+pub mod command_surfaces;
+/// Per-construct complexity increments behind the complexity scores.
+pub mod complexity_contribution;
 /// File discovery types: discovered files, file IDs, and entry points.
 pub mod discover;
 /// Shared duplicate-code output contracts.
@@ -28,13 +42,22 @@ pub mod duplicates;
 /// compiled (the JSON emission layer constructs them at runtime); the
 /// `schemars::JsonSchema` derive is gated per-struct on the `schema` feature.
 pub mod envelope;
+/// Where a fact sits on each JSON envelope shape, shared by the surfaces that
+/// read a saved envelope back rather than holding the run's typed state.
+pub mod envelope_sites;
 /// Module extraction types: exports, imports, re-exports, and member info.
 pub mod extract;
+pub mod flag_retirement;
 /// Guard output contracts for pre-edit architecture-rule lookup.
 pub mod guard;
+/// Stable finding identity: the shared FNV-1a 64 hash and dead-code
+/// `finding_id` values.
+pub mod identity;
 /// Shared issue-type contract metadata used by CLI, LSP, MCP, and suppression
 /// helpers.
 pub mod issue_meta;
+/// Levenshtein distance and closest-match policy for typo suggestions.
+pub mod levenshtein;
 /// Machine-readable manifest of the fallow MCP server's tools, shared by
 /// `fallow schema` and the telemetry tool-name allowlist; kept in sync with
 /// the live tool router by a drift test in `crates/mcp`.
@@ -68,6 +91,8 @@ pub mod output_format;
 pub mod output_health;
 /// Cross-platform path classification helpers.
 pub mod path_util;
+/// The `--performance` span tree and the process-level clock.
+pub mod pipeline_spans;
 /// Analysis result types: unused files, exports, dependencies, and members.
 pub mod results;
 /// Shared TypeScript semantic identity, provenance, API surface, impact, and
@@ -89,9 +114,21 @@ pub mod task_matrix;
 pub mod trace;
 /// Symbol-level trace-chain output contracts.
 pub mod trace_chain;
+/// Stack-trace frame resolution output contracts (`fallow trace-error`).
+pub mod trace_error;
+/// Per-specifier dependency usage contracts (`fallow trace --dependency`).
+pub mod trace_usage;
 /// Workspace and source-discovery diagnostic data types
 /// (`WorkspaceDiagnostic`, `WorkspaceDiagnosticKind`). Re-exported by
 /// `fallow-config` for back-compat; embedded directly by `fallow-output` so
 /// `workspace_diagnostics[]` keeps its typed JSON schema. The
 /// `schemars::JsonSchema` derive is gated on the `schema` feature.
 pub mod workspace;
+
+/// The `tracing` target of a warning that repeats a fact the JSON envelope
+/// carries, or that describes the quality of the analysis inputs.
+///
+/// `--quiet`, `--ci` and `FALLOW_QUIET` hide this target on stderr. An explicit
+/// `RUST_LOG` shows it again. Config-load warnings, such as an unknown rule
+/// key, do not use this target, so they stay visible in a quiet run.
+pub const ANALYSIS_DIAGNOSTIC_LOG_TARGET: &str = "fallow::analysis_diagnostic";

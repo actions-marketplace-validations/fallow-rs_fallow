@@ -7,9 +7,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Component, PathBuf};
 
 use crate::MemberAccess;
+use crate::function_body::BodyRef;
+use crate::js_text::JsText;
 
 use super::super::helpers::{extract_type_annotation_name, is_meta_url_arg};
-use super::{static_member_object_name, unwrap_static_expr};
+use super::visit_chain_names::MAX_RECORDED_CHAIN_LINKS;
+use super::{assignment_target_identifier_name, static_member_object_name, unwrap_static_expr};
 
 pub(super) const PINO_PACKAGE: &str = "pino";
 pub(super) const PINO_FACTORY_EXPORT: &str = "pino";
@@ -96,10 +99,10 @@ impl StructuralParamMemberCollector {
         }
     }
 
-    pub(super) fn collect_function_body(&mut self, body: &FunctionBody<'_>) {
+    pub(super) fn collect_function_body(&mut self, body: BodyRef<'_, '_>) {
         self.shadowed_stack.push(FxHashSet::default());
         self.alias_stack.push(FxHashMap::default());
-        self.visit_function_body(body);
+        body.visit(self);
         self.alias_stack.pop();
         self.shadowed_stack.pop();
     }
@@ -203,6 +206,25 @@ impl<'a> Visit<'a> for StructuralParamMemberCollector {
         walk::walk_static_member_expression(self, expr);
     }
 
+    fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'a>) {
+        if let Expression::StringLiteral(property) = &expr.expression
+            && let Some((param, property_path)) = self.resolve_receiver_path(&expr.object)
+        {
+            if property_path.is_empty() {
+                self.members
+                    .entry(param)
+                    .or_default()
+                    .insert(property.value.text().into_owned());
+            } else {
+                self.property_members
+                    .entry(param)
+                    .or_default()
+                    .insert((property_path, property.value.text().into_owned()));
+            }
+        }
+        walk::walk_computed_member_expression(self, expr);
+    }
+
     fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
         let shadowed = self.collect_shadowed_params(&func.params);
         self.shadowed_stack.push(shadowed);
@@ -276,13 +298,13 @@ use super::super::MockObjectProvenance;
 
 pub(super) fn mock_static_target_source(call: &CallExpression<'_>) -> Option<String> {
     call.arguments.first().and_then(|argument| match argument {
-        Argument::StringLiteral(value) => Some(value.value.to_string()),
+        Argument::StringLiteral(value) => Some(value.value.text().into_owned()),
         Argument::TemplateLiteral(value) if value.expressions.is_empty() => value
             .quasis
             .first()
             .map(|quasi| quasi.value.raw.to_string()),
         Argument::ImportExpression(value) => match &value.source {
-            Expression::StringLiteral(source) => Some(source.value.to_string()),
+            Expression::StringLiteral(source) => Some(source.value.text().into_owned()),
             _ => None,
         },
         _ => None,
@@ -415,7 +437,7 @@ fn collect_pino_transport_object_targets(obj: &ObjectExpression<'_>, out: &mut V
         let ObjectPropertyKind::ObjectProperty(prop) = prop else {
             continue;
         };
-        match prop.key.static_name().as_deref() {
+        match prop.key.static_name().as_ref().map(JsText::text).as_deref() {
             Some(PINO_TARGET_KEY) => record_pino_target_value(&prop.value, out),
             Some(PINO_TARGETS_KEY) => record_pino_targets_array(&prop.value, out),
             _ => {}
@@ -425,7 +447,7 @@ fn collect_pino_transport_object_targets(obj: &ObjectExpression<'_>, out: &mut V
 
 fn record_pino_target_value(expr: &Expression<'_>, out: &mut Vec<String>) {
     if let Expression::StringLiteral(lit) = unwrap_static_expr(expr) {
-        record_pino_target(lit.value.as_str(), out);
+        record_pino_target(&lit.value.text(), out);
     }
 }
 
@@ -594,7 +616,7 @@ impl<'a> Visit<'a> for MockFactoryProofVisitor {
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
         if member
             .static_property_name()
-            .is_some_and(|name| is_original_loader_property(&name))
+            .is_some_and(|name| is_original_loader_property(&name.text()))
         {
             self.unsafe_escape = true;
             return;
@@ -608,7 +630,7 @@ impl<'a> Visit<'a> for MockFactoryProofVisitor {
                 property
                     .key
                     .static_name()
-                    .is_some_and(|name| is_original_loader_property(&name))
+                    .is_some_and(|name| is_original_loader_property(&name.text()))
             })
         {
             self.unsafe_escape = true;
@@ -674,7 +696,7 @@ pub(super) fn is_value_returning_memo_callee(callee: &Expression<'_>) -> bool {
 /// Specifier source string from the first argument of `register(...)`.
 pub(super) fn node_module_register_specifier(call: &CallExpression<'_>) -> Option<String> {
     match call.arguments.first()? {
-        Argument::StringLiteral(value) => Some(value.value.to_string()),
+        Argument::StringLiteral(value) => Some(value.value.text().into_owned()),
         Argument::TemplateLiteral(value) if value.expressions.is_empty() => value
             .quasis
             .first()
@@ -718,10 +740,57 @@ pub(super) fn new_url_import_source(expr: &NewExpression<'_>) -> Option<String> 
         && (path_lit.value.starts_with("./") || path_lit.value.starts_with("../"))
         && !path_lit.value.ends_with('/')
     {
-        Some(path_lit.value.to_string())
+        Some(path_lit.value.text().into_owned())
     } else {
         None
     }
+}
+
+/// Callee names that take a filesystem path or a file URL and do not load a
+/// module: the `node:fs` sync, callback and promise APIs, plus
+/// `fileURLToPath` from `node:url`.
+const FILESYSTEM_PATH_CALLEES: &[&str] = &[
+    "accessSync",
+    "appendFileSync",
+    "copyFileSync",
+    "createReadStream",
+    "createWriteStream",
+    "existsSync",
+    "lstatSync",
+    "mkdirSync",
+    "readFileSync",
+    "readdirSync",
+    "realpathSync",
+    "rmSync",
+    "rmdirSync",
+    "statSync",
+    "unlinkSync",
+    "writeFileSync",
+    "access",
+    "appendFile",
+    "copyFile",
+    "lstat",
+    "mkdir",
+    "readFile",
+    "readdir",
+    "realpath",
+    "rm",
+    "rmdir",
+    "stat",
+    "unlink",
+    "writeFile",
+    "fileURLToPath",
+];
+
+/// Whether a call callee (`readFileSync(...)`, `fs.readFileSync(...)`,
+/// `fs.promises.readFile(...)`) names a filesystem path consumer.
+pub(super) fn is_filesystem_path_callee(callee: &Expression<'_>) -> bool {
+    let name = match callee {
+        Expression::Identifier(ident) => ident.name.as_str(),
+        Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+        _ => return false,
+    };
+    FILESYSTEM_PATH_CALLEES.contains(&name)
 }
 
 pub(super) fn is_child_process_source(source: &str) -> bool {
@@ -1090,39 +1159,6 @@ fn append_unique_paths(target: &mut Vec<String>, paths: Vec<String>) {
     }
 }
 
-fn assignment_target_identifier_name<'b>(target: &'b AssignmentTarget<'_>) -> Option<&'b str> {
-    match target {
-        AssignmentTarget::AssignmentTargetIdentifier(ident) => Some(ident.name.as_str()),
-        AssignmentTarget::TSAsExpression(ts_as) => expression_identifier_name(&ts_as.expression),
-        AssignmentTarget::TSSatisfiesExpression(ts_sat) => {
-            expression_identifier_name(&ts_sat.expression)
-        }
-        AssignmentTarget::TSNonNullExpression(ts_non_null) => {
-            expression_identifier_name(&ts_non_null.expression)
-        }
-        AssignmentTarget::TSTypeAssertion(ts_assertion) => {
-            expression_identifier_name(&ts_assertion.expression)
-        }
-        _ => None,
-    }
-}
-
-fn expression_identifier_name<'b>(expr: &'b Expression<'_>) -> Option<&'b str> {
-    match expr {
-        Expression::Identifier(ident) => Some(ident.name.as_str()),
-        Expression::ParenthesizedExpression(paren) => expression_identifier_name(&paren.expression),
-        Expression::TSAsExpression(ts_as) => expression_identifier_name(&ts_as.expression),
-        Expression::TSSatisfiesExpression(ts_sat) => expression_identifier_name(&ts_sat.expression),
-        Expression::TSNonNullExpression(ts_non_null) => {
-            expression_identifier_name(&ts_non_null.expression)
-        }
-        Expression::TSTypeAssertion(ts_assertion) => {
-            expression_identifier_name(&ts_assertion.expression)
-        }
-        _ => None,
-    }
-}
-
 fn extract_binding_local_name<'a>(pattern: &'a BindingPattern<'a>) -> Option<&'a str> {
     match pattern {
         BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
@@ -1134,7 +1170,7 @@ fn extract_binding_local_name<'a>(pattern: &'a BindingPattern<'a>) -> Option<&'a
 /// Collect `property -> class type` mappings from an object-type member list.
 pub(super) fn collect_object_type_property_types(
     members: &[TSSignature<'_>],
-) -> FxHashMap<String, String> {
+) -> FxHashMap<String, super::super::TypePropertyTarget> {
     let mut properties = FxHashMap::default();
     for member in members {
         let TSSignature::TSPropertySignature(prop) = member else {
@@ -1147,7 +1183,16 @@ pub(super) fn collect_object_type_property_types(
             continue;
         };
         if let Some(type_name) = extract_type_annotation_name(type_annotation) {
-            properties.insert(property_name.to_string(), type_name);
+            properties.insert(
+                property_name.text().into_owned(),
+                super::super::TypePropertyTarget {
+                    name: type_name,
+                    reference_span: super::super::helpers::extract_type_reference_origin(
+                        &type_annotation.type_annotation,
+                    ),
+                    owner_span: None,
+                },
+            );
         }
     }
     properties
@@ -1171,9 +1216,9 @@ fn collect_object_pattern_bindings(
             continue;
         };
         let next_path = if path_prefix.is_empty() {
-            fixture_name.to_string()
+            fixture_name.text().into_owned()
         } else {
-            format!("{path_prefix}.{fixture_name}")
+            format!("{path_prefix}.{}", fixture_name.text())
         };
         match &prop.value {
             BindingPattern::ObjectPattern(inner) => {
@@ -1188,13 +1233,20 @@ fn collect_object_pattern_bindings(
     }
 }
 
+/// The root name of a test callee (`test` in `test.describe.only`). The walk
+/// gives `None` past `MAX_RECORDED_CHAIN_LINKS` links, so one call stays bounded.
 pub(super) fn playwright_test_callee_name(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::Identifier(ident) => Some(ident.name.to_string()),
-        Expression::StaticMemberExpression(member) => playwright_test_callee_name(&member.object),
-        Expression::CallExpression(call) => playwright_test_callee_name(&call.callee),
-        _ => None,
+    let mut current = expr;
+    for _ in 0..=MAX_RECORDED_CHAIN_LINKS {
+        crate::cost::walk_step();
+        match current {
+            Expression::Identifier(ident) => return Some(ident.name.to_string()),
+            Expression::StaticMemberExpression(member) => current = &member.object,
+            Expression::CallExpression(call) => current = &call.callee,
+            _ => return None,
+        }
     }
+    None
 }
 
 /// Find the call expression returned by a function body. A direct
@@ -1251,19 +1303,13 @@ fn find_returned_const_declarator_call<'a, 'b>(
 pub(super) fn extract_arrow_return_call<'a, 'b>(
     arrow: &'b oxc_ast::ast::ArrowFunctionExpression<'a>,
 ) -> Option<&'b CallExpression<'a>> {
-    if arrow.expression {
-        if arrow.body.statements.len() != 1 {
-            return None;
-        }
-        let Statement::ExpressionStatement(stmt) = arrow.body.statements.first()? else {
-            return None;
-        };
-        let Expression::CallExpression(call) = &stmt.expression else {
-            return None;
-        };
-        return Some(call.as_ref());
+    match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => extract_function_body_final_return_call(body),
+        body => match body.as_expression()? {
+            Expression::CallExpression(call) => Some(call.as_ref()),
+            _ => None,
+        },
     }
-    extract_function_body_final_return_call(&arrow.body)
 }
 
 pub(super) struct PlaywrightFixtureMemberUse {
@@ -1276,11 +1322,12 @@ pub(super) fn collect_playwright_fixture_member_uses(
 ) -> Vec<PlaywrightFixtureMemberUse> {
     let Some(callback) = arguments.iter().find_map(|arg| match arg {
         Argument::ArrowFunctionExpression(arrow) => {
-            Some((arrow.params.items.first()?, arrow.body.as_ref()))
+            Some((arrow.params.items.first()?, BodyRef::arrow(&arrow.body)))
         }
-        Argument::FunctionExpression(function) => {
-            Some((function.params.items.first()?, function.body.as_deref()?))
-        }
+        Argument::FunctionExpression(function) => Some((
+            function.params.items.first()?,
+            BodyRef::Block(function.body.as_deref()?),
+        )),
         _ => None,
     }) else {
         return Vec::new();
@@ -1295,7 +1342,7 @@ pub(super) fn collect_playwright_fixture_member_uses(
     }
 
     let mut collector = PlaywrightFixtureMemberCollector::new(fixture_by_local);
-    collector.visit_function_body(callback.1);
+    callback.1.visit(&mut collector);
     collector
         .accesses
         .into_iter()
@@ -1306,17 +1353,34 @@ pub(super) fn collect_playwright_fixture_member_uses(
         .collect()
 }
 
-pub(super) fn playwright_extend_base_name(call: &CallExpression<'_>) -> Option<String> {
+/// The object that an `.extend(...)` call extends, or `None` when `call` is not
+/// an `.extend(...)` call.
+fn playwright_extend_receiver<'b, 'a>(call: &'b CallExpression<'a>) -> Option<&'b Expression<'a>> {
     let Expression::StaticMemberExpression(member) = &call.callee else {
         return None;
     };
     if member.property.name != "extend" {
         return None;
     }
-    let Expression::Identifier(base) = &member.object else {
-        return None;
-    };
-    Some(base.name.to_string())
+    Some(&member.object)
+}
+
+/// The `.extend(...)` calls of a chain such as `base.extend<A>({}).extend<B>({})`,
+/// outermost first, and the expression that the innermost call extends. The
+/// root is an identifier (`base`) or a call (`mergeTests(a, b)`, issue #3462).
+/// `None` when `call` is not an `.extend(...)` call.
+pub(super) fn playwright_extend_chain<'b, 'a>(
+    call: &'b CallExpression<'a>,
+) -> Option<(Vec<&'b CallExpression<'a>>, &'b Expression<'a>)> {
+    let mut receiver = playwright_extend_receiver(call)?;
+    let mut calls = vec![call];
+    while let Expression::CallExpression(inner) = receiver
+        && let Some(next) = playwright_extend_receiver(inner)
+    {
+        calls.push(inner);
+        receiver = next;
+    }
+    Some((calls, receiver))
 }
 
 pub(super) fn collect_fixture_type_bindings_from_type(
@@ -1398,9 +1462,9 @@ fn collect_fixture_type_binding_from_member(
         return;
     };
     let next_path = if path_prefix.is_empty() {
-        fixture_name.to_string()
+        fixture_name.text().into_owned()
     } else {
-        format!("{path_prefix}.{fixture_name}")
+        format!("{path_prefix}.{}", fixture_name.text())
     };
     if let Some((alias_name, _)) = fixture_type_reference_name(&type_annotation.type_annotation)
         && aliases.contains_key(alias_name.as_str())
@@ -1457,7 +1521,7 @@ fn fixture_indexed_access_type_name(ty: &TSType<'_>) -> Option<String> {
     if index.value.is_empty() || index.value.contains('"') {
         return None;
     }
-    Some(format!("{}[\"{}\"]", object.name, index.value))
+    Some(format!("{}[\"{}\"]", object.name, index.value.text()))
 }
 
 fn fixture_type_reference_name(ty: &TSType<'_>) -> Option<(String, Span)> {

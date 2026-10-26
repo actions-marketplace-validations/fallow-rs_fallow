@@ -41,6 +41,7 @@ fn make_fc(name: &str, cyclomatic: u16, cognitive: u16, line_count: u32) -> Func
     FunctionComplexity {
         name: name.to_string(),
         is_private_member: false,
+        context_named: None,
         line: 1,
         col: 0,
         cyclomatic,
@@ -67,6 +68,7 @@ fn make_fc_with_contributions(name: &str, cyclomatic: u16, cognitive: u16) -> Fu
         kind: ComplexityContributionKind::If,
         weight: 1,
         nesting: 0,
+        literal_membership: false,
     }];
     fc
 }
@@ -462,6 +464,7 @@ fn make_finding(name: &str, exceeded: ExceededThreshold) -> ComplexityViolation 
             | ExceededThreshold::All => 25,
             _ => 8,
         },
+        standard_cyclomatic: None,
         cognitive: match exceeded {
             ExceededThreshold::Cognitive
             | ExceededThreshold::Both
@@ -477,7 +480,9 @@ fn make_finding(name: &str, exceeded: ExceededThreshold) -> ComplexityViolation 
         react_hook_profile: None,
         exceeded,
         severity: FindingSeverity::Moderate,
+        effective_severity: None,
         crap: exceeded.includes_crap().then_some(30.0),
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,
@@ -517,6 +522,51 @@ fn sort_findings_by_severity_surfaces_crap_before_single_metric_findings() {
             "cognitive",
         ]
     );
+}
+
+#[test]
+fn sort_findings_breaks_metric_ties_by_source_location() {
+    let expected = ["worst", "alpha", "beta", "column", "line", "file"];
+    for root in ["/checkout/first", "/other/checkout with spaces"] {
+        for sort in [
+            HealthSort::Severity,
+            HealthSort::Cyclomatic,
+            HealthSort::Cognitive,
+            HealthSort::Lines,
+        ] {
+            let mut findings = [
+                ("file", "src/b.ts", 1, 1),
+                ("line", "src/a.ts", 20, 1),
+                ("column", "src/a.ts", 10, 3),
+                ("beta", "src/a.ts", 10, 2),
+                ("alpha", "src/a.ts", 10, 2),
+                ("worst", "src/z.ts", 1, 1),
+            ]
+            .map(|(name, path, line, col)| {
+                let mut finding = make_finding(name, ExceededThreshold::Cyclomatic);
+                finding.path = Path::new(root).join(path);
+                finding.line = line;
+                finding.col = col;
+                if name == "worst" {
+                    finding.severity = FindingSeverity::Critical;
+                    finding.cyclomatic += 1;
+                    finding.cognitive += 1;
+                    finding.line_count += 1;
+                }
+                finding
+            });
+            for shift in 0..findings.len() {
+                findings.rotate_left(shift);
+                findings.reverse();
+                sort_findings(&mut findings, sort);
+                assert_eq!(
+                    findings.each_ref().map(|finding| finding.name.as_str()),
+                    expected,
+                    "sort {sort:?} with root {root} and input rotation {shift}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -732,6 +782,7 @@ fn filter_complexity_findings_by_diff_keeps_hotspot_overlapping_diff_line() {
         line: 10,
         col: 0,
         cyclomatic: 30,
+        standard_cyclomatic: None,
         cognitive: 30,
         line_count: 110,
         param_count: 0,
@@ -741,7 +792,9 @@ fn filter_complexity_findings_by_diff_keeps_hotspot_overlapping_diff_line() {
         react_hook_profile: None,
         exceeded: ExceededThreshold::Both,
         severity: FindingSeverity::High,
+        effective_severity: None,
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,
@@ -771,6 +824,7 @@ fn filter_complexity_findings_by_diff_drops_finding_outside_diff() {
         line: 10,
         col: 0,
         cyclomatic: 30,
+        standard_cyclomatic: None,
         cognitive: 30,
         line_count: 5,
         param_count: 0,
@@ -780,7 +834,9 @@ fn filter_complexity_findings_by_diff_drops_finding_outside_diff() {
         react_hook_profile: None,
         exceeded: ExceededThreshold::Both,
         severity: FindingSeverity::High,
+        effective_severity: None,
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,
@@ -810,6 +866,7 @@ fn filter_complexity_findings_by_diff_handles_zero_line_count() {
         line: 5,
         col: 0,
         cyclomatic: 30,
+        standard_cyclomatic: None,
         cognitive: 30,
         line_count: 0,
         param_count: 0,
@@ -819,7 +876,9 @@ fn filter_complexity_findings_by_diff_handles_zero_line_count() {
         react_hook_profile: None,
         exceeded: ExceededThreshold::Both,
         severity: FindingSeverity::High,
+        effective_severity: None,
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,
@@ -855,6 +914,8 @@ fn filter_hotspots_by_diff_uses_file_level_membership() {
             complexity_density: 0.4,
             fan_in: 5,
             trend: crate::churn::ChurnTrend::Stable,
+            median_files_per_commit: None,
+            median_lines_per_commit: None,
             ownership: None,
             is_test_path: false,
         },
@@ -868,6 +929,8 @@ fn filter_hotspots_by_diff_uses_file_level_membership() {
             complexity_density: 0.4,
             fan_in: 5,
             trend: crate::churn::ChurnTrend::Stable,
+            median_files_per_commit: None,
+            median_lines_per_commit: None,
             ownership: None,
             is_test_path: false,
         },
@@ -1052,6 +1115,7 @@ fn collect_findings_preserves_function_metadata() {
         vec![FunctionComplexity {
             name: "processData".to_string(),
             is_private_member: false,
+            context_named: None,
             line: 42,
             col: 8,
             cyclomatic: 25,
@@ -1100,6 +1164,7 @@ fn merge_crap_findings_disambiguates_same_line_functions() {
     let outer = FunctionComplexity {
         name: "handler".to_string(),
         is_private_member: false,
+        context_named: None,
         line: 1,
         col: 23,
         cyclomatic: 1,
@@ -1115,6 +1180,7 @@ fn merge_crap_findings_disambiguates_same_line_functions() {
     let inner = FunctionComplexity {
         name: "<arrow>".to_string(),
         is_private_member: false,
+        context_named: None,
         line: 1,
         col: 43,
         cyclomatic: 7,
@@ -1209,6 +1275,7 @@ fn merge_crap_findings_picks_outer_when_outer_exceeds() {
     let outer = FunctionComplexity {
         name: "complex".to_string(),
         is_private_member: false,
+        context_named: None,
         line: 5,
         col: 10,
         cyclomatic: 8,
@@ -1224,6 +1291,7 @@ fn merge_crap_findings_picks_outer_when_outer_exceeds() {
     let inner = FunctionComplexity {
         name: "<arrow>".to_string(),
         is_private_member: false,
+        context_named: None,
         line: 5,
         col: 30,
         cyclomatic: 1,
@@ -1328,6 +1396,7 @@ fn fx_evidence(
     fallow_output::RuntimeCoverageEvidence {
         static_status: static_status.to_owned(),
         test_coverage: test_coverage.to_owned(),
+        test_only_reference: None,
         v8_tracking: v8_tracking.to_owned(),
         untracked_reason: None,
         observation_days: 7,
@@ -1343,6 +1412,7 @@ fn fx_evidence(
 fn runtime_coverage_top_applies_after_baseline_filtering() {
     let root = Path::new("/project");
     let baseline = HealthBaselineData {
+        kind: None,
         findings: vec![],
         finding_counts: std::collections::BTreeMap::new(),
         identity_finding_counts: std::collections::BTreeMap::new(),
@@ -1413,6 +1483,7 @@ fn runtime_coverage_top_applies_after_baseline_filtering() {
                 invocations: 500,
                 percentile: 99,
                 actions: vec![],
+                optimization_target: None,
             },
             fallow_output::RuntimeCoverageHotPath {
                 id: "fallow:hot:22222222".to_owned(),
@@ -1424,6 +1495,7 @@ fn runtime_coverage_top_applies_after_baseline_filtering() {
                 invocations: 250,
                 percentile: 50,
                 actions: vec![],
+                optimization_target: None,
             },
         ],
         blast_radius: vec![],
@@ -1462,6 +1534,7 @@ fn runtime_coverage_top_applies_after_baseline_filtering() {
 fn runtime_coverage_baseline_refreshes_to_clean_when_only_baselined_findings_remain() {
     let root = Path::new("/project");
     let baseline = HealthBaselineData {
+        kind: None,
         findings: vec![],
         finding_counts: std::collections::BTreeMap::new(),
         identity_finding_counts: std::collections::BTreeMap::new(),
@@ -1537,6 +1610,7 @@ fn runtime_coverage_changed_review_uses_hot_path_verdict() {
             invocations: 9_500,
             percentile: 99,
             actions: vec![],
+            optimization_target: None,
         }],
         blast_radius: vec![],
         importance: vec![],
@@ -1580,6 +1654,7 @@ fn runtime_coverage_changed_review_ignores_unmodified_hot_paths() {
             invocations: 9_500,
             percentile: 90,
             actions: vec![],
+            optimization_target: None,
         }],
         blast_radius: vec![],
         importance: vec![],
@@ -1640,7 +1715,40 @@ fn fx_hot_path(
         invocations: 9_500,
         percentile: 99,
         actions: vec![],
+        optimization_target: None,
     }
+}
+
+#[test]
+fn runtime_coverage_unmatched_warning_counts_hot_paths_left_in_change_scope() {
+    let root = Path::new("/project");
+    let changed_files: FxHashSet<PathBuf> =
+        std::iter::once(PathBuf::from("/project/src/changed.ts")).collect();
+    let mut report = fx_runtime_coverage_report_with_hot_paths(vec![
+        fx_hot_path("fallow:hot:0a0a0a0a", "src/changed.ts", 1, 5),
+        fx_hot_path("fallow:hot:0b0b0b0b", "src/other.ts", 1, 5),
+        fx_hot_path("fallow:hot:0c0c0c0c", "src/other.ts", 7, 9),
+    ]);
+    report.set_optimization_target_warning();
+
+    apply_runtime_coverage_filters(
+        &mut report,
+        &RuntimeCoverageFilterContext::new(root).with_changed_files(Some(&changed_files)),
+    );
+
+    assert_eq!(report.hot_paths.len(), 1);
+    let messages: Vec<&str> = report
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == fallow_output::OPTIMIZATION_TARGET_UNMATCHED_WARNING)
+        .map(|warning| warning.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "Optimization targets are missing for 1 of 1 hot paths. Each of these hot paths has no stable_id, or no static function in this checkout matches its stable_id."
+        ]
+    );
 }
 
 #[test]
@@ -2076,6 +2184,7 @@ fn make_class_finding(
         line,
         col: 0,
         cyclomatic,
+        standard_cyclomatic: None,
         cognitive,
         line_count: 20,
         param_count: 0,
@@ -2085,7 +2194,9 @@ fn make_class_finding(
         react_hook_profile: None,
         exceeded: ExceededThreshold::Both,
         severity: FindingSeverity::Moderate,
+        effective_severity: None,
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,
@@ -2109,6 +2220,7 @@ fn make_template_finding(
         line,
         col: 0,
         cyclomatic,
+        standard_cyclomatic: None,
         cognitive,
         line_count: 30,
         param_count: 0,
@@ -2118,7 +2230,9 @@ fn make_template_finding(
         react_hook_profile: None,
         exceeded: ExceededThreshold::Both,
         severity: FindingSeverity::Moderate,
+        effective_severity: None,
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,

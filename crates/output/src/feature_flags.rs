@@ -4,12 +4,20 @@ use std::path::Path;
 use std::time::Duration;
 
 use fallow_types::envelope::{ElapsedMs, SchemaVersion, TelemetryMeta, ToolVersion};
+use fallow_types::flag_retirement::FlagRetirementReport;
 use fallow_types::results::{FeatureFlag, FlagConfidence, FlagKind};
+use fallow_types::workspace::WorkspaceDiagnostic;
 use serde::Serialize;
 
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 
 /// Current schema version for feature-flag JSON output.
+///
+/// Unmoved by the additive `workspace_diagnostics[]` field: it carries
+/// `skip_serializing_if`, so a run that records no diagnostic emits the same
+/// bytes as before. This is the rule `docs/backwards-compatibility.md` states
+/// for additive optional fields, and the precedent the bare combined envelope
+/// set when it gained the same array.
 pub const FEATURE_FLAGS_SCHEMA_VERSION: u32 = 8;
 
 /// Schema projection for the feature-flags envelope's exact version.
@@ -31,8 +39,16 @@ pub struct FeatureFlagsOutputInput<'a> {
     pub flags: &'a [FeatureFlag],
     /// Analysis root paths are relativized against.
     pub root: &'a Path,
+    /// Workspace- and source-discovery diagnostics the run recorded. Passed
+    /// absolute; the builder relativizes them against `root`.
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
+    /// What became of the narrowing requests the run received, or `None` when
+    /// it received none.
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// `_meta` block to attach when `--explain` was passed.
     pub meta: Option<FeatureFlagsMeta>,
+    /// Retirement report, present only with `--retirement`.
+    pub retirement: Option<FlagRetirementReport>,
 }
 
 /// Envelope emitted by `fallow flags --format json`.
@@ -47,10 +63,50 @@ pub struct FeatureFlagsOutput {
     pub version: ToolVersion,
     /// Wall-clock analysis duration in milliseconds.
     pub elapsed_ms: ElapsedMs,
+    /// What the run was asked to narrow and whether it did. See
+    /// [`crate::RequestOutcomes`] for the full contract.
+    ///
+    /// `fallow flags` accepts `--changed-since`, and an unresolvable ref widens
+    /// the scan to the whole project rather than failing the run. Until this
+    /// member existed the only account of that was a stderr line, which `--quiet`
+    /// removes, so a flag inventory read as scoped to the change could silently
+    /// be the whole project's (issue #2734).
+    ///
+    /// The command applies no diff filter, so the object carries the
+    /// `changed-since` entry only. Omitted when the run was asked for nothing,
+    /// which keeps a scan that passed no narrowing flag byte-identical and moves
+    /// no `schema_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
     /// Detected feature-flag findings.
     pub feature_flags: Vec<FeatureFlagFinding>,
     /// Number of entries in `feature_flags`.
     pub total_flags: usize,
+    /// Workspace-discovery and source-discovery diagnostics for the run. See
+    /// `CheckOutput::workspace_diagnostics` for the full contract.
+    ///
+    /// A flags run walks and parses the project like every other analysis, so
+    /// it records the same discovery kinds: a `skipped-large-file`,
+    /// `skipped-minified-file`, or `source-read-failure` file was never
+    /// scanned for flags, a `source-parse-degraded` file was scanned from a
+    /// partial module, and a `source-nesting-too-deep` file was not scanned. Each is a reason a flag can be missing from
+    /// `feature_flags[]`, which is exactly what a consumer reading a
+    /// zero-result run needs to know. The analysis-stage kinds appear here
+    /// too: the scan correlates flags with dead exports, so it runs the
+    /// dead-code analyze pass that records them.
+    ///
+    /// Omitted when empty, so a project with no discovery noise sees no
+    /// change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
+    /// One row per flag with the reasons the flag can be retired.
+    ///
+    /// Present only with `--retirement`. Without that option the key is
+    /// omitted, so the envelope stays byte-identical and `schema_version`
+    /// does not move. The per-site `feature_flags[]` array is the same with
+    /// and without the option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<FlagRetirementReport>,
     /// `_meta` block; see [`FeatureFlagsMeta`].
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<FeatureFlagsMeta>,
@@ -102,7 +158,8 @@ pub enum FeatureFlagKind {
 pub enum FeatureFlagConfidence {
     /// Strong flag signal, e.g. a known SDK call.
     High,
-    /// Plausible flag signal with some ambiguity.
+    /// Plausible flag signal with some ambiguity, e.g. a generic SDK name
+    /// such as `isEnabled` in a file that imports no flag SDK or flag module.
     Medium,
     /// Weak signal; likely needs human confirmation.
     Low,
@@ -210,12 +267,23 @@ pub fn build_feature_flags_output(input: FeatureFlagsOutputInput<'_>) -> Feature
         .iter()
         .map(|flag| feature_flag_finding(flag, input.root))
         .collect();
+    // This envelope has no post-serialisation root-prefix strip, so the
+    // diagnostics are relativized here or they reach the wire as host paths.
+    let root = input.root;
+    let workspace_diagnostics = input
+        .workspace_diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.into_root_relative(root))
+        .collect();
     FeatureFlagsOutput {
         schema_version: SchemaVersion(input.schema_version),
         version: ToolVersion(input.version),
         elapsed_ms: ElapsedMs(input.elapsed.as_millis() as u64),
+        request_outcomes: input.request_outcomes,
         feature_flags,
         total_flags: input.flags.len(),
+        workspace_diagnostics,
+        retirement: input.retirement,
         meta: input.meta,
     }
 }
@@ -228,10 +296,9 @@ pub fn build_feature_flags_output(input: FeatureFlagsOutputInput<'_>) -> Feature
 /// JSON.
 pub fn serialize_feature_flags_json_output(
     output: FeatureFlagsOutput,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(output, "feature-flags", mode)?;
+    let mut value = serialize_named_json_output(output, "feature-flags")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -245,15 +312,15 @@ pub const fn feature_flags_meta() -> FeatureFlagsMeta {
             description: "Feature flag patterns detected via AST analysis",
             kinds: FeatureFlagsKindMeta {
                 environment_variable: "process.env.FEATURE_* pattern (high confidence)",
-                sdk_call: "Feature flag SDK function call (high confidence)",
+                sdk_call: "Feature flag SDK function call (high confidence, or medium for a generic SDK name without a flag import)",
                 config_object: "Config object property access matching flag keywords (low confidence, heuristic)",
             },
             confidence: FeatureFlagsConfidenceMeta {
-                high: "Unambiguous pattern match (env vars, direct SDK calls)",
-                medium: "Pattern match with some ambiguity",
+                high: "Unambiguous pattern match (env vars, specific SDK calls, generic SDK calls in a file that imports a flag SDK or flag module)",
+                medium: "Pattern match with some ambiguity: a generic SDK name such as isEnabled, getValue or useFeature in a file that imports no flag SDK or flag module",
                 low: "Heuristic match (config objects), may produce false positives",
             },
-            docs: "https://docs.fallow.tools/cli/flags",
+            docs: "https://fallow.tools/docs/cli/flags/",
         }),
     }
 }
@@ -356,15 +423,14 @@ mod tests {
             elapsed: Duration::from_millis(4),
             flags: &[flag()],
             root: Path::new("/repo"),
+            workspace_diagnostics: Vec::new(),
+            request_outcomes: None,
             meta: Some(feature_flags_meta()),
+            retirement: None,
         });
 
-        let value = serialize_feature_flags_json_output(
-            output,
-            RootEnvelopeMode::Tagged,
-            Some("run-flags"),
-        )
-        .expect("feature flags output should serialize");
+        let value = serialize_feature_flags_json_output(output, Some("run-flags"))
+            .expect("feature flags output should serialize");
 
         assert_eq!(value["kind"], "feature-flags");
         assert_eq!(value["feature_flags"][0]["path"], "src/app.ts");
@@ -374,7 +440,7 @@ mod tests {
         );
         assert_eq!(
             value["_meta"]["feature_flags"]["docs"],
-            "https://docs.fallow.tools/cli/flags"
+            "https://fallow.tools/docs/cli/flags/"
         );
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-flags");
     }
@@ -391,20 +457,95 @@ mod tests {
             elapsed: Duration::from_millis(4),
             flags: &[flag()],
             root: Path::new("/repo"),
+            workspace_diagnostics: Vec::new(),
+            request_outcomes: None,
             meta: None,
+            retirement: None,
         });
 
-        let value = serialize_feature_flags_json_output(
-            output,
-            RootEnvelopeMode::Tagged,
-            Some("run-flags"),
-        )
-        .expect("feature flags output should serialize");
+        let value = serialize_feature_flags_json_output(output, Some("run-flags"))
+            .expect("feature flags output should serialize");
 
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-flags");
         assert!(
             value["_meta"].get("feature_flags").is_none(),
             "feature_flags details are absent without --explain"
+        );
+    }
+
+    #[test]
+    fn recorded_diagnostics_reach_the_flags_envelope_root_relative() {
+        // A flags run that skipped a file scanned it for nothing. Without this
+        // array the skip was unreachable from both channels on this command:
+        // stderr no longer carries every kind, and the envelope had no key.
+        let output = build_feature_flags_output(FeatureFlagsOutputInput {
+            schema_version: FEATURE_FLAGS_SCHEMA_VERSION,
+            version: "0.0.0".to_string(),
+            elapsed: Duration::from_millis(4),
+            flags: &[flag()],
+            root: Path::new("/repo"),
+            workspace_diagnostics: vec![WorkspaceDiagnostic::new(
+                Path::new("/repo"),
+                PathBuf::from("/repo/src/generated.ts"),
+                fallow_types::workspace::WorkspaceDiagnosticKind::SkippedLargeFile {
+                    size_bytes: 9_000_000,
+                },
+            )],
+            request_outcomes: None,
+            meta: None,
+            retirement: None,
+        });
+
+        let value = serialize_feature_flags_json_output(output, None)
+            .expect("feature flags output should serialize");
+
+        assert_eq!(
+            value["workspace_diagnostics"][0]["path"], "src/generated.ts",
+            "the envelope has no post-serialisation strip, so the builder must relativize"
+        );
+        assert_eq!(
+            value["workspace_diagnostics"][0]["kind"], "skipped-large-file",
+            "the typed kind reaches the wire, envelope was {value}"
+        );
+    }
+
+    #[test]
+    fn a_clean_run_omits_the_diagnostics_key_entirely() {
+        let output = build_feature_flags_output(FeatureFlagsOutputInput {
+            schema_version: FEATURE_FLAGS_SCHEMA_VERSION,
+            version: "0.0.0".to_string(),
+            elapsed: Duration::from_millis(4),
+            flags: &[flag()],
+            root: Path::new("/repo"),
+            workspace_diagnostics: Vec::new(),
+            request_outcomes: None,
+            meta: None,
+            retirement: None,
+        });
+
+        let value = serialize_feature_flags_json_output(output, None)
+            .expect("feature flags output should serialize");
+
+        assert!(
+            value.get("workspace_diagnostics").is_none(),
+            "an empty array is omitted so a quiet project sees no wire change"
+        );
+    }
+
+    #[test]
+    fn explain_meta_names_the_medium_case_of_sdk_calls() {
+        let meta = feature_flags_meta()
+            .feature_flags
+            .expect("flags meta has details");
+        assert!(
+            !meta.kinds.sdk_call.contains("(high confidence)"),
+            "an sdk_call can be medium, so the kind must not claim high only: {}",
+            meta.kinds.sdk_call
+        );
+        assert!(
+            meta.confidence.medium.contains("isEnabled"),
+            "medium must name the generic SDK case: {}",
+            meta.confidence.medium
         );
     }
 }

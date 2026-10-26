@@ -5,11 +5,8 @@ import * as path from "node:path";
 // fallow-ignore-next-line unlisted-dependency
 import * as vscode from "vscode";
 import { countDiagnosticErrorIssues } from "./analysis-utils.js";
-import {
-  middleElidePath,
-  resolveFilePath as resolveFilePathPure,
-  sortCloneGroupsBySize,
-} from "./treeView-utils.js";
+import { middleElidePath, sortCloneGroupsBySize } from "./treeView-utils.js";
+import { resolveWorkspaceFilePath } from "./workspaceRoot.js";
 import { openFileCommand } from "./openFileCommand.js";
 import type {
   CloneGroupFinding,
@@ -19,8 +16,8 @@ import type {
 } from "./types.js";
 import { ISSUE_CATEGORY_LABELS } from "./types.js";
 
-const resolveFilePath = (filePath: string | undefined) =>
-  resolveFilePathPure(filePath, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+/** Shown on a package cycle whose package group has more cycles than the CLI lists. */
+const PACKAGE_GROUP_TRUNCATED_NOTE = "this package group has more cycles than listed";
 
 /** Icons per issue category. */
 const CATEGORY_ICONS: Record<IssueCategory, string> = {
@@ -37,10 +34,14 @@ const CATEGORY_ICONS: Record<IssueCategory, string> = {
   "unused-server-action": "symbol-method",
   "unused-load-data-keys": "symbol-property",
   "unused-component-prop": "symbol-property",
+  "absent-component-prop": "symbol-property",
   "unused-component-emit": "symbol-event",
   "unused-component-input": "symbol-property",
   "unused-component-output": "symbol-event",
   "unused-svelte-event": "symbol-event",
+  "unused-effect-layer": "layers",
+  "unused-tagged-error": "error",
+  "unproduced-catch-tag": "debug-disconnect",
   "unrendered-component": "symbol-misc",
   "unprovided-inject": "plug",
   "invalid-client-export": "error",
@@ -56,6 +57,7 @@ const CATEGORY_ICONS: Record<IssueCategory, string> = {
   "dev-dependencies-in-production": "package",
   "circular-dependencies": "sync",
   "re-export-cycles": "sync-ignored",
+  "package-cycles": "sync",
   "boundary-violation": "symbol-namespace",
   "policy-violations": "symbol-namespace",
   "stale-suppressions": "trash",
@@ -64,50 +66,17 @@ const CATEGORY_ICONS: Record<IssueCategory, string> = {
   "unresolved-catalog-references": "error",
   "unused-dependency-overrides": "package",
   "misconfigured-dependency-overrides": "error",
+  "prop-drilling": "symbol-property",
+  "thin-wrapper": "symbol-misc",
+  "duplicate-prop-shape": "symbol-structure",
 };
 
-/** Icons for individual issue items. */
+/** Icons for individual issue items. Only these categories use a different icon. */
 const ISSUE_ICONS: Record<IssueCategory, string> = {
+  ...CATEGORY_ICONS,
   "unused-files": "file",
-  "unused-exports": "symbol-method",
-  "unused-types": "symbol-interface",
-  "private-type-leaks": "symbol-interface",
-  "unused-dependencies": "package",
-  "unused-dev-dependencies": "package",
-  "unused-optional-dependencies": "package",
-  "unused-enum-members": "symbol-enum-member",
-  "unused-class-members": "symbol-field",
-  "unused-store-member": "symbol-field",
-  "unused-server-action": "symbol-method",
-  "unused-load-data-keys": "symbol-property",
-  "unused-component-prop": "symbol-property",
-  "unused-component-emit": "symbol-event",
-  "unused-component-input": "symbol-property",
-  "unused-component-output": "symbol-event",
-  "unused-svelte-event": "symbol-event",
-  "unrendered-component": "symbol-misc",
-  "unprovided-inject": "plug",
-  "invalid-client-export": "error",
-  "mixed-client-server-barrel": "files",
-  "misplaced-directive": "warning",
-  "route-collision": "git-merge",
-  "dynamic-segment-name-conflict": "git-merge",
-  "unresolved-imports": "error",
-  "unlisted-dependencies": "package",
   "duplicate-exports": "copy",
   "type-only-dependencies": "package",
-  "test-only-dependencies": "beaker",
-  "dev-dependencies-in-production": "package",
-  "circular-dependencies": "sync",
-  "re-export-cycles": "sync-ignored",
-  "boundary-violation": "symbol-namespace",
-  "policy-violations": "symbol-namespace",
-  "stale-suppressions": "trash",
-  "unused-catalog-entries": "package",
-  "empty-catalog-groups": "package",
-  "unresolved-catalog-references": "error",
-  "unused-dependency-overrides": "package",
-  "misconfigured-dependency-overrides": "error",
 };
 
 const staleSuppressionLabel = (
@@ -151,7 +120,7 @@ class IssueItem extends vscode.TreeItem {
   ) {
     super(label, vscode.TreeItemCollapsibleState.None);
 
-    const { absolute, relative } = resolveFilePath(filePath);
+    const { absolute, relative } = resolveWorkspaceFilePath(filePath);
 
     this.description = `${middleElidePath(relative)}:${line}`;
     this.tooltip = `${label}\n${absolute}:${line}:${col}`;
@@ -180,9 +149,9 @@ class CycleItem extends vscode.TreeItem {
         : vscode.TreeItemCollapsibleState.None,
     );
     this.fileItems = files.map((f) => new IssueItem(path.basename(f), f, 1, 0, category));
-    const { relative } = resolveFilePath(files[0] ?? "");
+    const { relative } = resolveWorkspaceFilePath(files[0] ?? "");
     this.description = relative ? middleElidePath(relative) : undefined;
-    this.tooltip = files.map((f) => resolveFilePath(f).absolute).join("\n");
+    this.tooltip = files.map((f) => resolveWorkspaceFilePath(f).absolute).join("\n");
     this.contextValue = "cycle";
     this.iconPath = new vscode.ThemeIcon(ISSUE_ICONS[category] ?? "warning");
   }
@@ -385,6 +354,22 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
       );
     }
 
+    if (this.result.absent_component_props) {
+      addCategory(
+        "absent-component-prop",
+        this.result.absent_component_props.map(
+          (p) =>
+            new IssueItem(
+              `${p.component_name}.${p.prop_name} (review)`,
+              p.path,
+              p.line,
+              p.col,
+              "absent-component-prop",
+            ),
+        ),
+      );
+    }
+
     if (this.result.unused_component_emits) {
       addCategory(
         "unused-component-emit",
@@ -444,6 +429,42 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
               e.line,
               e.col,
               "unused-svelte-event",
+            ),
+        ),
+      );
+    }
+
+    if (this.result.unused_effect_layers) {
+      addCategory(
+        "unused-effect-layer",
+        this.result.unused_effect_layers.map(
+          (layer) =>
+            new IssueItem(layer.name, layer.path, layer.line, layer.col, "unused-effect-layer"),
+        ),
+      );
+    }
+
+    if (this.result.unused_tagged_errors) {
+      addCategory(
+        "unused-tagged-error",
+        this.result.unused_tagged_errors.map(
+          (error) =>
+            new IssueItem(error.name, error.path, error.line, error.col, "unused-tagged-error"),
+        ),
+      );
+    }
+
+    if (this.result.unproduced_catch_tags) {
+      addCategory(
+        "unproduced-catch-tag",
+        this.result.unproduced_catch_tags.map(
+          (catchTag) =>
+            new IssueItem(
+              catchTag.tag,
+              catchTag.path,
+              catchTag.line,
+              catchTag.col,
+              "unproduced-catch-tag",
             ),
         ),
       );
@@ -602,6 +623,21 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
       );
     }
 
+    if (this.result.package_cycles) {
+      addCategory(
+        "package-cycles",
+        this.result.package_cycles.map(
+          (c) =>
+            new CycleItem(
+              [...c.packages, c.packages[0]].join(" -> ") +
+                (c.group_truncated ? ` (${PACKAGE_GROUP_TRUNCATED_NOTE})` : ""),
+              c.edges.map((edge) => edge.path),
+              "package-cycles",
+            ),
+        ),
+      );
+    }
+
     const boundaryItems = [
       ...(this.result.boundary_violations?.map(
         (v) =>
@@ -729,7 +765,67 @@ export class DeadCodeTreeProvider implements vscode.TreeDataProvider<DeadCodeIte
       );
     }
 
+    this.addComponentHealthCategories(addCategory);
+
     return categories;
+  }
+
+  /**
+   * The opt-in component health signals. Each item sits at the component the
+   * CLI anchors the finding to: the source hop of a prop drilling chain, the
+   * wrapper, or the component with the shared prop shape.
+   */
+  private addComponentHealthCategories(
+    addCategory: (category: IssueCategory, items: ReadonlyArray<IssueItem>) => void,
+  ): void {
+    if (!this.result) {
+      return;
+    }
+    if (this.result.prop_drilling_chains) {
+      addCategory(
+        "prop-drilling",
+        this.result.prop_drilling_chains.flatMap((chain) => {
+          const source = chain.hops[0];
+          if (!source) {
+            return [];
+          }
+          const trail = chain.hops.map((hop) => hop.component).join(" -> ");
+          return [
+            new IssueItem(`${chain.prop}: ${trail}`, source.file, source.line, 0, "prop-drilling"),
+          ];
+        }),
+      );
+    }
+    if (this.result.thin_wrappers) {
+      addCategory(
+        "thin-wrapper",
+        this.result.thin_wrappers.map(
+          (wrapper) =>
+            new IssueItem(
+              `${wrapper.component} -> ${wrapper.child_component}`,
+              wrapper.file,
+              wrapper.line,
+              0,
+              "thin-wrapper",
+            ),
+        ),
+      );
+    }
+    if (this.result.duplicate_prop_shapes) {
+      addCategory(
+        "duplicate-prop-shape",
+        this.result.duplicate_prop_shapes.map(
+          (shape) =>
+            new IssueItem(
+              `${shape.component} {${shape.shape.join(", ")}}`,
+              shape.file,
+              shape.line,
+              0,
+              "duplicate-prop-shape",
+            ),
+        ),
+      );
+    }
   }
 
   dispose(): void {
@@ -772,7 +868,7 @@ class CloneInstanceItem extends vscode.TreeItem {
     const basename = path.basename(filePath);
     super(`${basename}:${startLine}-${endLine}`, vscode.TreeItemCollapsibleState.None);
 
-    const { absolute, relative } = resolveFilePath(filePath);
+    const { absolute, relative } = resolveWorkspaceFilePath(filePath);
 
     this.description = middleElidePath(relative);
     this.tooltip = `${absolute}:${startLine}-${endLine}`;

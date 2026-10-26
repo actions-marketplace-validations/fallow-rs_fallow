@@ -13,7 +13,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AwaitExpression, CallExpression, Class,
     ClassElement, ComputedMemberExpression, Declaration, ExportDefaultDeclarationKind, Function,
-    FunctionBody, ImportExpression, JSXElement, JSXFragment, MethodDefinitionKind, NewExpression,
+    ImportExpression, JSXElement, JSXFragment, MethodDefinitionKind, NewExpression,
     ObjectExpression, ObjectPropertyKind, PrivateFieldExpression, Program, PropertyKind, Statement,
     StaticMemberExpression, TaggedTemplateExpression, ThrowStatement, UnaryExpression,
     UpdateExpression, VariableDeclaration, YieldExpression,
@@ -24,6 +24,9 @@ use oxc_semantic::ScopeFlags;
 use oxc_span::{GetSpan, SourceType, Span};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
+
+use crate::function_body::BodyRef;
+use crate::js_text::JsText;
 
 #[derive(Debug, Clone, Copy)]
 struct ReviewMetadata {
@@ -38,7 +41,7 @@ struct ReviewMetadata {
 impl ReviewMetadata {
     fn for_function(function: &Function<'_>, syntax_reliable: bool) -> Self {
         Self::from_body(
-            function.body.as_deref(),
+            function.body.as_deref().map(BodyRef::Block),
             function.params.items.len(),
             function.params.rest.is_some(),
             function.r#async,
@@ -49,7 +52,7 @@ impl ReviewMetadata {
 
     fn for_arrow(arrow: &ArrowFunctionExpression<'_>, syntax_reliable: bool) -> Self {
         Self::from_body(
-            Some(arrow.body.as_ref()),
+            Some(BodyRef::arrow(&arrow.body)),
             arrow.params.items.len(),
             arrow.params.rest.is_some(),
             arrow.r#async,
@@ -59,7 +62,7 @@ impl ReviewMetadata {
     }
 
     fn from_body(
-        body: Option<&FunctionBody<'_>>,
+        body: Option<BodyRef<'_, '_>>,
         fixed_params: usize,
         has_rest: bool,
         is_async: bool,
@@ -68,7 +71,7 @@ impl ReviewMetadata {
     ) -> Self {
         let mut visitor = ReviewMetadataVisitor::default();
         if let Some(body) = body {
-            visitor.visit_function_body(body);
+            body.visit(&mut visitor);
         }
         let param_count = fixed_params.saturating_add(usize::from(has_rest));
         let side_effect_hint = if !syntax_reliable {
@@ -223,10 +226,8 @@ impl<'a> ExtractionBuilder<'a> {
                 Statement::ClassDeclaration(class) => {
                     self.collect_class_declaration(class, None);
                 }
-                Statement::ExportNamedDeclaration(export) => {
-                    if let Some(declaration) = &export.declaration {
-                        self.collect_declaration(declaration);
-                    }
+                Statement::ExportDeclaration(export) => {
+                    self.collect_declaration(&export.declaration);
                 }
                 Statement::ExportDefaultDeclaration(export) => {
                     self.collect_default_export(&export.declaration);
@@ -351,7 +352,7 @@ impl<'a> ExtractionBuilder<'a> {
                 continue;
             };
             self.retain_function(
-                &format!("{class_name}.{method_name}"),
+                &format!("{class_name}.{}", method_name.text()),
                 SimilarCodeFunctionKind::ClassMethod,
                 method.span,
                 ReviewMetadata::for_function(&method.value, self.syntax_reliable),
@@ -385,7 +386,7 @@ impl<'a> ExtractionBuilder<'a> {
                 continue;
             };
             self.retain_function(
-                &format!("{binding_name}.{method_name}"),
+                &format!("{binding_name}.{}", method_name.text()),
                 SimilarCodeFunctionKind::ObjectMethod,
                 property.span,
                 ReviewMetadata::for_function(function, self.syntax_reliable),
@@ -601,17 +602,19 @@ pub fn extract_similar_code_functions(
     if is_generated_source(&file, source) {
         return single_skip_result(SimilarCodeExtractionSkipReason::GeneratedSource);
     }
-
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-    let syntax_reliable = parsed.errors.is_empty();
-    let mut builder = ExtractionBuilder::new(file, source, limits, syntax_reliable);
-    builder.record_skip(
-        SimilarCodeExtractionSkipReason::SyntaxDiagnostic,
-        parsed.errors.len(),
-    );
-    builder.collect_program(&parsed.program);
-    builder.finish(&parsed.program)
+    crate::parse_bounded(source, || {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        let syntax_reliable = parsed.diagnostics.is_empty();
+        let mut builder = ExtractionBuilder::new(file, source, limits, syntax_reliable);
+        builder.record_skip(
+            SimilarCodeExtractionSkipReason::SyntaxDiagnostic,
+            parsed.diagnostics.len(),
+        );
+        builder.collect_program(&parsed.program);
+        builder.finish(&parsed.program)
+    })
+    .unwrap_or_else(|| single_skip_result(SimilarCodeExtractionSkipReason::NestingLimit))
 }
 
 fn supported_source_type(path: &Path) -> Option<SourceType> {

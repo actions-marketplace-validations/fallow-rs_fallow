@@ -4,7 +4,10 @@ use crate::module_graph::StaticTestCoverage;
 
 use super::coverage_gaps::compute_coverage_gaps;
 pub(super) use super::coverage_gaps::{CoverageGapData, build_coverage_summary};
+use super::test_reach::build_test_referenced_exports;
 use super::threshold_overrides::ThresholdOverrideResolver;
+
+const MAX_FUNCTION_EVIDENCE: usize = 3;
 
 /// Output from `compute_file_scores`, including auxiliary data for refactoring targets.
 pub struct FileScoreOutput {
@@ -15,6 +18,8 @@ pub struct FileScoreOutput {
     pub(crate) circular_files: rustc_hash::FxHashSet<std::path::PathBuf>,
     /// Top 3 functions by cognitive complexity per file (name, line, cognitive score).
     pub(crate) top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
+    /// Eligible CRAP breaches, ranked and capped separately from structural evidence.
+    pub(crate) crap_target_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
     /// Files that are configured entry points.
     pub(crate) entry_points: rustc_hash::FxHashSet<std::path::PathBuf>,
     /// Total number of value exports per file (for dead code gate: total_value_exports >= 3).
@@ -51,6 +56,8 @@ pub struct FileScoreOutput {
     pub(crate) istanbul_files_joined: usize,
     /// Files the coverage map describes, joined or not. Zero without a map.
     pub(crate) istanbul_files_total: usize,
+    /// Input format of the coverage map. `None` without a map.
+    pub(crate) coverage_input_format: Option<fallow_output::CoverageInputFormat>,
     /// Per-file, per-function CRAP data used to emit `--max-crap` findings.
     /// Absolute paths match `FileHealthScore.path`. Absent entries indicate the
     /// file had zero functions.
@@ -63,16 +70,22 @@ pub struct FileScoreOutput {
     /// non-template files and for templates with no `.ts` owner.
     pub(crate) template_inherit_provenance:
         rustc_hash::FxHashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Static edges between analyzed files. Change coupling reads it to tell a
+    /// hidden co-change pair from a pair that an import already explains.
+    /// `None` when the run reads no commit history.
+    pub(crate) static_links: Option<crate::change_coupling::StaticLinkIndex>,
 }
 
 struct FileScoreOutputParts<'a> {
     graph: &'a fallow_graph::graph::ModuleGraph,
+    with_static_links: bool,
     file_paths: &'a rustc_hash::FxHashMap<crate::discover::FileId, &'a std::path::PathBuf>,
     results: &'a crate::results::AnalysisResults,
     scores: Vec<FileHealthScore>,
     coverage: CoverageGapData,
     circular_files: rustc_hash::FxHashSet<std::path::PathBuf>,
     top_complex_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
+    crap_target_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
     entry_points: rustc_hash::FxHashSet<std::path::PathBuf>,
     value_export_counts: rustc_hash::FxHashMap<std::path::PathBuf, usize>,
     unused_export_names: rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>>,
@@ -82,6 +95,7 @@ struct FileScoreOutputParts<'a> {
     istanbul_total: usize,
     istanbul_files_joined: usize,
     istanbul_files_total: usize,
+    coverage_input_format: Option<fallow_output::CoverageInputFormat>,
     per_function_crap: rustc_hash::FxHashMap<std::path::PathBuf, Vec<PerFunctionCrap>>,
     template_inherit: rustc_hash::FxHashMap<crate::discover::FileId, TemplateInheritContext>,
 }
@@ -192,6 +206,12 @@ fn dep_in_subset(subset: &crate::health::SubsetFilter<'_>, dep_path: &std::path:
 /// Aggregate complexity totals from a parsed module.
 ///
 /// Returns `(total_cyclomatic, total_cognitive, function_count, lines)`.
+///
+/// Every unit counts, including the synthetic `<module>` unit that carries the
+/// file's module-scope decision points. `function_count` therefore counts a
+/// non-function unit on files that branch outside every function, which is the
+/// point: complexity density measured against a total that skipped module
+/// scope understated the file.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "line count is bounded by source file size"
@@ -269,6 +289,7 @@ pub(super) struct CrapCeilingLookup<'a> {
     resolver: &'a ThresholdOverrideResolver,
     relative: &'a std::path::Path,
     enforce_crap: bool,
+    suppressions: &'a [crate::suppress::Suppression],
 }
 
 /// Threshold-relative CRAP signals accumulated over one file's functions.
@@ -287,64 +308,65 @@ struct CrapThresholdSignals {
     exempted: usize,
     /// Lowest effective ceiling among the observed functions.
     min_ceiling: Option<f64>,
+    suppressed: usize,
+    unsuppressed_max: f64,
+    unsuppressed_min_ceiling: Option<f64>,
+    /// Unsuppressed effective-ceiling breaches, before evidence sorting/capping.
+    eligible_functions: Vec<(String, u32, u16)>,
 }
 
 impl<'a> CrapCeilingLookup<'a> {
-    pub(super) fn new(thresholds: CrapScoreThresholds<'a>, relative: &'a std::path::Path) -> Self {
+    pub(super) fn new(
+        thresholds: CrapScoreThresholds<'a>,
+        relative: &'a std::path::Path,
+        suppressions: &'a [crate::suppress::Suppression],
+    ) -> Self {
         Self {
             resolver: thresholds.resolver,
             relative,
             enforce_crap: thresholds.enforce_crap,
+            suppressions,
         }
     }
 
     /// Fold one function's rounded CRAP value into the file's
     /// threshold-relative signals.
-    fn observe(&self, function: &str, crap_rounded: f64, signals: &mut CrapThresholdSignals) {
-        let ceiling = self.resolver.effective_max_crap(self.relative, function);
+    fn observe(
+        &self,
+        function: &fallow_types::extract::FunctionComplexity,
+        crap_rounded: f64,
+        signals: &mut CrapThresholdSignals,
+    ) {
+        let ceiling = self
+            .resolver
+            .effective_max_crap(self.relative, &function.name);
         signals.min_ceiling = Some(signals.min_ceiling.map_or(ceiling, |m| m.min(ceiling)));
-        if !self.enforce_crap {
-            if crap_rounded >= CRAP_THRESHOLD {
-                signals.exempted += 1;
-            }
-        } else if crap_rounded >= ceiling {
-            signals.above += 1;
-        } else if crap_rounded >= CRAP_THRESHOLD {
+        if (!self.enforce_crap || crap_rounded < ceiling) && crap_rounded >= CRAP_THRESHOLD {
             signals.exempted += 1;
         }
-    }
-}
-
-/// Compute per-function CRAP scores using the static binary model.
-///
-/// Binary model: test-reachable file -> CRAP = CC, untested -> CRAP = CC^2 + CC.
-/// Superseded by `compute_crap_scores_estimated` but retained for test coverage
-/// of the binary formula behavior.
-///
-/// Returns `(max_crap, count_above_threshold)`.
-#[cfg(test)]
-#[expect(
-    clippy::suboptimal_flops,
-    reason = "cc * cc + cc matches the CRAP formula specification"
-)]
-fn compute_crap_scores_binary(
-    complexity: &[fallow_types::extract::FunctionComplexity],
-    is_test_reachable: bool,
-) -> (f64, usize) {
-    if complexity.is_empty() {
-        return (0.0, 0);
-    }
-    let mut max = 0.0_f64;
-    let mut above = 0usize;
-    for f in complexity {
-        let cc = f64::from(f.cyclomatic);
-        let crap = if is_test_reachable { cc } else { cc * cc + cc };
-        max = max.max(crap);
-        if crap >= CRAP_THRESHOLD {
-            above += 1;
+        if crate::suppress::is_suppressed(
+            self.suppressions,
+            function.line,
+            crate::suppress::IssueKind::Complexity,
+        ) {
+            signals.suppressed += 1;
+            return;
+        }
+        signals.unsuppressed_max = signals.unsuppressed_max.max(crap_rounded);
+        signals.unsuppressed_min_ceiling = Some(
+            signals
+                .unsuppressed_min_ceiling
+                .map_or(ceiling, |minimum| minimum.min(ceiling)),
+        );
+        if self.enforce_crap && crap_rounded >= ceiling {
+            signals.above += 1;
+            signals.eligible_functions.push((
+                function.name.clone(),
+                function.line,
+                function.cognitive,
+            ));
         }
     }
-    ((max * 10.0).round() / 10.0, above)
 }
 
 /// Per-function CRAP data used to emit `--max-crap` findings.
@@ -424,16 +446,23 @@ fn compute_crap_scores_istanbul(
         // Synthetic template-family units carry no measurable coverage (an
         // Istanbul fnMap can never contain them), so they are excluded from
         // the CRAP dimension entirely: no per-function entry, no max /
-        // above-threshold contribution, no match-statistics slot.
-        if fallow_types::extract::is_synthetic_template_unit(&f.name) {
+        // above-threshold contribution, no match-statistics slot. The
+        // module-scope unit leaves for the same reason plus one more: it has no
+        // fnMap identity to match, so counting it would score every branching
+        // file as one more uncovered high-CRAP unit and drag the reported
+        // Istanbul match rate down.
+        if fallow_types::extract::is_synthetic_template_unit(&f.name)
+            || fallow_types::extract::is_synthetic_module_unit(&f.name)
+        {
             continue;
         }
         total += 1;
+        let cc = f64::from(ceilings.resolver.gate_cyclomatic(f));
         let (crap, coverage_pct, tier, source) =
-            crap_for_function(f, file_coverage, is_test_reachable, &mut matched);
+            crap_for_function(f, cc, file_coverage, is_test_reachable, &mut matched);
         let crap_rounded = (crap * 10.0).round() / 10.0;
         max = max.max(crap);
-        ceilings.observe(f.name.as_str(), crap_rounded, &mut signals);
+        ceilings.observe(f, crap_rounded, &mut signals);
         per_function.push(PerFunctionCrap {
             line: f.line,
             col: f.col,
@@ -461,6 +490,7 @@ fn compute_crap_scores_istanbul(
 )]
 fn crap_for_function(
     f: &fallow_types::extract::FunctionComplexity,
+    cc: f64,
     file_coverage: Option<&IstanbulFileCoverage>,
     is_test_reachable: bool,
     matched: &mut usize,
@@ -470,7 +500,6 @@ fn crap_for_function(
     fallow_output::CoverageTier,
     fallow_output::CoverageSource,
 ) {
-    let cc = f64::from(f.cyclomatic);
     let lookup = file_coverage.and_then(|fc| fc.lookup_function(f));
     if let Some(cov_pct) = lookup {
         *matched += 1;
@@ -518,7 +547,6 @@ const MAX_DIRECT_CALLER_EVIDENCE: usize = 5;
 /// - File is not test-reachable at all: 0%
 ///
 /// Applies the canonical CRAP formula with these estimates.
-/// Returns `(max_crap, count_above_threshold)`.
 /// Estimated CRAP result: score aggregates plus per-function data.
 #[derive(Debug)]
 struct EstimatedCrapResult {
@@ -549,11 +577,17 @@ fn compute_crap_scores_estimated(
         // Template-family units leave the CRAP dimension: their name never
         // appears in `test_referenced_exports`, so the estimate could only
         // ever restate the file's reachability as a disguised cyclomatic gate.
-        if fallow_types::extract::is_synthetic_template_unit(&f.name) {
+        // The module-scope unit is not an export either, so it leaves too.
+        if fallow_types::extract::is_synthetic_template_unit(&f.name)
+            || fallow_types::extract::is_synthetic_module_unit(&f.name)
+        {
             continue;
         }
-        let cc = f64::from(f.cyclomatic);
-        let estimated_coverage = if test_referenced_exports.contains(f.name.as_str()) {
+        let cc = f64::from(ceilings.resolver.gate_cyclomatic(f));
+        // A context name is not an export name, also when it repeats the name
+        // of the export that returns the function (`const load = () =>
+        // Effect.gen(...)`), so the lookup uses the identity name.
+        let estimated_coverage = if test_referenced_exports.contains(f.identity_name()) {
             DIRECT_TEST_COVERAGE_ESTIMATE
         } else if is_test_reachable {
             INDIRECT_TEST_COVERAGE_ESTIMATE
@@ -563,7 +597,7 @@ fn compute_crap_scores_estimated(
         let crap = crap_formula(cc, estimated_coverage);
         let crap_rounded = (crap * 10.0).round() / 10.0;
         max = max.max(crap);
-        ceilings.observe(f.name.as_str(), crap_rounded, &mut signals);
+        ceilings.observe(f, crap_rounded, &mut signals);
         per_function.push(PerFunctionCrap {
             line: f.line,
             col: f.col,
@@ -709,7 +743,11 @@ fn template_inherit_context_from_importers(
         if test_coverage.covers_file(owner_node.file_id) {
             any_reachable = true;
             provenance.get_or_insert_with(|| (*owner_path).clone());
-            let refs = build_test_referenced_exports(&owner_node.exports, test_coverage);
+            let refs = build_test_referenced_exports(
+                owner_node.file_id,
+                &owner_node.exports,
+                test_coverage,
+            );
             combined_refs.extend(refs);
         }
     }
@@ -748,27 +786,6 @@ fn is_template_owner_path(path: &std::path::Path) -> bool {
                 "ts" | "tsx" | "mts" | "cts"
             )
         })
-}
-
-/// Build the set of export names that have at least one test-reachable reference.
-///
-/// This is the per-function signal: if an export named "foo" has a reference from
-/// a test-reachable module, the function "foo" is considered directly tested.
-fn build_test_referenced_exports(
-    exports: &[fallow_graph::graph::ExportSymbol],
-    test_coverage: StaticTestCoverage<'_>,
-) -> rustc_hash::FxHashSet<String> {
-    let mut set = rustc_hash::FxHashSet::default();
-    for export in exports {
-        if export.is_type_only {
-            continue;
-        }
-        let has_test_ref = test_coverage.covers_any_reference(export);
-        if has_test_ref {
-            set.insert(export.name.to_string());
-        }
-    }
-    set
 }
 
 fn collect_direct_callers(
@@ -1115,9 +1132,13 @@ impl IstanbulFileCoverage {
         function: &fallow_types::extract::FunctionComplexity,
     ) -> Option<f64> {
         if function.is_private_member {
-            return None;
+            return self.lookup_private(&function.name, function.line, function.col);
         }
-        self.lookup(function.name.as_str(), function.line, function.col)
+        // A context name (`Command.make("setup")`, the name of the function
+        // that returns `Effect.gen(...)`) is not the name that a coverage
+        // producer records. It could match the record of the wrapper function
+        // on the same line, so the lookup uses the placeholder.
+        self.lookup(function.identity_name(), function.line, function.col)
     }
 
     fn new(mut functions: Vec<IstanbulFunctionCoverage>, relocated: bool) -> Self {
@@ -1257,6 +1278,63 @@ impl IstanbulFileCoverage {
         window
     }
 
+    /// Coverage for a private class member, from a record with its own
+    /// `#name` only.
+    ///
+    /// The anonymous, header-span, and relocated fallbacks of [`Self::lookup`]
+    /// match on proximity, and the nearest record to a private member is often
+    /// the enclosing function or a public twin. The named step stays, but it
+    /// must find exactly one record: two `#name` records near the member (for
+    /// example a private getter and setter) give no coverage (#3816).
+    fn lookup_private(&self, name: &str, line: u32, col: u32) -> Option<f64> {
+        let exact_key = (name.to_string(), line, col);
+        if self.ambiguous_aliases.contains(&exact_key) {
+            return None;
+        }
+        if let Some(&function_index) = self.alias_index.get(&exact_key) {
+            return Some(self.functions[function_index].coverage_pct);
+        }
+        let target = IstanbulPosition::new(line, col);
+        let window = self.fuzz_window(target);
+        let signature_owners = self.header_spans_containing(target);
+        let mut candidates = self.named_candidates(name, target, &window, &signature_owners);
+        let (_, function_index) = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        Some(self.functions[function_index].coverage_pct)
+    }
+
+    /// Records in `window` named `name`, with their alias distance from
+    /// `target`.
+    ///
+    /// A function written inside another function's signature is a
+    /// different function from the one the signature belongs to, and both
+    /// sit within a line or two of the same position. Proximity cannot
+    /// tell them apart, so `signature_owners` (the records whose signature
+    /// covers `target`) decide which candidates are eligible at all.
+    fn named_candidates<'a>(
+        &'a self,
+        name: &'a str,
+        target: IstanbulPosition,
+        window: &'a [usize],
+        signature_owners: &'a [usize],
+    ) -> impl Iterator<Item = ((u32, u32), usize)> + 'a {
+        window
+            .iter()
+            .copied()
+            .filter(move |function_index| self.functions[*function_index].answers_to(name))
+            .filter_map(move |function_index| {
+                self.functions[function_index]
+                    .nearest_alias(target, None)
+                    .map(|distance| (distance, function_index))
+            })
+            .filter(move |(distance, function_index)| {
+                *distance == (0, 0)
+                    || !self.foreign_signature_blocks(signature_owners, *function_index, target)
+            })
+    }
+
     /// Look up coverage for a function by name, start line, and start column.
     ///
     /// Resolution order:
@@ -1300,26 +1378,9 @@ impl IstanbulFileCoverage {
 
         let target = IstanbulPosition::new(line, col);
         let window = self.fuzz_window(target);
-        // A function written inside another function's signature is a
-        // different function from the one the signature belongs to, and both
-        // sit within a line or two of the same position. Proximity cannot
-        // tell them apart, so the records whose signature covers this target
-        // decide which candidates below are eligible at all.
         let signature_owners = self.header_spans_containing(target);
-        if let Some(function) = window
-            .iter()
-            .copied()
-            .filter(|function_index| self.functions[*function_index].answers_to(name))
-            .filter_map(|function_index| {
-                let function = &self.functions[function_index];
-                function
-                    .nearest_alias(target, None)
-                    .map(|distance| (distance, function_index))
-            })
-            .filter(|(distance, function_index)| {
-                *distance == (0, 0)
-                    || !self.foreign_signature_blocks(&signature_owners, *function_index, target)
-            })
+        if let Some(function) = self
+            .named_candidates(name, target, &window, &signature_owners)
             .min_by_key(|(distance, _)| *distance)
             .map(|(_, function_index)| &self.functions[function_index])
         {
@@ -1507,6 +1568,7 @@ impl IstanbulFileCoverage {
 /// Loaded Istanbul coverage data, keyed by canonical file path.
 pub struct IstanbulCoverage {
     files: rustc_hash::FxHashMap<std::path::PathBuf, IstanbulFileCoverage>,
+    format: fallow_output::CoverageInputFormat,
 }
 
 impl IstanbulCoverage {
@@ -1518,6 +1580,11 @@ impl IstanbulCoverage {
     /// How many files the coverage map describes, joined or not.
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// The input format the coverage was read from.
+    pub const fn format(&self) -> fallow_output::CoverageInputFormat {
+        self.format
     }
 }
 
@@ -1619,31 +1686,112 @@ pub(super) fn load_istanbul_coverage_for_sources(
 ) -> Result<IstanbulCoverage, String> {
     super::validate_coverage_root_absolute(coverage_root)?;
     let resolved = resolve_relative_to_root(path, project_root);
-    let file_path = if resolved.is_dir() {
+    match read_coverage_input(&resolved)? {
+        CoverageInput::Istanbul { file_path, json } => {
+            let raw = parse_coverage_map_tolerantly(&json).map_err(|e| {
+                format!(
+                    "failed to parse coverage data from {}: {e}",
+                    file_path.display()
+                )
+            })?;
+            let sources = CoverageMapSources {
+                coverage_root,
+                project_root,
+                discovered_sources,
+                relocated,
+            };
+            Ok(build_istanbul_coverage(
+                &raw,
+                &sources,
+                fallow_output::CoverageInputFormat::Istanbul,
+            ))
+        }
+        CoverageInput::V8 { dump_files } => {
+            let scope = super::coverage_v8::V8ScriptScope {
+                coverage_root,
+                project_root,
+                discovered_sources,
+            };
+            let raw = super::coverage_v8::load_v8_coverage_map(&dump_files, &scope)?;
+            // The V8 records already carry rebased canonical paths.
+            let sources = CoverageMapSources {
+                coverage_root: None,
+                project_root,
+                discovered_sources,
+                relocated,
+            };
+            Ok(build_istanbul_coverage(
+                &raw,
+                &sources,
+                fallow_output::CoverageInputFormat::V8,
+            ))
+        }
+    }
+}
+
+/// A `--coverage` input after format detection.
+enum CoverageInput {
+    Istanbul {
+        file_path: std::path::PathBuf,
+        json: String,
+    },
+    V8 {
+        dump_files: Vec<std::path::PathBuf>,
+    },
+}
+
+/// Detect the format of a `--coverage` path. A directory holds either an
+/// Istanbul `coverage-final.json` (preferred) or `NODE_V8_COVERAGE` dumps; a
+/// file is an Istanbul map or one V8 dump.
+fn read_coverage_input(resolved: &std::path::Path) -> Result<CoverageInput, String> {
+    if resolved.is_dir() {
         let candidate = resolved.join("coverage-final.json");
         if candidate.is_file() {
-            candidate
-        } else {
+            return read_coverage_file(candidate);
+        }
+        let dump_files = super::coverage_v8::dump_files_in(resolved)?;
+        if dump_files.is_empty() {
             return Err(format!(
-                "no coverage-final.json found in {}",
+                "no coverage-final.json or V8 coverage files found in {}",
                 resolved.display()
             ));
         }
-    } else {
-        resolved
-    };
+        return Ok(CoverageInput::V8 { dump_files });
+    }
+    read_coverage_file(resolved.to_path_buf())
+}
 
+fn read_coverage_file(file_path: std::path::PathBuf) -> Result<CoverageInput, String> {
     let json = std::fs::read_to_string(&file_path)
         .map_err(|e| format!("failed to read coverage file {}: {e}", file_path.display()))?;
+    if super::coverage_v8::is_v8_dump(&json) {
+        return Ok(CoverageInput::V8 {
+            dump_files: vec![file_path],
+        });
+    }
+    Ok(CoverageInput::Istanbul { file_path, json })
+}
 
-    let raw: std::collections::BTreeMap<String, oxc_coverage_instrument::FileCoverage> =
-        parse_coverage_map_tolerantly(&json).map_err(|e| {
-            format!(
-                "failed to parse coverage data from {}: {e}",
-                file_path.display()
-            )
-        })?;
+/// How the file paths of a coverage map relate to the analyzed project.
+#[derive(Clone, Copy)]
+struct CoverageMapSources<'a> {
+    coverage_root: Option<&'a std::path::Path>,
+    project_root: Option<&'a std::path::Path>,
+    discovered_sources: Option<&'a rustc_hash::FxHashSet<std::path::PathBuf>>,
+    relocated: bool,
+}
 
+fn build_istanbul_coverage(
+    raw: &std::collections::BTreeMap<String, oxc_coverage_instrument::FileCoverage>,
+    sources: &CoverageMapSources<'_>,
+    format: fallow_output::CoverageInputFormat,
+) -> IstanbulCoverage {
+    let CoverageMapSources {
+        coverage_root,
+        project_root,
+        discovered_sources,
+        relocated,
+    } = *sources;
     let mut files = rustc_hash::FxHashMap::default();
     for file_cov in raw.values() {
         // A producer may record project-relative keys. They are relative to
@@ -1662,9 +1810,14 @@ pub(super) fn load_istanbul_coverage_for_sources(
             .as_deref()
             .map(|source| IstanbulSourceIndex::new(source, &canonical));
 
+        let statement_owners = tally_statements_by_owner(file_cov);
         let mut functions = Vec::with_capacity(file_cov.fn_map.len());
         for (fn_id, fn_entry) in &file_cov.fn_map {
-            let coverage_pct = compute_function_statement_coverage(file_cov, fn_id, fn_entry);
+            let coverage_pct = compute_function_statement_coverage(
+                file_cov,
+                fn_id,
+                statement_owners.get(fn_id.as_str()),
+            );
             if let Some(function) =
                 istanbul_function_coverage(fn_entry, coverage_pct, source_index.as_ref())
             {
@@ -1675,7 +1828,7 @@ pub(super) fn load_istanbul_coverage_for_sources(
         files.insert(canonical, IstanbulFileCoverage::new(functions, relocated));
     }
 
-    Ok(IstanbulCoverage { files })
+    IstanbulCoverage { files, format }
 }
 
 #[expect(
@@ -1697,14 +1850,15 @@ fn read_discovered_source(
     }
 }
 
-/// Parse a coverage map, retrying once with unplaceable coordinates clamped.
+/// Parse a coverage map, retrying once with negative values clamped.
 ///
 /// A producer can emit a negative coordinate for a position it could not
 /// place: `v8-to-istanbul`, which is what c8 and nyc write, records
-/// `column: -1` on the implicit else of a bare `if`. Positions are unsigned,
-/// so one such coordinate rejects the entire map, and it always lands in
-/// `branchMap`, which nothing here reads. The retry costs a second parse and
-/// only runs after the strict one has already failed.
+/// `column: -1` on the implicit else of a bare `if`. Vitest `coverage-v8`
+/// (through ast-v8-to-istanbul) records a negative hit count for that same
+/// implicit else in `b`. Positions and counts are unsigned, so one such value
+/// rejects the entire map. The retry costs a second parse and only runs after
+/// the strict one has already failed.
 fn parse_coverage_map_tolerantly(
     json: &str,
 ) -> Result<std::collections::BTreeMap<String, oxc_coverage_instrument::FileCoverage>, String> {
@@ -1713,7 +1867,9 @@ fn parse_coverage_map_tolerantly(
         Err(strict_error) => {
             let mut value: serde_json::Value =
                 serde_json::from_str(json).map_err(|_| strict_error.to_string())?;
-            if !clamp_negative_positions(&mut value) {
+            let positions = clamp_negative_positions(&mut value);
+            let counts = clamp_negative_counts(&mut value);
+            if !positions && !counts {
                 return Err(strict_error.to_string());
             }
             serde_json::from_value(value).map_err(|_| strict_error.to_string())
@@ -1742,6 +1898,48 @@ fn clamp_negative_positions(value: &mut serde_json::Value) -> bool {
         }
         serde_json::Value::Array(items) => items.iter_mut().fold(false, |clamped, item| {
             clamped | clamp_negative_positions(item)
+        }),
+        _ => false,
+    }
+}
+
+/// The hit-count sections of an Istanbul file record.
+const COVERAGE_COUNT_KEYS: [&str; 4] = ["s", "f", "b", "b_T"];
+
+/// Clamp every negative hit count in the map to zero, reporting whether
+/// anything changed. A negative count is a miss: the coverage test here is
+/// `count > 0`, so zero gives the same answer the signed value would.
+fn clamp_negative_counts(value: &mut serde_json::Value) -> bool {
+    let serde_json::Value::Object(files) = value else {
+        return false;
+    };
+    let mut clamped = false;
+    for file in files.values_mut() {
+        let serde_json::Value::Object(sections) = file else {
+            continue;
+        };
+        for key in COVERAGE_COUNT_KEYS {
+            if let Some(counts) = sections.get_mut(key) {
+                clamped |= clamp_negative_numbers(counts);
+            }
+        }
+    }
+    clamped
+}
+
+/// Clamp every negative number in the tree to zero, reporting whether
+/// anything changed.
+fn clamp_negative_numbers(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) if number.as_f64().is_some_and(|n| n < 0.0) => {
+            *value = serde_json::Value::from(0);
+            true
+        }
+        serde_json::Value::Object(entries) => entries.values_mut().fold(false, |clamped, child| {
+            clamped | clamp_negative_numbers(child)
+        }),
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |clamped, item| {
+            clamped | clamp_negative_numbers(item)
         }),
         _ => false,
     }
@@ -2023,17 +2221,17 @@ fn collect_named_function_starts(
     source: &str,
     source_type: oxc_span::SourceType,
 ) -> Option<rustc_hash::FxHashMap<usize, usize>> {
-    let allocator = oxc_allocator::Allocator::default();
-    let parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
-    if parsed.panicked || !parsed.errors.is_empty() {
-        return None;
-    }
-    let mut starts = rustc_hash::FxHashMap::default();
-    let mut collector = NamedFunctionSyntaxCollector {
-        starts: &mut starts,
-    };
-    oxc_ast_visit::Visit::visit_program(&mut collector, &parsed.program);
-    Some(starts)
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        if parsed.fatal_error || !parsed.diagnostics.is_empty() {
+            return None;
+        }
+        let mut starts = rustc_hash::FxHashMap::default();
+        let mut collector = NamedFunctionSyntaxCollector {
+            starts: &mut starts,
+        };
+        oxc_ast_visit::Visit::visit_program(&mut collector, &parsed.program);
+        Some(starts)
+    })
 }
 
 struct NamedFunctionSyntaxCollector<'a> {
@@ -2095,44 +2293,108 @@ fn effective_istanbul_fn_line(fn_entry: &oxc_coverage_instrument::FnEntry) -> u3
     }
 }
 
-/// Compute statement-level coverage percentage for a single function.
-///
-/// Maps statements from `statementMap` to the function's body range (`loc`)
-/// and computes the fraction with non-zero hit counts. When no statements
-/// fall within the function body (e.g., one-liner arrow functions, getters),
-/// falls back to the function hit count as a binary signal.
-fn compute_function_statement_coverage(
-    file_cov: &oxc_coverage_instrument::FileCoverage,
-    fn_id: &str,
-    fn_entry: &oxc_coverage_instrument::FnEntry,
-) -> f64 {
-    let fn_start_line = fn_entry.loc.start.line;
-    let fn_start_col = fn_entry.loc.start.column;
-    let fn_end_line = fn_entry.loc.end.line;
-    let fn_end_col = fn_entry.loc.end.column;
+/// Statements owned by a single `fnMap` record.
+#[derive(Default)]
+struct StatementTally {
+    covered: u32,
+    total: u32,
+}
 
-    let mut total = 0u32;
-    let mut covered = 0u32;
+/// Whether `outer` encloses `inner`, with both bounds inclusive.
+///
+/// These are the bounds the per-function statement scan has always used, so
+/// which statements a function can claim is unchanged; only how a contested
+/// statement is awarded moved.
+fn istanbul_range_contains(
+    outer: &oxc_coverage_instrument::Location,
+    inner: &oxc_coverage_instrument::Location,
+) -> bool {
+    let after_start = inner.start.line > outer.start.line
+        || (inner.start.line == outer.start.line && inner.start.column >= outer.start.column);
+    let before_end = inner.end.line < outer.end.line
+        || (inner.end.line == outer.end.line && inner.end.column <= outer.end.column);
+    after_start && before_end
+}
+
+/// Assign every statement to the innermost `fnMap` record that encloses it.
+///
+/// A nested function body lies inside the enclosing function's `loc`, so a
+/// bare containment test charges a closure's statements to the function that
+/// returns it as well, and an outer function that ran every statement of its
+/// own is scored down for code it does not own. Ownership here is exclusive:
+/// a statement counts for exactly one record, or for none at all when no
+/// record encloses it, which keeps module-scope statements out of every
+/// function as before.
+///
+/// Innermost is the record with the greatest `loc` start. A tie breaks on the
+/// smallest `loc` end, and a remaining tie between two byte-identical ranges
+/// keeps the first record in `fnMap` key order, which is stable because the
+/// map is a `BTreeMap`. Identical ranges are pathological and any winner is
+/// arbitrary, so determinism is the property that matters.
+///
+/// Computed once per file for the same reason as
+/// [`mark_headers_holding_other_fns`]: every record needs the answer, and the
+/// alternative rescans the whole statement map once per record.
+fn tally_statements_by_owner(
+    file_cov: &oxc_coverage_instrument::FileCoverage,
+) -> rustc_hash::FxHashMap<&str, StatementTally> {
+    let mut owners: rustc_hash::FxHashMap<&str, StatementTally> = rustc_hash::FxHashMap::default();
 
     for (stmt_id, stmt_loc) in &file_cov.statement_map {
-        let after_start = stmt_loc.start.line > fn_start_line
-            || (stmt_loc.start.line == fn_start_line && stmt_loc.start.column >= fn_start_col);
-        let before_end = stmt_loc.end.line < fn_end_line
-            || (stmt_loc.end.line == fn_end_line && stmt_loc.end.column <= fn_end_col);
+        let mut owner: Option<(&str, &oxc_coverage_instrument::Location)> = None;
 
-        if after_start && before_end {
-            total += 1;
-            if file_cov.s.get(stmt_id).copied().unwrap_or(0) > 0 {
-                covered += 1;
+        for (fn_id, fn_entry) in &file_cov.fn_map {
+            if !istanbul_range_contains(&fn_entry.loc, stmt_loc) {
+                continue;
             }
+            let inner_than_current = owner.is_none_or(|(_, best)| {
+                let candidate = (
+                    (fn_entry.loc.start.line, fn_entry.loc.start.column),
+                    std::cmp::Reverse((fn_entry.loc.end.line, fn_entry.loc.end.column)),
+                );
+                let incumbent = (
+                    (best.start.line, best.start.column),
+                    std::cmp::Reverse((best.end.line, best.end.column)),
+                );
+                candidate > incumbent
+            });
+            if inner_than_current {
+                owner = Some((fn_id.as_str(), &fn_entry.loc));
+            }
+        }
+
+        let Some((fn_id, _)) = owner else {
+            continue;
+        };
+        let tally = owners.entry(fn_id).or_default();
+        tally.total += 1;
+        if file_cov.s.get(stmt_id).copied().unwrap_or(0) > 0 {
+            tally.covered += 1;
         }
     }
 
-    if total == 0 {
-        let hit = file_cov.f.get(fn_id).copied().unwrap_or(0);
-        if hit > 0 { 100.0 } else { 0.0 }
-    } else {
-        f64::from(covered) / f64::from(total) * 100.0
+    owners
+}
+
+/// Compute statement-level coverage percentage for a single function.
+///
+/// Takes the fraction of the statements the function owns that have non-zero
+/// hit counts, where ownership comes from [`tally_statements_by_owner`] and a
+/// statement belongs only to the innermost function that encloses it. When the
+/// function owns no statements (a one-liner arrow, a getter, an outer function
+/// whose whole body is a nested declaration, or a producer that emits an empty
+/// `statementMap`), falls back to the function hit count as a binary signal.
+fn compute_function_statement_coverage(
+    file_cov: &oxc_coverage_instrument::FileCoverage,
+    fn_id: &str,
+    owned: Option<&StatementTally>,
+) -> f64 {
+    match owned {
+        Some(tally) if tally.total > 0 => f64::from(tally.covered) / f64::from(tally.total) * 100.0,
+        _ => {
+            let hit = file_cov.f.get(fn_id).copied().unwrap_or(0);
+            if hit > 0 { 100.0 } else { 0.0 }
+        }
     }
 }
 
@@ -2199,11 +2461,58 @@ fn file_score_structural_concern(score: &FileHealthScore) -> f64 {
 /// CRAP finding in exactly these states, so the row must not read `risk`.
 #[must_use]
 pub fn file_score_fully_crap_exempt(score: &FileHealthScore, max_crap_threshold: f64) -> bool {
-    max_crap_threshold <= 0.0 || (score.crap_above_threshold == 0 && score.crap_exempted > 0)
+    let signal = file_score_crap_signal(score, max_crap_threshold);
+    max_crap_threshold <= 0.0
+        || (score.crap_above_threshold == 0
+            && if signal.suppression_aware {
+                signal.maximum >= CRAP_THRESHOLD
+            } else {
+                score.crap_exempted > 0
+            })
 }
 
-/// CRAP concern bands generalized over the row's effective ceiling `t`
-/// (`crap_effective_threshold`, falling back to the run global). At `t = 30`
+/// The complete CRAP metric/ceiling pair used for triage and remediation.
+pub struct FileScoreCrapSignal {
+    /// Maximum remaining score, or the raw maximum for legacy rows.
+    pub maximum: f64,
+    /// Effective ceiling belonging to the same population as the maximum.
+    pub threshold: f64,
+    suppression_aware: bool,
+}
+
+impl FileScoreCrapSignal {
+    /// JSON metric whose value the signal carries.
+    pub const fn metric(&self) -> &'static str {
+        if self.suppression_aware {
+            "crap_unsuppressed_max"
+        } else {
+            "crap_max"
+        }
+    }
+}
+
+/// Select the unsuppressed pair only when complete. Absent or partial external
+/// metadata uses the complete legacy pair, never a mixture of populations.
+pub fn file_score_crap_signal(score: &FileHealthScore, global: f64) -> FileScoreCrapSignal {
+    match (
+        score.crap_unsuppressed_max,
+        score.crap_unsuppressed_effective_threshold,
+    ) {
+        (Some(maximum), Some(threshold)) => FileScoreCrapSignal {
+            maximum,
+            threshold,
+            suppression_aware: true,
+        },
+        _ => FileScoreCrapSignal {
+            maximum: score.crap_max,
+            threshold: score.crap_effective_threshold.unwrap_or(global),
+            suppression_aware: false,
+        },
+    }
+}
+
+/// CRAP concern bands generalized over the selected metric pair's ceiling `t`.
+/// The complete unsuppressed pair takes precedence over legacy metrics. At `t = 30`
 /// the breakpoints are the historical (15, 30, 100). A fully exempt file
 /// scores `0.0`: band generalization alone cannot drop an exempted file below
 /// its structural concern, so the tag would keep reading `risk` against a run
@@ -2212,8 +2521,9 @@ fn file_score_crap_concern(score: &FileHealthScore, max_crap_threshold: f64) -> 
     if file_score_fully_crap_exempt(score, max_crap_threshold) {
         return 0.0;
     }
-    let crap_max = score.crap_max;
-    let t = score.crap_effective_threshold.unwrap_or(max_crap_threshold);
+    let signal = file_score_crap_signal(score, max_crap_threshold);
+    let crap_max = signal.maximum;
+    let t = signal.threshold;
     let half = t / 2.0;
     let saturation = t * 10.0 / 3.0;
     if crap_max <= 0.0 {
@@ -2285,7 +2595,11 @@ fn compare_file_score_triage(
 ) -> std::cmp::Ordering {
     file_score_triage_concern(b, max_crap_threshold)
         .total_cmp(&file_score_triage_concern(a, max_crap_threshold))
-        .then_with(|| b.crap_max.total_cmp(&a.crap_max))
+        .then_with(|| {
+            file_score_crap_signal(b, max_crap_threshold)
+                .maximum
+                .total_cmp(&file_score_crap_signal(a, max_crap_threshold).maximum)
+        })
         .then_with(|| a.maintainability_index.total_cmp(&b.maintainability_index))
         .then_with(|| a.path.cmp(&b.path))
 }
@@ -2301,6 +2615,12 @@ pub(super) struct FileScoreComputeInput<'a> {
     pub(super) istanbul_coverage: Option<&'a IstanbulCoverage>,
     pub(super) root: &'a std::path::Path,
     pub(super) crap_thresholds: CrapScoreThresholds<'a>,
+    /// Build the static edge index for change coupling. Only a run that reads
+    /// the commit history needs it, so other runs skip the graph walk.
+    pub(super) with_static_links: bool,
+    /// Graph of the full project that supplies test reachability when the
+    /// analysis graph has no test files (production mode).
+    pub(super) test_reach: Option<&'a super::test_reach::TestReachGraph>,
 }
 
 /// Compute per-file health scores using a pre-computed analysis output.
@@ -2319,9 +2639,14 @@ pub(super) fn compute_file_scores(
         istanbul_coverage,
         root,
         crap_thresholds,
+        with_static_links,
+        test_reach,
     } = input;
     let retained_graph = analysis_output.graph.ok_or("graph not available")?;
-    let test_coverage = retained_graph.static_test_coverage();
+    let test_coverage = test_reach.map_or_else(
+        || retained_graph.static_test_coverage(),
+        super::test_reach::TestReachGraph::static_test_coverage,
+    );
     let graph = retained_graph.as_graph();
     let results = &analysis_output.results;
 
@@ -2370,12 +2695,14 @@ pub(super) fn compute_file_scores(
 
     Ok(build_file_score_output(FileScoreOutputParts {
         graph,
+        with_static_links,
         file_paths,
         results,
         scores: acc.scores,
         coverage,
         circular_files,
         top_complex_fns,
+        crap_target_fns: acc.crap_target_fns,
         entry_points: acc.entry_points,
         value_export_counts: acc.value_export_counts,
         unused_export_names: acc.unused_export_names,
@@ -2385,6 +2712,7 @@ pub(super) fn compute_file_scores(
         istanbul_total: acc.istanbul_total,
         istanbul_files_joined: acc.istanbul_files_joined,
         istanbul_files_total: acc.istanbul_files_total,
+        coverage_input_format: istanbul_coverage.map(IstanbulCoverage::format),
         per_function_crap: acc.per_function_crap,
         template_inherit,
     }))
@@ -2412,6 +2740,7 @@ struct FileScoreAccumulator {
     entry_points: rustc_hash::FxHashSet<std::path::PathBuf>,
     value_export_counts: rustc_hash::FxHashMap<std::path::PathBuf, usize>,
     unused_export_names: rustc_hash::FxHashMap<std::path::PathBuf, Vec<String>>,
+    crap_target_fns: rustc_hash::FxHashMap<std::path::PathBuf, Vec<(String, u32, u16)>>,
     per_function_crap: rustc_hash::FxHashMap<std::path::PathBuf, Vec<PerFunctionCrap>>,
     istanbul_matched: usize,
     istanbul_files_joined: usize,
@@ -2427,6 +2756,7 @@ impl FileScoreAccumulator {
             entry_points: rustc_hash::FxHashSet::default(),
             value_export_counts: rustc_hash::FxHashMap::default(),
             unused_export_names: rustc_hash::FxHashMap::default(),
+            crap_target_fns: rustc_hash::FxHashMap::default(),
             per_function_crap: rustc_hash::FxHashMap::default(),
             istanbul_matched: 0,
             istanbul_total: 0,
@@ -2509,12 +2839,23 @@ fn compute_one_file_score(
         compute_file_score_metrics(node, &path_owned, ctx, total_cyclomatic, lines, fan_out);
 
     let relative = path_owned.strip_prefix(ctx.root).unwrap_or(&path_owned);
-    let ceilings = CrapCeilingLookup::new(ctx.crap_thresholds, relative);
+    let suppressions = ctx
+        .module_by_id
+        .get(&node.file_id)
+        .map_or(&[][..], |module| module.suppressions.as_slice());
+    let ceilings = CrapCeilingLookup::new(ctx.crap_thresholds, relative, suppressions);
     let crap = compute_file_score_crap(node, ctx, &path_owned, &ceilings);
     acc.istanbul_matched += crap.istanbul_matched;
     acc.istanbul_total += crap.istanbul_total;
     acc.istanbul_files_joined += usize::from(crap.coverage_file_joined);
     record_per_function_crap(&mut acc.per_function_crap, &path_owned, crap.per_function);
+    let mut eligible_functions = crap.signals.eligible_functions;
+    if !eligible_functions.is_empty() {
+        eligible_functions.sort_by_key(|function| std::cmp::Reverse(function.2));
+        eligible_functions.truncate(MAX_FUNCTION_EVIDENCE);
+        acc.crap_target_fns
+            .insert(path_owned.clone(), eligible_functions);
+    }
 
     // `crap_effective_threshold` is the file's lowest effective ceiling, on the
     // wire only when it differs from the run global. Both sides come from the
@@ -2540,6 +2881,11 @@ fn compute_one_file_score(
         crap_max: crap.max,
         crap_above_threshold: crap.signals.above,
         crap_exempted: crap.signals.exempted,
+        crap_suppressed: crap.signals.suppressed,
+        crap_unsuppressed_max: (crap.signals.suppressed > 0)
+            .then_some(crap.signals.unsuppressed_max),
+        crap_unsuppressed_effective_threshold: (crap.signals.suppressed > 0)
+            .then_some(crap.signals.unsuppressed_min_ceiling.unwrap_or(global_crap)),
         crap_effective_threshold,
     }
 }
@@ -2595,6 +2941,7 @@ fn build_file_score_output(parts: FileScoreOutputParts<'_>) -> FileScoreOutput {
         coverage: parts.coverage,
         circular_files: parts.circular_files,
         top_complex_fns: parts.top_complex_fns,
+        crap_target_fns: parts.crap_target_fns,
         entry_points: parts.entry_points,
         value_export_counts: parts.value_export_counts,
         unused_export_names: parts.unused_export_names,
@@ -2608,8 +2955,12 @@ fn build_file_score_output(parts: FileScoreOutputParts<'_>) -> FileScoreOutput {
         istanbul_total: parts.istanbul_total,
         istanbul_files_joined: parts.istanbul_files_joined,
         istanbul_files_total: parts.istanbul_files_total,
+        coverage_input_format: parts.coverage_input_format,
         per_function_crap: parts.per_function_crap,
         template_inherit_provenance,
+        static_links: parts
+            .with_static_links
+            .then(|| crate::change_coupling::StaticLinkIndex::from_graph(parts.graph)),
     }
 }
 
@@ -2745,13 +3096,9 @@ fn compute_file_score_crap(
         CrapCoverageResolution::Istanbul { file_coverage } => {
             compute_istanbul_file_crap(module, file_coverage, is_test_reachable, ceilings)
         }
-        CrapCoverageResolution::StaticEstimated => compute_static_file_crap(
-            module,
-            &node.exports,
-            ctx.test_coverage,
-            is_test_reachable,
-            ceilings,
-        ),
+        CrapCoverageResolution::StaticEstimated => {
+            compute_static_file_crap(module, node, ctx.test_coverage, is_test_reachable, ceilings)
+        }
     }
 }
 
@@ -2788,12 +3135,12 @@ fn compute_istanbul_file_crap(
 
 fn compute_static_file_crap(
     module: &crate::source::ModuleInfo,
-    exports: &[fallow_graph::graph::ExportSymbol],
+    node: &fallow_graph::graph::ModuleNode,
     test_coverage: StaticTestCoverage<'_>,
     is_test_reachable: bool,
     ceilings: &CrapCeilingLookup<'_>,
 ) -> FileScoreCrap {
-    let test_refs = build_test_referenced_exports(exports, test_coverage);
+    let test_refs = build_test_referenced_exports(node.file_id, &node.exports, test_coverage);
     FileScoreCrap::estimated(compute_crap_scores_estimated(
         &module.complexity,
         &test_refs,
@@ -2874,14 +3221,19 @@ fn collect_top_complex_fns(
         let Some(path) = file_paths.get(&module.file_id) else {
             continue;
         };
+        // The module-scope unit is excluded: this list feeds the refactoring
+        // target's evidence copy, which would otherwise render
+        // "<module> has cognitive complexity 12" next to advice about
+        // extracting helpers.
         let mut funcs: Vec<(String, u32, u16)> = module
             .complexity
             .iter()
+            .filter(|f| !fallow_types::extract::is_synthetic_module_unit(&f.name))
             .map(|f| (f.name.clone(), f.line, f.cognitive))
             .collect();
         funcs.sort_by_key(|f| std::cmp::Reverse(f.2));
-        funcs.truncate(3);
-        if funcs[0].2 > 0 {
+        funcs.truncate(MAX_FUNCTION_EVIDENCE);
+        if funcs.first().is_some_and(|worst| worst.2 > 0) {
             top_complex_fns.insert((*path).clone(), funcs);
         }
     }
@@ -2988,6 +3340,10 @@ fn build_analysis_counts_snapshot(
 }
 
 #[cfg(test)]
+#[path = "scoring_private_member_tests.rs"]
+mod private_member_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::threshold_overrides::GlobalHealthThresholds;
     use super::*;
@@ -3022,7 +3378,7 @@ mod tests {
     }
 
     /// `compute_crap_scores_istanbul` with default-configuration ceilings.
-    fn istanbul_crap_default(
+    pub(super) fn istanbul_crap_default(
         complexity: &[fallow_types::extract::FunctionComplexity],
         file_coverage: Option<&IstanbulFileCoverage>,
         is_test_reachable: bool,
@@ -3034,6 +3390,7 @@ mod tests {
                 enforce_crap: true,
             },
             std::path::Path::new("src/test.ts"),
+            &[],
         );
         compute_crap_scores_istanbul(complexity, file_coverage, is_test_reachable, &ceilings)
     }
@@ -3084,6 +3441,7 @@ mod tests {
                     enforce_crap: true,
                 },
                 std::path::Path::new("src/test.ts"),
+                &[],
             ),
         );
 
@@ -3151,6 +3509,7 @@ mod tests {
                 enforce_crap: true,
             },
             std::path::Path::new("src/test.ts"),
+            &[],
         );
         compute_crap_scores_estimated(
             complexity,
@@ -3182,6 +3541,8 @@ mod tests {
                     resolver: &resolver,
                     enforce_crap: true,
                 },
+                with_static_links: false,
+                test_reach: None,
             },
             analysis_output,
         )
@@ -3201,6 +3562,7 @@ mod tests {
         };
         let istanbul = IstanbulCoverage {
             files: rustc_hash::FxHashMap::default(),
+            format: fallow_output::CoverageInputFormat::Istanbul,
         };
 
         let resolution = resolve_crap_coverage(
@@ -3219,6 +3581,7 @@ mod tests {
     fn crap_resolution_keeps_istanbul_when_file_is_missing() {
         let istanbul = IstanbulCoverage {
             files: rustc_hash::FxHashMap::default(),
+            format: fallow_output::CoverageInputFormat::Istanbul,
         };
 
         let resolution = resolve_crap_coverage(
@@ -3362,6 +3725,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_graph::graph::ExportSymbol {
                 name: crate::source::ExportName::Named("b".into()),
@@ -3373,6 +3738,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_graph::graph::ExportSymbol {
                 name: crate::source::ExportName::Named("c".into()),
@@ -3384,6 +3751,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_graph::graph::ExportSymbol {
                 name: crate::source::ExportName::Named("MyType".into()),
@@ -3395,6 +3764,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
         ];
 
@@ -3421,6 +3792,8 @@ mod tests {
             references: vec![],
             reference_paths: Vec::new(),
             members: vec![],
+            deprecated: false,
+            deprecated_reason: None,
         }];
         let unused_map = rustc_hash::FxHashMap::default();
 
@@ -3446,6 +3819,7 @@ mod tests {
             complexity: vec![fallow_types::extract::FunctionComplexity {
                 name: "doStuff".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 7,
@@ -3476,6 +3850,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "a".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 3,
@@ -3491,6 +3866,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "b".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 2,
                     col: 0,
                     cyclomatic: 5,
@@ -3532,6 +3908,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }),
             crate::results::UnusedExportFinding::with_actions(crate::results::UnusedExport {
                 path: std::path::PathBuf::from("/src/a.ts"),
@@ -3541,6 +3919,8 @@ mod tests {
                 col: 0,
                 span_start: 40,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }),
             crate::results::UnusedExportFinding::with_actions(crate::results::UnusedExport {
                 path: std::path::PathBuf::from("/src/b.ts"),
@@ -3550,6 +3930,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }),
         ];
         let map = count_unused_exports_by_path(&exports);
@@ -3573,6 +3955,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_graph::graph::ExportSymbol {
                 name: crate::source::ExportName::Named("b".into()),
@@ -3584,6 +3968,8 @@ mod tests {
                 references: vec![],
                 reference_paths: Vec::new(),
                 members: vec![],
+                deprecated: false,
+                deprecated_reason: None,
             },
         ];
 
@@ -3610,6 +3996,8 @@ mod tests {
             references: vec![],
             reference_paths: Vec::new(),
             members: vec![],
+            deprecated: false,
+            deprecated_reason: None,
         }];
 
         let mut unused_map: rustc_hash::FxHashMap<&std::path::Path, usize> =
@@ -3635,6 +4023,8 @@ mod tests {
             references: vec![],
             reference_paths: Vec::new(),
             members: vec![],
+            deprecated: false,
+            deprecated_reason: None,
         }];
 
         let unused_map = rustc_hash::FxHashMap::default();
@@ -3690,6 +4080,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             },
         )];
         let map = count_unused_exports_by_path(&exports);
@@ -3744,7 +4136,127 @@ mod tests {
             crap_max,
             crap_above_threshold: usize::from(crap_max >= CRAP_THRESHOLD),
             crap_exempted: 0,
+            crap_suppressed: 0,
+            crap_unsuppressed_max: None,
+            crap_unsuppressed_effective_threshold: None,
             crap_effective_threshold: None,
+        }
+    }
+
+    #[test]
+    fn suppressed_crap_keeps_unsuppressed_bands_and_legacy_fallback() {
+        for (remaining, threshold, above, exempted, global, expected) in [
+            (20.0, 30.0, 0, 1, 30.0, 55.0),
+            (20.0, 30.0, 0, 0, 30.0, 55.0),
+            (0.0, 30.0, 0, 0, 30.0, 0.0),
+            (110.0, 500.0, 0, 1, 30.0, 0.0),
+            (42.0, 0.0, 0, 2, 0.0, 0.0),
+            (20.0, 5.0, 1, 0, 5.0, 100.0),
+        ] {
+            let mut score = make_file_score("src/legacy.ts", 100.0, 210.0);
+            score.crap_suppressed = 1;
+            score.crap_above_threshold = above;
+            score.crap_exempted = exempted;
+            score.crap_effective_threshold = Some(5.0);
+            score.crap_unsuppressed_max = Some(remaining);
+            score.crap_unsuppressed_effective_threshold = Some(threshold);
+            let restored: FileHealthScore =
+                serde_json::from_value(serde_json::to_value(&score).unwrap()).unwrap();
+            assert!((file_score_crap_concern(&restored, global) - expected).abs() < f64::EPSILON);
+            assert_eq!(restored.crap_max, 210.0);
+            assert_eq!(restored.crap_effective_threshold, Some(5.0));
+            assert_eq!(restored.crap_exempted, exempted);
+        }
+        let mut legacy = make_file_score("src/legacy.ts", 100.0, 20.0);
+        legacy.crap_effective_threshold = Some(10.0);
+        for (maximum, threshold) in [(None, None), (Some(0.0), None), (None, Some(500.0))] {
+            legacy.crap_unsuppressed_max = maximum;
+            legacy.crap_unsuppressed_effective_threshold = threshold;
+            let restored: FileHealthScore =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            let signal = file_score_crap_signal(&restored, 30.0);
+            assert_eq!(signal.maximum, 20.0);
+            assert_eq!(signal.threshold, 10.0);
+            assert_eq!(signal.metric(), "crap_max");
+            assert!(
+                (file_score_crap_concern(&restored, 30.0) - 85.714_285_714_285_71).abs() < 1e-10
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_crap_maximum_does_not_win_the_triage_tie_break() {
+        let mut suppressed = make_file_score("src/a.ts", 0.0, 210.0);
+        suppressed.crap_suppressed = 1;
+        suppressed.crap_unsuppressed_max = Some(42.0);
+        suppressed.crap_unsuppressed_effective_threshold = Some(30.0);
+        let other = make_file_score("src/b.ts", 0.0, 50.0);
+        assert_eq!(
+            compare_file_score_triage(&suppressed, &other, 30.0),
+            std::cmp::Ordering::Greater
+        );
+        suppressed.crap_unsuppressed_max = Some(60.0);
+        assert_eq!(
+            compare_file_score_triage(&suppressed, &other, 30.0),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn inherited_crap_suppression_keeps_raw_function_measurements() {
+        let mut module = make_module_info(
+            0,
+            30,
+            vec![
+                make_named_fn_complexity("suppressed", 1, 14),
+                make_named_fn_complexity("remaining", 20, 6),
+            ],
+        );
+        let resolver = test_crap_resolver(30.0);
+        let context = TemplateInheritContext {
+            is_test_reachable: false,
+            test_referenced_exports: rustc_hash::FxHashSet::default(),
+            provenance_owner: std::path::PathBuf::from("src/owner.ts"),
+        };
+        for (suppressed, expected_above) in [(false, 2), (true, 1)] {
+            module.suppressions = if suppressed {
+                vec![crate::suppress::Suppression::issue(
+                    1,
+                    1,
+                    crate::suppress::IssueKind::Complexity,
+                )]
+            } else {
+                Vec::new()
+            };
+            let lookup = CrapCeilingLookup::new(
+                CrapScoreThresholds {
+                    resolver: &resolver,
+                    enforce_crap: true,
+                },
+                std::path::Path::new("src/template.html"),
+                &module.suppressions,
+            );
+            let result = compute_template_inherited_crap(&module, &context, &lookup);
+            assert_eq!(result.max, 210.0);
+            assert_eq!(result.signals.above, expected_above);
+            assert_eq!(result.signals.suppressed, usize::from(suppressed));
+            assert_eq!(
+                result.signals.unsuppressed_max,
+                if suppressed { 42.0 } else { 210.0 }
+            );
+            let raw = result
+                .per_function
+                .iter()
+                .map(|function| (function.line, function.crap))
+                .collect::<Vec<_>>();
+            assert_eq!(raw, [(1, 210.0), (20, 42.0)]);
+            assert!(
+                result
+                    .per_function
+                    .iter()
+                    .all(|function| function.coverage_source
+                        == fallow_output::CoverageSource::EstimatedComponentInherited)
+            );
         }
     }
 
@@ -3921,6 +4433,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -3953,6 +4466,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -3993,6 +4507,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -4006,6 +4522,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "foo".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 5,
@@ -4031,6 +4548,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4086,6 +4604,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4140,6 +4659,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "fn_a".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 2,
@@ -4159,6 +4679,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "fn_b".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 3,
@@ -4190,6 +4711,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4245,6 +4767,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "complex_fn".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 30,
@@ -4264,6 +4787,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "simple_fn".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 1,
@@ -4291,6 +4815,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4330,6 +4855,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             ..Default::default()
@@ -4343,6 +4870,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "orphan".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 1,
@@ -4377,6 +4905,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4425,6 +4954,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "high".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 10,
@@ -4440,6 +4970,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "medium".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 11,
                     col: 0,
                     cyclomatic: 5,
@@ -4455,6 +4986,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "low".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 21,
                     col: 0,
                     cyclomatic: 2,
@@ -4470,6 +5002,7 @@ mod tests {
                 fallow_types::extract::FunctionComplexity {
                     name: "trivial".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 31,
                     col: 0,
                     cyclomatic: 1,
@@ -4496,6 +5029,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4562,6 +5096,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "fn_a".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 2,
@@ -4581,6 +5116,7 @@ mod tests {
                 vec![fallow_types::extract::FunctionComplexity {
                     name: "fn_b".into(),
                     is_private_member: false,
+                    context_named: None,
                     line: 1,
                     col: 0,
                     cyclomatic: 3,
@@ -4622,6 +5158,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4670,6 +5207,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: crate::source::ExportName::Named("bar".into()),
@@ -4681,6 +5220,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -4695,6 +5236,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "fn_a".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 1,
@@ -4719,6 +5261,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_types::extract::ExportInfo {
                 name: crate::source::ExportName::Named("bar".into()),
@@ -4730,6 +5274,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
         ]
         .into();
@@ -4750,6 +5296,8 @@ mod tests {
                     col: 0,
                     span_start: 0,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ),
         );
@@ -4763,6 +5311,8 @@ mod tests {
                     col: 0,
                     span_start: 40,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ),
         );
@@ -4774,6 +5324,7 @@ mod tests {
                     path: std::path::PathBuf::from("/package.json"),
                     line: 1,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ),
         );
@@ -4785,6 +5336,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4830,6 +5382,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: crate::source::ExportName::Named("bar".into()),
@@ -4841,6 +5395,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: crate::source::ExportName::Named("baz".into()),
@@ -4852,6 +5408,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -4866,6 +5424,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "fn_a".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 1,
@@ -4890,6 +5449,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             fallow_types::extract::ExportInfo {
                 name: crate::source::ExportName::Named("bar".into()),
@@ -4901,6 +5462,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
         ]
         .into();
@@ -4922,6 +5485,8 @@ mod tests {
                         col: 0,
                         span_start: 0,
                         is_re_export: name == "baz",
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 ),
             );
@@ -4934,6 +5499,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -4973,6 +5539,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "fn_a".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 2,
@@ -4997,6 +5564,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5035,6 +5603,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "fn".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 7,
@@ -5060,6 +5629,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5100,6 +5670,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: crate::source::ExportName::Named("b".into()),
@@ -5111,6 +5683,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
                 fallow_types::extract::ExportInfo {
                     name: crate::source::ExportName::Named("T".into()),
@@ -5122,6 +5696,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 },
             ]
             .into(),
@@ -5136,6 +5712,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "fn_a".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 2,
@@ -5161,6 +5738,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5199,6 +5777,7 @@ mod tests {
             vec![fallow_types::extract::FunctionComplexity {
                 name: "trivial".into(),
                 is_private_member: false,
+                context_named: None,
                 line: 1,
                 col: 0,
                 cyclomatic: 1,
@@ -5224,6 +5803,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5239,10 +5819,11 @@ mod tests {
         assert!(!result.top_complex_fns.contains_key(&path_a));
     }
 
-    fn make_fn_complexity(cyclomatic: u16) -> fallow_types::extract::FunctionComplexity {
+    pub(super) fn make_fn_complexity(cyclomatic: u16) -> fallow_types::extract::FunctionComplexity {
         fallow_types::extract::FunctionComplexity {
             name: "test_fn".into(),
             is_private_member: false,
+            context_named: None,
             line: 1,
             col: 0,
             cyclomatic,
@@ -5265,6 +5846,7 @@ mod tests {
         fallow_types::extract::FunctionComplexity {
             name: name.into(),
             is_private_member: false,
+            context_named: None,
             line,
             col: 0,
             cyclomatic,
@@ -5307,6 +5889,7 @@ mod tests {
                 enforce_crap,
             },
             std::path::Path::new(relative),
+            &[],
         );
         compute_crap_scores_estimated(
             complexity,
@@ -5449,6 +6032,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5465,6 +6049,8 @@ mod tests {
                     resolver: &resolver,
                     enforce_crap: true,
                 },
+                with_static_links: false,
+                test_reach: None,
             },
             output,
         )
@@ -5515,6 +6101,7 @@ mod tests {
             modules: None,
             files: None,
             script_used_packages: rustc_hash::FxHashSet::default(),
+            trace_provenance: crate::trace::TraceProvenance::default(),
             file_hashes: rustc_hash::FxHashMap::default(),
         };
 
@@ -5532,6 +6119,8 @@ mod tests {
                     resolver: &resolver,
                     enforce_crap: true,
                 },
+                with_static_links: false,
+                test_reach: None,
             },
             output,
         )
@@ -5549,55 +6138,28 @@ mod tests {
         );
     }
 
+    /// Untested-file aggregation on the shipped estimated path: the reported
+    /// max is the highest rounded score, `above` counts only the units at or
+    /// over their effective ceiling, and the synthetic template and module
+    /// units leave the CRAP dimension entirely.
     #[test]
-    fn crap_scores_empty_complexity() {
-        let (max, above) = compute_crap_scores_binary(&[], true);
-        assert!((max).abs() < f64::EPSILON);
-        assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn crap_scores_test_reachable() {
-        let funcs = vec![make_fn_complexity(5)];
-        let (max, above) = compute_crap_scores_binary(&funcs, true);
-        assert!((max - 5.0).abs() < f64::EPSILON);
-        assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn crap_scores_untested_at_threshold() {
-        let funcs = vec![make_fn_complexity(5)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 30.0).abs() < f64::EPSILON);
-        assert_eq!(above, 1);
-    }
-
-    #[test]
-    fn crap_scores_untested_above_threshold() {
-        let funcs = vec![make_fn_complexity(6)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 42.0).abs() < f64::EPSILON);
-        assert_eq!(above, 1);
-    }
-
-    #[test]
-    fn crap_scores_untested_below_threshold() {
-        let funcs = vec![make_fn_complexity(4)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 20.0).abs() < f64::EPSILON);
-        assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn crap_scores_mixed_functions_untested() {
+    fn estimated_crap_untested_aggregates_over_real_units_only() {
         let funcs = vec![
-            make_fn_complexity(2),
-            make_fn_complexity(5),
-            make_fn_complexity(8),
+            make_named_fn_complexity("below", 1, 4),
+            make_named_fn_complexity("at_threshold", 2, 5),
+            make_named_fn_complexity("above_threshold", 3, 8),
+            make_named_fn_complexity("<template>", 4, 21),
+            make_named_fn_complexity("<module>", 5, 21),
         ];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 72.0).abs() < f64::EPSILON);
-        assert_eq!(above, 2);
+        let result = estimated_crap_default(
+            &funcs,
+            &rustc_hash::FxHashSet::default(),
+            false,
+            fallow_output::CoverageSource::Estimated,
+        );
+        assert!((result.max_crap - 72.0).abs() < f64::EPSILON, "{result:#?}");
+        assert_eq!(result.signals.above, 2);
+        assert_eq!(result.per_function.len(), 3);
     }
 
     #[test]
@@ -5737,6 +6299,27 @@ mod tests {
     }
 
     #[test]
+    fn estimated_crap_context_name_is_not_a_direct_test_reference() {
+        let mut generator = make_fn_complexity(10);
+        generator.context_named = Some(fallow_types::extract::AnonymousFunctionKind::Function);
+        let mut refs = rustc_hash::FxHashSet::default();
+        refs.insert("test_fn".to_string());
+        let with_context_name = estimated_crap_default(
+            &[generator],
+            &refs,
+            true,
+            fallow_output::CoverageSource::Estimated,
+        );
+        let without_reference = estimated_crap_default(
+            &[make_fn_complexity(10)],
+            &rustc_hash::FxHashSet::default(),
+            true,
+            fallow_output::CoverageSource::Estimated,
+        );
+        assert!((with_context_name.max_crap - without_reference.max_crap).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn estimated_crap_indirect_test_reachable() {
         let funcs = vec![make_fn_complexity(10)];
         let refs = rustc_hash::FxHashSet::default();
@@ -5803,6 +6386,8 @@ mod tests {
             references: vec![],
             reference_paths: Vec::new(),
             members: vec![],
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -5853,21 +6438,39 @@ mod tests {
         assert!((ratio - 0.5).abs() < f64::EPSILON);
     }
 
-    fn write_single_file_istanbul_fixture(
+    pub(super) fn write_single_file_istanbul_fixture(
         coverage_path: &std::path::Path,
         source_path: &std::path::Path,
         fn_map: &serde_json::Value,
         function_hits: &serde_json::Value,
+    ) {
+        write_single_file_istanbul_fixture_with_statements(
+            coverage_path,
+            source_path,
+            fn_map,
+            function_hits,
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        );
+    }
+
+    fn write_single_file_istanbul_fixture_with_statements(
+        coverage_path: &std::path::Path,
+        source_path: &std::path::Path,
+        fn_map: &serde_json::Value,
+        function_hits: &serde_json::Value,
+        statement_map: &serde_json::Value,
+        statement_hits: &serde_json::Value,
     ) {
         let mut root = serde_json::Map::new();
         root.insert(
             source_path.to_string_lossy().into_owned(),
             serde_json::json!({
                 "path": source_path.to_string_lossy().into_owned(),
-                "statementMap": {},
+                "statementMap": statement_map,
                 "fnMap": fn_map,
                 "branchMap": {},
-                "s": {},
+                "s": statement_hits,
                 "f": function_hits,
                 "b": {}
             }),
@@ -5934,6 +6537,107 @@ mod tests {
         let file_coverage = coverage.get(&canonical_source).unwrap();
 
         assert_eq!(file_coverage.lookup("pick", 1, 16), Some(100.0));
+    }
+
+    /// Vitest `coverage-v8` (through ast-v8-to-istanbul) records a negative
+    /// hit count for the implicit else of an `if`, for example `[5, -1]`.
+    /// Counts are unsigned, so the strict parse rejected the whole map over a
+    /// value in `b`, which nothing here reads (issue #3564).
+    #[test]
+    fn a_negative_branch_count_does_not_cost_the_whole_map() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/a.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            "export function f(a) {\n  if (a) {\n    return 1;\n  }\n  return 2;\n}\n",
+        )
+        .unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        let source = source_path.to_string_lossy().into_owned();
+        let branch_loc = serde_json::json!({
+            "start": { "line": 2, "column": 2 },
+            "end": { "line": 4, "column": 3 }
+        });
+        std::fs::write(
+            &coverage_path,
+            serde_json::to_string(&serde_json::json!({
+                source.clone(): {
+                    "path": source,
+                    "statementMap": {
+                        "0": branch_loc,
+                        "1": { "start": { "line": 3, "column": 4 }, "end": { "line": 3, "column": 13 } },
+                        "2": { "start": { "line": 5, "column": 2 }, "end": { "line": 5, "column": 11 } }
+                    },
+                    "fnMap": {
+                        "0": {
+                            "name": "f",
+                            "line": 1,
+                            "decl": { "start": { "line": 1, "column": 16 }, "end": { "line": 1, "column": 17 } },
+                            "loc": { "start": { "line": 1, "column": 20 }, "end": { "line": 6, "column": 1 } }
+                        }
+                    },
+                    "branchMap": {
+                        "0": {
+                            "type": "if",
+                            "line": 2,
+                            "loc": branch_loc,
+                            "locations": [branch_loc, branch_loc]
+                        }
+                    },
+                    "s": { "0": 5, "1": 5, "2": 0 },
+                    "f": { "0": 5 },
+                    "b": { "0": [5, -1] },
+                    "b_T": { "0": [5, -5] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        let pct = file_coverage.lookup("f", 1, 16).unwrap();
+        assert!((pct - 200.0 / 3.0).abs() < 1e-9, "got {pct}");
+    }
+
+    /// A negative statement or function count is a miss, the same answer the
+    /// `> 0` coverage test gives for it, rather than a reason to reject the map.
+    #[test]
+    fn a_negative_statement_count_reads_as_a_miss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/a.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &serde_json::json!({
+                "0": {
+                    "name": "f",
+                    "line": 1,
+                    "decl": { "start": { "line": 1, "column": 16 }, "end": { "line": 1, "column": 17 } },
+                    "loc": { "start": { "line": 1, "column": 20 }, "end": { "line": 6, "column": 1 } }
+                }
+            }),
+            &serde_json::json!({ "0": -2 }),
+            &serde_json::json!({
+                "0": { "start": { "line": 2, "column": 2 }, "end": { "line": 2, "column": 11 } },
+                "1": { "start": { "line": 3, "column": 2 }, "end": { "line": 3, "column": 11 } }
+            }),
+            &serde_json::json!({ "0": 3, "1": -1 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("f", 1, 16), Some(50.0));
     }
 
     /// Raw V8 coverage and `oxc-coverage-instrument` record an accessor as
@@ -6232,6 +6936,59 @@ mod tests {
             fallow_output::CoverageSource::Istanbul
         );
         assert_eq!(result.per_function[0].coverage_pct, Some(100.0));
+    }
+
+    /// A generator that a named arrow returns takes the arrow's name as a
+    /// context name, but the coverage producer records it without a name. The
+    /// name must not match the wrapper's record two columns away, so the
+    /// lookup treats the generator as anonymous.
+    #[test]
+    fn a_context_named_generator_takes_its_own_anonymous_record() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/load.ts");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            "export const load = (id: string) =>\n  Effect.gen(function* () {\n    if (id) {}\n  });\n",
+        )
+        .unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture(
+            &coverage_path,
+            &source_path,
+            &serde_json::json!({
+                "0": {
+                    "name": "load",
+                    "line": 1,
+                    "decl": { "start": { "line": 1, "column": 20 }, "end": { "line": 1, "column": 21 } },
+                    "loc": { "start": { "line": 1, "column": 20 }, "end": { "line": 4, "column": 4 } }
+                },
+                "1": {
+                    "name": "(anonymous_1)",
+                    "line": 2,
+                    "decl": { "start": { "line": 2, "column": 13 }, "end": { "line": 2, "column": 14 } },
+                    "loc": { "start": { "line": 2, "column": 13 }, "end": { "line": 4, "column": 3 } }
+                }
+            }),
+            &serde_json::json!({ "0": 1, "1": 0 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        let mut generator = make_fn_complexity(2);
+        generator.name = "load".to_string();
+        generator.line = 2;
+        generator.col = 13;
+        assert_eq!(
+            file_coverage.lookup_function(&generator),
+            Some(100.0),
+            "a declared name matches the wrapper record"
+        );
+        generator.context_named = Some(fallow_types::extract::AnonymousFunctionKind::Function);
+        assert_eq!(file_coverage.lookup_function(&generator), Some(0.0));
     }
 
     /// Curried arrows written one per line put each record's body start on
@@ -6789,89 +7546,6 @@ mod tests {
         );
     }
 
-    /// No instrumenter emits an `fnMap` identity for a private class member,
-    /// so any candidate one reaches belongs to an enclosing function.
-    #[test]
-    fn private_class_member_never_takes_enclosing_coverage() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source_path = temp.path().join("src/vault.js");
-        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
-
-        let coverage_path = temp.path().join("coverage-final.json");
-        write_single_file_istanbul_fixture(
-            &coverage_path,
-            &source_path,
-            &serde_json::json!({
-                "0": {
-                    "name": "(anonymous_0)",
-                    "line": 7,
-                    "decl": { "start": { "line": 1, "column": 24 }, "end": { "line": 1, "column": 25 } },
-                    "loc": { "start": { "line": 7, "column": 5 }, "end": { "line": 7, "column": 20 } }
-                }
-            }),
-            &serde_json::json!({ "0": 1 }),
-        );
-
-        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
-        let canonical_source = dunce::canonicalize(&source_path).unwrap();
-        let file_coverage = coverage.get(&canonical_source).unwrap();
-
-        // `#wipe` sits in the arrow's header span and the arrow ran, but the
-        // private member has no record of its own and never ran.
-        let mut private_member = make_fn_complexity(1);
-        private_member.name = "#wipe".to_string();
-        private_member.is_private_member = true;
-        private_member.line = 3;
-        private_member.col = 9;
-        let result = istanbul_crap_default(&[private_member], Some(file_coverage), false);
-        assert_eq!(result.matched, 0);
-        assert_eq!(
-            result.per_function[0].coverage_source,
-            fallow_output::CoverageSource::Estimated
-        );
-        assert_eq!(file_coverage.lookup("<arrow>", 1, 24), Some(100.0));
-    }
-
-    #[test]
-    fn quoted_hash_method_keeps_exact_istanbul_coverage() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source_path = temp.path().join("src/vault.js");
-        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-        std::fs::write(&source_path, "class Vault { '#wipe'() {} }\n").unwrap();
-
-        let coverage_path = temp.path().join("coverage-final.json");
-        write_single_file_istanbul_fixture(
-            &coverage_path,
-            &source_path,
-            &serde_json::json!({
-                "0": {
-                    "name": "#wipe",
-                    "line": 1,
-                    "decl": { "start": { "line": 1, "column": 14 }, "end": { "line": 1, "column": 21 } },
-                    "loc": { "start": { "line": 1, "column": 24 }, "end": { "line": 1, "column": 26 } }
-                }
-            }),
-            &serde_json::json!({ "0": 1 }),
-        );
-
-        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
-        let canonical_source = dunce::canonicalize(&source_path).unwrap();
-        let file_coverage = coverage.get(&canonical_source).unwrap();
-
-        let mut quoted_public_method = make_fn_complexity(1);
-        quoted_public_method.name = "#wipe".to_string();
-        quoted_public_method.line = 1;
-        quoted_public_method.col = 14;
-        let result = istanbul_crap_default(&[quoted_public_method], Some(file_coverage), false);
-        assert_eq!(result.matched, 1);
-        assert_eq!(
-            result.per_function[0].coverage_source,
-            fallow_output::CoverageSource::Istanbul
-        );
-        assert_eq!(result.per_function[0].coverage_pct, Some(100.0));
-    }
-
     /// A decorated member's `decl` opens at the decorator and its `loc` opens
     /// at the body brace, so the extracted position sits between them with no
     /// alias in reach: the decorator is more than
@@ -7099,6 +7773,367 @@ mod tests {
 
         assert_eq!(file_coverage.lookup("nested", 1, 22), Some(100.0));
         assert_eq!(file_coverage.lookup("<arrow>", 1, 28), Some(0.0));
+    }
+
+    /// A nested function body sits inside its enclosing function's `loc`, so
+    /// counting every contained statement charged the inner body's misses to
+    /// the outer record as well.
+    ///
+    /// Geometry recorded verbatim from istanbul-lib-instrument 6.0.3 for:
+    ///
+    /// ```js
+    /// function outer() {
+    ///   return function inner(flag) {
+    ///     if (flag) return "yes";
+    ///     return "no";
+    ///   };
+    /// }
+    ///
+    /// module.exports = { outer };
+    /// ```
+    ///
+    /// with `outer()` called once and `inner` never called. Statement 0 is
+    /// the outer return and is hit, statements 1 to 3 are the inner body and
+    /// are not, statement 4 is the module-scope export.
+    #[test]
+    fn nested_function_statements_do_not_lower_the_outer_function() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/nested.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &nested_return_fn_map(),
+            &serde_json::json!({ "0": 1, "1": 0 }),
+            &nested_return_statement_map(),
+            &serde_json::json!({ "0": 1, "1": 0, "2": 0, "3": 0, "4": 1 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("outer", 1, 9), Some(100.0));
+        assert_eq!(file_coverage.lookup("inner", 2, 18), Some(0.0));
+    }
+
+    /// A statement outside every `fnMap` record belongs to no function. The
+    /// module-scope export in the fixture above is hit, and flipping it to
+    /// unhit must not move either function.
+    #[test]
+    fn module_scope_statements_belong_to_no_function() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/nested.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &nested_return_fn_map(),
+            &serde_json::json!({ "0": 1, "1": 0 }),
+            &nested_return_statement_map(),
+            &serde_json::json!({ "0": 1, "1": 0, "2": 0, "3": 0, "4": 0 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("outer", 1, 9), Some(100.0));
+        assert_eq!(file_coverage.lookup("inner", 2, 18), Some(0.0));
+    }
+
+    /// Ownership can leave a record with no statements of its own, and that
+    /// record still has to fall back to the function hit count. Geometry
+    /// recorded verbatim from istanbul-lib-instrument 6.0.3 for:
+    ///
+    /// ```js
+    /// function outer() {
+    ///   function inner(flag) {
+    ///     if (flag) return "yes";
+    ///     return "no";
+    ///   }
+    /// }
+    ///
+    /// module.exports = { outer };
+    /// ```
+    ///
+    /// with `outer()` called once. A hoisted declaration is not a statement,
+    /// so every statement inside `outer` belongs to `inner`.
+    #[test]
+    fn an_outer_function_with_only_a_nested_body_falls_back_to_the_hit_count() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/decl-nested.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &serde_json::json!({
+                "0": {
+                    "name": "outer",
+                    "line": 1,
+                    "decl": {
+                        "start": { "line": 1, "column": 9 },
+                        "end": { "line": 1, "column": 14 }
+                    },
+                    "loc": {
+                        "start": { "line": 1, "column": 17 },
+                        "end": { "line": 6, "column": 1 }
+                    }
+                },
+                "1": {
+                    "name": "inner",
+                    "line": 2,
+                    "decl": {
+                        "start": { "line": 2, "column": 11 },
+                        "end": { "line": 2, "column": 16 }
+                    },
+                    "loc": {
+                        "start": { "line": 2, "column": 23 },
+                        "end": { "line": 5, "column": 3 }
+                    }
+                }
+            }),
+            &serde_json::json!({ "0": 1, "1": 0 }),
+            &serde_json::json!({
+                "0": {
+                    "start": { "line": 3, "column": 4 },
+                    "end": { "line": 3, "column": 27 }
+                },
+                "1": {
+                    "start": { "line": 3, "column": 14 },
+                    "end": { "line": 3, "column": 27 }
+                },
+                "2": {
+                    "start": { "line": 4, "column": 4 },
+                    "end": { "line": 4, "column": 16 }
+                },
+                "3": {
+                    "start": { "line": 8, "column": 0 },
+                    "end": { "line": 8, "column": 27 }
+                }
+            }),
+            &serde_json::json!({ "0": 0, "1": 0, "2": 0, "3": 1 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("outer", 1, 9), Some(100.0));
+        assert_eq!(file_coverage.lookup("inner", 2, 11), Some(0.0));
+    }
+
+    /// Two functions at module scope never contain each other, so ownership
+    /// must leave them exactly where they were. Geometry recorded verbatim
+    /// from istanbul-lib-instrument 6.0.3 for the same source with `inner`
+    /// hoisted out of `outer`.
+    #[test]
+    fn sibling_functions_keep_independent_statement_coverage() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/sibling.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &serde_json::json!({
+                "0": {
+                    "name": "inner",
+                    "line": 1,
+                    "decl": {
+                        "start": { "line": 1, "column": 9 },
+                        "end": { "line": 1, "column": 14 }
+                    },
+                    "loc": {
+                        "start": { "line": 1, "column": 21 },
+                        "end": { "line": 4, "column": 1 }
+                    }
+                },
+                "1": {
+                    "name": "outer",
+                    "line": 6,
+                    "decl": {
+                        "start": { "line": 6, "column": 9 },
+                        "end": { "line": 6, "column": 14 }
+                    },
+                    "loc": {
+                        "start": { "line": 6, "column": 17 },
+                        "end": { "line": 8, "column": 1 }
+                    }
+                }
+            }),
+            &serde_json::json!({ "0": 0, "1": 1 }),
+            &serde_json::json!({
+                "0": {
+                    "start": { "line": 2, "column": 2 },
+                    "end": { "line": 2, "column": 25 }
+                },
+                "1": {
+                    "start": { "line": 2, "column": 12 },
+                    "end": { "line": 2, "column": 25 }
+                },
+                "2": {
+                    "start": { "line": 3, "column": 2 },
+                    "end": { "line": 3, "column": 14 }
+                },
+                "3": {
+                    "start": { "line": 7, "column": 2 },
+                    "end": { "line": 7, "column": 15 }
+                },
+                "4": {
+                    "start": { "line": 10, "column": 0 },
+                    "end": { "line": 10, "column": 27 }
+                }
+            }),
+            &serde_json::json!({ "0": 0, "1": 0, "2": 0, "3": 1, "4": 1 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("outer", 6, 9), Some(100.0));
+        assert_eq!(file_coverage.lookup("inner", 1, 9), Some(0.0));
+    }
+
+    /// Curried arrows share their closing position, so the inner body is
+    /// distinguished only by its later start. Geometry recorded verbatim from
+    /// istanbul-lib-instrument 6.0.3 for `const add = (a) => (b) => a + b;`
+    /// with `add(1)` called once, so the outer arrow ran and the inner did
+    /// not. Statement 1 is the outer expression body, statement 2 the inner.
+    #[test]
+    fn curried_arrow_statements_belong_to_the_innermost_arrow() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_path = temp.path().join("src/curried.js");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, "// geometry fixture\n").unwrap();
+
+        let coverage_path = temp.path().join("coverage-final.json");
+        write_single_file_istanbul_fixture_with_statements(
+            &coverage_path,
+            &source_path,
+            &serde_json::json!({
+                "0": {
+                    "name": "(anonymous_0)",
+                    "line": 1,
+                    "decl": {
+                        "start": { "line": 1, "column": 12 },
+                        "end": { "line": 1, "column": 13 }
+                    },
+                    "loc": {
+                        "start": { "line": 1, "column": 19 },
+                        "end": { "line": 1, "column": 31 }
+                    }
+                },
+                "1": {
+                    "name": "(anonymous_1)",
+                    "line": 1,
+                    "decl": {
+                        "start": { "line": 1, "column": 19 },
+                        "end": { "line": 1, "column": 20 }
+                    },
+                    "loc": {
+                        "start": { "line": 1, "column": 26 },
+                        "end": { "line": 1, "column": 31 }
+                    }
+                }
+            }),
+            &serde_json::json!({ "0": 1, "1": 0 }),
+            &serde_json::json!({
+                "0": {
+                    "start": { "line": 1, "column": 12 },
+                    "end": { "line": 1, "column": 31 }
+                },
+                "1": {
+                    "start": { "line": 1, "column": 19 },
+                    "end": { "line": 1, "column": 31 }
+                },
+                "2": {
+                    "start": { "line": 1, "column": 26 },
+                    "end": { "line": 1, "column": 31 }
+                },
+                "3": {
+                    "start": { "line": 3, "column": 0 },
+                    "end": { "line": 3, "column": 25 }
+                }
+            }),
+            &serde_json::json!({ "0": 1, "1": 1, "2": 0, "3": 1 }),
+        );
+
+        let coverage = load_istanbul_coverage(&coverage_path, None, None, false).unwrap();
+        let canonical_source = dunce::canonicalize(&source_path).unwrap();
+        let file_coverage = coverage.get(&canonical_source).unwrap();
+
+        assert_eq!(file_coverage.lookup("add", 1, 12), Some(100.0));
+        assert_eq!(file_coverage.lookup("<arrow>", 1, 19), Some(0.0));
+    }
+
+    /// The `fnMap` and `statementMap` istanbul-lib-instrument 6.0.3 records
+    /// for the nested-return source, shared by the two tests that pin
+    /// statement ownership against it.
+    fn nested_return_fn_map() -> serde_json::Value {
+        serde_json::json!({
+            "0": {
+                "name": "outer",
+                "line": 1,
+                "decl": {
+                    "start": { "line": 1, "column": 9 },
+                    "end": { "line": 1, "column": 14 }
+                },
+                "loc": {
+                    "start": { "line": 1, "column": 17 },
+                    "end": { "line": 6, "column": 1 }
+                }
+            },
+            "1": {
+                "name": "inner",
+                "line": 2,
+                "decl": {
+                    "start": { "line": 2, "column": 18 },
+                    "end": { "line": 2, "column": 23 }
+                },
+                "loc": {
+                    "start": { "line": 2, "column": 30 },
+                    "end": { "line": 5, "column": 3 }
+                }
+            }
+        })
+    }
+
+    fn nested_return_statement_map() -> serde_json::Value {
+        serde_json::json!({
+            "0": {
+                "start": { "line": 2, "column": 2 },
+                "end": { "line": 5, "column": 4 }
+            },
+            "1": {
+                "start": { "line": 3, "column": 4 },
+                "end": { "line": 3, "column": 27 }
+            },
+            "2": {
+                "start": { "line": 3, "column": 14 },
+                "end": { "line": 3, "column": 27 }
+            },
+            "3": {
+                "start": { "line": 4, "column": 4 },
+                "end": { "line": 4, "column": 16 }
+            },
+            "4": {
+                "start": { "line": 8, "column": 0 },
+                "end": { "line": 8, "column": 27 }
+            }
+        })
     }
 
     /// istanbul-lib-instrument geometry for a multi-line higher-order
@@ -7775,15 +8810,11 @@ mod tests {
     fn build_test_refs_empty() {
         let exports: Vec<fallow_graph::graph::ExportSymbol> = vec![];
         let graph = fallow_graph::graph::ModuleGraph::build(&[], &[], &[]);
-        let refs = build_test_referenced_exports(&exports, StaticTestCoverage::new(&graph));
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn build_test_refs_empty_inputs() {
-        let exports: Vec<fallow_graph::graph::ExportSymbol> = vec![];
-        let graph = fallow_graph::graph::ModuleGraph::build(&[], &[], &[]);
-        let refs = build_test_referenced_exports(&exports, StaticTestCoverage::new(&graph));
+        let refs = build_test_referenced_exports(
+            crate::discover::FileId(0),
+            &exports,
+            StaticTestCoverage::new(&graph),
+        );
         assert!(refs.is_empty());
     }
 
@@ -7834,44 +8865,5 @@ mod tests {
         let (max, above) = (result.max_crap, result.signals.above);
         assert!(max > 10.0);
         assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn binary_crap_test_reachable() {
-        let funcs = vec![make_fn_complexity(10)];
-        let (max, above) = compute_crap_scores_binary(&funcs, true);
-        assert!((max - 10.0).abs() < f64::EPSILON);
-        assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn binary_crap_not_reachable() {
-        let funcs = vec![make_fn_complexity(6)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 42.0).abs() < f64::EPSILON);
-        assert_eq!(above, 1);
-    }
-
-    #[test]
-    fn binary_crap_threshold_boundary() {
-        let funcs = vec![make_fn_complexity(5)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 30.0).abs() < f64::EPSILON);
-        assert_eq!(above, 1);
-    }
-
-    #[test]
-    fn binary_crap_empty() {
-        let (max, above) = compute_crap_scores_binary(&[], true);
-        assert!((max).abs() < f64::EPSILON);
-        assert_eq!(above, 0);
-    }
-
-    #[test]
-    fn binary_crap_multiple_functions() {
-        let funcs = vec![make_fn_complexity(3), make_fn_complexity(8)];
-        let (max, above) = compute_crap_scores_binary(&funcs, false);
-        assert!((max - 72.0).abs() < f64::EPSILON);
-        assert_eq!(above, 1);
     }
 }

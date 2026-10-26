@@ -26,11 +26,18 @@ pub struct LspInitializationOptions {
     pub config_path: Option<String>,
     pub allow_remote_extends: bool,
     pub issue_types: Option<BTreeMap<String, bool>>,
+    pub muted_categories: Option<Vec<String>>,
     pub changed_since: Option<String>,
+    /// `false` ignores `workspaces.changedSince`, as `--no-package-baselines`
+    /// does on the CLI. Absent keeps the map.
+    pub package_baselines: Option<bool>,
     pub duplication: Option<LspDuplicationOptions>,
     pub production: Option<bool>,
     pub health: Option<LspHealthOptions>,
     pub type_aware: Option<LspTypeAwareOptions>,
+    /// Parse the project at `initialized`, before the first open, without a
+    /// publish. Off by default.
+    pub prewarm: bool,
 }
 
 #[must_use]
@@ -56,10 +63,22 @@ pub fn parse_initialization_options(opts: Option<&serde_json::Value>) -> LspInit
                 .collect::<BTreeMap<_, _>>();
             (!issue_types.is_empty()).then_some(issue_types)
         }),
+        muted_categories: obj.get("mutedCategories").and_then(|value| {
+            let categories = value
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            (!categories.is_empty()).then_some(categories)
+        }),
         changed_since: obj
             .get("changedSince")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        package_baselines: obj
+            .get("packageBaselines")
+            .and_then(serde_json::Value::as_bool),
         duplication: obj
             .get("duplication")
             .and_then(|value| serde_json::from_value(value.clone()).ok()),
@@ -75,6 +94,10 @@ pub fn parse_initialization_options(opts: Option<&serde_json::Value>) -> LspInit
         type_aware: obj
             .get("typeAware")
             .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        prewarm: obj
+            .get("prewarm")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -116,6 +139,7 @@ pub struct LspDuplicationOptions {
     pub skip_local: Option<bool>,
     pub cross_language: Option<bool>,
     pub ignore_imports: Option<bool>,
+    pub ignore_symlinks: Option<bool>,
 }
 
 impl LspDuplicationOptions {
@@ -135,6 +159,7 @@ impl LspDuplicationOptions {
             ignored_clones: config.ignored_clones.clone(),
             ignore_defaults: config.ignore_defaults,
             skip_local: self.skip_local.unwrap_or(config.skip_local),
+            ignore_symlinks: self.ignore_symlinks.unwrap_or(config.ignore_symlinks),
             cross_language: self.cross_language.unwrap_or(config.cross_language),
             ignore_imports: self.ignore_imports.unwrap_or(config.ignore_imports),
             normalization: config.normalization.clone(),
@@ -142,28 +167,4 @@ impl LspDuplicationOptions {
             min_corpus_size_for_token_cache: config.min_corpus_size_for_token_cache,
         }
     }
-}
-
-#[cfg(test)]
-pub fn initialization_duplication_options(
-    opts: &serde_json::Value,
-) -> Option<LspDuplicationOptions> {
-    parse_initialization_options(Some(opts)).duplication
-}
-
-/// Read the optional production-mode override from `initializationOptions`.
-/// `Some(true)`/`Some(false)` force production on/off; a missing or non-boolean
-/// `production` key yields `None`, deferring to the project config (issue
-/// #1055). VS Code omits the key for the `"auto"` setting state.
-#[cfg(test)]
-pub fn initialization_production_override(opts: &serde_json::Value) -> Option<bool> {
-    parse_initialization_options(Some(opts)).production
-}
-
-#[cfg(test)]
-pub fn initialization_inline_complexity_enabled(opts: &serde_json::Value) -> bool {
-    parse_initialization_options(Some(opts))
-        .health
-        .and_then(|health| health.inline_complexity)
-        .unwrap_or(false)
 }

@@ -17,7 +17,7 @@ use rustc_hash::FxHashSet;
 
 use crate::asset_url::normalize_asset_url;
 use crate::html::is_remote_url;
-use crate::sfc::{SfcScript, SourceRegion};
+use crate::sfc::{SfcScript, SourceRegion, ranges_to_gaps};
 use crate::source_map::ExtractionResult;
 use crate::template_expression_scan::{
     TemplateScanMode, guarded_import_locals, import_declaration_ranges, merge_ranges,
@@ -364,7 +364,7 @@ fn extend_template_expression_usage(
         let wrapped = format!("({region});");
         let allocator = Allocator::default();
         let parser_return = Parser::new(&allocator, &wrapped, SourceType::tsx()).parse();
-        if parser_return.panicked || !parser_return.errors.is_empty() {
+        if parser_return.fatal_error || !parser_return.diagnostics.is_empty() {
             continue;
         }
         extractor.visit_program(&parser_return.program);
@@ -543,34 +543,6 @@ pub fn extract_astro_style_regions(source: &str) -> Vec<SourceRegion> {
         .collect()
 }
 
-fn ranges_to_gaps(source: &str, ranges: &[(usize, usize)]) -> Vec<SourceRegion> {
-    let mut regions = Vec::new();
-    let mut cursor = 0;
-    for &(start, end) in ranges {
-        if start > cursor {
-            push_region(source, cursor, start, &mut regions);
-        }
-        cursor = cursor.max(end);
-    }
-    if cursor < source.len() {
-        push_region(source, cursor, source.len(), &mut regions);
-    }
-    regions
-}
-
-fn push_region(source: &str, start: usize, end: usize, regions: &mut Vec<SourceRegion>) {
-    let Some(body) = source.get(start..end) else {
-        return;
-    };
-    if body.trim().is_empty() {
-        return;
-    }
-    regions.push(SourceRegion {
-        body: body.to_string(),
-        byte_offset: start,
-    });
-}
-
 pub(crate) fn is_astro_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -614,7 +586,7 @@ pub(crate) fn parse_astro_to_module(
 
     let AstroFrontmatterAnalysis {
         mut extractor,
-        semantic_usage,
+        mut semantic_usage,
         props_harvest,
         complexity: frontmatter_complexity,
     } = analyze_astro_frontmatter(
@@ -633,6 +605,31 @@ pub(crate) fn parse_astro_to_module(
     let frontmatter_array_element_types = extractor.array_binding_element_types().clone();
 
     let mut info = extractor.into_module_info(file_id, content_hash, parsed_suppressions);
+    crate::component_contracts::merge(
+        &mut info.component_contracts,
+        std::mem::take(&mut semantic_usage.component_contracts),
+        frontmatter_offset as u32,
+        Some(fallow_types::extract::ComponentFramework::Astro),
+    );
+    let mut caller_source = template.as_bytes().to_vec();
+    for &(start, end) in &masked {
+        caller_source[start..end].fill(b' ');
+    }
+    if let Ok(caller_source) = std::str::from_utf8(&caller_source) {
+        let callers = crate::sfc_template::component_contracts::collect(
+            caller_source,
+            &info.imports,
+            fallow_types::extract::ComponentFramework::Astro,
+            template_offset as u32,
+            info.component_contracts
+                .as_deref()
+                .map_or(&[], |facts| facts.spread_bindings.as_slice()),
+            info.component_contracts
+                .as_deref()
+                .map_or(&[], |facts| facts.aliases.as_slice()),
+        );
+        crate::component_contracts::merge(&mut info.component_contracts, callers, 0, None);
+    }
 
     // Member-expression component tags (`<SC.Card />`) feed the same
     // member-access stream namespace narrowing reads for `.tsx` (issue #2355).
@@ -683,6 +680,7 @@ pub(crate) fn parse_astro_to_module(
             .extend(crate::template_complexity::compute_astro_template_complexity(source));
     }
     info.line_offsets = line_offsets;
+    crate::component_contracts::attach_sfc_default_export(&mut info);
     info
 }
 
@@ -699,6 +697,7 @@ fn analyze_astro_frontmatter(
     let allocator = Allocator::default();
     let parser_return = Parser::new(&allocator, &script.body, source_type).parse();
     let mut extractor = ModuleInfoExtractor::new();
+    extractor.set_top_level_is_component_body(true);
     extractor.visit_program(&parser_return.program);
     let semantic_usage = crate::parse::compute_semantic_usage_for_extractor(
         &parser_return.program,
@@ -709,12 +708,7 @@ fn analyze_astro_frontmatter(
     extractor.remap_spans_with(|span| extraction.remap_span(span));
     let props_harvest = crate::sfc_props::harvest_astro_props(&parser_return.program);
     let complexity = if need_complexity {
-        compute_astro_frontmatter_complexity(
-            &parser_return.program,
-            &script.body,
-            script.byte_offset,
-            line_offsets,
-        )
+        crate::sfc::translate_script_complexity(script, &parser_return.program, line_offsets)
     } else {
         Vec::new()
     };
@@ -733,32 +727,6 @@ fn empty_astro_frontmatter_analysis() -> AstroFrontmatterAnalysis {
         props_harvest: crate::sfc_props::DefinePropsHarvest::default(),
         complexity: Vec::new(),
     }
-}
-
-/// Score the frontmatter's JS functions (cyclomatic/cognitive), remapping each
-/// function's line/col from the frontmatter-body coordinate space onto the
-/// `.astro` source. Mirrors the Vue/Svelte `sfc::translate_script_complexity`
-/// path so a complex `.astro` frontmatter contributes to the health complexity
-/// aggregate the same as an SFC `<script>`.
-fn compute_astro_frontmatter_complexity(
-    program: &oxc_ast::ast::Program<'_>,
-    body: &str,
-    body_byte_offset: usize,
-    source_line_offsets: &[u32],
-) -> Vec<fallow_types::extract::FunctionComplexity> {
-    let body_line_offsets = fallow_types::extract::compute_line_offsets(body);
-    let mut complexity = crate::complexity::compute_complexity(program, body, &body_line_offsets);
-    let (body_start_line, body_start_col) = fallow_types::extract::byte_offset_to_line_col(
-        source_line_offsets,
-        u32::try_from(body_byte_offset).unwrap_or(u32::MAX),
-    );
-    for function in &mut complexity {
-        function.line = body_start_line + function.line.saturating_sub(1);
-        if function.line == body_start_line {
-            function.col += body_start_col;
-        }
-    }
-    complexity
 }
 
 /// Thread the harvested Astro `Props` declaration + `Astro.props` usage onto the
@@ -785,6 +753,16 @@ fn apply_astro_props(
             .saturating_add(u32::try_from(frontmatter_offset).unwrap_or(u32::MAX));
         prop.used_in_template =
             template_used.contains(&prop.local) || template_used.contains(&prop.name);
+        if let Some(facts) = &mut info.component_contracts {
+            for declaration in facts
+                .declarations
+                .iter_mut()
+                .filter(|declaration| declaration.name == prop.name)
+            {
+                declaration.is_used |= prop.used_in_script || prop.used_in_template;
+                declaration.incomplete |= info.has_props_attrs_fallthrough;
+            }
+        }
         info.component_props.push(prop);
     }
 }

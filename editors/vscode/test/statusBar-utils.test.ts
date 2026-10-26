@@ -31,6 +31,7 @@ const baseParams = (
   devDependenciesInProduction: 0,
   circularDependencies: 0,
   reExportCycles: 0,
+  packageCycles: 0,
   boundaryViolations: 0,
   staleSuppressions: 0,
   unusedCatalogEntries: 0,
@@ -91,6 +92,32 @@ describe("buildStatusBarTooltipMarkdown", () => {
   it("surfaces the changedSince ref when scoped", () => {
     const markdown = buildStatusBarTooltipMarkdown(baseParams(), "fallow-baseline");
     expect(markdown).toContain("Scoped to changes since fallow\\-baseline");
+  });
+
+  it("lists package refs and explains the remaining full scope", () => {
+    const markdown = buildStatusBarTooltipMarkdown(
+      baseParams({
+        packageBaselines: [
+          { workspace_root: "packages/web", reference: "main" },
+          { workspace_root: "packages/legacy", reference: "release/2024.10" },
+        ],
+      }),
+    );
+    expect(markdown).toContain("Code diagnostics and clone groups use package baselines:");
+    expect(markdown).toContain("packages/web: main");
+    expect(markdown).toContain("packages/legacy: release/2024\\.10");
+    expect(markdown).toContain("Unlisted packages and root files remain in full scope.");
+    expect(markdown).toContain("Health and security reports use their own scopes.");
+  });
+
+  it("prefers a completed package scope over a setting changed after the run", () => {
+    const params = baseParams({
+      packageBaselines: [{ workspace_root: "packages/web", reference: "main" }],
+    });
+    expect(buildStatusBarTooltipMarkdown(params, "new-global-ref"))
+      .toContain("packages/web: main");
+    expect(renderStatusBarText("$(search) Fallow", "new-global-ref", undefined, params.packageBaselines))
+      .toBe("$(search) Fallow (package baselines)");
   });
 
   it("uses the server-applied changedSince scope when present", () => {
@@ -203,6 +230,22 @@ describe("renderStatusBarText", () => {
     ).toBe("$(search) Fallow: 3 issues (since origin/main)");
   });
 
+  it("shows reported package baselines until a reported global scope overrides them", () => {
+    const packages = [{ workspace_root: "packages/web", reference: "main" }];
+    expect(renderStatusBarText("$(search) Fallow", null, undefined, packages)).toBe(
+      "$(search) Fallow (package baselines)",
+    );
+    expect(renderStatusBarText("$(search) Fallow", "HEAD", undefined, packages)).toBe(
+      "$(search) Fallow (package baselines)",
+    );
+    expect(renderStatusBarText("$(search) Fallow", "HEAD", {
+      requestedRef: "HEAD",
+      state: "applied",
+    }, packages)).toBe(
+      "$(search) Fallow (since HEAD)",
+    );
+  });
+
   it("marks dropped scope without claiming the filter is active", () => {
     expect(
       renderStatusBarText("$(search) Fallow: 3 issues", "missing-ref", {
@@ -224,7 +267,7 @@ describe("renderStatusBarText", () => {
 
 describe("buildParamsFromCli", () => {
   const emptyCheck = (): FallowCheckResult => ({
-    schema_version: 9,
+    schema_version: 10,
     version: "0.0.0-test",
     elapsed_ms: 0,
     total_issues: 0,
@@ -251,6 +294,7 @@ describe("buildParamsFromCli", () => {
       unused_exports: 0,
       unused_types: 0,
       private_type_leaks: 0,
+      deprecated_exports_in_use: 0,
       unused_dependencies: 0,
       unused_enum_members: 0,
       unused_class_members: 0,
@@ -272,10 +316,36 @@ describe("buildParamsFromCli", () => {
   });
 
   it("returns zero counts when both inputs are null", () => {
-    const params = buildParamsFromCli(null, null);
+    const params = buildParamsFromCli(null, null, null);
     expect(params.totalIssues).toBe(0);
     expect(params.duplicationPercentage).toBe(0);
     expect(params.cloneGroups).toBe(0);
+  });
+
+  it("uses CLI scope provenance for the displayed analysis", () => {
+    const params = buildParamsFromCli(emptyCheck(), null, {
+      package_baselines: [{ workspace_root: "packages/web", reference: "main" }],
+    });
+    expect(
+      renderStatusBarText("$(search) Fallow", null, params.changedSinceScope, params.packageBaselines),
+    ).toBe("$(search) Fallow (package baselines)");
+    expect(buildStatusBarTooltipMarkdown(params)).toContain("packages/web: main");
+
+    const dropped = buildParamsFromCli(emptyCheck(), null, {
+      request_outcomes: {
+        "changed-since": {
+          status: "not-applied",
+          affects: "scope",
+          requested: "missing-ref",
+          reason: "git-missing",
+          message: "The Git ref was not found.",
+        },
+      },
+    });
+    expect(renderStatusBarText("$(search) Fallow", "missing-ref", dropped.changedSinceScope))
+      .toBe("$(search) Fallow (since missing-ref: scope dropped)");
+    expect(buildStatusBarTooltipMarkdown(dropped, "missing-ref"))
+      .toContain("The Git ref was not found\\.");
   });
 
   it("counts issue categories from the check result", () => {
@@ -362,7 +432,7 @@ describe("buildParamsFromCli", () => {
       ],
     };
 
-    const params = buildParamsFromCli(check, null);
+    const params = buildParamsFromCli(check, null, null);
     expect(params.unusedFiles).toBe(1);
     expect(params.unusedExports).toBe(2);
     expect(params.unusedOptionalDependencies).toBe(1);
@@ -399,7 +469,7 @@ describe("buildParamsFromCli", () => {
       ],
     };
 
-    const params = buildParamsFromCli(check, null);
+    const params = buildParamsFromCli(check, null, null);
     expect(params.boundaryViolations).toBe(2);
     expect(params.totalIssues).toBe(2);
   });
@@ -416,12 +486,13 @@ describe("buildParamsFromCli", () => {
         total_tokens: 5000,
         duplicated_tokens: 40,
         clone_groups: 3,
+        clone_families: 1,
         clone_instances: 6,
         duplication_percentage: 0.8,
       },
     };
 
-    const params = buildParamsFromCli(null, dupes);
+    const params = buildParamsFromCli(null, dupes, null);
     expect(params.duplicationPercentage).toBe(0.8);
     expect(params.cloneGroups).toBe(3);
   });
@@ -440,7 +511,7 @@ describe("buildParamsFromCli", () => {
     delete (check as { boundary_violations?: unknown }).boundary_violations;
     delete (check as { stale_suppressions?: unknown }).stale_suppressions;
 
-    const params = buildParamsFromCli(check, null);
+    const params = buildParamsFromCli(check, null, null);
     expect(params.unusedOptionalDependencies).toBe(0);
     expect(params.privateTypeLeaks).toBe(0);
     expect(params.typeOnlyDependencies).toBe(0);

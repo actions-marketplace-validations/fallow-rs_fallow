@@ -156,6 +156,99 @@ snapshots:
     );
 }
 
+/// Issue #2909: with `packageManager` set, pnpm 12 writes `pnpm-lock.yaml` as
+/// two YAML documents. The first holds the package manager environment. The
+/// second holds the project graph, which resolves the override target.
+#[test]
+fn override_resolved_in_second_pnpm_lockfile_document_is_used() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"repro","private":true,"packageManager":"pnpm@12.6.0","devDependencies":{"@types/node":"22.20.4"}}"#,
+    )
+    .expect("write root package.json");
+    fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "overrides:\n  undici-types: 6.23.0\n  pnpm: 12.6.0\n  left-pad: 1.3.0\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+    fs::write(root.join("index.ts"), "export {};\n").expect("write index.ts");
+    fs::write(
+        root.join("pnpm-lock.yaml"),
+        r"---
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies: {}
+    packageManagerDependencies:
+      pnpm:
+        specifier: 12.6.0
+        version: 12.6.0
+
+packages:
+
+  pnpm@12.6.0:
+    resolution: {integrity: sha512-p}
+
+snapshots:
+
+  pnpm@12.6.0: {}
+
+---
+lockfileVersion: '9.0'
+
+overrides:
+  undici-types: 6.23.0
+
+importers:
+
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: 22.20.4
+        version: 22.20.4
+
+packages:
+
+  '@types/node@22.20.4':
+    resolution: {integrity: sha512-n}
+
+  undici-types@6.23.0:
+    resolution: {integrity: sha512-u}
+
+snapshots:
+
+  '@types/node@22.20.4':
+    dependencies:
+      undici-types: 6.23.0
+
+  undici-types@6.23.0: {}
+",
+    )
+    .expect("write pnpm lockfile");
+
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let actual: FxHashSet<&str> = results
+        .unused_dependency_overrides
+        .iter()
+        .map(|finding| finding.entry.target_package.as_str())
+        .collect();
+
+    // `pnpm` resolves only in the package manager document, so it must stay
+    // reported: that document does not hold project packages.
+    assert_eq!(
+        actual,
+        FxHashSet::from_iter(["pnpm", "left-pad"]),
+        "the second lockfile document resolves undici-types; got {:?}",
+        results.unused_dependency_overrides
+    );
+}
+
 // Trimmed from a real `bun install` run (bun 1.3.x); keeps bun's trailing
 // commas so the JSONC dialect is exercised end to end. `ws` is a transitive
 // dependency of `happy-dom`, declared in no dependency section.
@@ -682,4 +775,143 @@ fn unused_overrides_carry_transitive_hint_on_every_shape() {
             finding.entry.raw_key
         );
     }
+}
+
+/// Copy a fixture directory into a tempdir. With `theirs`, wrap the `ours`
+/// block of `lock_file` in merge-conflict markers, with `theirs` as the other
+/// side. The markers are built at runtime, so the repository holds no literal
+/// conflict markers. The copy keeps the lockfile name.
+fn lock_conflict_project(
+    fixture: &str,
+    lock_file: &str,
+    ours: &str,
+    theirs: Option<&str>,
+) -> tempfile::TempDir {
+    let source = fixture_path(fixture);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for entry in fs::read_dir(&source).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        fs::copy(entry.path(), tmp.path().join(entry.file_name())).expect("copy fixture file");
+    }
+    if let Some(theirs) = theirs {
+        let lock_path = tmp.path().join(lock_file);
+        let lock = fs::read_to_string(&lock_path).expect("read lockfile");
+        assert!(lock.contains(ours), "fixture {lock_file} changed shape");
+        let (start, separator, end) = ("<".repeat(7), "=".repeat(7), ">".repeat(7));
+        let conflict = format!("{start} HEAD\n{ours}{separator}\n{theirs}{end} feature-branch\n");
+        fs::write(&lock_path, lock.replacen(ours, &conflict, 1)).expect("write lockfile");
+    }
+    tmp
+}
+
+const PNPM_CONFLICT_FIXTURE: &str = "pnpm-lock-merge-conflict-overrides";
+const PNPM_OURS: &str = "        specifier: ^4.21.2\n        version: 4.21.2\n";
+const PNPM_THEIRS: &str = "        specifier: ^4.21.1\n        version: 4.21.1\n";
+
+const NPM_CONFLICT_FIXTURE: &str = "npm-lock-merge-conflict-overrides";
+const NPM_OURS: &str = r#"    "node_modules/express": {
+      "version": "4.21.2",
+      "dependencies": {
+        "path-to-regexp": "0.1.13"
+      }
+    },
+"#;
+const NPM_THEIRS: &str = r#"    "node_modules/express": {
+      "version": "4.21.1",
+      "dependencies": {
+        "path-to-regexp": "0.1.10"
+      }
+    },
+"#;
+
+fn skip_diagnostics(
+    root: &std::path::Path,
+    kind: &fallow_config::WorkspaceDiagnosticKind,
+) -> Vec<fallow_config::WorkspaceDiagnostic> {
+    fallow_config::workspace_diagnostics_for(root)
+        .into_iter()
+        .filter(|diagnostic| &diagnostic.kind == kind)
+        .collect()
+}
+
+fn flagged_override_targets(root: &std::path::Path) -> Vec<String> {
+    let config = config_for_fixture(root.to_path_buf(), vec![]);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    results
+        .unused_dependency_overrides
+        .iter()
+        .map(|f| f.entry.target_package.clone())
+        .collect()
+}
+
+/// Control: the valid lockfiles resolve the transitive-only pin.
+#[test]
+fn valid_lockfiles_resolve_the_transitive_override() {
+    for (fixture, lock_file, ours) in [
+        (PNPM_CONFLICT_FIXTURE, "pnpm-lock.yaml", PNPM_OURS),
+        (NPM_CONFLICT_FIXTURE, "package-lock.json", NPM_OURS),
+    ] {
+        let project = lock_conflict_project(fixture, lock_file, ours, None);
+        let flagged = flagged_override_targets(project.path());
+        assert!(flagged.is_empty(), "{fixture}: got {flagged:?}");
+        assert!(
+            fallow_config::workspace_diagnostics_for(project.path())
+                .iter()
+                .all(|diagnostic| !diagnostic
+                    .kind
+                    .id()
+                    .ends_with("-override-resolution-skipped")),
+            "{fixture}: a valid lockfile records no skip diagnostic"
+        );
+    }
+}
+
+/// A `pnpm-lock.yaml` with unresolved merge-conflict markers does not parse.
+/// Declaration-only analysis cannot tell a transitive-only pin from a
+/// removable override, so the check fails closed with a diagnostic.
+#[test]
+fn pnpm_lock_with_merge_conflict_markers_skips_removal_advice_with_a_diagnostic() {
+    let project = lock_conflict_project(
+        PNPM_CONFLICT_FIXTURE,
+        "pnpm-lock.yaml",
+        PNPM_OURS,
+        Some(PNPM_THEIRS),
+    );
+    let flagged = flagged_override_targets(project.path());
+    assert!(
+        flagged.is_empty(),
+        "a transitive-only override must not be reported while pnpm-lock.yaml does not parse: \
+         {flagged:?}"
+    );
+    let diagnostics = skip_diagnostics(
+        project.path(),
+        &fallow_config::WorkspaceDiagnosticKind::PnpmLockOverrideResolutionSkipped,
+    );
+    assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+    assert!(diagnostics[0].path.ends_with("pnpm-lock.yaml"));
+}
+
+/// A `package-lock.json` with unresolved merge-conflict markers does not
+/// parse. Without another lockfile, the check fails closed with a diagnostic
+/// instead of reporting a transitive-only npm override as unused.
+#[test]
+fn npm_lock_with_merge_conflict_markers_skips_removal_advice_with_a_diagnostic() {
+    let project = lock_conflict_project(
+        NPM_CONFLICT_FIXTURE,
+        "package-lock.json",
+        NPM_OURS,
+        Some(NPM_THEIRS),
+    );
+    let flagged = flagged_override_targets(project.path());
+    assert!(
+        flagged.is_empty(),
+        "a transitive-only override must not be reported while package-lock.json does not parse: \
+         {flagged:?}"
+    );
+    let diagnostics = skip_diagnostics(
+        project.path(),
+        &fallow_config::WorkspaceDiagnosticKind::NpmLockOverrideResolutionSkipped,
+    );
+    assert_eq!(diagnostics.len(), 1, "got {diagnostics:?}");
+    assert!(diagnostics[0].path.ends_with("package-lock.json"));
 }

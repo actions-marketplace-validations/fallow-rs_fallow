@@ -1,7 +1,10 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use crate::params::ProjectInfoParams;
 
 use fallow_api::{
-    AnalysisOptions, ProjectInfoOptions, run_project_info as run_api_project_info,
+    ProjectInfoOptions, run_project_info as run_api_project_info,
     serialize_project_info_programmatic_json,
 };
 use rmcp::ErrorData as McpError;
@@ -9,8 +12,8 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::{
     api_runtime::{
-        changed_since_from_param, env_diff_file, json_success, non_empty_path,
-        programmatic_error_body, run_api_blocking,
+        EnvScope, call_cancellation, json_success, programmatic_error_body, run_api_blocking,
+        shared_analysis_options, shared_params,
     },
     push_global, push_remote_extends,
 };
@@ -20,8 +23,9 @@ pub async fn run_project_info(
     _binary: &str,
     params: ProjectInfoParams,
 ) -> Result<CallToolResult, McpError> {
-    let options = project_info_options_from_params(&params);
-    let result = run_api_blocking("project_info", move || {
+    let cancellation = call_cancellation();
+    let options = project_info_options_from_params(&params, Some(Arc::clone(&cancellation)));
+    let result = run_api_blocking("project_info", cancellation, move || {
         run_api_project_info(&options).and_then(serialize_project_info_programmatic_json)
     })
     .await?
@@ -34,8 +38,10 @@ pub async fn run_project_info(
 
 pub fn run_project_info_api_value(
     params: &ProjectInfoParams,
+    cancellation: Option<Arc<AtomicBool>>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let value = run_api_project_info(&project_info_options_from_params(params))
+    let options = project_info_options_from_params(params, cancellation);
+    let value = run_api_project_info(&options)
         .and_then(serialize_project_info_programmatic_json)
         .map_err(|err| programmatic_error_body(&err))?;
 
@@ -75,23 +81,15 @@ pub fn build_project_info_args(params: &ProjectInfoParams) -> Vec<String> {
     args
 }
 
-fn project_info_options_from_params(params: &ProjectInfoParams) -> ProjectInfoOptions {
+fn project_info_options_from_params(
+    params: &ProjectInfoParams,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> ProjectInfoOptions {
     ProjectInfoOptions {
-        analysis: AnalysisOptions {
-            root: non_empty_path(params.root.as_deref()),
-            config_path: non_empty_path(params.config.as_deref()),
-            allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
-            no_cache: params.no_cache == Some(true),
-            threads: params.threads,
-            diff_file: env_diff_file(),
-            production: false,
-            production_override: None,
-            changed_since: changed_since_from_param(None),
-            workspace: None,
-            changed_workspaces: None,
-            explain: false,
-            type_aware: fallow_api::TypeAwareOptions::default(),
-        },
+        // This envelope carries no `request_outcomes`, so a ref that stood
+        // down would widen the result with nothing to say so: keep the hard
+        // error of an explicit ref.
+        analysis: shared_analysis_options(shared_params!(params), EnvScope::HardRef, cancellation),
         entry_points: params.entry_points == Some(true),
         files: params.files == Some(true),
         plugins: params.plugins == Some(true),
@@ -144,5 +142,21 @@ mod tests {
         assert_eq!(json["entry_point_count"], 1);
         assert_eq!(json["workspace_count"], 0);
         assert!(json.get("kind").is_none());
+    }
+}
+
+#[cfg(test)]
+mod route_parity_tests {
+    use super::*;
+
+    /// Both routes of `project_info` express the same shared settings.
+    #[test]
+    fn typed_and_cli_routes_agree_on_shared_settings() {
+        super::super::route_parity::assert_routes_agree(
+            "project_info",
+            &serde_json::json!({}),
+            |params: ProjectInfoParams| build_project_info_args(&params),
+            |params: ProjectInfoParams| project_info_options_from_params(&params, None).analysis,
+        );
     }
 }

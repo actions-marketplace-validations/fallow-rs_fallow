@@ -36,6 +36,24 @@ error by suppressing a downstream detector.
   `crates/core/src/analyze/boundary.rs`,
   `crates/core/src/analyze/boundary_calls/`, and
   `crates/core/src/analyze/policy/`.
+  Import rules, `boundaries.calls.forbidden`, and
+  `boundaries.coverage.requireAllFiles` check every analyzed file.
+  Reachability does not gate them: a file that only a task runner executes is
+  still real code. Such a file can get an `unused-files` finding and a
+  boundary finding in the same run (issue #2937).
+  Opt-in `gdp-proof-producer` rule-pack policies also check every analyzed
+  file. They join scope-resolved imported call sites with resolved imports
+  and re-exports to restrict gdp-ts factory creation. Each applicable rule
+  reports independently. Kind-specific rules match only literal strings;
+  arbitrary wrappers and ambiguous origins remain outside the check.
+  Import rules follow re-export chains. A named or default import through a
+  barrel is judged against the zone of the module that declares the symbol,
+  and `to_path` is that origin module. The optional `via_path` field names the
+  barrel. The pass reports one finding per importer and origin module. A
+  direct import of the origin wins over a barrel import. When a hop in the
+  chain breaks the rules of the zone that owns the re-exporting file, only
+  that hop gets a finding. Namespace and side-effect imports stay judged by
+  the direct target (issue #2939).
 - Framework and component intelligence:
   `crates/core/src/analyze/react_intel.rs`, route and render analyzers, and
   `crates/core/src/plugins/`.
@@ -45,9 +63,44 @@ error by suppressing a downstream detector.
   `crates/engine/src/health/`.
 - Security candidates: `crates/core/src/analyze/security/` with matcher data
   owned by `crates/security/`.
-- Feature flags: extraction facts in `crates/extract/src/flags.rs`, detector
-  behavior in `crates/core/src/analyze/feature_flags.rs`, and orchestration in
-  `crates/engine/src/feature_flags.rs`.
+- Feature flags: extraction facts in `crates/extract/src/flags.rs`, project
+  analysis in `crates/engine/src/flags.rs`, and extraction helpers exposed by
+  `crates/engine/src/feature_flags.rs`. A read such as `useFlag(FLAGS.X)`
+  resolves in the extractor when `FLAGS` is a module-level `as const` object
+  or a string enum. When `FLAGS` is imported, the extractor keeps the read in
+  `ModuleInfo::flag_registry_facts`, and `crates/engine/src/flag_registry.rs`
+  resolves the key from the exporting module. The extractor has no
+  semantic scopes, so it records each parameter and nested binding with a
+  registry name as a shadow for its function or block. The engine does not
+  resolve an import from a declared dependency that is not a workspace
+  package. The user patterns of the
+  `flags` config section apply during the parse, so one parse gives every
+  flag. `cache_config_hash` folds those patterns into the parse cache key,
+  and every parse that writes the cache must pass
+  `ResolvedConfig::flags.patterns()`.
+- Flag retirement (`fallow flags --retirement`): the extractor stores guard
+  facts (`FlagSiteFacts`: identical branches, a guard with no code in any branch, a
+  Vercel `flag()` definition) on each `FlagUse`, and literal `const` flags
+  and definition bindings in `flag_registry_facts`. These facts stay out of
+  the per-site `feature_flags[]` array.
+  `flags::analyze_feature_flags_for_retirement` returns the same flags as
+  the plain scan plus `flag_retirement::RetirementFacts`, and it keeps the
+  dead-code results of the pass the scan already runs.
+  `flag_retirement::aggregate_flags` groups sites by kind, SDK, name and
+  workspace. It takes every site of the project and a scope predicate,
+  because the read reasons count reads outside the scope.
+  `crates/engine/src/flag_age.rs` reads age from `git blame` (default) or
+  `git log -S`, counts days against `AnalysisClock`, and caches results in
+  `flag-age.json` for the current HEAD. `crates/engine/src/flag_vendor.rs`
+  reads the `--flag-state` export (schema version 1, capped at 16 MiB,
+  unknown fields rejected) and adds the four vendor reasons. Only SDK rows
+  match the export, and only the rows of the SDK that the export `source`
+  names when the project has that SDK. `vendor-only` rows need a
+  whole-project run. `crates/engine/src/flag_report.rs` is the one entry
+  point that the CLI and the API call, so both surfaces build the same
+  block. The regression gate lives in `crates/cli/src/regression/flags.rs`
+  and works only with `--retirement`. Every retirement action is
+  `auto_fixable: false`.
 
 ## Accuracy invariants
 
@@ -64,6 +117,15 @@ error by suppressing a downstream detector.
 - Prefer conservative advisory output over noisy speculation.
 - Preserve entry points, re-export chains, workspace edges, type-only usage,
   framework conventions, and suppression behavior through the full pipeline.
+- Class instances stored in object literals retain their property-path identity
+  through lexical aliases, static computed access, and nested or defaulted
+  static destructuring.
+  Dynamic keys credit every proven target below the receiver, which can hide a
+  finding but cannot invent one. Namespace-qualified constructors require a
+  real namespace import and emit a typed access fact. Exported containers emit
+  a separate typed property fact that the member pass joins through named and
+  re-exported imports; ordinary dotted member accesses are not treated as
+  namespace constructors.
 - Keep issue identity and ordering deterministic. Baselines, audits, editor
   diagnostics, and review comments depend on stable keys.
 - A name supplied by two different `export *` sources is not exported by the
@@ -173,6 +235,9 @@ error by suppressing a downstream detector.
   object a consumer observes in Phase 2 (an ambient-module star, a
   dynamic-import pattern match through `import()`, `import.meta.glob`, or
   `require.context`, a bare side-effect `require('./barrel')` with no binding,
+  an `import()` without a binding whose value escapes (a return value, a call
+  argument, or an array element; only a discarded `import()` statement stays
+  a side-effect edge), a member read on an un-awaited `import()` binding,
   and a namespace import the graph cannot narrow: a whole-object use, a
   binding handed on without member access, or a binding exported under its own
   name from any module, entry point included) plus every `export * as ns`
@@ -295,6 +360,55 @@ error by suppressing a downstream detector.
   version to move with the changed semantics.
 - Security findings are verification candidates until an agent or human
   confirms the evidence.
+- The load kind of an edge (`ImportLoadKind`) is the one model for when and
+  whether the edge runs its target. `PathReference` (`require.resolve`) and
+  `AssetReference` (a webpack asset loader request) keep the target in use,
+  but `loads_target()` is false. Cycles, the entry load closure, the startup
+  weight, the boundary detector and the security cone read that predicate,
+  through `ModuleGraph::outgoing_edge_summaries` where they walk edges. Only
+  `runs_target_code()` separates the two: reachability continues through a
+  path reference, because the consumer of the path can run the file, and
+  stops at an asset reference. A new consumer that walks edges must pick one
+  of these predicates instead of reading the variants.
+- A `require` from `createRequire(import.meta.url)` or
+  `createRequire(__filename)` in any scope is the module `require`, so its
+  `require.resolve` calls count. A nested `require` with another base, a
+  parameter or another declaration shadows the module `require`
+  (`is_module_create_require_binding`).
+
+## Value references and test reach
+
+`ModuleGraph::is_test_reference_covered` accepts only a reference with
+`namespace == ExportNamespace::Value`. A type reference never runs the
+export, so it never gives test coverage. The graph attaches a type reference
+for `import type`, for a `type` specifier, and for a plain `import` whose
+binding the file uses only in type positions (`desired_import_namespaces` in
+`narrowing.rs`).
+Coverage gaps, the static CRAP estimate, and the static test signal of
+runtime coverage read this predicate through `StaticTestCoverage`.
+
+File-level test reach (`is_test_reachable`) does not follow an edge whose
+every symbol is type-only (`Edge::runs_target_code_in_tests`). The build
+erases `import type` before the test runs, so a test with only an
+`import type` of a module does not reach that module or its imports. The
+legacy pass, the profiled pass, and `test_entry_points_reaching` all use this
+predicate. Dead-code reachability keeps `Edge::runs_target_code`, so it still
+follows type-only edges.
+
+A plain `import` that the test uses only in type positions still gives file
+reach, because the edge symbol is not type-only. Only the export-level check
+above sees that case.
+
+Coverage gaps skip a module that declares only types
+(`declares_only_types` in `health/coverage_gaps.rs`): a declaration file, or
+a module with at least one export, only type-only exports and re-exports, and
+no runtime statement or declaration, function, CommonJS export, side-effect
+import, dynamic import, or `require()` call. Extraction records additional
+top-level runtime expressions, `await`, and emitted declarations outside the
+import/export records as a cached semantic fact; erased types, ambient
+declarations, and type-only namespaces do not produce that fact. Such a
+type-only module is not a runtime file and is never an untested file. A module
+with no exports can run side effects, so it stays.
 
 ## Mock-aware test reachability
 
@@ -338,7 +452,7 @@ sibling is synthesized only for path-shaped specifiers containing a `/`
 (`./services/api` credits `./services/__mocks__/api`); a sibling that stays in
 package space after alias substitution is dropped so it cannot fabricate a
 phantom `@scope/__mocks__` package (issue #2213). A bare package specifier
-(`vi.mock('axios')`, `jest.mock('@scope/pkg')`) additionally synthesizes a
+(`vi.mock('axios')`, `jest.mock('@scope/pkg')`) also synthesizes a
 root-level `__mocks__/<specifier>` candidate; the resolver probes ancestor
 `__mocks__` directories of the test file up to the analysis root and credits
 the manual mock file when it exists, so root-level node-module mocks do not
@@ -358,7 +472,120 @@ invocation of a declared script (`npm run lint -- --format gha`,
 arguments appended, so binaries and flag values behind the indirection are
 credited. The indirection is only followed when the call site adds arguments,
 because a plain `npm run build` reaches a body that is already analyzed on its
-own.
+own. npm 7 and later forward the positional arguments after the script name
+without `--`, and parse the `-`-prefixed arguments before `--` as npm config.
+So `npm run lint --fix src/a.ts` forwards only `src/a.ts`. The npm config flags
+that take a value also consume the next argument. The list in
+`crates/core/src/scripts/mod.rs` follows the npm config definitions: every
+definition whose type does not accept a boolean, such as `-w`, `--prefix`,
+`--tag`, `--otp`, and `--node-options`. Dockerfile flag values
+(`--input=src/a.ts`) go through the same resolution, so `ignoreCommandEntries`
+applies to the command of the script body.
+
+A package-manager command can run in other workspace packages. The parser
+records where the command runs as a `RunLocation` in
+`crates/core/src/scripts/mod.rs`:
+
+- A package selection (`yarn workspace web`, `npm -w web`, `pnpm --filter
+  web`, `pnpm -r`) keeps the selectors. `crates/core/src/scripts/workspace_selection.rs`
+  matches them against the workspace packages that `ScriptCatalog::with_workspaces`
+  attaches: a pnpm name, name glob, `./dir` glob, `{dir}` glob, or `!`
+  exclusion, an npm name or directory (resolved against the calling
+  package, as npm does), and an exact yarn name. The file and
+  config arguments resolve against the directory of each selected package,
+  relative to the calling package. A call of a script
+  (`npm run -w web gen -- scripts/a.ts`) expands the body of that script in
+  each selected package, with the catalog of that package. The pnpm
+  dependency and changed-package filters (`web...`, `[origin/main]`) and a
+  name that matches no package select nothing.
+- A selection of every package is the `All` selector: `pnpm -r`,
+  `yarn workspaces foreach -A`, and the yarn classic `yarn workspaces run`.
+  Another including selector narrows it (`pnpm -r --filter web`,
+  `foreach -A --include web`), and an excluding selector removes packages.
+  `npm --workspaces` is the npm directory selector `.` from the calling
+  package, because npm sets the package that contains the working directory
+  as the default workspace. A package where the file does not exist adds no
+  entry: the entry-point passes only keep files that exist.
+- The workspace map also holds the root package (`WorkspacePackages::add_root`,
+  directory `""`). The `All` selector leaves it out. The `IncludeRoot`
+  selector adds it when no other including selector exists:
+  `yarn workspaces foreach -A` (yarn berry lists the root as a workspace),
+  and `pnpm --include-workspace-root` with `-r` or with a filter that only
+  excludes packages (`--filter '!web'`). An including filter keeps the root
+  out (`--filter web --include-workspace-root` runs only in `web`). The
+  `Root` selector selects the root: `pnpm -w`, and npm
+  `--include-workspace-root` (`-iwr`), which adds the root to every npm
+  workspace selection (`-w web`, `--workspaces`). A pnpm filter, a yarn
+  name, and a directory can match the root. An npm workspace name or
+  directory does not match it. The yarn `foreach` globs match
+  the workspace name or its directory relative to the project root, where
+  `.` is the root. The other `yarn workspaces foreach` selections (`--since`,
+  `--recursive`, `--from`, `--worktree`, `--no-private`) need facts that the
+  map does not hold, so they make no entry points. The binary still counts as
+  used.
+- A directory flag (`pnpm -C <dir>`, `npm --prefix <dir>`, `yarn --cwd <dir>`)
+  joins the file arguments of a binary to that directory. A script call in a
+  directory that holds a workspace package selects that package
+  (`ScriptCatalog::script_call_location`), so the call forwards its arguments
+  to the script of that package.
+
+`yarn node <file>` is the yarn command that runs Node.js, so the file is a
+runner argument, also after a directory flag or a package selection. The
+monorepo task runners `turbo`, `nx`, and `lerna` forward their arguments to the
+task scripts of other packages, so none of their arguments is an entry point.
+Package scripts get the workspace packages in `lib.rs`, and so do CI files and
+Dockerfile, Procfile, and `fly.toml` commands. The entry-point passes in
+`discover/entry_points.rs` get the same map through `ScriptWorkspaces`, so the
+root package and each workspace package resolve a selection in the same way,
+and a `start` script that selects a package makes a runtime entry point. A
+file reference outside the calling package (`../web/scripts/a.ts`) resolves
+from the project root. `workspace_runtime_script_seeds` follows each runtime
+script through `referenced_workspace_scripts`, which uses the same run
+parser, so every selection form (`pnpm -r run serve`,
+`pnpm -C packages/web run serve`, `yarn --cwd`, `npm --prefix`) marks the
+called script of each selected package as runtime. The public
+`discover_entry_points(config, files, workspaces)` builds the same map and
+seeds, so the type-aware entry points (`list_inventory::collect_entry_points`)
+match the package entry points of the analysis.
+
+CI commands run in the `working-directory` of their step, or of the innermost
+`defaults.run` (`crates/core/src/scripts/ci.rs`). `parse_working_directory` keeps the directory
+as segments relative to the root. A segment with a run-time value
+(`${{ matrix.name }}`) or a directory outside the project (`${{ runner.temp }}`)
+is an `Expression` segment. A file argument that ends on an `Expression`
+segment makes no entry point, but `../x.ts` can pop one. A workspace anchor
+(`$GITHUB_WORKSPACE/`) is rewritten to a relative path back to the root, so it
+always resolves. A workspace package directory resolves script calls with the
+scripts of that package. Composite actions under `.github/actions/` and the
+root `action.yml` are CI files too.
+
+Three CI forms name a script outside a plain `run:` value
+(`crates/core/src/scripts/ci_references.rs` and `ci.rs`):
+
+- A command that is only `${{ matrix.<path> }}` becomes the values of that
+  key path in the `matrix:` block of the same job, directly or under
+  `include:`: a plain scalar, each line of a block scalar, or each item of a
+  block sequence. A key under `exclude:` gives nothing. The values keep the
+  `working-directory` of the step.
+- The `script:` input of an `actions/github-script` step names a file through
+  `${process.env.GITHUB_WORKSPACE}/`, `${{ github.workspace }}/`, or
+  `require('./...')`, which resolves from the workspace. A relative `import()`
+  resolves from the action bundle, so it makes no entry point. A line that
+  starts a JavaScript comment is not read. In a composite
+  action, `${{ github.action_path }}/` resolves from the action directory.
+- A step `env` entry whose whole value is a workspace anchor
+  (`NAME: ${{ github.action_path }}`) replaces `$NAME` and `${NAME}` in the
+  commands of that step. Job and workflow `env` entries are not read.
+
+The bin map also holds the `bin` fields of the declared workspace packages
+(`add_workspace_binaries`), so a workspace binary credits its package without
+`node_modules`. An entry from `node_modules` keeps priority.
+
+A declared script name wins over a binary with the same name, as it does in
+the package manager. When the body is unknown (several packages declare the
+name with different bodies), `yarn eslint src/a.ts` keeps `src/a.ts` as a file
+reference, like `npm run eslint -- src/a.ts`, instead of dropping it as an
+`eslint` target.
 
 The script catalog separates names from bodies. Names are always the full set of
 declared scripts, because a package manager resolves `pnpm <name>` to the script
@@ -406,6 +633,322 @@ expanded for one command, because the cycle guard only rejects names on the
 current path and mutually calling scripts otherwise fan out per path. Both
 bounds are deliberate ceilings: a project that exceeds them loses crediting for
 the deepest calls rather than degrading analysis time.
+
+## Discovery and resolver fallback boundaries
+
+The discovery backend uses `ALLOWED_HIDDEN_DIRS` in
+`crates/core/src/discover/mod.rs` together with explicit script/plugin scopes;
+a blanket hidden-directory exclusion would lose tool configuration and assets.
+The default `**/build/**` exclusion matches a `build` path segment at any
+depth, so per-package output in a monorepo is skipped the same way `**/dist/**`
+and `**/coverage/**` are, and the same way `is_skip_listed_dir` in
+`crates/config/src/workspace/diagnostics.rs` already treats the name. Keep
+discovery ignore behavior separate from workspace-package candidate filtering.
+
+A `!` entry in `ignorePatterns` is an exception, not a glob of the union
+(issues #2940 and #2452). `IgnorePatternSet` in
+`crates/config/src/config/ignore_patterns.rs` applies the order: built-in
+defaults, then the project's own patterns, then the `!` exceptions. A path that
+an exception matches is not ignored, so a hand-written source directory named
+`build` or `coverage` comes back with `!src/policy/coverage/**`. These rules
+apply:
+
+- Paths under `node_modules` or `.git` are never lifted. A `!` entry that names
+  one of these segments fails config load with exit 2.
+- An exception can open a hidden directory. The walk opens a hidden directory
+  when the literal start of an exception names it or a directory inside it, or
+  when the exception names it after a leading glob (`!**/.config/**`). In a
+  hidden directory that only an exception opened, the walk keeps only the
+  files that an exception matches.
+- The exceptions are not part of the index layout below.
+  `user_ignore_pattern_count` counts only the positive project patterns.
+
+Because the exclusion is silent by construction, the walk counts it. Every
+candidate source file a built-in pattern drops is attributed to that pattern,
+and one `excluded-by-default-ignore` workspace diagnostic per pattern reaches
+`workspace_diagnostics[]` carrying the pattern text, an exact `file_count`, a
+`directory_count`, and a `path` anchored at the matched directory that lost the
+most files. One entry per pattern is what keeps the array bounded on a project
+of any size; per-file or per-directory entries would scale with the tree. `path`
+names the largest group and not a majority, which is why `directory_count`
+travels with it: ten packages each losing one file to `**/dist/**` make every
+one of them "the largest". `directory_count` counts matched scopes, not the
+directories the files sat in, so one excluded subtree counts once however deep
+it nests.
+
+The anchor is the DEEPEST segment the pattern matched, not the first. The glob
+is tested against the path relative to the run root, so on
+`build/tools/build/a.ts` an anchor at the outer `build` would name a root under
+which `**/build/**` matches again and the `--root` remedy would recover
+nothing.
+
+Preserve these properties of the count:
+
+- Attribution reads the index layout of the compiled union. User
+  `ignorePatterns` occupy `0..user_ignore_pattern_count` and
+  `DEFAULT_IGNORE_PATTERNS` follows in order, so a file whose lowest match
+  falls in the user range was an explicit project choice and is attributed to
+  nothing. Reordering either half changes an output contract.
+- Gitignored trees count zero. The walker sets `git_ignore`, `git_global`, and
+  `git_exclude`, so a repository that already hides its own `dist/` prunes it
+  before the visitor runs. The honest population is "candidate source files git
+  did not already hide and a built-in pattern then dropped".
+- Only excluded files pay for attribution. The kept-file path still runs a
+  single `GlobSet::is_match`; `matches_into` runs on a per-thread reusable
+  buffer and only for paths that match already.
+- `**/node_modules/**` is never reported. Installed dependencies are not the
+  first-party source this diagnostic is about, a project that does not gitignore
+  them would report a five-figure count with no useful remedy, and skipping the
+  attribution on a `node_modules` component keeps the dependency tree off the
+  attribution path entirely. `**/.git/**` cannot fire, since hidden directories
+  are not traversed and no exception can open `.git`.
+
+The diagnostic does not warn on stderr and is not a
+`source_never_analyzed` kind: these exclusions are designed behavior on
+generated output, so caveating findings would fire on most projects and make
+`fallow fix` withhold `delete-file` and `remove-export` project-wide. A human
+run mentions the counts only under `--explain-skipped` on `check`, `dead-code`,
+`audit` and the default run, the same flag that widens the duplication note on
+`dupes` and `audit`. The one exception is a run that discovered no source files
+at all while a built-in pattern excluded some: that run says so on stderr
+without the flag, on the same commands, because it has nothing else to report
+and a green result would be misleading. That line states two measured facts
+("No source files were analyzed. The built-in ignore pattern `<p>` excluded N
+files") and joins them with a period rather than a colon: `--production`
+excludes, a skipped hidden directory, and the size and minification skips can
+each empty the file list on their own and none of them is in this tally, so
+naming the pattern as the cause would be false on exactly those runs.
+
+The remedy depends on the pattern's shape, and the two are not
+interchangeable. A `!<dir>/**` exception in `ignorePatterns` lifts either shape
+in the same run, and every message names it first. A directory-shaped built-in (`**/dist/**`) is matched
+against the path relative to the run root, so re-rooting inside the matched
+directory removes the matched segment and the files become visible: that is the
+`fallow --root <dir>` advice. A file-shaped built-in (`**/*.min.js`,
+`**/*.min.mjs`, `**/*.min.cjs`, `**/*.bundle.js`) matches on the file name and
+keeps matching at every root, so re-rooting re-excludes the same file; those
+entries say so and point at renaming instead.
+
+### Dynamic import pattern base
+
+`resolve_dynamic_patterns` matches a dynamic import pattern relative to the
+directory of the importing file. Each leading `../` step of the pattern moves
+the match base up one directory, as Vite and webpack do. The exclude globs move
+to the same base. An exclude that starts above that base removes no file. A
+base outside the project root matches no file. With canonical file paths, the
+root check uses the canonical root.
+
+### Workspace sources
+
+`collect_workspaces_and_diagnostics` in `crates/config/src/workspace/mod.rs`
+merges these sources and keeps the first entry for each canonical directory:
+
+1. `package.json` `workspaces`, `pnpm-workspace.yaml` `packages`, and the Deno
+   `workspace` field.
+2. `tsconfig.json` `references`.
+3. `link:` and `file:` specs in the root `dependencies`, `devDependencies` and
+   `optionalDependencies`.
+4. The shallow scan of two directory levels. This source runs only when no
+   workspace pattern exists.
+5. Nested independent pnpm projects. This source runs only when a root
+   manifest declares a workspace pattern. A directory up to two levels deep
+   that holds both `package.json` and `pnpm-workspace.yaml`, and that no root
+   manifest pattern declares, is registered as a workspace with a
+   `nested-project-root` diagnostic (`collect_nested_project_workspaces`).
+   `ignorePatterns` excludes it. The undeclared-workspace scan does not look
+   inside such a directory.
+
+Three more rules keep the workspace diagnostics and the catalog checks
+consistent:
+
+- The undeclared-workspace scan skips a `package.json` with no `name` and no
+  dependency field (`manifest_declares_package`). Such a file, for example
+  `{"type":"module"}`, only sets the module type of the scripts next to it.
+- A positive pattern whose literal directory prefix does not exist gets
+  `workspace-pattern-dir-missing`, anchored at the declaring file
+  (`missing_dir_patterns`). `has_missing_workspace_pattern_dirs` reads the
+  same function, and the dead-code pass then does not report
+  `unused-catalog-entries`, because the packages in the missing directory can
+  consume the entries. Unresolved references and empty catalog groups are
+  still reported.
+- `is_independent_pnpm_project` removes a nested pnpm project from the root
+  catalog consumers, also when the fallow config `workspaces.patterns` adds
+  it. pnpm resolves its `catalog:` references against its own catalog.
+
+Source 3 is for yarn-era monorepos such as older Kibana. These repositories
+have no `workspaces` field. The root lists each package as
+`"@kbn/foo": "link:path/to/foo"`, often three to five levels deep, where the
+shallow scan does not go. Without the workspace, a bare `@kbn/foo` import
+resolves as an external package, and the package files become unused files.
+A target is a workspace only when it is a directory inside the project root
+that holds a package manifest. Fallow skips a target outside the root, a
+missing target, and a tarball, with no diagnostic: a dependency spec is not a
+workspace declaration. Fallow also skips a target that source discovery does
+not walk. The first check (`is_skipped_link_target`) skips a path with a
+hidden, `node_modules`, `build`, `dist` or `coverage` segment (the
+`is_skip_listed_dir` list), or a path that `ignorePatterns` matches. The second
+check (`dirs_reached_by_source_walk` in `crates/config/src/source_walk.rs`) walks from the root to the
+targets with `source_walk_builder`, the ignore-file settings of source
+discovery, and skips each target that the walk does not reach. Thus a target
+under a gitignored directory is skipped, also when a nested `.gitignore`,
+`.git/info/exclude` or the global gitignore holds the rule. Outside a git
+repository, `.gitignore` does not apply, the same as in source discovery. A
+workspace under a skipped path has no discovered source files, so each import
+of the package becomes an unresolved import. A yalc copy (`file:.yalc/pkg`) is
+the common case. A gitignore rule that ignores only files (for example `*.ts`)
+does not prune the directory, so that target stays a workspace. The shallow
+scan does not read `.gitignore`. A target with a malformed
+`package.json` gets the `malformed-package-json` diagnostic, the same as a
+declared workspace. Source 3 runs in every repository, also when source 1
+exists, and discovery does not follow link specs of the linked packages.
+
+In this layout the root `link:` entry is the declaration of the package. The
+unused-dependency pass does not report a root `link:` or `file:` entry when
+the spec is the only declaration of the workspace
+(`link_only_workspace_dependencies` in `crates/config/src/workspace/mod.rs`).
+Removing that entry removes the package from the analysis, and its files then
+become unused files. When source 1 or source 2 also declares the target, the
+entry is an ordinary dependency and the pass reports it when no code uses it.
+
+A declared workspace member under a gitignored directory stays a workspace, so
+imports and catalog references still reach its manifest. CI often clones an
+upstream repository into such a directory before the install. Source discovery
+does not read the files of that member, so the run cannot prove that its
+dependencies are unused. The unused-dependency pass skips each member that the
+source walk does not reach (`source_walked_workspaces`). This agrees with the
+audit base snapshot, which does not hold the gitignored member.
+
+## The plugin stage as a diagnostic stage
+
+Framework plugins are the fifth stage that writes `workspace_diagnostics[]`,
+beside workspace discovery, source discovery, the analyze stage and the health
+pipeline, and it has its own predicate
+(`WorkspaceDiagnosticKind::is_plugin_stage`) for the same reason the other two
+late stages do. Plugins run in the dead-code prelude, after the config-load
+stash, so `stash_workspace_diagnostics` has to preserve their entries across
+combined mode's per-analysis config re-loads; and they run INSIDE the pass that
+clears the analyze stage on entry, so classifying a plugin kind as
+analysis-stage would wipe it mid-run.
+
+Its refresh rule is a single replace rather than a clear plus an append.
+`record_plugin_config_diagnostics` retains every non-plugin entry, extends with
+the deduplicated new set, and emits the stderr lines, under one lock, and it runs
+even with nothing to record, so a config the user fixed drops out on the next
+run. There is exactly one writer, at the end of the plugin run, because that is
+where the root and workspace plugin results have converged; a writer inside a
+workspace run would publish a partial set, and a second writer would be replaced
+by the first.
+
+Plugin config parsing is not cached: every analysis re-reads each config from
+disk and feeds only the plugin config hash, so these entries are identical on a
+warm and a cold cache and need no cache-version bump or mirror field. `fallow
+list` runs plugins on its own inventory path and records nothing, so
+`fallow list --workspaces` carries no plugin-stage entry.
+
+The stderr dedupe keys on the rendered message, not on the kind id plus the
+path. One config file can hold two unreadable keys, which is two entries under
+one kind on one path, and an id-and-path key printed only the first.
+
+The ignore filter in `crates/core/src/discover/walk.rs` runs before the walker
+splits a path into the source set and the config-candidate channel, so an
+excluded path reaches neither. A framework config under an ignored segment,
+such as `app/build/webpack.config.js`, is therefore invisible to Phase 3a in
+`crates/core/src/plugins/registry/helpers.rs`, which deliberately leaves
+source-extension root patterns to the discovered source set, and the path
+aliases that config declares are lost. Widening a default ignore pattern
+widens that loss, so weigh the config-candidate channel alongside the source
+set when changing the defaults.
+
+Resolver fallbacks in `crates/graph/src/resolve/` preserve tracked source
+identity when package exports point to ignored output, pnpm virtual-store paths
+or workspace self-references. Keep dependency-usage metadata when an npm
+specifier resolves back to workspace source. Package `imports` aliases are
+owned by the nearest package manifest; do not turn unmatched hash specifiers
+into global aliases. Per-file tsconfig failure may degrade to ordinary relative
+or package resolution, with diagnostics, without inventing missing path aliases.
+A bare specifier that a `paths` pattern of the nearest tsconfig matches is an
+alias, also when its scope is lowercase or a real package has the same name.
+When it resolves into `node_modules`, the package of the resolved file gets the
+dependency credit (`package_credit.rs`). A target that is a declaration file
+keeps the credit on the specifier, because that mapping is for types only.
+Without an install, an alias target in a package directory that does not exist
+credits that package.
+Web-root-relative asset resolution must preserve the importer/workspace context
+before considering the analysis root. A workspace package subpath that names a
+non-source file on disk, such as `<pkg>/package.json`, credits the package
+without `node_modules` (`workspace_package_asset`). An `exports` map that does
+not list the subpath still blocks the import. A relative package root import
+(`require('..')`, `require('.')`) uses the package source entry when `main`
+names build output that is not on disk, the same as `require('../')`. A
+dependency alias `"vite": "workspace:@scope/core@*"` in the nearest manifest of
+the importer sends the workspace fallback for `vite/<subpath>` to the package
+`@scope/core`, also when another workspace member has the name `vite`
+(`crates/graph/src/resolve/workspace_alias.rs`). The result keeps `vite` as the
+package name, because the importer declares the alias.
+
+Style resolution is distinct from JavaScript resolution. Preserve scoped npm
+specifier identity, SCSS partial and directory-index lookup, configured include
+paths and installed-package fallback. The `from_style` fact on SFC imports is
+part of that routing contract. React Native platform variants must remain
+reachable alongside standard source extensions.
+
+## Framework and analysis regression boundaries
+
+Framework activation needs explicit project evidence. Plugin entries and
+`used_exports` rules are separate: a generated-binding entry can require export
+credit even under entry-export checking. SvelteKit remote functions and layout
+reset routes, Electron renderer inputs, browser-extension manifest entries,
+Kibana `kibana.jsonc` plugin entries and WXT entrypoint helpers have
+deliberately different scopes. Their source tests
+must retain unrelated-file controls. Vite preprocessor data and Cypress config
+paths must pass through shared path/config parsing instead of local copies.
+See the [plugin reference](plugin-internals.md) for ownership and validation.
+
+Keep decorated/lifecycle member credit distinct from enum-member usage, and
+preserve typed instance/inheritance propagation without inventing unresolved
+types. Visibility markers and same-file export references have different
+semantics: local value use does not necessarily make an export surface public.
+An `expected-unused` marker becomes stale when reachable consumers adopt the
+export. Disabled-rule suppressions must not become stale merely because their
+detector did not run.
+
+Dependency credit must distinguish source, scripts, configuration, required
+installed peers, optional peers and runtime-provided built-ins. The
+peer-dependency closure starts from the imported packages and also from the
+packages that a script runs, that a plugin config names, or that a plugin
+credits as tooling with evidence of use. Plugin tooling without evidence and
+catalogue tooling do not start a closure. The dependency trace reads the same
+seeds through `TraceProvenance::peer_seeds`, so `peer_of` names the same
+hosts. A duplicate-export group drops an aliased-import adapter: a module that
+imports `X` under another local name from a group member and declares its own
+`X` derives its export from that member, as a re-export chain member does.
+An adapter is dropped only when its adapter links reach a member that is not
+an adapter. Two modules that import `X` from each other under aliases both
+stay. The check does not read the body of the local `X`, so an aliased import
+that only avoids a name clash also marks the module as an adapter.
+Dependency ignores suppress findings without fabricating resolution edges. Raw-specifier
+unresolved-import ignores are not filesystem globs. A relative import whose
+target is missing and ignored by a repository ignore file is build output, not
+an unresolved import; this check reads no global git excludes file and applies
+only inside a git repository. The resolver records the missing paths that a
+project package `exports` entry names for an unresolved bare specifier
+(`ResolvedModule::missing_export_targets`, kept in the graph cache), and the
+same check applies when each of those paths is ignored. No edge points at a
+missing path. Static test coverage is
+reference reachability, not runtime line coverage; complexity suppression
+controls findings while aggregate metrics continue to describe the source.
+Security and feature-flag analysis retain their own opt-in contracts and cannot
+be silently folded into dead-code totals.
+
+## Verification must observe production behavior
+
+Test adapters may construct inputs or expose observations from the real
+implementation. They must not keep retired normalization, parsing or graph
+algorithms alive solely for their old tests. A differential reference algorithm
+is useful when tests compare its result with production across meaningful
+inputs. A test-only copy that is never compared with production is not such an
+oracle. Performance assertions must observe actual operations, rather than
+infer an operation count from a result enum or other derived label.
 
 ## Adding or changing an analyzer
 

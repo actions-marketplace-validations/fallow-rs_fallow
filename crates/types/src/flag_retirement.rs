@@ -1,0 +1,422 @@
+//! Flag retirement report types.
+//!
+//! `fallow flags --retirement` groups the per-site flag findings into one row
+//! per flag and attaches the evidence that the flag can be retired. A person
+//! makes the decision. Every action is `auto_fixable: false`, and Fallow never
+//! removes code for this report.
+
+use std::collections::BTreeMap;
+
+#[cfg(feature = "schema")]
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// Why a flag is a retirement candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RetirementReason {
+    /// The flag has exactly one read site.
+    SingleReadSite,
+    /// Every read site is in a test, story or mock file.
+    TestOnly,
+    /// The flag is a `const` bound to a literal and used as a guard.
+    LiteralConstant,
+    /// The guarded branch and the other branch are the same code.
+    IdenticalBranches,
+    /// No branch of the guard holds code, so the flag does nothing.
+    EmptyBranch,
+    /// The guarded block holds unused exports.
+    GuardsDeadCode,
+    /// The flag is defined, but no code reads it.
+    DefinedNeverRead,
+    /// The vendor export says the flag is rolled out, or that the flag
+    /// serves one variation.
+    FullyRolledOut,
+    /// The vendor export says the flag is archived.
+    ArchivedInVendor,
+    /// The code reads the flag, but the vendor export does not hold its key.
+    MissingInVendor,
+    /// The vendor export holds the flag, but no code reads it.
+    VendorOnly,
+}
+
+impl RetirementReason {
+    /// Every reason, in report order.
+    pub const ALL: [Self; 11] = [
+        Self::SingleReadSite,
+        Self::TestOnly,
+        Self::LiteralConstant,
+        Self::IdenticalBranches,
+        Self::EmptyBranch,
+        Self::GuardsDeadCode,
+        Self::DefinedNeverRead,
+        Self::FullyRolledOut,
+        Self::ArchivedInVendor,
+        Self::MissingInVendor,
+        Self::VendorOnly,
+    ];
+
+    /// The wire code of the reason.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::SingleReadSite => "single-read-site",
+            Self::TestOnly => "test-only",
+            Self::LiteralConstant => "literal-constant",
+            Self::IdenticalBranches => "identical-branches",
+            Self::EmptyBranch => "empty-branch",
+            Self::GuardsDeadCode => "guards-dead-code",
+            Self::DefinedNeverRead => "defined-never-read",
+            Self::FullyRolledOut => "fully-rolled-out",
+            Self::ArchivedInVendor => "archived-in-vendor",
+            Self::MissingInVendor => "missing-in-vendor",
+            Self::VendorOnly => "vendor-only",
+        }
+    }
+}
+
+/// How a retirement row's flag was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementFlagKind {
+    /// Environment-variable read used as a toggle.
+    EnvironmentVariable,
+    /// Feature-flag SDK evaluation call or definition.
+    SdkCall,
+    /// Flag key in a configuration object.
+    ConfigObject,
+    /// A `const` binding with a flag-style name and a literal value. It is
+    /// in the retirement block only, not in `feature_flags[]`.
+    Constant,
+    /// A key in the `--flag-state` vendor export that no code reads. The
+    /// row has no sites.
+    VendorExport,
+}
+
+/// What a site does with the flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum FlagSiteRole {
+    /// The site reads the flag value.
+    Read,
+    /// The site defines the flag.
+    Definition,
+}
+
+/// How the report measures the age of a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum FlagAgeMode {
+    /// `git blame` of the flag sites. The age is a lower bound: it is the age
+    /// of the oldest line that still holds the flag.
+    #[default]
+    Blame,
+    /// `git log -S` per flag name. The age is the date of the first commit
+    /// that added the name.
+    Pickaxe,
+    /// No age.
+    Off,
+}
+
+/// State of a flag in a `--flag-state` vendor export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VendorFlagState {
+    /// The flag is on and can serve more than one variation.
+    On,
+    /// The flag is off.
+    Off,
+    /// The flag serves one variation to every user.
+    RolledOut,
+    /// The vendor archived the flag.
+    Archived,
+    /// The flag runs an experiment.
+    Experiment,
+}
+
+/// The vendor state of one flag in the retirement report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementVendor {
+    /// The key in the vendor export, before `flags.vendorKeyPrefix` is
+    /// removed.
+    pub key: String,
+    /// The state in the vendor export.
+    pub state: VendorFlagState,
+    /// Whether the flag serves one variation, when the export says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serves_single_variation: Option<bool>,
+    /// When the vendor created the flag, as the export gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// When the vendor last evaluated the flag, as the export gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_evaluated_at: Option<String>,
+}
+
+/// The `--flag-state` vendor export that the report read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementVendorState {
+    /// The vendor name from the export, for example `launchdarkly`.
+    pub source: String,
+    /// When the export was made, as the export gives it.
+    pub exported_at: String,
+    /// Days between `exported_at` and the analysis clock. `null` when the
+    /// date cannot be read.
+    pub export_age_days: Option<u64>,
+    /// Number of flags in the export.
+    pub flags: usize,
+}
+
+/// One site of a flag in the retirement report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementSite {
+    /// File path relative to the analysed root.
+    pub path: String,
+    /// 1-based line.
+    pub line: u32,
+    /// 0-based byte column.
+    pub col: u32,
+    /// What the site does with the flag.
+    pub role: FlagSiteRole,
+    /// Whether the file is a test, story or mock file.
+    pub in_test: bool,
+}
+
+/// A commit that git history links to a flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagCommit {
+    /// Abbreviated commit hash.
+    pub commit: String,
+    /// Commit date in UTC, as `YYYY-MM-DD`.
+    pub date: String,
+}
+
+/// One piece of evidence for a retirement reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementEvidence {
+    /// The reason this evidence supports.
+    pub reason: RetirementReason,
+    /// File path relative to the analysed root. For `vendor-only`, the path
+    /// of the `--flag-state` file: relative to the root when the file is
+    /// inside it, else as given.
+    pub path: String,
+    /// 1-based line.
+    pub line: u32,
+    /// What the evidence shows.
+    pub detail: String,
+}
+
+/// Action discriminants for a retirement row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum RetirementActionType {
+    /// A person reviews the flag for retirement.
+    ReviewRetirement,
+}
+
+/// A follow-up action for a retirement candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementAction {
+    /// Action discriminator, serialized as `type`.
+    #[serde(rename = "type")]
+    pub kind: RetirementActionType,
+    /// Always `false`: Fallow never removes a flag.
+    pub auto_fixable: bool,
+    /// Human-readable action description.
+    pub description: String,
+}
+
+/// One flag in the retirement report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementFlag {
+    /// Flag identifier.
+    pub flag_name: String,
+    /// How the flag was detected.
+    pub kind: RetirementFlagKind,
+    /// Flag SDK, for SDK flags with a known provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_name: Option<String>,
+    /// Workspace root relative to the analysed root, when the project has
+    /// workspaces and the flag is inside one. Part of the flag identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// Every site of the flag, sorted by path, line and column.
+    pub sites: Vec<RetirementSite>,
+    /// Number of sites in this row that read the flag.
+    pub read_sites: usize,
+    /// Whether every read site is in a test, story or mock file. Read sites
+    /// of the same flag in other workspaces count too.
+    pub test_only: bool,
+    /// First commit that added the flag name. Set in `pickaxe` mode only.
+    pub first_seen: Option<FlagCommit>,
+    /// Oldest commit among the lines that still hold the flag.
+    pub oldest_surviving_site: Option<FlagCommit>,
+    /// Newest commit among the lines that still hold the flag.
+    pub last_touched: Option<FlagCommit>,
+    /// Days between the flag's oldest known commit and the analysis clock.
+    /// In `blame` mode this is a lower bound.
+    pub age_days: Option<u64>,
+    /// Retirement reasons, in report order. Empty for a flag that is not a
+    /// candidate.
+    pub reasons: Vec<RetirementReason>,
+    /// Evidence for each reason.
+    pub evidence: Vec<RetirementEvidence>,
+    /// Follow-up actions. Empty for a flag that is not a candidate.
+    pub actions: Vec<RetirementAction>,
+    /// The vendor state of the flag. Present only with `--flag-state`, for
+    /// a flag whose key is in the export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<RetirementVendor>,
+}
+
+/// Totals of the retirement report.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct RetirementSummary {
+    /// Distinct flags in the code in scope, before `--min-age` and
+    /// `--reason`. The `vendor-only` rows of a `--flag-state` export do not
+    /// count here, so the count does not change when a key is added in the
+    /// vendor only. `by_reason` counts them.
+    pub distinct_flags: usize,
+    /// Rows in scope with at least one reason, `vendor-only` rows included.
+    pub candidates: usize,
+    /// Number of rows in scope per reason.
+    pub by_reason: BTreeMap<RetirementReason, usize>,
+}
+
+impl RetirementSummary {
+    /// All rows in scope: the flags in the code and the `vendor-only` rows.
+    #[must_use]
+    pub fn listed_flags(&self) -> usize {
+        self.distinct_flags
+            + self
+                .by_reason
+                .get(&RetirementReason::VendorOnly)
+                .copied()
+                .unwrap_or(0)
+    }
+}
+
+/// The `retirement` block of `fallow flags --retirement --format json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagRetirementReport {
+    /// The analysis clock that ages count from, as an RFC 3339 UTC
+    /// timestamp. `null` when the age mode is `off`, and also when no git
+    /// history is available: outside a repository, on a branch without
+    /// commits, or in a shallow clone. A `workspace_diagnostics` entry then
+    /// gives the reason.
+    pub generated_at_clock: Option<String>,
+    /// How the report measured flag age.
+    pub age_mode: FlagAgeMode,
+    /// The vendor export that the report read. Present only with
+    /// `--flag-state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_state: Option<RetirementVendorState>,
+    /// Totals for the flags in scope.
+    pub summary: RetirementSummary,
+    /// Verdict of `--fail-on-regression` against a flags regression
+    /// baseline. Present only when the gate ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regression: Option<FlagRegressionResult>,
+    /// Verdict of `--max-flag-age`. Present only with that option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_flag_age: Option<FlagAgeGate>,
+    /// One row per flag after the `--min-age`, `--reason`, `--sort` and
+    /// `--top` options. A row with an empty `reasons` array is not a
+    /// candidate.
+    pub flags: Vec<RetirementFlag>,
+}
+
+/// One count that the flags regression gate compares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagRegressionMetric {
+    /// `distinct_flags`, or a reason code from `--reason`.
+    pub metric: String,
+    /// The count in the baseline.
+    pub baseline: usize,
+    /// The count in this run.
+    pub current: usize,
+    /// `current - baseline`.
+    pub delta: i64,
+    /// Whether the growth is more than the tolerance.
+    pub exceeded: bool,
+}
+
+/// Verdict of the flags regression gate.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagRegressionResult {
+    /// Outcome of the gate.
+    pub status: crate::envelope::RegressionStatus,
+    /// The `--tolerance` value. Absent when the status is `skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<f64>,
+    /// How to read `tolerance`. Absent when the status is `skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance_kind: Option<crate::envelope::RegressionToleranceKind>,
+    /// The compared counts: `distinct_flags` first, then each `--reason`
+    /// code. Empty when the status is `skipped`.
+    pub metrics: Vec<FlagRegressionMetric>,
+    /// Whether one count grew more than the tolerance.
+    pub exceeded: bool,
+    /// Why the gate did not run. Present only when the status is `skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A flag that is older than `--max-flag-age`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagAgeGateEntry {
+    /// Flag identifier.
+    pub flag_name: String,
+    /// How the flag was detected.
+    pub kind: RetirementFlagKind,
+    /// Flag SDK, for SDK flags with a known provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_name: Option<String>,
+    /// Workspace root of the flag, in a project with workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// Age of the flag in days.
+    pub age_days: u64,
+}
+
+/// Verdict of `--max-flag-age`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct FlagAgeGate {
+    /// Outcome of the gate. `skipped` when git history is not available (a
+    /// shallow clone or no repository), so no age was measured. A skipped
+    /// gate does not fail the run.
+    pub status: crate::envelope::RegressionStatus,
+    /// The `--max-flag-age` value in days.
+    pub max_days: u64,
+    /// Whether one flag in scope is older than `max_days`.
+    pub exceeded: bool,
+    /// Flags in the code in scope without a measured age. The gate cannot
+    /// check these flags.
+    pub unmeasured: usize,
+    /// Why the gate did not run. Present only when the status is `skipped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The flags in scope that are older than `max_days`, oldest first.
+    /// The `--reason`, `--min-age` and `--top` options do not change this
+    /// list.
+    pub flags: Vec<FlagAgeGateEntry>,
+}

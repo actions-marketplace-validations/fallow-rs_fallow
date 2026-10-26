@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
@@ -15,6 +17,7 @@ import {
   parseArgs,
   perturbCoverageColumns,
   perturbCoverageMap,
+  producerVersionDrift,
   runConformance,
   runSelfTest,
 } from "./coverage-producer-conformance.mjs";
@@ -52,6 +55,35 @@ test("manifest pins the producer lockfile, every fixture and every recorded map"
   assert.ok(loaded.producers.size >= 4, "the matrix needs at least four producer rows");
   assert.ok(loaded.maps.size >= loaded.fixtures.size);
   assert.equal(loaded.census.size, loaded.maps.size);
+});
+
+test("every producer version matches the version the lockfile pins", () => {
+  const loaded = loadManifest(MANIFEST);
+  const lock = JSON.parse(
+    readFileSync(
+      resolve(
+        REPO_ROOT,
+        "tests/coverage-producer-corpus",
+        loaded.manifest.recorded.producers_lock_file,
+      ),
+      "utf8",
+    ),
+  );
+
+  assert.deepEqual(producerVersionDrift(loaded.manifest.producers, lock), []);
+});
+
+test("a producer version that the lockfile does not pin is named with both versions", () => {
+  const lock = { packages: { "node_modules/example-producer": { version: "1.0.6" } } };
+  const producers = [
+    { id: "example", package: "example-producer", version: "1.0.5" },
+    { id: "missing", package: "missing-producer", version: "2.0.0" },
+  ];
+
+  assert.deepEqual(producerVersionDrift(producers, lock), [
+    "producers[0] (example) records example-producer 1.0.5, but the lockfile pins 1.0.6",
+    "producers[1] (missing) records missing-producer 2.0.0, but the lockfile pins no version",
+  ]);
 });
 
 test("every probe carries a named invariant that points at a matcher mechanism", () => {
@@ -349,4 +381,26 @@ test("the corpus lives outside every formatter and linter directory list", () =>
     undefined,
     "the producers are installed under their own prefix, never by the root npm ci",
   );
+});
+
+// A missing binary stops the run after the manifest loads and before any
+// producer or fallow process starts.
+test("the script starts as CI runs it and stops on a missing fallow binary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fallow-coverage-producers-"));
+  try {
+    const missing = join(dir, "fallow");
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/coverage-producer-conformance.mjs", "--fallow-bin", missing],
+      { cwd: REPO_ROOT, encoding: "utf8", env: { PATH: process.env.PATH ?? "" } },
+    );
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      `fallow binary not found at ${missing}; run cargo build -p fallow-cli --bin fallow\n`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

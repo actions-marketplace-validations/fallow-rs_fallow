@@ -1,18 +1,24 @@
 //! Engine-owned analysis session orchestration.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fallow_config::{DuplicatesConfig, ResolvedConfig, WorkspaceInfo};
+use fallow_types::cache_rejection::CacheRejection;
 use fallow_types::discover::DiscoveredFile;
-use fallow_types::extract::ModuleInfo;
+use fallow_types::extract::{ModuleInfo, SourceParseDegradation, SourceReadFailure};
 #[cfg(test)]
 use fallow_types::results::AnalysisResults;
-use fallow_types::source_fingerprint::SourceFingerprint;
+use fallow_types::source_fingerprint::{SourceFingerprint, now_ns};
 use fallow_types::workspace::{WorkspaceDiagnostic, merge_workspace_diagnostics};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+pub use crate::session_reuse::SessionParseCounts;
+use crate::session_reuse::{
+    MAX_INCREMENTAL_REPARSE_FILES, ParseCountCells, changed_file_indices, merge_reparsed_modules,
+};
 use crate::{
     EngineResult, core_backend, duplicates,
     project_analysis::{
@@ -23,6 +29,7 @@ use crate::{
         DeadCodeAnalysis, DeadCodeAnalysisArtifacts, DeadCodeAnalysisOutput, DuplicationAnalysis,
         SharedDeadCodeAnalysisArtifacts,
     },
+    warm_parse::{WarmParse, WarmParseKey, WarmParseStore},
 };
 
 /// Reusable engine session for one resolved project.
@@ -34,18 +41,39 @@ use crate::{
 pub struct AnalysisSession {
     config: ResolvedConfig,
     config_path: Option<PathBuf>,
+    config_inputs: fallow_config::ConfigInputs,
+    config_inputs_before_resolve: fallow_config::ConfigInputsSnapshot,
     discovery: crate::discover::AnalysisDiscovery,
     workspaces: Vec<WorkspaceInfo>,
     workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     parsed_cache: Mutex<Option<ParsedModuleCache>>,
     styling_cache: Mutex<Option<Arc<crate::health::StylingAnalysisArtifacts>>>,
+    cancellation: Option<Arc<AtomicBool>>,
+    warm_parse: Option<Arc<WarmParseStore>>,
+    /// Config load already resolved the workspaces, so a discovery refresh
+    /// keeps them.
+    preloaded_workspaces: bool,
+    parse_counts: ParseCountCells,
+    /// An incremental parse changed modules that the persisted parse cache
+    /// does not hold yet. [`AnalysisSession::flush_parse_cache`] writes them.
+    disk_cache_stale: AtomicBool,
 }
 
 #[derive(Debug)]
 struct ParsedModuleCache {
     need_complexity: bool,
     fingerprints: Vec<SourceFingerprint>,
+    /// The wall-clock time before the session read `fingerprints`. A
+    /// fingerprint that is not settled before this time can belong to a
+    /// later write in the same timestamp tick, so it does not prove that the
+    /// module is current.
+    read_started_ns: u64,
     modules: Arc<[ModuleInfo]>,
+    /// The read failures of the parse, kept so that an incremental parse can
+    /// record the full set of the project again.
+    read_failures: Vec<SourceReadFailure>,
+    /// The parse degradations of the parse, kept for the same reason.
+    parse_degradations: Vec<SourceParseDegradation>,
 }
 
 /// Owned session parts for runners that need to continue an existing pipeline.
@@ -172,7 +200,19 @@ impl AnalysisSession {
     /// config-load warning but should still surface best-effort diagnostics.
     #[must_use]
     pub fn load_default(root: &Path) -> Self {
-        Self::from_config(default_project_config(root))
+        Self::load_default_with_config(root, |_| {})
+    }
+
+    /// Build a session from built-in defaults, apply one caller-supplied
+    /// adjustment, then discover project files.
+    #[must_use]
+    pub fn load_default_with_config(
+        root: &Path,
+        configure: impl FnOnce(&mut ResolvedConfig),
+    ) -> Self {
+        let mut project_config = default_project_config(root);
+        configure(&mut project_config.config);
+        Self::from_config(project_config)
     }
 
     /// Build a session from a previously resolved config.
@@ -221,12 +261,206 @@ impl AnalysisSession {
         Self {
             config: project_config.config,
             config_path: project_config.path,
+            config_inputs: project_config.inputs,
+            config_inputs_before_resolve: project_config.inputs_before_resolve,
             discovery,
             workspaces,
             workspace_diagnostics,
             parsed_cache: Mutex::new(None),
             styling_cache: Mutex::new(None),
+            cancellation: None,
+            warm_parse: crate::warm_parse::installed(),
+            preloaded_workspaces: uses_preloaded_workspaces,
+            parse_counts: ParseCountCells::default(),
+            disk_cache_stale: AtomicBool::new(false),
         }
+    }
+
+    /// Attach a caller-owned cancellation token to this session.
+    ///
+    /// Analyses that run through the session check the token at each pipeline
+    /// stage boundary and inside the per-file parse loop, and return
+    /// [`crate::EngineError::cancelled`] instead of a partial result once it is
+    /// set. A session without a token can never be cancelled, so existing
+    /// callers keep their current behavior.
+    ///
+    /// The stop is cooperative, and how long it takes is bounded by the
+    /// longest stage that holds no check, not by any promised latency. Only
+    /// the parse loop stops per file. Duplication detection (tokenization plus
+    /// suffix-array matching) and the dead-code detectors run to the end of the
+    /// stage once entered, and on a large repository either is seconds of work.
+    /// A caller that needs a bounded stop has to kill the process instead.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Use `store` for parsed modules across sessions, in place of the store
+    /// that the process installed with [`crate::warm_parse::install`].
+    /// `None` makes the session parse through the persisted cache only.
+    #[must_use]
+    pub fn with_warm_parse(mut self, store: Option<Arc<WarmParseStore>>) -> Self {
+        self.warm_parse = store;
+        self
+    }
+
+    /// Replace the cancellation token of a session that serves several runs.
+    ///
+    /// A long-lived session gets the token of each new run, so a set token of
+    /// an earlier run does not stop the next one.
+    pub fn set_cancellation(&mut self, cancellation: Arc<AtomicBool>) {
+        self.cancellation = Some(cancellation);
+    }
+
+    /// The parse work of this session since it was created.
+    #[must_use]
+    pub fn parse_counts(&self) -> SessionParseCounts {
+        self.parse_counts.snapshot()
+    }
+
+    /// Walk the project again and keep the parsed modules when the file set
+    /// did not change.
+    ///
+    /// A session that serves several runs calls this before each run, so a
+    /// created or deleted file reaches the analysis without a config reload.
+    /// When the file set changed, the file ids move, so the session writes its
+    /// parsed modules to the persisted parse cache and drops them. The next
+    /// parse then reads that cache. Returns whether the file set changed.
+    ///
+    /// The session also drops its modules when a fingerprint of the cached
+    /// parse cannot stand in for the file content, as on a platform without
+    /// ctime. A same-size edit with a restored mtime keeps such a
+    /// fingerprint, so only the persisted cache, which then compares content
+    /// hashes, can tell whether the module is current.
+    pub fn refresh_discovery(&mut self) -> bool {
+        let discovery = if self.preloaded_workspaces {
+            crate::discover::prepare_analysis_discovery_with_workspaces(
+                &self.config,
+                &self.workspaces,
+                0.0,
+            )
+        } else {
+            crate::discover::prepare_analysis_discovery(&self.config)
+        };
+        let same_files = discovery.files().len() == self.files().len()
+            && discovery
+                .files()
+                .iter()
+                .zip(self.files())
+                .all(|(fresh, known)| fresh.path == known.path);
+        if !same_files || !self.cached_fingerprints_are_trustworthy() {
+            self.flush_parse_cache();
+            *self
+                .parsed_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.clear_styling_cache();
+        }
+        if !self.preloaded_workspaces {
+            self.workspaces = discovery.workspaces().to_vec();
+        }
+        self.discovery = discovery;
+        !same_files
+    }
+
+    /// Whether each fingerprint of the cached parse can stand in for the file
+    /// content. No cached parse counts as trustworthy.
+    fn cached_fingerprints_are_trustworthy(&mut self) -> bool {
+        self.parsed_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|cache| {
+                cache
+                    .fingerprints
+                    .iter()
+                    .all(|fingerprint| fingerprint.is_trustworthy_without_content())
+            })
+    }
+
+    /// Write the modules of incremental parses to the persisted parse cache.
+    ///
+    /// Each module is stored with the fingerprint that the session read before
+    /// it parsed the file. A file that changed after that parse then misses
+    /// the cache instead of serving the older module. Does nothing when no
+    /// incremental parse happened since the last write, or when the cache is
+    /// off.
+    ///
+    /// The session does not write these modules when it is dropped. A caller
+    /// that parses again after files changed, such as a session that lives
+    /// across editor runs, calls this method before it drops the session. A
+    /// session that parses once needs no call: the full parse writes the
+    /// persisted cache itself. The editor server is the only caller now.
+    pub fn flush_parse_cache(&self) {
+        if self.config.no_cache || !self.disk_cache_stale.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(cache) = self.parsed_cache.lock() else {
+            return;
+        };
+        let Some(cache) = cache.as_ref() else {
+            return;
+        };
+        let cache_max_size_bytes =
+            crate::project_config::resolve_cache_max_size_bytes(&self.config);
+        let mut store = fallow_extract::cache::CacheStore::load(
+            &self.config.cache_dir,
+            &self.config.root,
+            self.config.cache_config_hash,
+            cache_max_size_bytes,
+        )
+        .ok();
+        let files = self.files();
+        write_parse_cache(
+            &self.config,
+            &mut store,
+            &ParseCacheWrite {
+                modules: &cache.modules,
+                files,
+                need_complexity: cache.need_complexity,
+                fingerprint_of: &|file: &DiscoveredFile| {
+                    cache.fingerprints.get(file.id.0 as usize).map_or_else(
+                        || SourceFingerprint::new(0, 0),
+                        |fingerprint| fingerprint.for_content_read_at(cache.read_started_ns),
+                    )
+                },
+            },
+        );
+    }
+
+    /// Parse the discovered files into the module cache of the session,
+    /// without analysis. A later run of this session then starts from warm
+    /// modules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::EngineError::cancelled`] when the token of the session
+    /// is set.
+    pub fn prewarm_parsed_modules(&self, need_complexity: bool) -> EngineResult<()> {
+        self.shared_parsed_modules_cancellable(need_complexity, "prewarm")
+            .map(drop)
+    }
+
+    fn clear_styling_cache(&self) {
+        if let Ok(mut cache) = self.styling_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    /// Whether this session's caller has requested cancellation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+    }
+
+    fn ensure_not_cancelled(&self, stage: &str) -> EngineResult<()> {
+        if self.is_cancelled() {
+            return Err(crate::EngineError::cancelled(stage));
+        }
+        Ok(())
     }
 
     /// Build a session from a resolved config when the caller already owns
@@ -240,6 +474,8 @@ impl AnalysisSession {
         let (workspaces, workspace_diagnostics, workspace_discovery_ms) =
             crate::project_config::collect_workspace_metadata(&config)?;
         Ok(Self::from_config(ProjectConfig {
+            inputs: fallow_config::ConfigInputs::default(),
+            inputs_before_resolve: fallow_config::ConfigInputsSnapshot::default(),
             config,
             path: None,
             workspaces,
@@ -264,6 +500,39 @@ impl AnalysisSession {
     #[must_use]
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    /// The plugin files, rule packs and `autoDiscover` directories that
+    /// config resolution read. A session built from a resolved config
+    /// lists none.
+    #[must_use]
+    pub const fn config_inputs(&self) -> &fallow_config::ConfigInputs {
+        &self.config_inputs
+    }
+
+    /// The content of [`Self::config_inputs`] just before config resolution
+    /// read them. A snapshot after the load that differs from this one tells
+    /// that an input changed during the load.
+    #[must_use]
+    pub const fn config_inputs_before_resolve(&self) -> &fallow_config::ConfigInputsSnapshot {
+        &self.config_inputs_before_resolve
+    }
+
+    /// The estimated heap memory of the parsed modules that the session
+    /// keeps between calls, with the estimate of
+    /// [`crate::warm_parse::estimated_retained_bytes`]. Zero before the first
+    /// parse.
+    #[must_use]
+    pub fn retained_bytes_estimate(&self) -> u64 {
+        self.parsed_cache
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .as_ref()
+                    .map(|cache| crate::warm_parse::estimated_retained_bytes(&cache.fingerprints))
+            })
+            .unwrap_or(0)
     }
 
     /// Discovered files for this session.
@@ -305,6 +574,11 @@ impl AnalysisSession {
         git_ref: &str,
     ) -> Result<FxHashSet<PathBuf>, crate::changed_files::ChangedFilesError> {
         crate::changed_files::changed_files(&self.config.root, git_ref)
+    }
+
+    /// The discovery this session walked.
+    pub(crate) const fn discovery(&self) -> &crate::discover::AnalysisDiscovery {
+        &self.discovery
     }
 
     /// Workspace and source-discovery diagnostics captured for this session.
@@ -381,7 +655,8 @@ impl AnalysisSession {
             modules,
             metrics,
             source_diagnostics,
-        } = parse_files_with_config(&config, &files, need_complexity);
+            ..
+        } = parse_files_with_config(&config, &files, need_complexity, None);
         ParsedAnalysisSessionParts {
             config,
             config_path,
@@ -403,7 +678,7 @@ impl AnalysisSession {
     /// Parse discovered files without consuming the session.
     #[must_use]
     pub fn parsed_parts(&self, need_complexity: bool) -> ParsedAnalysisSessionParts {
-        let SharedParsedModules { modules, metrics } = self.parse_modules(need_complexity);
+        let SharedParsedModules { modules, metrics } = self.parse_modules(need_complexity, None);
         self.parsed_parts_from_modules(modules.to_vec(), metrics)
     }
 
@@ -413,7 +688,7 @@ impl AnalysisSession {
         &self,
         need_complexity: bool,
     ) -> SharedParsedAnalysisSessionParts {
-        let SharedParsedModules { modules, metrics } = self.parse_modules(need_complexity);
+        let SharedParsedModules { modules, metrics } = self.parse_modules(need_complexity, None);
         SharedParsedAnalysisSessionParts {
             config: self.config.clone(),
             files: self.discovery.files().to_vec(),
@@ -433,18 +708,52 @@ impl AnalysisSession {
     #[doc(hidden)]
     #[must_use]
     pub(crate) fn shared_parsed_modules(&self, need_complexity: bool) -> Arc<[ModuleInfo]> {
-        self.parse_modules(need_complexity).modules
+        self.parse_modules(need_complexity, None).modules
+    }
+
+    /// Parse the discovered files, stopping if the session's caller cancelled.
+    ///
+    /// The token is checked on both sides of the parse loop, so the truncated
+    /// module set a cancelled parse produces is never returned as a smaller
+    /// project. `stage` names the work that would have followed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::EngineError::cancelled`] when the token is set. A
+    /// session without a token can never return it.
+    pub(crate) fn shared_parsed_modules_cancellable(
+        &self,
+        need_complexity: bool,
+        stage: &str,
+    ) -> EngineResult<Arc<[ModuleInfo]>> {
+        self.ensure_not_cancelled("parsing")?;
+        let modules = self
+            .parse_modules(need_complexity, self.cancellation.as_deref())
+            .modules;
+        self.ensure_not_cancelled(stage)?;
+        Ok(modules)
     }
 
     /// Parse discovered files without consuming the session or retaining parser
     /// output in the session cache.
     #[must_use]
     pub fn parsed_parts_uncached(&self, need_complexity: bool) -> ParsedAnalysisSessionParts {
+        let read_started_ns = now_ns();
+        let fingerprints = self
+            .warm_parse
+            .as_ref()
+            .and_then(|_| source_fingerprints_for_files(self.files()));
+        if let Some(warm) = self.warm_parse(
+            need_complexity,
+            fingerprints.as_deref(),
+            read_started_ns,
+            None,
+        ) {
+            return self.parsed_parts_from_modules(warm.modules.to_vec(), warm.metrics);
+        }
         let ParsedModules {
-            modules,
-            metrics,
-            source_diagnostics: _,
-        } = parse_files_with_config(&self.config, self.files(), need_complexity);
+            modules, metrics, ..
+        } = parse_files_with_config(&self.config, self.files(), need_complexity, None);
         self.parsed_parts_from_modules(modules, metrics)
     }
 
@@ -575,6 +884,7 @@ impl AnalysisSession {
             retain_graph: true,
             retain_modules: false,
             retain_files: false,
+            cancellation: self.cancellation.as_deref(),
         })
         .map(SharedDeadCodeAnalysisArtifacts::into_owned)
     }
@@ -585,7 +895,13 @@ impl AnalysisSession {
         retain_graph: bool,
         retain_files: bool,
     ) -> EngineResult<SharedDeadCodeAnalysisArtifacts> {
-        let SharedParsedModules { modules, metrics } = self.parse_modules(need_complexity);
+        self.ensure_not_cancelled("parsing")?;
+        let SharedParsedModules { modules, metrics } =
+            self.parse_modules(need_complexity, self.cancellation.as_deref());
+        // The parse loop no-ops the files it has not reached yet, so a token
+        // set during parsing leaves `modules` truncated. It must never reach
+        // the graph as if it were the whole project.
+        self.ensure_not_cancelled("the dead-code pipeline")?;
         run_engine_owned_dead_code_pipeline(EngineDeadCodePipelineInput {
             config: &self.config,
             discovery: &self.discovery,
@@ -595,6 +911,7 @@ impl AnalysisSession {
             retain_graph,
             retain_modules: need_complexity,
             retain_files,
+            cancellation: self.cancellation.as_deref(),
         })
     }
 
@@ -619,18 +936,6 @@ impl AnalysisSession {
             changed_files,
             source_fingerprints: self.source_fingerprints(),
         })
-    }
-
-    /// Run duplication detection using the session's discovered files.
-    #[must_use]
-    pub fn find_duplicates(&self) -> duplicates::DuplicationReport {
-        duplicates::find_duplicates(&self.config.root, self.files(), &self.config.duplicates)
-    }
-
-    /// Run duplication detection using custom duplicate options.
-    #[must_use]
-    pub fn find_duplicates_with(&self, config: &DuplicatesConfig) -> duplicates::DuplicationReport {
-        duplicates::find_duplicates(&self.config.root, self.files(), config)
     }
 
     /// Run dead-code and duplication analysis for this session.
@@ -670,6 +975,7 @@ impl AnalysisSession {
         duplicates_config: &DuplicatesConfig,
         options: ProjectAnalysisArtifactOptions,
     ) -> EngineResult<ProjectAnalysisArtifacts> {
+        self.ensure_not_cancelled("duplication detection")?;
         let cache_dir = (!self.config.no_cache).then_some(self.config.cache_dir.as_path());
         let duplication = if let Some(changed_files) = options.changed_files.as_ref() {
             let changed_files = changed_files.iter().cloned().collect::<Vec<_>>();
@@ -683,6 +989,10 @@ impl AnalysisSession {
             self.find_duplicates_with_defaults(duplicates_config, cache_dir)
                 .report
         };
+        // Duplication detection is infallible, so a token set while it ran can
+        // only be reported here, before its report is handed on as a complete
+        // one.
+        self.ensure_not_cancelled("the dead-code half of project analysis")?;
         let source_fingerprints = options
             .collect_source_fingerprints
             .then(|| self.source_fingerprints());
@@ -729,55 +1039,312 @@ impl AnalysisSession {
         )
     }
 
-    fn parse_modules(&self, need_complexity: bool) -> SharedParsedModules {
+    /// Parse the discovered files, reusing the session's warm module cache.
+    ///
+    /// `cancellation` is threaded through to the per-file parse loop, so a set
+    /// token truncates the returned modules. Only callers that convert a set
+    /// token into an error may pass one.
+    fn parse_modules(
+        &self,
+        need_complexity: bool,
+        cancellation: Option<&AtomicBool>,
+    ) -> SharedParsedModules {
+        let read_started_ns = now_ns();
         let fingerprints = source_fingerprints_for_files(self.files());
         if let Some(fingerprints) = fingerprints.as_ref()
-            && let Some(modules) = self.cached_modules(need_complexity, fingerprints)
+            && let Some(parsed) = self.reparse_changed_modules(
+                need_complexity,
+                fingerprints,
+                read_started_ns,
+                cancellation,
+            )
         {
-            return SharedParsedModules {
-                modules,
-                metrics: core_backend::ParseMetrics {
-                    parse_ms: 0.0,
-                    cache_ms: 0.0,
-                    cache_hits: 0,
-                    cache_misses: 0,
-                    parse_cpu_ms: 0.0,
-                },
-            };
+            return parsed;
         }
 
-        let ParsedModules {
-            modules,
-            metrics,
-            source_diagnostics: _,
-        } = parse_files_with_config(&self.config, self.files(), need_complexity);
-        let modules: Arc<[ModuleInfo]> = modules.into();
-        if let Some(fingerprints) = fingerprints
+        let (modules, metrics, has_complexity, modules_reused, problems) = if let Some(warm) = self
+            .warm_parse(
+                need_complexity,
+                fingerprints.as_deref(),
+                read_started_ns,
+                cancellation,
+            ) {
+            let reused = if warm.reused { warm.modules.len() } else { 0 };
+            (warm.modules, warm.metrics, true, reused, warm.problems)
+        } else {
+            let ParsedModules {
+                modules,
+                metrics,
+                read_failures,
+                parse_degradations,
+                ..
+            } = parse_files_with_config(&self.config, self.files(), need_complexity, cancellation);
+            let problems = SourceProblems {
+                read_failures,
+                parse_degradations,
+            };
+            (modules.into(), metrics, need_complexity, 0, problems)
+        };
+        self.parse_counts.record(SessionParseCounts {
+            modules_parsed: metrics.cache_misses,
+            disk_cache_hits: metrics.cache_hits,
+            modules_reused,
+        });
+        // A cancelled parse returns a truncated module set. Storing it would
+        // serve that truncation to the next call as a warm cache hit, long
+        // after the cancellation itself is forgotten.
+        if !token_is_set(cancellation)
+            && let Some(fingerprints) = fingerprints
             && let Ok(mut cache) = self.parsed_cache.lock()
         {
             *cache = Some(ParsedModuleCache {
-                need_complexity,
+                need_complexity: has_complexity,
                 fingerprints,
+                read_started_ns,
                 modules: Arc::clone(&modules),
+                read_failures: problems.read_failures,
+                parse_degradations: problems.parse_degradations,
             });
+            // The full parse wrote the persisted cache for these modules.
+            self.disk_cache_stale.store(false, Ordering::SeqCst);
+            self.clear_styling_cache();
         }
         SharedParsedModules { modules, metrics }
     }
 
-    fn cached_modules(
+    /// Parse through the store of parsed modules across sessions.
+    ///
+    /// Returns `None` when the session has no store, when caching is off, or
+    /// when a fingerprint cannot stand in for the file content. The caller
+    /// then parses through the persisted cache only.
+    ///
+    /// The parse always computes complexity. The cost is
+    /// about the same, and a later `health` session can then use the modules.
+    /// The persisted cache and the in-session cache already serve modules with
+    /// complexity to callers that need none. One case costs more: a persisted
+    /// cache without complexity, from a CLI `dead-code` run, gives no hits, so
+    /// the first parse through the store parses each file from source.
+    fn warm_parse(
+        &self,
+        need_complexity: bool,
+        fingerprints: Option<&[SourceFingerprint]>,
+        read_started_ns: u64,
+        cancellation: Option<&AtomicBool>,
+    ) -> Option<WarmParsedModules> {
+        let store = self.warm_parse.as_deref()?;
+        if self.config.no_cache {
+            return None;
+        }
+        let key = WarmParseKey {
+            root: &self.config.root,
+            cache_config_hash: self.config.cache_config_hash,
+            files: self.files(),
+            fingerprints: fingerprints?,
+            read_started_ns,
+        };
+        if !key.is_reusable() {
+            return None;
+        }
+        if let Some(parse) = store.get(&key, need_complexity) {
+            // A parse records its read failures and parse degradations for the
+            // project, and the session reads them back as workspace
+            // diagnostics. Record the kept ones again, so the diagnostics of
+            // this run are the same as after a parse.
+            record_source_diagnostics(
+                &self.config,
+                &parse.read_failures,
+                &parse.parse_degradations,
+            );
+            return Some(WarmParsedModules {
+                modules: parse.modules,
+                metrics: reused_parse_metrics(),
+                reused: true,
+                problems: SourceProblems {
+                    read_failures: parse.read_failures.to_vec(),
+                    parse_degradations: parse.parse_degradations.to_vec(),
+                },
+            });
+        }
+
+        let parsed = parse_files_with_config(&self.config, self.files(), true, cancellation);
+        store.record_parse(parsed.metrics.cache_misses, parsed.metrics.cache_hits);
+        let modules: Arc<[ModuleInfo]> = parsed.modules.into();
+        if !token_is_set(cancellation) {
+            store.put(
+                &key,
+                true,
+                WarmParse {
+                    modules: Arc::clone(&modules),
+                    read_failures: parsed.read_failures.clone().into(),
+                    parse_degradations: parsed.parse_degradations.clone().into(),
+                },
+            );
+        }
+        Some(WarmParsedModules {
+            modules,
+            metrics: parsed.metrics,
+            reused: false,
+            problems: SourceProblems {
+                read_failures: parsed.read_failures,
+                parse_degradations: parsed.parse_degradations,
+            },
+        })
+    }
+
+    /// The file positions that changed since the kept parse, with the read
+    /// start and the modules of that parse.
+    ///
+    /// The fingerprints are compared under the lock. The unsettled files are
+    /// read after it, so a concurrent caller does not wait on disk work.
+    /// Returns `None` when there is no kept parse, when it lacks the requested
+    /// complexity, or when the file set differs.
+    fn changed_since_kept_parse(
         &self,
         need_complexity: bool,
         fingerprints: &[SourceFingerprint],
-    ) -> Option<Arc<[ModuleInfo]>> {
-        let Ok(cache) = self.parsed_cache.lock() else {
+    ) -> Option<(Vec<usize>, u64, Arc<[ModuleInfo]>)> {
+        let unsettled = std::cell::RefCell::new(Vec::new());
+        let guard = self.parsed_cache.lock().ok()?;
+        let cache = guard.as_ref()?;
+        if need_complexity && !cache.need_complexity {
             return None;
-        };
-        let cache = cache.as_ref()?;
-        let complexity_mode_satisfies_request = cache.need_complexity || !need_complexity;
-        if complexity_mode_satisfies_request && cache.fingerprints == fingerprints {
-            return Some(Arc::clone(&cache.modules));
         }
-        None
+        let mut changed = changed_file_indices(
+            &cache.fingerprints,
+            cache.read_started_ns,
+            fingerprints,
+            &|index| {
+                unsettled.borrow_mut().push(index);
+                true
+            },
+        )?;
+        let kept_read_started_ns = cache.read_started_ns;
+        let kept_modules = Arc::clone(&cache.modules);
+        drop(guard);
+        changed.extend(unsettled.into_inner().into_iter().filter(|&index| {
+            !self.files().get(index).is_some_and(|file| {
+                crate::session_reuse::module_matches_source(&kept_modules, file.id, &file.path)
+            })
+        }));
+        changed.sort_unstable();
+        Some((changed, kept_read_started_ns, kept_modules))
+    }
+
+    /// Parse only the files whose fingerprint changed since the cached parse,
+    /// and keep the other cached modules. When no file changed, return the
+    /// cached modules as they are.
+    ///
+    /// Returns `None` when the cache cannot serve the request: no cached
+    /// parse, a cache without the requested complexity, a different file set,
+    /// or more changed files than [`MAX_INCREMENTAL_REPARSE_FILES`]. The
+    /// caller then parses every file through the persisted cache.
+    fn reparse_changed_modules(
+        &self,
+        need_complexity: bool,
+        fingerprints: &[SourceFingerprint],
+        read_started_ns: u64,
+        cancellation: Option<&AtomicBool>,
+    ) -> Option<SharedParsedModules> {
+        let (changed, kept_read_started_ns, kept_modules) =
+            self.changed_since_kept_parse(need_complexity, fingerprints)?;
+        let mut guard = self.parsed_cache.lock().ok()?;
+        let cache = guard.as_mut()?;
+        // A concurrent cache change during the reads falls back to a full
+        // parse. This is rare and accepted.
+        if !Arc::ptr_eq(&cache.modules, &kept_modules)
+            || cache.read_started_ns != kept_read_started_ns
+        {
+            return None;
+        }
+        // Release the extra reference, so the merge below can update the
+        // modules in place.
+        drop(kept_modules);
+        if changed.is_empty() {
+            // Each recent file had the kept content, and the content was read
+            // after `read_started_ns`, so the fingerprints now prove it from
+            // that time on.
+            cache.read_started_ns = read_started_ns;
+            let modules = Arc::clone(&cache.modules);
+            drop(guard);
+            self.parse_counts.record(SessionParseCounts {
+                modules_reused: modules.len(),
+                ..SessionParseCounts::default()
+            });
+            return Some(SharedParsedModules {
+                modules,
+                metrics: reused_parse_metrics(),
+            });
+        }
+        if changed.len() > MAX_INCREMENTAL_REPARSE_FILES {
+            return None;
+        }
+        let files: Vec<DiscoveredFile> = changed
+            .iter()
+            .filter_map(|&index| self.files().get(index).cloned())
+            .collect();
+        let parse_start = Instant::now();
+        let parsed = crate::source::parse_all_files(
+            &files,
+            None,
+            cache.need_complexity,
+            cancellation,
+            &self.config.flags.patterns(),
+        );
+        // The caller turns a set token into an error. The cache keeps the
+        // earlier complete modules, because the parse above may be truncated.
+        if token_is_set(cancellation) {
+            return Some(SharedParsedModules {
+                modules: Arc::clone(&cache.modules),
+                metrics: reused_parse_metrics(),
+            });
+        }
+        let mut fresh = parsed.modules;
+        for module in &mut fresh {
+            module.prepare_analysis_facts();
+        }
+        let fresh_count = fresh.len();
+        let reparsed: Vec<_> = files.iter().map(|file| file.id).collect();
+        merge_reparsed_modules(&mut cache.modules, &reparsed, fresh);
+        cache.fingerprints = fingerprints.to_vec();
+        cache.read_started_ns = read_started_ns;
+        cache
+            .read_failures
+            .retain(|failure| !reparsed.contains(&failure.file_id));
+        cache.read_failures.extend(parsed.read_failures);
+        cache
+            .parse_degradations
+            .retain(|degradation| !reparsed.contains(&degradation.file_id));
+        cache.parse_degradations.extend(parsed.parse_degradations);
+        record_source_diagnostics(
+            &self.config,
+            &cache.read_failures,
+            &cache.parse_degradations,
+        );
+        self.parse_counts.record(SessionParseCounts {
+            modules_parsed: parsed.cache_misses,
+            disk_cache_hits: 0,
+            modules_reused: cache.modules.len().saturating_sub(fresh_count),
+        });
+        let modules = Arc::clone(&cache.modules);
+        drop(guard);
+        self.disk_cache_stale.store(true, Ordering::SeqCst);
+        self.clear_styling_cache();
+        Some(SharedParsedModules {
+            modules,
+            metrics: core_backend::ParseMetrics {
+                parse_ms: parse_start.elapsed().as_secs_f64() * 1000.0,
+                cache_ms: 0.0,
+                cache_hits: 0,
+                cache_misses: parsed.cache_misses,
+                parse_cpu_ms: parsed.parse_cpu_ms,
+                cache_rejection: None,
+                files_read: parsed.files_read,
+                source_bytes_read: parsed.source_bytes_read,
+                parse_cache_bytes_read: 0,
+                css_masked_bytes: parsed.css_masked_bytes,
+                parse_cache_load_ms: 0.0,
+            },
+        })
     }
 }
 
@@ -785,6 +1352,8 @@ struct ParsedModules {
     modules: Vec<ModuleInfo>,
     metrics: core_backend::ParseMetrics,
     source_diagnostics: Vec<WorkspaceDiagnostic>,
+    read_failures: Vec<SourceReadFailure>,
+    parse_degradations: Vec<SourceParseDegradation>,
 }
 
 struct SharedParsedModules {
@@ -792,43 +1361,125 @@ struct SharedParsedModules {
     metrics: core_backend::ParseMetrics,
 }
 
+/// Modules from [`AnalysisSession::warm_parse`]. They always have complexity.
+struct WarmParsedModules {
+    modules: Arc<[ModuleInfo]>,
+    metrics: core_backend::ParseMetrics,
+    /// The modules came from the store without parse work.
+    reused: bool,
+    problems: SourceProblems,
+}
+
+/// The files of a parse that did not read or that parsed with errors.
+struct SourceProblems {
+    read_failures: Vec<SourceReadFailure>,
+    parse_degradations: Vec<SourceParseDegradation>,
+}
+
+fn token_is_set(cancellation: Option<&AtomicBool>) -> bool {
+    cancellation.is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+}
+
 fn parse_files_with_config(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
     need_complexity: bool,
+    cancellation: Option<&AtomicBool>,
 ) -> ParsedModules {
     let parse_start = Instant::now();
     let cache_max_size_bytes = crate::project_config::resolve_cache_max_size_bytes(config);
+    let mut cache_rejection = None;
+    let mut parse_cache_bytes_read = 0;
+    let mut parse_cache_load_ms = 0.0;
     let mut cache = if config.no_cache {
         None
     } else {
-        fallow_extract::cache::CacheStore::load(
+        let load_start = Instant::now();
+        let (loaded, bytes_read) = fallow_extract::cache::CacheStore::load_counting_bytes(
             &config.cache_dir,
+            &config.root,
             config.cache_config_hash,
             cache_max_size_bytes,
-        )
+        );
+        parse_cache_bytes_read = bytes_read;
+        parse_cache_load_ms = load_start.elapsed().as_secs_f64() * 1000.0;
+        match loaded {
+            Ok(store) => Some(store),
+            Err(rejection) => {
+                cache_rejection = Some(rejection);
+                None
+            }
+        }
     };
-    let parse_result = crate::source::parse_all_files(files, cache.as_ref(), need_complexity);
-    let source_diagnostics =
-        fallow_config::record_source_read_failures(&config.root, &parse_result.read_failures);
+    let read_started_ns = now_ns();
+    let parse_result = crate::source::parse_all_files(
+        files,
+        cache.as_ref(),
+        need_complexity,
+        cancellation,
+        &config.flags.patterns(),
+    );
+    let source_diagnostics = record_source_diagnostics(
+        config,
+        &parse_result.read_failures,
+        &parse_result.parse_degradations,
+    );
     let mut modules = parse_result.modules;
     for module in &mut modules {
         module.prepare_analysis_facts();
     }
     let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
-    let cache_ms = update_parse_cache_if_enabled(config, &mut cache, &modules, files);
+    let cache_ms = if token_is_set(cancellation) {
+        0.0
+    } else {
+        update_parse_cache_if_enabled(
+            config,
+            &mut cache,
+            &ParseCacheWrite {
+                modules: &modules,
+                files,
+                need_complexity,
+                fingerprint_of: &|file: &DiscoveredFile| {
+                    source_fingerprint(&file.path).for_content_read_at(read_started_ns)
+                },
+            },
+        )
+    };
     let metrics = core_backend::ParseMetrics {
         parse_ms,
         cache_ms,
         cache_hits: parse_result.cache_hits,
         cache_misses: parse_result.cache_misses,
         parse_cpu_ms: parse_result.parse_cpu_ms,
+        cache_rejection,
+        files_read: parse_result.files_read,
+        source_bytes_read: parse_result.source_bytes_read,
+        parse_cache_bytes_read,
+        css_masked_bytes: parse_result.css_masked_bytes,
+        parse_cache_load_ms,
     };
     ParsedModules {
         modules,
         metrics,
         source_diagnostics,
+        read_failures: parse_result.read_failures,
+        parse_degradations: parse_result.parse_degradations,
     }
+}
+
+/// Record the read failures and parse degradations of a parse for the
+/// project, and return them as workspace diagnostics.
+fn record_source_diagnostics(
+    config: &ResolvedConfig,
+    read_failures: &[SourceReadFailure],
+    parse_degradations: &[SourceParseDegradation],
+) -> Vec<WorkspaceDiagnostic> {
+    let mut diagnostics = fallow_config::record_source_read_failures(&config.root, read_failures);
+    diagnostics.extend(fallow_config::record_source_parse_degradations(
+        config,
+        parse_degradations,
+    ));
+    diagnostics
 }
 
 fn reused_parse_metrics() -> core_backend::ParseMetrics {
@@ -838,6 +1489,12 @@ fn reused_parse_metrics() -> core_backend::ParseMetrics {
         cache_hits: 0,
         cache_misses: 0,
         parse_cpu_ms: 0.0,
+        cache_rejection: None,
+        files_read: 0,
+        source_bytes_read: 0,
+        parse_cache_bytes_read: 0,
+        css_masked_bytes: 0,
+        parse_cache_load_ms: 0.0,
     }
 }
 
@@ -856,17 +1513,34 @@ fn source_fingerprints_for_files(files: &[DiscoveredFile]) -> Option<Vec<SourceF
 fn update_parse_cache_if_enabled(
     config: &ResolvedConfig,
     cache: &mut Option<fallow_extract::cache::CacheStore>,
-    modules: &[ModuleInfo],
-    files: &[DiscoveredFile],
+    write: &ParseCacheWrite<'_>,
 ) -> f64 {
     let start = Instant::now();
+    write_parse_cache(config, cache, write);
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Modules to store in the persisted parse cache, with the fingerprint that
+/// each file gets in the cache.
+struct ParseCacheWrite<'a> {
+    modules: &'a [ModuleInfo],
+    files: &'a [DiscoveredFile],
+    need_complexity: bool,
+    fingerprint_of: &'a dyn Fn(&DiscoveredFile) -> SourceFingerprint,
+}
+
+fn write_parse_cache(
+    config: &ResolvedConfig,
+    cache: &mut Option<fallow_extract::cache::CacheStore>,
+    write: &ParseCacheWrite<'_>,
+) {
     if config.no_cache {
-        return start.elapsed().as_secs_f64() * 1000.0;
+        return;
     }
 
     let cache_max_size_bytes = crate::project_config::resolve_cache_max_size_bytes(config);
-    let store = cache.get_or_insert_with(fallow_extract::cache::CacheStore::new);
-    if update_parse_cache(store, modules, files)
+    let store = cache.get_or_insert_with(|| fallow_extract::cache::CacheStore::new(&config.root));
+    if update_parse_cache(store, write)
         && let Err(error) = store.save(
             &config.cache_dir,
             config.cache_config_hash,
@@ -875,26 +1549,46 @@ fn update_parse_cache_if_enabled(
     {
         tracing::warn!("Failed to save cache: {error}");
     }
-    start.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Mirror of `fallow_core`'s `update_cache` for session-owned parsing: rewrite
+/// an unchanged entry only when its metadata moved or when this run can add
+/// complexity the entry lacks, and never let a complexity-blind run strip the
+/// complexity a `health` run stored.
 fn update_parse_cache(
     store: &mut fallow_extract::cache::CacheStore,
-    modules: &[ModuleInfo],
-    files: &[DiscoveredFile],
+    write: &ParseCacheWrite<'_>,
 ) -> bool {
+    let ParseCacheWrite {
+        modules,
+        files,
+        need_complexity,
+        fingerprint_of,
+    } = *write;
     let mut dirty = false;
     for module in modules {
         if let Some(file) = files.get(module.file_id.0 as usize) {
-            let fingerprint = source_fingerprint(&file.path);
+            let fingerprint = fingerprint_of(file);
             if let Some(cached) = store.get_by_path_only(&file.path)
                 && cached.content_hash == module.content_hash
             {
-                if cached.source_fingerprint() != fingerprint {
-                    let preserved_last_access = cached.last_access_secs;
-                    let mut refreshed =
-                        fallow_extract::cache::module_to_cached(module, fingerprint);
-                    refreshed.last_access_secs = preserved_last_access;
+                let stale_metadata = cached.source_fingerprint() != fingerprint;
+                let adds_complexity = need_complexity && !cached.complexity_extracted;
+                if stale_metadata && !adds_complexity {
+                    store.refresh_fingerprint(&file.path, fingerprint);
+                    dirty = true;
+                } else if adds_complexity {
+                    let preserved_complexity = (!need_complexity && cached.complexity_extracted)
+                        .then(|| cached.complexity.clone());
+                    let mut refreshed = fallow_extract::cache::module_to_cached(
+                        module,
+                        fingerprint,
+                        need_complexity,
+                    );
+                    if let Some(complexity) = preserved_complexity {
+                        refreshed.complexity = complexity;
+                        refreshed.complexity_extracted = true;
+                    }
                     store.insert(&file.path, refreshed);
                     dirty = true;
                 }
@@ -902,7 +1596,7 @@ fn update_parse_cache(
             }
             store.insert(
                 &file.path,
-                fallow_extract::cache::module_to_cached(module, fingerprint),
+                fallow_extract::cache::module_to_cached(module, fingerprint, need_complexity),
             );
             dirty = true;
         }
@@ -926,6 +1620,7 @@ struct EngineDeadCodePipelineInput<'a> {
     retain_graph: bool,
     retain_modules: bool,
     retain_files: bool,
+    cancellation: Option<&'a AtomicBool>,
 }
 
 fn run_engine_owned_dead_code_pipeline(
@@ -940,11 +1635,23 @@ fn run_engine_owned_dead_code_pipeline(
         retain_graph,
         retain_modules,
         retain_files,
+        cancellation,
     } = input;
+    let stopped = |stage: &str| -> EngineResult<()> {
+        if token_is_set(cancellation) {
+            return Err(crate::EngineError::cancelled(stage));
+        }
+        Ok(())
+    };
+    stopped("the dead-code prelude")?;
     let prelude = core_backend::prepare_dead_code_backend_prelude(config, discovery)?;
     let prelude_timings = prelude.timings();
+    stopped("dead-code entry-point discovery")?;
     let entry_points = core_backend::discover_dead_code_entry_points(&prelude);
-    let (resolved, graph) = resolve_or_build_dead_code_graph(&prelude, &entry_points, &modules);
+    stopped("import resolution and graph construction")?;
+    let (resolved, graph, graph_cache_rejection) =
+        resolve_or_build_dead_code_graph(&prelude, &entry_points, &modules);
+    stopped("the dead-code detectors")?;
 
     let mut detector = core_backend::run_dead_code_detectors(
         &prelude,
@@ -954,7 +1661,20 @@ fn run_engine_owned_dead_code_pipeline(
         collect_usages,
         &entry_points,
     );
+    // Stamp ids on the full set, before any filter removes a finding. The
+    // tiebreak suffix depends on the other findings with the same identity.
+    crate::dead_code::stamp_finding_ids(&mut detector.results, &config.root);
+    // Security ids too, so every surface reads the id this pipeline set.
+    crate::security::stamp_security_finding_ids(
+        &mut detector.results.security_findings,
+        &config.root,
+    );
     crate::dead_code::filter_configured_ignored_findings(&mut detector.results, config);
+    // The detectors are the longest uninterruptible stage. Without this a
+    // token set inside them yields a complete report, so the same request
+    // would be answered with results or with `cancelled` depending only on
+    // which side of the stage the flip landed.
+    stopped("assembling the dead-code report")?;
     let profile =
         core_backend::dead_code_pipeline_profile(core_backend::DeadCodePipelineProfileInput {
             retain_timings: retain_graph,
@@ -968,8 +1688,10 @@ fn run_engine_owned_dead_code_pipeline(
             detector: &detector,
             file_count: discovery.files().len(),
             workspace_count: discovery.workspaces().len(),
+            graph_cache_rejection,
         });
     let script_used_packages = prelude.script_used_packages();
+    let trace_provenance = prelude.trace_provenance(&modules, retain_graph);
     prelude.finish();
     let file_hashes = collect_file_hashes(&modules, discovery.files());
 
@@ -980,10 +1702,18 @@ fn run_engine_owned_dead_code_pipeline(
         modules: retain_modules.then_some(modules),
         files: retain_files.then(|| discovery.files().to_vec()),
         script_used_packages,
+        trace_provenance,
         file_hashes,
     })
 }
 
+/// Reuse the persisted module graph, or rebuild it and carry the reason the
+/// persisted one was refused.
+///
+/// The reason is the third element rather than a discarded `Option`: a warm run
+/// that paid for a multi-megabyte decode and reused none of it is the case the
+/// perf table exists to explain, and every engine-backed command reaches the
+/// pipeline through here.
 fn resolve_or_build_dead_code_graph(
     prelude: &core_backend::DeadCodeBackendPrelude,
     entry_points: &core_backend::DeadCodeEntryPoints,
@@ -991,17 +1721,18 @@ fn resolve_or_build_dead_code_graph(
 ) -> (
     core_backend::DeadCodeResolvedModules,
     core_backend::DeadCodeGraphRun,
+    Option<CacheRejection>,
 ) {
-    if let Some((resolved, graph)) =
-        core_backend::try_load_dead_code_graph_cache(prelude, entry_points, modules)
-    {
-        return (resolved, graph);
-    }
+    let rejection =
+        match core_backend::try_load_dead_code_graph_cache(prelude, entry_points, modules) {
+            Ok((resolved, graph)) => return (resolved, graph, None),
+            Err(rejection) => rejection,
+        };
 
     let resolved = core_backend::resolve_dead_code_imports(prelude, modules);
     let graph =
         core_backend::build_dead_code_graph(prelude, &resolved.project, entry_points, modules);
-    (resolved, graph)
+    (resolved, graph, rejection)
 }
 
 fn collect_file_hashes(
@@ -1038,12 +1769,16 @@ pub(crate) fn analyze_dead_code_with_parse_result_from_config(
         retain_graph: true,
         retain_modules: false,
         retain_files: false,
+        cancellation: None,
     })
     .map(SharedDeadCodeAnalysisArtifacts::into_owned)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+    use std::time::Duration;
+
     use super::*;
 
     fn session_with_source(source: &str) -> (tempfile::TempDir, AnalysisSession) {
@@ -1053,6 +1788,554 @@ mod tests {
         std::fs::write(root.join("src/index.ts"), source).expect("write source");
         let session = AnalysisSession::load_default(root);
         (project, session)
+    }
+
+    fn class_projection_session(root: &Path) -> AnalysisSession {
+        AnalysisSession::load_default_with_config(root, |config| {
+            config.rules.unused_class_members = fallow_config::Severity::Error;
+        })
+    }
+
+    fn session_class_projection(session: &AnalysisSession) -> Vec<String> {
+        let analysis = session.analyze_dead_code().expect("class member analysis");
+        assert!(analysis.results.unresolved_imports.is_empty());
+        let mut members: Vec<_> = analysis
+            .results
+            .unused_class_members
+            .iter()
+            .filter(|finding| finding.member.parent_name == "C")
+            .map(|finding| finding.member.member_name.clone())
+            .collect();
+        members.sort();
+        members
+    }
+
+    #[test]
+    fn factory_property_proof_refresh_matches_fresh_sessions() {
+        for (present, absent) in [
+            (
+                "import { C } from './classes'; const make = (): C => new C(); export const createUi = () => ({ page: make() });",
+                "export const createUi = () => ({ page: { used() {} } });",
+            ),
+            (
+                "import { Owner } from './owner'; export const createUi = () => { const owner = new Owner(); return { page: owner.widget }; };",
+                "export const createUi = () => ({ page: { used() {} } });",
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("session fixture");
+            let root = project.path();
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"name":"producer-refresh","type":"module","main":"index.ts"}"#,
+            )
+            .expect("package");
+            std::fs::write(
+                root.join("classes.ts"),
+                "export class C { control() {} used() {} dead() {} }",
+            )
+            .expect("class");
+            std::fs::write(
+                root.join("owner.ts"),
+                "import { C } from './classes'; export class Owner { widget: C = new C(); }",
+            )
+            .expect("owner");
+            std::fs::write(root.join("index.ts"), "import { createUi } from './factory'; const ui = createUi(); ui.page.used(); import { C } from './classes'; new C().control();").expect("consumer");
+            let path = root.join("factory.ts");
+            std::fs::write(&path, present).expect("initial producer");
+            let mut session = class_projection_session(root);
+            assert_eq!(session_class_projection(&session), ["dead"]);
+            for (source, expected) in [(absent, vec!["dead", "used"]), (present, vec!["dead"])] {
+                std::fs::write(&path, source).expect("producer update");
+                session.refresh_discovery();
+                assert_eq!(session_class_projection(&session), expected);
+                assert_eq!(
+                    session_class_projection(&session),
+                    session_class_projection(&class_projection_session(root))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn callback_property_proof_refresh_matches_fresh_sessions() {
+        for (present, absent) in [
+            (
+                "export function wrap<T>(callback: () => T) { return { value: callback() }; }",
+                "export function wrap<T>(callback: () => T) { return { value: { used() {} } }; }",
+            ),
+            (
+                "export { computed as wrap } from 'vue';",
+                "export { computed as wrap } from 'foreign';",
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("callback session fixture");
+            let root = project.path();
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"name":"callback-refresh","type":"module","main":"index.ts","dependencies":{"vue":"*","foreign":"*"}}"#,
+            )
+            .expect("package");
+            std::fs::write(
+                root.join("classes.ts"),
+                "export class C { control() {} used() {} dead() {} }",
+            )
+            .expect("class");
+            std::fs::write(root.join("index.ts"), "import { wrap } from './factory'; import { C } from './classes'; new C().control(); wrap(() => new C()).value.used();").expect("consumer");
+            let path = root.join("factory.ts");
+            std::fs::write(&path, present).expect("initial producer");
+            let mut session = class_projection_session(root);
+            assert_eq!(session_class_projection(&session), ["dead"]);
+            for (source, expected) in [(absent, vec!["dead", "used"]), (present, vec!["dead"])] {
+                std::fs::write(&path, source).expect("producer update");
+                session.refresh_discovery();
+                assert_eq!(session_class_projection(&session), expected);
+                assert_eq!(
+                    session_class_projection(&session),
+                    session_class_projection(&class_projection_session(root))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn callback_review_proof_refresh_matches_fresh_sessions() {
+        for (present, absent) in [
+            (
+                "let current = new C(); wrap((ignored = 0) => current).value.used();",
+                "let current = new C(); wrap((ignored = (current = { used() {} })) => current).value.used();",
+            ),
+            (
+                "import { computed } from 'vue'; const getter = () => new C(); const alias = getter; const options = { get: alias, set: value => {} }; computed(options).value.used();",
+                "import { computed } from 'vue'; const getter = () => new C(); const alias = getter; const options = { get: alias, set: value => {} }; options.get = () => ({ used() {} }); computed(options).value.used();",
+            ),
+            (
+                "let current = new C(); wrap(() => current).value.used();",
+                "let current = new C(); wrap(() => { current = { used() {} }; return current; }).value.used();",
+            ),
+            (
+                "import { computed } from 'vue'; const options = { get: () => new C(), set: value => {} }; const alias = options; computed(alias).value.used();",
+                "import { computed } from 'vue'; const options = { get: () => new C(), set: value => {} }; const alias = options; alias.get = () => ({ used() {} }); computed(options).value.used();",
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("callback review session fixture");
+            let root = project.path();
+            std::fs::write(root.join("package.json"), r#"{"name":"callback-review-refresh","type":"module","main":"index.ts","dependencies":{"vue":"*"}}"#).expect("package");
+            std::fs::write(
+                root.join("classes.ts"),
+                "export class C { control() {} used() {} dead() {} }",
+            )
+            .expect("class");
+            std::fs::write(
+                root.join("helper.ts"),
+                "export function wrap(fn) { return { value: fn() }; }",
+            )
+            .expect("helper");
+            let path = root.join("index.ts");
+            let source = |body: &str| {
+                format!(
+                    "import {{ C }} from './classes'; import {{ wrap }} from './helper'; new C().control(); {body}"
+                )
+            };
+            std::fs::write(&path, source(present)).expect("initial source");
+            let mut session = class_projection_session(root);
+            assert_eq!(session_class_projection(&session), ["dead"]);
+            for (body, expected) in [(absent, vec!["dead", "used"]), (present, vec!["dead"])] {
+                std::fs::write(&path, source(body)).expect("source update");
+                session.refresh_discovery();
+                assert_eq!(session_class_projection(&session), expected);
+                assert_eq!(
+                    session_class_projection(&session),
+                    session_class_projection(&class_projection_session(root))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_source_proof_removal_and_restoration_matches_fresh_sessions() {
+        for (label, present, absent, access) in [
+            (
+                "literal",
+                "const items = [new C()];",
+                "const items = [new Other()];",
+                "items[0].used();",
+            ),
+            (
+                "vue",
+                "import { computed } from 'vue';const items = computed(() => [new C()]);",
+                "import { computed } from 'foreign';const items = computed(() => [new C()]);",
+                "items.value[0].used();",
+            ),
+        ] {
+            let project = tempfile::tempdir().expect("session fixture");
+            let root = project.path();
+            std::fs::create_dir(root.join("src")).expect("source directory");
+            std::fs::write(root.join("package.json"),
+                r#"{"name":"session-array-proof","type":"module","main":"src/index.ts","dependencies":{"vue":"*","foreign":"*"}}"#)
+                .expect("package manifest");
+            std::fs::write(root.join("src/classes.ts"),
+                "export class C { control() {} used() {} dead() {} } export class Other { used() {} }")
+                .expect("classes");
+            for provider in ["vue", "foreign"] {
+                let directory = root.join("node_modules").join(provider);
+                std::fs::create_dir_all(&directory).expect("provider directory");
+                std::fs::write(
+                    directory.join("package.json"),
+                    format!(r#"{{"name":"{provider}","type":"module","main":"index.js"}}"#),
+                )
+                .expect("provider package");
+                std::fs::write(
+                    directory.join("index.js"),
+                    "export const computed = getter => ({ get value() { return getter(); } });",
+                )
+                .expect("provider source");
+            }
+            let source = |producer: &str| {
+                format!(
+                    "import {{ C, Other }} from './classes';new C().control();\n{producer}\n{access}\n"
+                )
+            };
+            let original = source(present);
+            let path = root.join("src/index.ts");
+            std::fs::write(&path, &original).expect("initial source");
+            let mut retained = class_projection_session(root);
+            for (phase, content, expected) in [
+                ("initial", original.as_str(), vec!["dead"]),
+                ("removed", source(absent).as_str(), vec!["dead", "used"]),
+                ("restored", original.as_str(), vec!["dead"]),
+            ] {
+                std::fs::write(&path, content).expect("update proof source");
+                retained.refresh_discovery();
+                let actual = session_class_projection(&retained);
+                assert_eq!(actual, expected, "{label}: {phase}");
+                assert_eq!(
+                    actual,
+                    session_class_projection(&class_projection_session(root)),
+                    "{label}: retained and fresh differ after {phase}"
+                );
+            }
+        }
+    }
+
+    /// A cancelled session reports the failure and names the boundary it
+    /// stopped at, so a caller can tell a stopped run from a broken one.
+    #[test]
+    fn a_cancelled_session_returns_a_cancellation_error_not_an_empty_result() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::create_dir(root.join("src")).expect("create source directory");
+        std::fs::write(root.join("src/index.ts"), "export const entry = 1;\n").expect("entry");
+        std::fs::write(root.join("src/orphan.ts"), "export const orphan = 1;\n").expect("orphan");
+
+        let baseline = AnalysisSession::load_default(root)
+            .analyze_dead_code()
+            .expect("an uncancelled session analyzes");
+        assert!(
+            !baseline.results.unused_files.is_empty(),
+            "the fixture must have findings, so an empty result would be a plausible wrong answer"
+        );
+
+        let error = AnalysisSession::load_default(root)
+            .with_cancellation(Arc::new(AtomicBool::new(true)))
+            .analyze_dead_code()
+            .expect_err("a cancelled session must not return results");
+        assert!(error.is_cancelled(), "unexpected error: {error}");
+        assert!(error.message().contains("cancelled"));
+    }
+
+    /// The engine pipeline is what every CLI command runs, and it reported no
+    /// graph-cache reason at all: the loader produced one, the boundary threw
+    /// it away, and the profile hardcoded `None`. A warm run that decoded a
+    /// multi-megabyte graph and then rebuilt from scratch looked exactly like a
+    /// first run, so the row that explains it could never print.
+    #[test]
+    fn a_refused_graph_cache_names_its_reason_in_the_engine_timings() {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::create_dir(root.join("src")).expect("create source directory");
+        std::fs::write(root.join("src/index.ts"), "export const entry = 1;\n").expect("entry");
+
+        let cold = AnalysisSession::load_default(root)
+            .analyze_dead_code_with_artifacts(false, true)
+            .expect("cold run analyzes");
+        assert_eq!(
+            cold.timings
+                .expect("cold timings retained")
+                .graph_cache_rejection,
+            Some(CacheRejection::Absent),
+            "a first run has no persisted graph to refuse"
+        );
+
+        std::fs::write(
+            root.join("src/index.ts"),
+            "export const entry = 1;\nexport const added = 2;\n",
+        )
+        .expect("edit the entry");
+
+        let warm = AnalysisSession::load_default(root)
+            .analyze_dead_code_with_artifacts(false, true)
+            .expect("warm run analyzes");
+        assert_eq!(
+            warm.timings
+                .expect("warm timings retained")
+                .graph_cache_rejection,
+            Some(CacheRejection::FingerprintChanged),
+            "the decoded graph was refused because a file changed, and the run must say so"
+        );
+    }
+
+    /// A session that is not given a token can never be cancelled, so every
+    /// existing caller keeps its current behavior.
+    #[test]
+    fn a_session_without_a_token_is_never_cancelled() {
+        let (_project, session) = session_with_source("export const unused = 1;\n");
+        assert!(!session.is_cancelled());
+        session
+            .analyze_dead_code()
+            .expect("a session without a token analyzes");
+    }
+
+    /// Files per fixture for the parse-loop tests. Large enough that a parse
+    /// takes long enough to be cancelled part way through, small enough to
+    /// stay a unit test.
+    const PARSE_LOOP_FILES: usize = 400;
+
+    fn parse_loop_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().expect("project");
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        for module in 0..PARSE_LOOP_FILES {
+            let mut source = String::new();
+            for symbol in 0..20 {
+                let _ = writeln!(
+                    source,
+                    "export const helper{symbol} = (input: number): number => {{\n  \
+                     if (input > {symbol}) {{\n    return input * {symbol};\n  }}\n  \
+                     return input - {symbol};\n}};"
+                );
+            }
+            std::fs::write(src.join(format!("mod{module}.ts")), source).expect("module");
+        }
+        project
+    }
+
+    /// A platform without ctime, such as Windows, gives fingerprints that
+    /// can stand in for the content only after a content check. A kept
+    /// session must not serve its modules to the next run on such a
+    /// fingerprint, because a same-size edit with a restored mtime keeps it.
+    // Unix only: other platforms expose no inode change time, so no
+    // fingerprint is trustworthy and a refresh always drops the modules.
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_drops_modules_whose_fingerprints_need_a_content_check() {
+        let (_project, mut session) = session_with_source("export const kept = 1;\n");
+        drop(session.parse_modules(false, None));
+
+        assert!(!session.refresh_discovery(), "the file set is the same");
+        assert!(
+            session.parsed_cache.lock().expect("parse cache").is_some(),
+            "fingerprints with a known ctime keep the modules for the next run"
+        );
+
+        if let Some(cache) = session
+            .parsed_cache
+            .get_mut()
+            .expect("parse cache")
+            .as_mut()
+        {
+            for fingerprint in &mut cache.fingerprints {
+                fingerprint.ctime_ns = 0;
+            }
+        }
+        assert!(!session.refresh_discovery(), "the file set is the same");
+        assert!(
+            session.parsed_cache.lock().expect("parse cache").is_none(),
+            "the next run parses through the persisted cache, which checks the content"
+        );
+    }
+
+    /// A flush writes the kept modules to the persisted cache. A fingerprint
+    /// that did not settle before the kept parse read the file must lose its
+    /// ctime there, or the next run takes the metadata fast path on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_stores_an_unsettled_fingerprint_without_its_ctime() {
+        let (project, mut session) = session_with_source("export const kept = 1;\n");
+        drop(session.parse_modules(false, None));
+        let path = project.path().join("src/index.ts");
+        let stored_ctime = |session: &AnalysisSession| {
+            let _ = std::fs::remove_dir_all(&session.config.cache_dir);
+            session.disk_cache_stale.store(true, Ordering::SeqCst);
+            session.flush_parse_cache();
+            let store = fallow_extract::cache::CacheStore::load(
+                &session.config.cache_dir,
+                &session.config.root,
+                session.config.cache_config_hash,
+                crate::project_config::resolve_cache_max_size_bytes(&session.config),
+            )
+            .expect("flush writes the parse cache");
+            store
+                .get_by_path_only(&path)
+                .expect("flushed module")
+                .ctime_ns
+        };
+
+        // Set the read start relative to the file's own ctime, so the test
+        // does not depend on how much time passed since the write.
+        let set_read_started = |session: &mut AnalysisSession, offset: u64| {
+            if let Some(cache) = session
+                .parsed_cache
+                .get_mut()
+                .expect("parse cache")
+                .as_mut()
+            {
+                let ctime = cache.fingerprints[0].ctime_ns;
+                assert!(ctime > 0, "the platform reports a ctime");
+                cache.read_started_ns = ctime.saturating_add(offset);
+            }
+        };
+
+        set_read_started(&mut session, 0);
+        assert_eq!(
+            stored_ctime(&session),
+            0,
+            "a fingerprint inside the window is not settled"
+        );
+
+        set_read_started(
+            &mut session,
+            fallow_types::source_fingerprint::TIMESTAMP_SETTLE_WINDOW_NS,
+        );
+        assert!(
+            stored_ctime(&session) > 0,
+            "a settled fingerprint keeps its ctime"
+        );
+    }
+
+    /// A same-length write in the same timestamp tick as the previous write
+    /// keeps mtime, ctime and size. The kept modules must not stand in for
+    /// the new content when the fingerprint is that recent.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_tick_rewrite_does_not_reuse_the_kept_module() {
+        let (project, mut session) = session_with_source("export const alpha = 1;\n");
+        drop(session.parse_modules(false, None));
+
+        let path = project.path().join("src/index.ts");
+        std::fs::write(&path, "export const bravo = 1;\n").expect("rewrite source");
+        let same_tick = SourceFingerprint::from_metadata(
+            &std::fs::metadata(&path).expect("metadata after rewrite"),
+        );
+        if let Some(cache) = session
+            .parsed_cache
+            .get_mut()
+            .expect("parse cache")
+            .as_mut()
+        {
+            cache.fingerprints = vec![same_tick];
+        }
+
+        let modules = session.parse_modules(false, None).modules;
+        let exports: Vec<String> = modules
+            .iter()
+            .flat_map(|module| module.exports.iter())
+            .map(|export| export.name.to_string())
+            .collect();
+        assert_eq!(exports, vec!["bravo".to_string()]);
+    }
+
+    /// A session over `root` that never reads or writes the on-disk parse
+    /// cache, so repeated parses in one test all do the same work.
+    fn uncached_session(root: &Path) -> AnalysisSession {
+        let mut project_config = crate::project_config::default_project_config(root);
+        project_config.config.no_cache = true;
+        AnalysisSession::from_config(project_config)
+    }
+
+    /// The parse loop is the one place cancellation stops work per item rather
+    /// than at a stage boundary, so it is the one place the stop can be
+    /// asserted from what was parsed instead of from how long the call took.
+    ///
+    /// A truncated parse is also the most dangerous thing cancellation
+    /// produces: served from a cache it would read as a project with fewer
+    /// modules long after the cancellation was forgotten. The second half
+    /// asserts it is not retained.
+    #[test]
+    fn a_cancelled_parse_stops_partway_and_leaves_no_truncated_cache_behind() {
+        let project = parse_loop_project();
+        let root = project.path();
+
+        // Warm the page cache, so the timed run measures parsing.
+        drop(uncached_session(root).parse_modules(false, None));
+
+        let started = Instant::now();
+        let full = uncached_session(root).parse_modules(false, None);
+        let full_parse = started.elapsed();
+        let full_count = full.modules.len();
+        assert_eq!(
+            full_count, PARSE_LOOP_FILES,
+            "the fixture must parse every generated module"
+        );
+        assert!(
+            full_parse >= Duration::from_millis(20),
+            "the fixture is too small to cancel part way through: {full_parse:?}"
+        );
+
+        // Where the flip lands is a scheduling outcome, so this retries until
+        // one attempt lands strictly inside the loop. Every attempt asserts the
+        // property; the retry only chooses an attempt that measures the stop
+        // part way through rather than at the entry guard.
+        let mut partial = None;
+        let mut cancelled_session = None;
+        for attempt in 1..=6_u32 {
+            let token = Arc::new(AtomicBool::new(false));
+            // Build the session before arming the watchdog. Discovery runs in
+            // the constructor, and a delay spent there would leave the token
+            // already set when the loop starts.
+            let session = uncached_session(root).with_cancellation(Arc::clone(&token));
+            let watchdog = {
+                let token = Arc::clone(&token);
+                let delay = full_parse * attempt / 6;
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    token.store(true, Ordering::SeqCst);
+                })
+            };
+            let cancelled = session.parse_modules(false, Some(&token));
+            watchdog.join().expect("watchdog thread");
+
+            let parsed = cancelled.modules.len();
+            assert!(
+                parsed < full_count,
+                "the parse returned all {full_count} modules, so the loop never read the token"
+            );
+            cancelled_session = Some(session);
+            if parsed > 0 {
+                partial = Some(parsed);
+                break;
+            }
+        }
+        let parsed = partial.expect(
+            "no attempt flipped the token while the loop was running, so this never measured a \
+             stop part way through",
+        );
+        assert!(parsed < full_count);
+
+        assert!(
+            cancelled_session
+                .expect("a cancelled session")
+                .parsed_cache
+                .lock()
+                .expect("parse cache")
+                .is_none(),
+            "a truncated parse must not be retained as this session's warm cache"
+        );
+        let recovered = uncached_session(root).parse_modules(false, None);
+        assert_eq!(
+            recovered.modules.len(),
+            full_count,
+            "a later uncancelled parse must still see the whole project"
+        );
     }
 
     #[test]
@@ -1185,11 +2468,165 @@ mod tests {
         assert_eq!(results.unused_files[0].file.path, outside);
     }
 
+    /// Two files under `src/`, with the default config, so the persisted
+    /// parse cache is on.
+    #[cfg(unix)]
+    fn warm_store_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::create_dir(root.join("src")).expect("create source directory");
+        std::fs::write(root.join("src/index.ts"), "export const entry = 1;\n").expect("entry");
+        std::fs::write(root.join("src/other.ts"), "export const other = 2;\n").expect("other");
+        project
+    }
+
+    #[cfg(unix)]
+    fn warm_session(root: &Path, store: &Arc<WarmParseStore>) -> AnalysisSession {
+        AnalysisSession::load_default(root).with_warm_parse(Some(Arc::clone(store)))
+    }
+
+    #[cfg(unix)]
+    fn exported_names(modules: &[ModuleInfo]) -> Vec<String> {
+        let mut names: Vec<String> = modules
+            .iter()
+            .flat_map(|module| module.exports.iter().map(|export| export.name.to_string()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_store_serves_a_new_session_without_parse_work() {
+        let project = warm_store_project();
+        let store = Arc::new(WarmParseStore::new(
+            crate::warm_parse::WarmParseLimits::default(),
+        ));
+
+        let first = warm_session(project.path(), &store).parse_modules(false, None);
+        let second = warm_session(project.path(), &store).parse_modules(false, None);
+
+        assert!(Arc::ptr_eq(&first.modules, &second.modules));
+        assert_eq!(second.metrics.cache_hits + second.metrics.cache_misses, 0);
+        let counts = store.counts();
+        assert_eq!(counts.parse_runs, 1);
+        assert_eq!(counts.modules_parsed, 2);
+        assert_eq!(counts.modules_reused, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_store_serves_the_health_parse_of_a_new_session() {
+        let project = warm_store_project();
+        let store = Arc::new(WarmParseStore::new(
+            crate::warm_parse::WarmParseLimits::default(),
+        ));
+
+        drop(warm_session(project.path(), &store).parse_modules(false, None));
+        let health = warm_session(project.path(), &store).parsed_parts_uncached(true);
+
+        assert_eq!(health.modules.len(), 2);
+        assert_eq!(health.cache_hits + health.cache_misses, 0);
+        assert_eq!(
+            store.counts().parse_runs,
+            1,
+            "the first parse computed complexity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_or_a_new_file_makes_the_next_session_parse_again() {
+        let project = warm_store_project();
+        let root = project.path();
+        let store = Arc::new(WarmParseStore::new(
+            crate::warm_parse::WarmParseLimits::default(),
+        ));
+        drop(warm_session(root, &store).parse_modules(false, None));
+
+        std::fs::write(root.join("src/other.ts"), "export const renamed = 22;\n").expect("edit");
+        let edited = warm_session(root, &store).parse_modules(false, None);
+        assert_eq!(exported_names(&edited.modules), ["entry", "renamed"]);
+        assert_eq!(
+            edited.metrics.cache_misses, 1,
+            "only the edited file is parsed"
+        );
+
+        std::fs::write(root.join("src/added.ts"), "export const added = 3;\n").expect("add");
+        let added = warm_session(root, &store).parse_modules(false, None);
+        assert_eq!(
+            exported_names(&added.modules),
+            ["added", "entry", "renamed"]
+        );
+
+        let counts = store.counts();
+        assert_eq!(counts.parse_runs, 3);
+        assert_eq!(counts.modules_reused, 0);
+        assert_eq!(store.len(), 2, "each file list keeps its latest parse only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_without_the_persisted_cache_does_not_use_the_store() {
+        let project = warm_store_project();
+        let store = Arc::new(WarmParseStore::new(
+            crate::warm_parse::WarmParseLimits::default(),
+        ));
+
+        drop(
+            uncached_session(project.path())
+                .with_warm_parse(Some(Arc::clone(&store)))
+                .parse_modules(false, None),
+        );
+
+        assert_eq!(
+            store.counts(),
+            crate::warm_parse::WarmParseCounts::default()
+        );
+        assert!(store.is_empty());
+    }
+
+    /// A parse records its read failures for the project. A session that
+    /// takes kept modules must record them again, or a run between the two
+    /// that cleared them would hide the failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_parse_records_its_read_failures_again() {
+        let project = warm_store_project();
+        let root = project.path();
+        std::fs::write(root.join("src/broken.ts"), [0xff, 0xfe, 0x00]).expect("invalid UTF-8");
+        let store = Arc::new(WarmParseStore::new(
+            crate::warm_parse::WarmParseLimits::default(),
+        ));
+        let read_failures = |session: &AnalysisSession| {
+            session
+                .current_workspace_diagnostics()
+                .into_iter()
+                .filter(|diagnostic| {
+                    matches!(
+                        diagnostic.kind,
+                        fallow_types::workspace::WorkspaceDiagnosticKind::SourceReadFailure { .. }
+                    )
+                })
+                .count()
+        };
+
+        let first = warm_session(root, &store);
+        drop(first.parse_modules(false, None));
+        assert_eq!(read_failures(&first), 1);
+
+        drop(fallow_config::record_source_read_failures(root, &[]));
+        let second = warm_session(root, &store);
+        drop(second.parse_modules(false, None));
+        assert_eq!(store.counts().modules_reused, 2);
+        assert_eq!(read_failures(&second), 1);
+    }
+
     #[test]
     fn warm_parse_cache_reuses_module_storage() {
         let (_project, session) = session_with_source("export function value() { return 1; }\n");
-        let first = session.parse_modules(true);
-        let second = session.parse_modules(false);
+        let first = session.parse_modules(true, None);
+        let second = session.parse_modules(false, None);
 
         assert!(
             Arc::ptr_eq(&first.modules, &second.modules),
@@ -1224,14 +2661,6 @@ mod tests {
     }
 
     #[test]
-    fn parsed_parts_keep_owned_module_compatibility() {
-        let (_project, session) = session_with_source("export const value = 1;\n");
-        let parts: ParsedAnalysisSessionParts = session.parsed_parts(false);
-
-        let _: Vec<ModuleInfo> = parts.modules;
-    }
-
-    #[test]
     fn shared_parsed_parts_reuse_public_session_storage() {
         let (_project, session) = session_with_source("export const value = 1;\n");
         let cached = session.shared_parsed_modules(true);
@@ -1243,7 +2672,7 @@ mod tests {
     #[test]
     fn warm_complexity_artifacts_reuse_cached_module_storage() {
         let (_project, session) = session_with_source("export function value() { return 1; }\n");
-        let cached = session.parse_modules(true);
+        let cached = session.parse_modules(true, None);
         let artifacts = session
             .analyze_dead_code_with_reuse_artifacts(true, true, false)
             .expect("analysis succeeds");
@@ -1392,7 +2821,7 @@ wrapper();
             cold.graph.as_ref().expect("cold graph retained"),
         );
         assert!(
-            fallow_graph::cache::GraphCacheStore::load(&cold_session.config().cache_dir).is_some(),
+            fallow_graph::cache::GraphCacheStore::load(&cold_session.config().cache_dir).is_ok(),
             "cold analysis must persist the graph cache"
         );
 

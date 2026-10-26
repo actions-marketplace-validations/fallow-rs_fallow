@@ -9,9 +9,10 @@ published user documentation. Each fact has one authored source.
 |---|---|---|
 | Open-source maintainer knowledge | `fallow/docs/` | Humans, Codex, Claude |
 | Maintainer workflows | `fallow/.agents/skills/` | Codex directly, generated Claude adapters |
+| Shared reviewer constraints | `fallow/.agents/rules/` | Maintainer skills, with durable facts routed to `docs/` |
 | Claude runtime constraints | `fallow/.claude/rules/` | Claude, with durable facts routed to `docs/` |
 | Public CLI, config, MCP, and output contracts | Public Fallow source and generated schemas | Public docs, skills, integrations, private consumers |
-| Released Fallow skill contract | `fallow/npm/fallow/skills/fallow/` | npm package and portable skill packaging |
+| Released Fallow skill contract | `fallow/npm/fallow/skills/<name>/` (`fallow`, `fallow-setup`) | npm package, the binary embed for `fallow agent install`, portable skill packaging, and the generated maintainer copies in `.agents/skills/<name>/` |
 | Public user documentation | `fallow-docs` | Documentation site and private site builds |
 | Portable plugin packaging and additional end-user skills | `fallow-skills` | Agent hosts and plugin marketplaces |
 | Cloud-facing runtime protocol | `fallow-cov-protocol` | Public producers and private consumers |
@@ -70,6 +71,14 @@ Public examples must be generic or come from an explicitly public fixture.
 The public docs archive records a complete content digest and source commit.
 Private consumers pin both values. The portable skill repository records the
 exact Fallow source commit, source root, target root, and declared transform.
+After a skill change lands on `main`, `node scripts/sync-skills-companion.mjs`
+prepares the signed companion commit. The companion `main` branch is
+protected, so the maintainer publishes the commit through a fallow-skills pull
+request. The script prints the commands.
+Pull requests compare the published companion with their exact public base
+commit, while required generation checks validate the candidate contracts and
+adapters. Pushes compare the current source and keep failing on landed drift
+until the companion is synchronized.
 Protocol consumers pin the public crate in their lockfile and verify published
 sidecar parity.
 

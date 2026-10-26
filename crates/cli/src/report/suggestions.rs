@@ -49,14 +49,17 @@ fn suggestions_enabled_from(value: Option<&str>) -> bool {
 pub fn setup_pointer_applicable(root: &Path) -> bool {
     root.exists()
         && fallow_config::FallowConfig::find_config_path(root).is_none()
-        && !crate::telemetry::is_ci()
+        && !fallow_engine::ci_env::is_ci()
         && !crate::impact::load(root).onboarding_declined
 }
 
 /// One-line human setup hint for bare `fallow` output: the prose counterpart of
 /// the `setup` next-step (agents get the JSON form, humans get this line).
 /// Worded as an offer, not a deficiency: zero-config is a supported happy path.
-pub const SETUP_HINT: &str = "Setup: `fallow init --agents` writes an agent guide; `fallow hooks install --target agent` adds a commit gate (hide this hint: `fallow init --decline`).";
+/// It names `fallow agent install`, the one-pass agent setup, so that the
+/// skills and the MCP server are part of the offer, not only the guide and
+/// the gate.
+pub const SETUP_HINT: &str = "Setup: `fallow init` writes a config; `fallow agent install --dry-run` previews the agent guide, skills, MCP server, and commit gate (hide this hint: `fallow init --decline`).";
 
 /// Real-counter summary fragment shared by the next-step reason and the human
 /// one-liner. The output crate owns the `impact-report` command contract.
@@ -87,20 +90,30 @@ pub fn impact_digest_line(digest: crate::impact::ImpactDigest) -> String {
 /// show it.
 #[must_use]
 pub fn due_impact_digest(root: &Path) -> Option<crate::impact::ImpactDigest> {
-    if !suggestions_enabled() || crate::telemetry::is_ci() {
+    if !suggestions_enabled() || fallow_engine::ci_env::is_ci() {
         return None;
     }
     crate::impact::take_due_digest(root)
 }
 
+/// The `scope-workspaces` ref. `None` without a git probe when suggestions
+/// are disabled.
 fn default_workspace_ref_for_next_step(root: &Path) -> Option<String> {
-    fallow_engine::repo_refs::default_workspace_ref(root)
+    if !suggestions_enabled() {
+        return None;
+    }
+    fallow_engine::repo_refs::default_workspace_ref(
+        root,
+        &crate::output_runtime::workspace_patterns(),
+    )
 }
 
 /// `audit-changed`: gate only the files the current branch changed. `fallow
-/// audit` auto-detects its base, so no ref needs embedding.
+/// audit` auto-detects its base, so no ref needs embedding. `false` without a
+/// git probe when suggestions are disabled, so a run with
+/// `FALLOW_SUGGESTIONS=off` starts no process for its next steps.
 pub fn audit_changed_applicable(root: &Path) -> bool {
-    fallow_engine::churn::is_git_repo(root)
+    suggestions_enabled() && fallow_engine::churn::is_git_repo(root)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,17 +122,23 @@ pub fn audit_changed_applicable(root: &Path) -> bool {
 // documented exception: a due `impact-report` digest may ride a clean run.
 // ---------------------------------------------------------------------------
 
-/// Next-steps for standalone `fallow dead-code`. `offer_setup` is the caller's
-/// [`setup_pointer_applicable`] result (threaded as a parameter so the builders
-/// stay free of env/filesystem probes and deterministic under test).
+/// Next-steps for standalone `fallow dead-code` and `fallow architecture`.
+/// `command` is the subcommand that ran; the `scope-workspaces` step names it.
+/// `offer_setup` is the caller's [`setup_pointer_applicable`] result (threaded
+/// as a parameter so the builders stay free of env/filesystem probes and
+/// deterministic under test).
 #[must_use]
-pub fn build_dead_code_next_steps(
+pub fn build_check_next_steps(
     results: &AnalysisResults,
     root: &Path,
     offer_setup: bool,
     digest: Option<crate::impact::ImpactDigest>,
+    command: &str,
 ) -> Vec<NextStep> {
     let workspace_ref = default_workspace_ref_for_next_step(root);
+    // `fallow architecture` records its own command when it loads a baseline,
+    // so the `recheck-baseline` step reruns the command that ran.
+    let loaded_baseline = crate::output_runtime::loaded_baseline_for(command);
     build_dead_code_next_steps_contract(DeadCodeNextStepsInput {
         suggestions_enabled: suggestions_enabled(),
         results,
@@ -129,6 +148,40 @@ pub fn build_dead_code_next_steps(
         workspace_ref: workspace_ref.as_deref(),
         audit_changed: audit_changed_applicable(root),
         has_external_plugins: has_external_plugins(root),
+        baseline_recheck: loaded_baseline.as_ref().and_then(baseline_recheck_input),
+        command,
+    })
+}
+
+/// The `recheck-baseline` input for a baseline this process recorded at load
+/// time, in the borrowed shape the contract builders take.
+///
+/// `None` when the step's command would inherit the diff from the environment:
+/// the command carries `--baseline` and nothing else, so with
+/// `FALLOW_DIFF_FILE` exported it narrows again and offers itself again.
+fn baseline_recheck_input(
+    loaded: &crate::output_runtime::LoadedBaselineRecheck,
+) -> Option<fallow_output::BaselineRecheckInput<'_>> {
+    let diff_file_exported = std::env::var_os("FALLOW_DIFF_FILE").is_some_and(|v| !v.is_empty());
+    recheck_input_unless_diff_survives(loaded, diff_file_exported)
+}
+
+fn recheck_input_unless_diff_survives(
+    loaded: &crate::output_runtime::LoadedBaselineRecheck,
+    diff_file_exported: bool,
+) -> Option<fallow_output::BaselineRecheckInput<'_>> {
+    if diff_file_exported
+        && loaded
+            .scope_reasons
+            .contains(fallow_output::ScopeReason::Diff)
+    {
+        return None;
+    }
+    Some(fallow_output::BaselineRecheckInput {
+        command: loaded.command,
+        path: &loaded.path,
+        baseline_entries: loaded.baseline_entries,
+        scope_reasons: loaded.scope_reasons,
     })
 }
 
@@ -139,25 +192,34 @@ fn has_external_plugins(root: &Path) -> bool {
     !fallow_config::discover_external_plugins(root, &[]).is_empty()
 }
 
-/// Next-steps for standalone `fallow health`. See [`build_dead_code_next_steps`]
+/// Next-steps for standalone `fallow health`. See [`build_check_next_steps`]
 /// for the `offer_setup` parameter contract.
 #[must_use]
-pub fn health_next_steps_input(
+pub fn health_next_steps_input<'a>(
     report: &HealthReport,
     root: &Path,
     offer_setup: bool,
     digest: Option<crate::impact::ImpactDigest>,
-) -> HealthNextStepsInput {
+    loaded_baseline: Option<&'a crate::output_runtime::LoadedBaselineRecheck>,
+) -> HealthNextStepsInput<'a> {
     fallow_output::build_health_next_steps_input(
         report,
         suggestions_enabled(),
         offer_setup,
         digest.map(impact_counts),
         audit_changed_applicable(root),
+        loaded_baseline.and_then(baseline_recheck_input),
     )
 }
 
-/// Next-steps for standalone `fallow dupes`. See [`build_dead_code_next_steps`]
+/// The baseline `fallow health` recorded at load time, held by the caller so
+/// the borrowed input outlives the builder call.
+#[must_use]
+pub fn loaded_health_baseline() -> Option<crate::output_runtime::LoadedBaselineRecheck> {
+    crate::output_runtime::loaded_baseline_for("health")
+}
+
+/// Next-steps for standalone `fallow dupes`. See [`build_check_next_steps`]
 /// for the `offer_setup` parameter contract.
 #[must_use]
 pub fn build_dupes_next_steps(
@@ -171,12 +233,14 @@ pub fn build_dupes_next_steps(
         .iter()
         .map(|group| group.fingerprint.as_str())
         .collect::<Vec<_>>();
+    let loaded_baseline = crate::output_runtime::loaded_baseline_for("dupes");
     build_dupes_next_steps_contract(DupesNextStepsInput {
         suggestions_enabled: suggestions_enabled(),
         clone_fingerprints: &clone_fingerprints,
         offer_setup,
         impact_digest: digest.map(impact_counts),
         audit_changed: audit_changed_applicable(root),
+        baseline_recheck: loaded_baseline.as_ref().and_then(baseline_recheck_input),
     })
 }
 
@@ -205,6 +269,11 @@ pub fn build_combined_next_steps(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    // A combined run baselines its dead-code sub-pass only, which records itself
+    // under that command's name, so this is the lookup and the step names
+    // `fallow dead-code`. Without it a combined run with a narrowed scope was the
+    // one shape that loaded a baseline and offered no way to judge it.
+    let loaded_baseline = crate::output_runtime::loaded_baseline_for("dead-code");
     build_combined_next_steps_contract(&CombinedNextStepsInput {
         suggestions_enabled: suggestions_enabled(),
         has_dead_code_findings: results.is_some_and(|r| r.total_issues() > 0),
@@ -217,6 +286,7 @@ pub fn build_combined_next_steps(
         audit_changed: audit_changed_applicable(root),
         has_external_plugins: has_external_plugins(root),
         has_unused_files: results.is_some_and(|r| !r.unused_files.is_empty()),
+        baseline_recheck: loaded_baseline.as_ref().and_then(baseline_recheck_input),
     })
 }
 
@@ -272,6 +342,39 @@ mod tests {
 
     use super::*;
 
+    fn build_dead_code_next_steps(
+        results: &AnalysisResults,
+        root: &Path,
+        offer_setup: bool,
+        digest: Option<crate::impact::ImpactDigest>,
+    ) -> Vec<NextStep> {
+        build_check_next_steps(results, root, offer_setup, digest, "dead-code")
+    }
+
+    fn loaded_baseline(
+        reason: fallow_output::ScopeReason,
+    ) -> crate::output_runtime::LoadedBaselineRecheck {
+        crate::output_runtime::LoadedBaselineRecheck {
+            command: "dead-code",
+            path: "baseline.json".to_string(),
+            baseline_entries: 3,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty().with(reason),
+        }
+    }
+
+    #[test]
+    fn recheck_is_withheld_when_the_environment_would_narrow_the_rerun_again() {
+        let diff = loaded_baseline(fallow_output::ScopeReason::Diff);
+        assert!(recheck_input_unless_diff_survives(&diff, true).is_none());
+        assert!(recheck_input_unless_diff_survives(&diff, false).is_some());
+    }
+
+    #[test]
+    fn an_exported_diff_file_does_not_withhold_a_recheck_for_another_channel() {
+        let file = loaded_baseline(fallow_output::ScopeReason::File);
+        assert!(recheck_input_unless_diff_survives(&file, true).is_some());
+    }
+
     fn unused_export(path: &str, name: &str) -> UnusedExportFinding {
         UnusedExportFinding::with_actions(UnusedExport {
             path: PathBuf::from(path),
@@ -281,6 +384,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         })
     }
 
@@ -293,6 +398,7 @@ mod tests {
 
     fn clone_instance(path: &str, fragment: &str) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(path),
             start_line: 1,
             end_line: 8,
@@ -328,6 +434,7 @@ mod tests {
                 line: 1,
                 col: 0,
                 cyclomatic: 21,
+                standard_cyclomatic: None,
                 cognitive: 16,
                 line_count: 42,
                 param_count: 0,
@@ -336,8 +443,10 @@ mod tests {
                 react_prop_count: 0,
                 react_hook_profile: None,
                 exceeded: ExceededThreshold::Both,
+                effective_severity: None,
                 severity: FindingSeverity::High,
                 crap: None,
+                mutation: None,
                 coverage_pct: None,
                 coverage_tier: None,
                 coverage_source: None,
@@ -465,6 +574,7 @@ mod tests {
             Path::new("/project"),
             false,
             None,
+            None,
         ));
         let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
 
@@ -475,8 +585,13 @@ mod tests {
     #[test]
     fn health_next_steps_input_feeds_output_contract_builder() {
         let report = health_report_with_finding();
-        let input =
-            health_next_steps_input(&report, Path::new("/project"), true, Some(digest(2, 1)));
+        let input = health_next_steps_input(
+            &report,
+            Path::new("/project"),
+            true,
+            Some(digest(2, 1)),
+            None,
+        );
 
         assert!(input.suggestions_enabled);
         assert!(input.has_findings);
@@ -589,7 +704,7 @@ mod tests {
         ));
         all.extend(build_dupes_next_steps(&payload, &root, false, None));
         all.extend(build_health_next_steps_contract(health_next_steps_input(
-            &report, &root, false, None,
+            &report, &root, false, None, None,
         )));
         all.extend(build_combined_next_steps(
             Some(&results),

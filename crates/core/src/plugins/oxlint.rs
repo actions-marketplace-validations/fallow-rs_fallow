@@ -4,16 +4,38 @@
 
 use std::path::{Path, PathBuf};
 
+use oxc_ast::ast::{
+    Argument, ArrayExpressionElement, ArrowFunctionExpression, Expression, Function,
+    ImportDeclarationSpecifier, ObjectExpression, Program, Statement, VariableDeclarationKind,
+};
+use oxc_ast_visit::{Visit, walk};
+use oxc_span::Span;
+use oxc_syntax::scope::ScopeFlags;
+
 use super::config_parser;
 use super::{Plugin, PluginResult};
 
 const ENABLERS: &[&str] = &["oxlint"];
 
-const CONFIG_PATTERNS: &[&str] = &[".oxlintrc.json", "oxlint.json", "oxlint.config.ts"];
+/// Oxlint discovers `.oxlintrc.json`, `.oxlintrc.jsonc`, `oxlint.config.ts`
+/// and `oxlint.config.mts` on its own. `oxlint.json` stays for older setups.
+const CONFIG_PATTERNS: &[&str] = &[
+    ".oxlintrc.{json,jsonc}",
+    "oxlint.json",
+    "oxlint.config.{ts,mts}",
+];
 
 const ALWAYS_USED: &[&str] = CONFIG_PATTERNS;
 
 const TOOLING_DEPENDENCIES: &[&str] = &["oxlint", "oxlint-tsgolint"];
+
+const ULTRACITE_JS_PLUGINS_SOURCE: &str = "ultracite/oxlint/js-plugins";
+
+const ULTRACITE_JS_PLUGIN_DEPENDENCIES: &[(&str, &str)] = &[
+    ("github", "eslint-plugin-github"),
+    ("sonarjs", "eslint-plugin-sonarjs"),
+    ("react-doctor", "oxlint-plugin-react-doctor"),
+];
 
 define_plugin! {
     struct OxlintPlugin => "oxlint",
@@ -30,22 +52,209 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        let js_plugins = config_parser::extract_config_shallow_strings_or_object_property(
-            source,
-            config_path,
-            "jsPlugins",
-            "specifier",
+        credit_oxlint_config(&mut result, source, config_path, root, &[]);
+        result.referenced_dependencies.extend(
+            extract_ultracite_selected_js_plugin_dependencies(source, config_path),
         );
-        for specifier in js_plugins {
-            credit_config_specifier(&mut result, config_path, root, &specifier);
-        }
-
-        let extends = config_parser::extract_config_shallow_strings(source, config_path, "extends");
-        for entry in extends {
-            credit_config_specifier(&mut result, config_path, root, &entry);
-        }
 
         result
+    }
+}
+
+/// Credit the plugin specifiers of an Oxlint config object: `jsPlugins`,
+/// `overrides[].jsPlugins` and `extends`. `base` is the property path of that
+/// object in the exported config. It is empty for an Oxlint config file and
+/// `["lint"]` for the `lint` block of a Vite+ config.
+pub(super) fn credit_oxlint_config(
+    result: &mut PluginResult,
+    source: &str,
+    config_path: &Path,
+    root: &Path,
+    base: &[&str],
+) {
+    let specifiers = config_parser::extract_from_source(source, config_path, |program| {
+        let mut config = config_parser::find_config_object(program)?;
+        for key in base {
+            config = config_parser::property_object(config, key)?;
+        }
+        Some(oxlint_config_specifiers(config))
+    })
+    .unwrap_or_default();
+    for specifier in specifiers {
+        credit_config_specifier(result, config_path, root, &specifier);
+    }
+}
+
+fn oxlint_config_specifiers(config: &ObjectExpression<'_>) -> Vec<String> {
+    let js_plugins = |object: &ObjectExpression<'_>| {
+        config_parser::property_expr(object, "jsPlugins").map_or_else(Vec::new, |value| {
+            config_parser::collect_shallow_string_or_object_property_values(value, "specifier")
+        })
+    };
+    let mut specifiers = js_plugins(config);
+    if let Some(Expression::ArrayExpression(overrides)) =
+        config_parser::property_expr(config, "overrides")
+    {
+        for element in &overrides.elements {
+            if let Some(Expression::ObjectExpression(entry)) = element.as_expression() {
+                specifiers.extend(js_plugins(entry));
+            }
+        }
+    }
+    if let Some(extends) = config_parser::property_expr(config, "extends") {
+        specifiers.extend(config_parser::collect_shallow_string_values(extends));
+    }
+    specifiers
+}
+
+fn extract_ultracite_selected_js_plugin_dependencies(
+    source: &str,
+    config_path: &Path,
+) -> Vec<String> {
+    config_parser::extract_from_source(source, config_path, |program| {
+        let helper_binding = ultracite_selector_binding(program)?;
+        let selected_plugins_binding = wired_js_plugins_binding(program)?;
+
+        for statement in &program.body {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                continue;
+            };
+            if declaration.kind != VariableDeclarationKind::Const {
+                continue;
+            }
+
+            for declarator in &declaration.declarations {
+                let Some(binding) = declarator.id.get_binding_identifier() else {
+                    continue;
+                };
+                if binding.name.as_str() != selected_plugins_binding {
+                    continue;
+                }
+
+                let Some(Expression::CallExpression(call)) = &declarator.init else {
+                    return None;
+                };
+                let Expression::Identifier(callee) = &call.callee else {
+                    return None;
+                };
+                if callee.name.as_str() != helper_binding || call.arguments.len() != 1 {
+                    return None;
+                }
+                let Some(Argument::ArrayExpression(selection)) = call.arguments.first() else {
+                    return None;
+                };
+                if !selection
+                    .elements
+                    .iter()
+                    .all(|element| matches!(element, ArrayExpressionElement::StringLiteral(_)))
+                {
+                    return None;
+                }
+
+                let dependencies = selection
+                    .elements
+                    .iter()
+                    .filter_map(|element| {
+                        let ArrayExpressionElement::StringLiteral(plugin) = element else {
+                            return None;
+                        };
+                        ULTRACITE_JS_PLUGIN_DEPENDENCIES
+                            .iter()
+                            .find_map(|(name, dependency)| {
+                                (plugin.value == *name).then(|| (*dependency).to_string())
+                            })
+                    })
+                    .collect();
+                return Some(dependencies);
+            }
+        }
+
+        None
+    })
+    .unwrap_or_default()
+}
+
+fn ultracite_selector_binding(program: &Program<'_>) -> Option<String> {
+    let mut binding = None;
+
+    for statement in &program.body {
+        let Statement::ImportDeclaration(declaration) = statement else {
+            continue;
+        };
+        if declaration.source.value != ULTRACITE_JS_PLUGINS_SOURCE
+            || declaration.import_kind.is_type()
+        {
+            continue;
+        }
+        let Some(specifiers) = &declaration.specifiers else {
+            continue;
+        };
+
+        for specifier in specifiers {
+            let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier else {
+                continue;
+            };
+            if specifier.import_kind.is_type() || specifier.imported.name() != "selectJsPlugins" {
+                continue;
+            }
+            if binding.is_some() {
+                return None;
+            }
+            binding = Some(specifier.local.name.to_string());
+        }
+    }
+
+    binding
+}
+
+fn wired_js_plugins_binding(program: &Program<'_>) -> Option<String> {
+    let config = config_parser::find_config_object(program)?;
+    if function_scoped_config_object(program, config) {
+        return None;
+    }
+    let Expression::StaticMemberExpression(member) =
+        config_parser::property_expr(config, "jsPlugins")?
+    else {
+        return None;
+    };
+    if member.property.name != "jsPlugins" {
+        return None;
+    }
+    let Expression::Identifier(binding) = &member.object else {
+        return None;
+    };
+    Some(binding.name.to_string())
+}
+
+fn function_scoped_config_object(program: &Program<'_>, config: &ObjectExpression<'_>) -> bool {
+    let mut detector = FunctionScopeDetector {
+        target: config.span,
+        found: false,
+    };
+    detector.visit_program(program);
+    detector.found
+}
+
+struct FunctionScopeDetector {
+    target: Span,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for FunctionScopeDetector {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if function.span.contains_inclusive(self.target) {
+            self.found = true;
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        if arrow.span.contains_inclusive(self.target) {
+            self.found = true;
+            return;
+        }
+        walk::walk_arrow_function_expression(self, arrow);
     }
 }
 
@@ -168,6 +377,246 @@ mod tests {
         let deps = &result.referenced_dependencies;
         assert!(deps.contains(&"eslint-plugin-testing-library".to_string()));
         assert!(deps.contains(&"eslint-plugin-playwright".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_override_js_plugins_json() {
+        let source = r#"
+            {
+                "overrides": [
+                    { "files": ["*.ts"], "jsPlugins": ["eslint-plugin-foo"] },
+                    {
+                        "files": ["*.test.ts"],
+                        "jsPlugins": [
+                            { "name": "bar", "specifier": "eslint-plugin-bar" },
+                            "./plugins/local.js"
+                        ]
+                    },
+                    { "files": ["*.js"], "rules": {} }
+                ]
+            }
+        "#;
+        let plugin = OxlintPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/.oxlintrc.json"),
+            source,
+            Path::new("/project"),
+        );
+
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"eslint-plugin-foo".to_string()));
+        assert!(deps.contains(&"eslint-plugin-bar".to_string()));
+        assert!(!deps.contains(&"bar".to_string()));
+        assert!(
+            result
+                .setup_files
+                .contains(&PathBuf::from("/project/plugins/local.js"))
+        );
+    }
+
+    #[test]
+    fn resolve_config_override_js_plugins_ts_config() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+
+            export default defineConfig({
+                overrides: [
+                    { files: ["*.ts"], jsPlugins: ["eslint-plugin-foo"] },
+                ],
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"eslint-plugin-foo".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_ultracite_selected_js_plugins() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+            import core from "ultracite/oxlint/core";
+            import { jsPluginSettings, selectJsPlugins } from "ultracite/oxlint/js-plugins";
+
+            const jsPlugins = selectJsPlugins(["github", "sonarjs", "react-doctor"]);
+
+            export default defineConfig({
+                extends: [core, jsPlugins],
+                ignorePatterns: core.ignorePatterns,
+                jsPlugins: jsPlugins.jsPlugins,
+                settings: jsPluginSettings,
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"eslint-plugin-github".to_string()));
+        assert!(deps.contains(&"eslint-plugin-sonarjs".to_string()));
+        assert!(deps.contains(&"oxlint-plugin-react-doctor".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_ignores_unwired_and_unrelated_plugin_selectors() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+            import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+
+            const unusedSelection = selectJsPlugins(["github"]);
+            const jsPlugins = chooseJsPlugins(["sonarjs"]);
+
+            export default defineConfig({
+                jsPlugins: jsPlugins.jsPlugins,
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        let deps = &result.referenced_dependencies;
+        assert!(!deps.contains(&"eslint-plugin-github".to_string()));
+        assert!(!deps.contains(&"eslint-plugin-sonarjs".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_requires_ultracite_selector_provenance() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+            import { selectJsPlugins } from "another-package";
+
+            const jsPlugins = selectJsPlugins(["github"]);
+
+            export default defineConfig({
+                jsPlugins: jsPlugins.jsPlugins,
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&"eslint-plugin-github".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_config_ignores_dynamic_ultracite_plugin_selections() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+            import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+
+            const extraPlugins = ["sonarjs"];
+            const jsPlugins = selectJsPlugins([
+                "github",
+                "anti-slop",
+                "unknown-plugin",
+                configuredPlugin,
+                ...extraPlugins,
+            ]);
+
+            export default defineConfig({
+                jsPlugins: jsPlugins.jsPlugins,
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        let deps = &result.referenced_dependencies;
+        assert!(!deps.contains(&"eslint-plugin-github".to_string()));
+        assert!(!deps.contains(&"eslint-plugin-sonarjs".to_string()));
+        assert!(!deps.contains(&"anti-slop".to_string()));
+        assert!(!deps.contains(&"unknown-plugin".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_supports_an_aliased_ultracite_selector_import() {
+        let source = r#"
+            import { defineConfig } from "oxlint";
+            import { selectJsPlugins as select } from "ultracite/oxlint/js-plugins";
+
+            const selected = select(["github", "anti-slop", "unknown-plugin"]);
+
+            export default defineConfig({
+                jsPlugins: selected.jsPlugins,
+            });
+        "#;
+        let plugin = OxlintPlugin;
+        let result =
+            plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+        let deps = &result.referenced_dependencies;
+        assert!(deps.contains(&"eslint-plugin-github".to_string()));
+        assert!(!deps.contains(&"anti-slop".to_string()));
+        assert!(!deps.contains(&"unknown-plugin".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_requires_const_and_exact_member_wiring() {
+        for source in [
+            r#"
+                import { defineConfig } from "oxlint";
+                import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+                let selected = selectJsPlugins(["github"]);
+                export default defineConfig({ jsPlugins: selected.jsPlugins });
+            "#,
+            r#"
+                import { defineConfig } from "oxlint";
+                import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+                const selected = selectJsPlugins(["github"]);
+                export default defineConfig({ jsPlugins: selected.plugins });
+            "#,
+        ] {
+            let plugin = OxlintPlugin;
+            let result =
+                plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+            assert!(
+                !result
+                    .referenced_dependencies
+                    .contains(&"eslint-plugin-github".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_config_rejects_function_scoped_shadowing() {
+        for source in [
+            r#"
+                import { defineConfig } from "oxlint";
+                import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+                const selected = selectJsPlugins(["github"]);
+                export default defineConfig((selected) => ({
+                    jsPlugins: selected.jsPlugins,
+                }));
+            "#,
+            r#"
+                import { defineConfig } from "oxlint";
+                import { selectJsPlugins } from "ultracite/oxlint/js-plugins";
+                const selected = selectJsPlugins(["github"]);
+                export default defineConfig(function (selected) {
+                    return { jsPlugins: selected.jsPlugins };
+                });
+            "#,
+        ] {
+            let plugin = OxlintPlugin;
+            let result =
+                plugin.resolve_config(Path::new("oxlint.config.ts"), source, Path::new("/project"));
+
+            assert!(
+                !result
+                    .referenced_dependencies
+                    .contains(&"eslint-plugin-github".to_string())
+            );
+        }
     }
 
     #[test]

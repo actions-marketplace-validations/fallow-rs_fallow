@@ -96,6 +96,14 @@ pub struct EntryPoints {
     pub sources: BTreeMap<String, usize>,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a reference"
+)]
+const fn zero_count(count: &usize) -> bool {
+    *count == 0
+}
+
 /// Per-category issue counts for dead-code analysis. Always present in
 /// `CheckOutput`; when `--summary` is used the individual issue arrays are
 /// omitted but this object stays populated.
@@ -104,6 +112,9 @@ pub struct EntryPoints {
 pub struct CheckSummary {
     /// Total number of issues across all categories.
     pub total_issues: usize,
+    /// Prop chains whose saved effective severity explicitly enforces error policy.
+    #[serde(default, skip_serializing_if = "zero_count")]
+    pub prop_drilling_chains: usize,
     /// Unused source files.
     pub unused_files: usize,
     /// Unused value exports.
@@ -112,6 +123,8 @@ pub struct CheckSummary {
     pub unused_types: usize,
     /// Public exports whose signature references same-file private types.
     pub private_type_leaks: usize,
+    /// Exports marked `@deprecated` that are still referenced.
+    pub deprecated_exports_in_use: usize,
     /// Combined count of unused entries across `dependencies`,
     /// `devDependencies`, and `optionalDependencies`. The per-section
     /// breakdown lives in the individual issue arrays on `CheckOutput`.
@@ -132,6 +145,9 @@ pub struct CheckSummary {
     /// Vue, Svelte, or React props referenced nowhere inside their own component.
     #[serde(default)]
     pub unused_component_props: usize,
+    /// Optional consumed props omitted by known reachable callers, for manual review.
+    #[serde(default)]
+    pub absent_component_props: usize,
     /// Vue `<script setup>` emits emitted nowhere inside their own SFC.
     #[serde(default)]
     pub unused_component_emits: usize,
@@ -145,6 +161,15 @@ pub struct CheckSummary {
     /// whose name is listened to nowhere in the project.
     #[serde(default)]
     pub unused_svelte_events: usize,
+    /// Effect layers composed only into layers that nothing uses.
+    #[serde(default)]
+    pub unused_effect_layers: usize,
+    /// Effect tagged error classes that no code constructs or fails with.
+    #[serde(default)]
+    pub unused_tagged_errors: usize,
+    /// `catchTag` handlers for a project tag that no code produces.
+    #[serde(default)]
+    pub unproduced_catch_tags: usize,
     /// Next.js Server Actions (exports of `"use server"` files) referenced by no
     /// code in the project.
     #[serde(default)]
@@ -173,6 +198,9 @@ pub struct CheckSummary {
     /// re-exporting from each other in a loop).
     #[serde(default)]
     pub re_export_cycles: usize,
+    /// Dependency cycles between workspace packages.
+    #[serde(default)]
+    pub package_cycles: usize,
     /// Imports that cross architecture boundary rules.
     pub boundary_violations: usize,
     /// Files that match no architecture boundary zone.

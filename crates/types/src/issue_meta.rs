@@ -58,22 +58,10 @@ impl IssueKindMeta {
         issue_sarif_rule_ids(self.code)
     }
 
-    /// Whether this issue row is eligible for SARIF rule metadata.
-    #[must_use]
-    pub fn sarif_enabled(self) -> bool {
-        self.has_result_contract()
-    }
-
     /// CodeClimate check names used by CI formatters for this issue row.
     #[must_use]
     pub fn codeclimate_check_names(self) -> Vec<String> {
         issue_codeclimate_check_names(self.code)
-    }
-
-    /// Whether this issue row is eligible for CodeClimate output.
-    #[must_use]
-    pub fn codeclimate_enabled(self) -> bool {
-        !self.codeclimate_check_names().is_empty()
     }
 
     /// Documentation anchor under `/explanations/dead-code`.
@@ -154,6 +142,19 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         suppress_token: Some("private-type-leak"),
         suppress_file_level: false,
         lsp: true,
+        docs_category: "source",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::DeprecatedExportInUse),
+        code: "deprecated-export-in-use",
+        aliases: &[],
+        label: "Deprecated Exports in Use",
+        config_key: Some("deprecated-exports-in-use"),
+        filter_flag: Some("--deprecated-exports-in-use"),
+        mcp_issue_type: Some("deprecated-exports-in-use"),
+        suppress_token: Some("deprecated-export-in-use"),
+        suppress_file_level: false,
+        lsp: false,
         docs_category: "source",
     },
     IssueKindMeta {
@@ -339,6 +340,19 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         docs_category: "architecture",
     },
     IssueKindMeta {
+        kind: Some(IssueKind::PackageCycle),
+        code: "package-cycle",
+        aliases: &["package-cycles"],
+        label: "Package Cycles",
+        config_key: Some("package-cycle"),
+        filter_flag: Some("--package-cycles"),
+        mcp_issue_type: Some("package-cycles"),
+        suppress_token: Some("package-cycle"),
+        suppress_file_level: false,
+        lsp: true,
+        docs_category: "architecture",
+    },
+    IssueKindMeta {
         kind: Some(IssueKind::BoundaryViolation),
         code: "boundary-violation",
         aliases: &[],
@@ -469,6 +483,19 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         docs_category: "framework",
     },
     IssueKindMeta {
+        kind: Some(IssueKind::AbsentComponentProp),
+        code: "absent-component-prop",
+        aliases: &["absent-component-props"],
+        label: "Absent Optional Component Props",
+        config_key: Some("absent-component-props"),
+        filter_flag: Some("--absent-component-props"),
+        mcp_issue_type: Some("absent-component-props"),
+        suppress_token: Some("absent-component-prop"),
+        suppress_file_level: false,
+        lsp: true,
+        docs_category: "framework",
+    },
+    IssueKindMeta {
         kind: Some(IssueKind::UnusedComponentEmit),
         code: "unused-component-emit",
         aliases: &["unused-component-emits"],
@@ -542,6 +569,45 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         filter_flag: Some("--unused-load-data-keys"),
         mcp_issue_type: Some("unused-load-data-keys"),
         suppress_token: Some("unused-load-data-key"),
+        suppress_file_level: false,
+        lsp: true,
+        docs_category: "framework",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::UnusedEffectLayer),
+        code: "unused-effect-layer",
+        aliases: &["unused-effect-layers"],
+        label: "Unused Effect Layers",
+        config_key: Some("unused-effect-layers"),
+        filter_flag: Some("--unused-effect-layers"),
+        mcp_issue_type: Some("unused-effect-layers"),
+        suppress_token: Some("unused-effect-layer"),
+        suppress_file_level: false,
+        lsp: true,
+        docs_category: "framework",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::UnusedTaggedError),
+        code: "unused-tagged-error",
+        aliases: &["unused-tagged-errors"],
+        label: "Unused Tagged Errors",
+        config_key: Some("unused-tagged-errors"),
+        filter_flag: Some("--unused-tagged-errors"),
+        mcp_issue_type: Some("unused-tagged-errors"),
+        suppress_token: Some("unused-tagged-error"),
+        suppress_file_level: false,
+        lsp: true,
+        docs_category: "framework",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::UnproducedCatchTag),
+        code: "unproduced-catch-tag",
+        aliases: &["unproduced-catch-tags"],
+        label: "Unproduced Catch Tags",
+        config_key: Some("unproduced-catch-tags"),
+        filter_flag: Some("--unproduced-catch-tags"),
+        mcp_issue_type: Some("unproduced-catch-tags"),
+        suppress_token: Some("unproduced-catch-tag"),
         suppress_file_level: false,
         lsp: true,
         docs_category: "framework",
@@ -746,7 +812,7 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         mcp_issue_type: None,
         suppress_token: Some("prop-drilling"),
         suppress_file_level: false,
-        lsp: false,
+        lsp: true,
         docs_category: "source",
     },
     IssueKindMeta {
@@ -759,7 +825,7 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         mcp_issue_type: None,
         suppress_token: Some("thin-wrapper"),
         suppress_file_level: false,
-        lsp: false,
+        lsp: true,
         docs_category: "source",
     },
     IssueKindMeta {
@@ -772,7 +838,7 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         mcp_issue_type: None,
         suppress_token: Some("duplicate-prop-shape"),
         suppress_file_level: false,
-        lsp: false,
+        lsp: true,
         docs_category: "source",
     },
     IssueKindMeta {
@@ -840,6 +906,73 @@ pub const ISSUE_KIND_META: &[IssueKindMeta] = &[
         lsp: false,
         docs_category: "health",
     },
+    IssueKindMeta {
+        kind: Some(IssueKind::WeakenedTests),
+        code: "weakened-tests",
+        aliases: &[],
+        label: "Weakened Tests",
+        config_key: Some("weakened-tests"),
+        filter_flag: None,
+        mcp_issue_type: None,
+        suppress_token: Some("weakened-tests"),
+        suppress_file_level: false,
+        lsp: false,
+        docs_category: "audit",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::AddedSuppression),
+        code: "added-suppression",
+        aliases: &[],
+        label: "Added Suppressions",
+        config_key: Some("added-suppression"),
+        filter_flag: None,
+        mcp_issue_type: None,
+        suppress_token: Some("added-suppression"),
+        suppress_file_level: false,
+        lsp: false,
+        docs_category: "audit",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::TestOnlyBranch),
+        code: "test-only-branch",
+        aliases: &[],
+        label: "Test-Only Branches",
+        config_key: Some("test-only-branch"),
+        filter_flag: None,
+        mcp_issue_type: None,
+        suppress_token: Some("test-only-branch"),
+        suppress_file_level: false,
+        lsp: false,
+        docs_category: "audit",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::DivergedCloneSibling),
+        code: "diverged-clone-sibling",
+        aliases: &[],
+        label: "Diverged Clone Siblings",
+        config_key: Some("diverged-clone-sibling"),
+        filter_flag: None,
+        mcp_issue_type: None,
+        suppress_token: Some("diverged-clone-sibling"),
+        suppress_file_level: false,
+        lsp: false,
+        docs_category: "audit",
+    },
+    IssueKindMeta {
+        kind: Some(IssueKind::AddedDependency),
+        code: "added-dependency",
+        aliases: &[],
+        label: "Added Dependencies",
+        config_key: Some("added-dependency"),
+        filter_flag: None,
+        mcp_issue_type: None,
+        // `package.json` cannot hold a comment, so the only suppression is
+        // an `overrides` entry that sets the rule to `off`.
+        suppress_token: None,
+        suppress_file_level: false,
+        lsp: false,
+        docs_category: "audit",
+    },
 ];
 
 /// Shared contract facts for serialized `AnalysisResults` arrays.
@@ -862,7 +995,8 @@ pub struct IssueResultMeta {
     pub docs_anchor: &'static str,
     /// Serialized `AnalysisResults` array key that carries this issue row.
     pub result_key: &'static str,
-    /// Whether `result_key` contributes to `AnalysisResults::total_issues()`.
+    /// Whether `result_key` can contribute to `AnalysisResults::total_issues()`.
+    /// Prop-drilling contributes only when its saved severity is `error`.
     pub counts_in_total: bool,
 }
 
@@ -905,6 +1039,13 @@ pub const ISSUE_TS_ALIAS_META: &[IssueTsAliasMeta] = &[
         alias: TsAliasMeta {
             name: "PrivateTypeLeak",
             parent: "PrivateTypeLeakFinding",
+        },
+    },
+    IssueTsAliasMeta {
+        code: "deprecated-export-in-use",
+        alias: TsAliasMeta {
+            name: "DeprecatedExportInUse",
+            parent: "DeprecatedExportInUseFinding",
         },
     },
     IssueTsAliasMeta {
@@ -1006,6 +1147,13 @@ pub const ISSUE_TS_ALIAS_META: &[IssueTsAliasMeta] = &[
         },
     },
     IssueTsAliasMeta {
+        code: "package-cycle",
+        alias: TsAliasMeta {
+            name: "PackageCycle",
+            parent: "PackageCycleFinding",
+        },
+    },
+    IssueTsAliasMeta {
         code: "boundary-violation",
         alias: TsAliasMeta {
             name: "BoundaryViolation",
@@ -1093,6 +1241,17 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         summary_label: "Private type leaks",
         docs_anchor: "private-type-leaks",
         result_key: "private_type_leaks",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
+        code: "deprecated-export-in-use",
+        sarif_description: "Export marked @deprecated is still referenced",
+        meta_description: "Exports whose leading JSDoc carries @deprecated and that still have at least one consumer in a reachable file. Each finding lists the consumer count and a capped consumer sample.",
+        meta_docs_path: "explanations/dead-code#deprecated-exports-in-use",
+        meta_name: "Deprecated Exports in Use",
+        summary_label: "Deprecated exports in use",
+        docs_anchor: "deprecated-exports-in-use",
+        result_key: "deprecated_exports_in_use",
         counts_in_total: true,
     },
     IssueResultMeta {
@@ -1250,6 +1409,17 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         counts_in_total: true,
     },
     IssueResultMeta {
+        code: "package-cycle",
+        sarif_description: "Two or more workspace packages import each other in a loop",
+        meta_description: "Workspace packages whose resolved imports form a cycle, even when no file-level cycle exists.",
+        meta_docs_path: "explanations/dead-code#package-cycles",
+        meta_name: "Package Cycles",
+        summary_label: "Package cycles",
+        docs_anchor: "package-cycles",
+        result_key: "package_cycles",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
         code: "boundary-violation",
         sarif_description: "Import crosses a configured architecture boundary",
         meta_description: "A module imports from a zone that its configured boundary rules do not allow.",
@@ -1284,8 +1454,8 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
     },
     IssueResultMeta {
         code: "policy-violation",
-        sarif_description: "Banned usage matched a rule-pack rule",
-        meta_description: "A call site, import, or catalogue-derived effect matched a configured rule pack rule.",
+        sarif_description: "Usage violates a configured rule-pack policy",
+        meta_description: "A call, import, export, catalogue-derived effect, or graph-resolved GDP proof producer violates a configured rule pack rule.",
         meta_docs_path: "explanations/dead-code#policy-violations",
         meta_name: "Policy Violation",
         summary_label: "Policy violations",
@@ -1333,7 +1503,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unprovided-injects",
         meta_name: "Unprovided injects",
         summary_label: "Unprovided injects",
-        docs_anchor: "unprovided-inject",
+        docs_anchor: "unprovided-injects",
         result_key: "unprovided_injects",
         counts_in_total: true,
     },
@@ -1344,7 +1514,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unrendered-components",
         meta_name: "Unrendered components",
         summary_label: "Unrendered components",
-        docs_anchor: "unrendered-component",
+        docs_anchor: "unrendered-components",
         result_key: "unrendered_components",
         counts_in_total: true,
     },
@@ -1355,8 +1525,19 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-component-props",
         meta_name: "Unused component props",
         summary_label: "Unused component props",
-        docs_anchor: "unused-component-prop",
+        docs_anchor: "unused-component-props",
         result_key: "unused_component_props",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
+        code: "absent-component-prop",
+        sarif_description: "Known reachable callers do not supply this used optional input; review defaults and API intent manually.",
+        meta_description: "Known reachable callers do not supply this used optional input; review defaults and API intent manually.",
+        meta_docs_path: "explanations/dead-code#absent-component-props",
+        meta_name: "Absent optional component props",
+        summary_label: "Absent optional component props",
+        docs_anchor: "absent-component-props",
+        result_key: "absent_component_props",
         counts_in_total: true,
     },
     IssueResultMeta {
@@ -1366,7 +1547,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-component-emits",
         meta_name: "Unused component emits",
         summary_label: "Unused component emits",
-        docs_anchor: "unused-component-emit",
+        docs_anchor: "unused-component-emits",
         result_key: "unused_component_emits",
         counts_in_total: true,
     },
@@ -1377,7 +1558,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-component-inputs",
         meta_name: "Unused component inputs",
         summary_label: "Unused component inputs",
-        docs_anchor: "unused-component-input",
+        docs_anchor: "unused-component-inputs",
         result_key: "unused_component_inputs",
         counts_in_total: true,
     },
@@ -1388,7 +1569,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-component-outputs",
         meta_name: "Unused component outputs",
         summary_label: "Unused component outputs",
-        docs_anchor: "unused-component-output",
+        docs_anchor: "unused-component-outputs",
         result_key: "unused_component_outputs",
         counts_in_total: true,
     },
@@ -1399,7 +1580,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-svelte-events",
         meta_name: "Unused Svelte events",
         summary_label: "Unused Svelte events",
-        docs_anchor: "unused-svelte-event",
+        docs_anchor: "unused-svelte-events",
         result_key: "unused_svelte_events",
         counts_in_total: true,
     },
@@ -1410,7 +1591,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-server-actions",
         meta_name: "Unused server actions",
         summary_label: "Unused server actions",
-        docs_anchor: "unused-server-action",
+        docs_anchor: "unused-server-actions",
         result_key: "unused_server_actions",
         counts_in_total: true,
     },
@@ -1421,8 +1602,41 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         meta_docs_path: "explanations/dead-code#unused-load-data-keys",
         meta_name: "Unused load data keys",
         summary_label: "Unused load data keys",
-        docs_anchor: "unused-load-data-key",
+        docs_anchor: "unused-load-data-keys",
         result_key: "unused_load_data_keys",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
+        code: "unused-effect-layer",
+        sarif_description: "An Effect layer is composed only into layers that nothing uses",
+        meta_description: "An Effect layer is composed only into other layers that nothing in the project uses.",
+        meta_docs_path: "explanations/dead-code#unused-effect-layers",
+        meta_name: "Unused Effect layers",
+        summary_label: "Unused Effect layers",
+        docs_anchor: "unused-effect-layers",
+        result_key: "unused_effect_layers",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
+        code: "unused-tagged-error",
+        sarif_description: "An Effect tagged error class is referenced only as a type or a catchTag string, and no code constructs or fails with it",
+        meta_description: "An Effect tagged error class is referenced only as a type or a catchTag string. No code constructs or fails with it.",
+        meta_docs_path: "explanations/dead-code#unused-tagged-errors",
+        meta_name: "Unused tagged errors",
+        summary_label: "Unused tagged errors",
+        docs_anchor: "unused-tagged-errors",
+        result_key: "unused_tagged_errors",
+        counts_in_total: true,
+    },
+    IssueResultMeta {
+        code: "unproduced-catch-tag",
+        sarif_description: "A catchTag handler names a project error tag that no code produces",
+        meta_description: "A catchTag or catchTags handler names a project error tag that no code in the project produces.",
+        meta_docs_path: "explanations/dead-code#unproduced-catch-tags",
+        meta_name: "Unproduced catch tags",
+        summary_label: "Unproduced catch tags",
+        docs_anchor: "unproduced-catch-tags",
+        result_key: "unproduced_catch_tags",
         counts_in_total: true,
     },
     IssueResultMeta {
@@ -1522,7 +1736,7 @@ pub const ISSUE_RESULT_META: &[IssueResultMeta] = &[
         summary_label: "Prop drilling",
         docs_anchor: "prop-drilling",
         result_key: "prop_drilling_chains",
-        counts_in_total: false,
+        counts_in_total: true,
     },
     IssueResultMeta {
         code: "thin-wrapper",
@@ -1811,6 +2025,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "too slow under Miri: loops over every issue kind in safe code"
+    )]
     fn contract_tokens_resolve_through_metadata() {
         for meta in ISSUE_KIND_META {
             assert_eq!(
@@ -1939,7 +2157,7 @@ mod tests {
         for meta in result_issue_metas() {
             let issue = issue_meta_by_code(meta.code)
                 .unwrap_or_else(|| panic!("result metadata code {} has no issue row", meta.code));
-            assert!(issue.sarif_enabled());
+            assert!(issue.has_result_contract());
             let sarif_ids = issue.sarif_rule_ids();
             assert!(sarif_ids.contains(&format!("fallow/{}", meta.code)));
             for rule_id in sarif_ids {
@@ -1960,70 +2178,6 @@ mod tests {
     }
 
     #[test]
-    fn ci_summary_check_tables_match_result_metadata() {
-        assert_summary_check_table_matches_result_metadata(
-            include_str!("../../../action/jq/summary-check.jq"),
-            "action/jq/summary-check.jq",
-        );
-        assert_summary_check_table_matches_result_metadata(
-            include_str!("../../../ci/jq/summary-check.jq"),
-            "ci/jq/summary-check.jq",
-        );
-    }
-
-    #[test]
-    fn ci_summary_combined_tables_match_result_metadata() {
-        assert_summary_combined_table_matches_result_metadata(
-            include_str!("../../../action/jq/summary-combined.jq"),
-            "action/jq/summary-combined.jq",
-        );
-        assert_summary_combined_table_matches_result_metadata(
-            include_str!("../../../ci/jq/summary-combined.jq"),
-            "ci/jq/summary-combined.jq",
-        );
-    }
-
-    fn assert_summary_check_table_matches_result_metadata(source: &str, path: &str) {
-        for meta in counted_result_issue_metas() {
-            let expected = format!(
-                r#"table_row("{}"; "{}"; "{}")"#,
-                meta.summary_label, meta.result_key, meta.docs_anchor
-            );
-            assert!(
-                source.contains(&expected),
-                "{path} must include registry row for {} as `{expected}`",
-                meta.code
-            );
-        }
-    }
-
-    fn assert_summary_combined_table_matches_result_metadata(source: &str, path: &str) {
-        for meta in counted_result_issue_metas() {
-            let row = source
-                .lines()
-                .find(|line| line.contains(&format!(".check.{}", meta.result_key)))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{path} must include combined summary row for {} ({})",
-                        meta.code, meta.result_key
-                    )
-                });
-            assert!(
-                row.contains(&format!("[{}]", meta.summary_label)),
-                "{path} row for {} must use registry label `{}`: {row}",
-                meta.code,
-                meta.summary_label
-            );
-            assert!(
-                row.contains(&format!(r#"docs("{}")"#, meta.docs_anchor)),
-                "{path} row for {} must use registry docs anchor `{}`: {row}",
-                meta.code,
-                meta.docs_anchor
-            );
-        }
-    }
-
-    #[test]
     fn ts_alias_policy_is_explicit() {
         let aliases: BTreeSet<(&str, &str)> = ISSUE_TS_ALIAS_META
             .iter()
@@ -2034,6 +2188,7 @@ mod tests {
             BTreeSet::from([
                 ("BoundaryViolation", "BoundaryViolationFinding"),
                 ("CircularDependency", "CircularDependencyFinding"),
+                ("DeprecatedExportInUse", "DeprecatedExportInUseFinding"),
                 (
                     "DevDependencyInProduction",
                     "DevDependencyInProductionFinding",
@@ -2045,6 +2200,7 @@ mod tests {
                     "MisconfiguredDependencyOverrideFinding",
                 ),
                 ("PrivateTypeLeak", "PrivateTypeLeakFinding"),
+                ("PackageCycle", "PackageCycleFinding"),
                 ("ReExportCycle", "ReExportCycleFinding"),
                 ("TestOnlyDependency", "TestOnlyDependencyFinding"),
                 ("TypeOnlyDependency", "TypeOnlyDependencyFinding"),
@@ -2124,11 +2280,7 @@ mod tests {
 
     #[test]
     fn advisory_result_keys_are_explicitly_excluded_from_total() {
-        let expected = BTreeSet::from([
-            "duplicate_prop_shapes",
-            "prop_drilling_chains",
-            "thin_wrappers",
-        ]);
+        let expected = BTreeSet::from(["duplicate_prop_shapes", "thin_wrappers"]);
         let from_meta: BTreeSet<&str> = result_issue_metas()
             .filter(|meta| !meta.counts_in_total)
             .map(|meta| meta.result_key)

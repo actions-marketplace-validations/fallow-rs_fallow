@@ -34,8 +34,13 @@ pub struct CodeClimateIssue {
     pub severity: CodeClimateSeverity,
     /// Stable finding fingerprint GitLab uses to track issues across pushes.
     pub fingerprint: String,
-    /// File and begin-line location of the finding.
+    /// File and inclusive line range of the finding.
     pub location: CodeClimateLocation,
+    /// Other source locations that provide evidence for the finding. GitLab's
+    /// Code Quality widget ignores this standard CodeClimate field, but Fallow
+    /// preserves it for review-comment rendering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_locations: Vec<CodeClimateLocation>,
     /// Optional owner attribution used by grouped dead-code output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
@@ -43,6 +48,13 @@ pub struct CodeClimateIssue {
     /// output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// The fingerprint an older Fallow version gave this issue, when it is
+    /// different from `fingerprint`. Never serialized: the CodeClimate wire
+    /// shape does not change. The review layer uses it for one release to
+    /// match review threads that carry the older marker.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub legacy_fingerprint: Option<String>,
 }
 
 /// Discriminator value for [`CodeClimateIssue::kind`].
@@ -89,17 +101,20 @@ pub enum CodeClimateSeverity {
 pub struct CodeClimateLocation {
     /// File path relative to the analysed root.
     pub path: String,
-    /// Wrapper carrying the begin line so the schema lines up with
+    /// Wrapper carrying the line range so the schema lines up with
     /// CodeClimate's spec.
     pub lines: CodeClimateLines,
 }
 
-/// `lines.begin` for [`CodeClimateLocation`].
+/// Inclusive line range for [`CodeClimateLocation`].
 #[derive(Debug, Clone, Copy, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CodeClimateLines {
     /// 1-based start line.
     pub begin: u32,
+    /// Inclusive 1-based end line. Omitted for point findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<u32>,
 }
 
 /// Fields needed to build one CodeClimate issue.
@@ -136,20 +151,11 @@ pub enum CodeClimateAnnotationField {
 
 /// Compute a deterministic fingerprint hash from key fields.
 ///
-/// Uses FNV-1a (64-bit) for guaranteed cross-version stability. `DefaultHasher`
-/// is intentionally not used because it is not specified across Rust versions.
+/// Delegates to [`fallow_types::identity::fnv1a64_parts`], the one FNV-1a 64
+/// implementation that fingerprints and finding ids share.
 #[must_use]
 pub fn codeclimate_fingerprint_hash(parts: &[&str]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in parts {
-        for byte in part.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        hash ^= 0xff;
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
+    fallow_types::identity::fnv1a64_parts(parts)
 }
 
 /// Build a single CodeClimate issue from a stable contract descriptor.
@@ -166,10 +172,13 @@ pub fn build_codeclimate_issue(input: CodeClimateIssueInput<'_>) -> CodeClimateI
             path: input.path.to_string(),
             lines: CodeClimateLines {
                 begin: input.begin_line.unwrap_or(1),
+                end: None,
             },
         },
+        other_locations: Vec::new(),
         owner: None,
         group: None,
+        legacy_fingerprint: None,
     }
 }
 
@@ -177,6 +186,11 @@ pub fn build_codeclimate_issue(input: CodeClimateIssueInput<'_>) -> CodeClimateI
 ///
 /// Infallible: `CodeClimateIssue` contains only strings, integers, arrays, and
 /// enums serialized as fixed strings.
+///
+/// # Panics
+///
+/// Does not panic in practice: every `CodeClimateIssue` field serializes
+/// infallibly.
 #[must_use]
 #[expect(
     clippy::expect_used,
@@ -224,6 +238,8 @@ mod tests {
         assert_eq!(value["type"], "issue");
         assert_eq!(value["severity"], "major");
         assert_eq!(value["location"]["lines"]["begin"], 7);
+        assert!(value["location"]["lines"].get("end").is_none());
+        assert!(value.get("other_locations").is_none());
     }
 
     #[test]
@@ -252,6 +268,36 @@ mod tests {
         });
 
         assert_eq!(issue.location.lines.begin, 1);
+    }
+
+    #[test]
+    fn codeclimate_fingerprint_hash_is_deterministic_16_hex() {
+        let a = codeclimate_fingerprint_hash(&["src/index.ts", "FEATURE_X", "3"]);
+        let b = codeclimate_fingerprint_hash(&["src/index.ts", "FEATURE_X", "3"]);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Per-part separation means reordering parts changes the digest.
+        assert_ne!(
+            a,
+            codeclimate_fingerprint_hash(&["FEATURE_X", "src/index.ts", "3"])
+        );
+    }
+
+    /// Pins exact digests. CI review threads and CodeClimate consumers match on
+    /// these values, so a change to the hash breaks every saved fingerprint.
+    /// The expected values come from an independent FNV-1a 64 script.
+    #[test]
+    fn codeclimate_fingerprint_hash_golden_values() {
+        assert_eq!(
+            codeclimate_fingerprint_hash(&["src/index.ts", "FEATURE_X", "3"]),
+            "2278c9d9bd9d2dd2"
+        );
+        assert_eq!(
+            codeclimate_fingerprint_hash(&["fallow/unused-file", "src/orphan.ts"]),
+            "c03b925ddb7d871a"
+        );
+        assert_eq!(codeclimate_fingerprint_hash(&[]), "cbf29ce484222325");
     }
 
     #[test]

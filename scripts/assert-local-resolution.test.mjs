@@ -150,6 +150,117 @@ test("a dependency missing everywhere reports the install command", () => {
   }
 });
 
+const pinDependency = (root, spec, field = "devDependencies") =>
+  writeFileSync(
+    join(root, "package.json"),
+    `${JSON.stringify({ private: true, [field]: { [DEPENDENCY]: spec } })}\n`,
+  );
+
+test("a stale local install names the installed and the pinned version", () => {
+  const { outer, checkout, entrypoint } = nestedCheckout();
+  installPackage(checkout, { version: "1.0.0" });
+  pinDependency(checkout, "1.2.0");
+  try {
+    assert.throws(
+      () =>
+        assertLocalResolution({
+          dependency: DEPENDENCY,
+          resolveFrom: entrypoint,
+          repoRoot: checkout,
+          installCommand: "npm ci",
+        }),
+      (error) =>
+        error.message.includes(`${DEPENDENCY} 1.0.0 is installed`) &&
+        error.message.includes("pins 1.2.0") &&
+        error.message.includes(join(checkout, "package.json")) &&
+        error.message.includes("npm ci"),
+    );
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+test("a local install at the pinned version passes", () => {
+  const { outer, checkout, entrypoint } = nestedCheckout();
+  installPackage(checkout, { version: "1.2.0" });
+  pinDependency(checkout, "1.2.0", "dependencies");
+  try {
+    assert.doesNotThrow(() =>
+      assertLocalResolution({
+        dependency: DEPENDENCY,
+        resolveFrom: entrypoint,
+        repoRoot: checkout,
+        installCommand: "npm ci",
+      }),
+    );
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+test("an installed package without a version names its package.json", () => {
+  const { outer, checkout, entrypoint } = nestedCheckout();
+  const local = installPackage(checkout, { version: undefined });
+  pinDependency(checkout, "1.2.0");
+  try {
+    assert.throws(
+      () =>
+        assertLocalResolution({
+          dependency: DEPENDENCY,
+          resolveFrom: entrypoint,
+          repoRoot: checkout,
+          installCommand: "npm ci",
+        }),
+      (error) =>
+        error.message.includes(join(local, "package.json")) &&
+        error.message.includes("has no version") &&
+        !error.message.includes("undefined"),
+    );
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+test("a package.json that is not valid JSON is named in the error", () => {
+  const { outer, checkout, entrypoint } = nestedCheckout();
+  installPackage(checkout, { version: "1.2.0" });
+  writeFileSync(join(checkout, "package.json"), "{ not json\n");
+  try {
+    assert.throws(
+      () =>
+        assertLocalResolution({
+          dependency: DEPENDENCY,
+          resolveFrom: entrypoint,
+          repoRoot: checkout,
+          installCommand: "npm ci",
+        }),
+      (error) =>
+        error.message.includes(join(checkout, "package.json")) &&
+        error.message.includes("is not valid JSON"),
+    );
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+test("a range spec leaves the version to the lockfile", () => {
+  const { outer, checkout, entrypoint } = nestedCheckout();
+  installPackage(checkout, { version: "1.0.0" });
+  pinDependency(checkout, "^1.2.0");
+  try {
+    assert.doesNotThrow(() =>
+      assertLocalResolution({
+        dependency: DEPENDENCY,
+        resolveFrom: entrypoint,
+        repoRoot: checkout,
+        installCommand: "npm ci",
+      }),
+    );
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
 test("the repository pins resolve inside this checkout", () => {
   assert.doesNotThrow(() => assertLocalResolution({ dependency: "oxlint" }));
   assert.doesNotThrow(() => assertLocalResolution({ dependency: "oxfmt" }));
@@ -184,4 +295,18 @@ test("ignore-scripts cannot bypass the lint script guard", () => {
   } finally {
     rmSync(outer, { recursive: true, force: true });
   }
+});
+
+test("the package script reports a dependency that is not installed", () => {
+  const dependency = "fallow-start-test-missing-dependency";
+  const result = spawnSync(process.execPath, ["scripts/assert-local-resolution.mjs", dependency], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(
+    result.stderr,
+    new RegExp(`^${dependency} is not installed anywhere Node can reach from `, "u"),
+  );
 });

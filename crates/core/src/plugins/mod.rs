@@ -1,17 +1,15 @@
 //! Plugin system for framework-aware codebase analysis.
 //!
-//! Unlike knip's JavaScript plugin system that evaluates config files at runtime,
-//! fallow's plugin system uses Oxc's parser to extract configuration values from
-//! JS/TS/JSON config files via AST walking, no JavaScript evaluation needed.
-//!
-//! Each plugin implements the [`Plugin`] trait with:
-//! - **Static defaults**: Entry patterns, config file patterns, used exports
-//! - **Dynamic resolution**: Parse tool config files to discover additional entries,
-//!   referenced dependencies, and setup files
+//! Plugins read JS, TS and JSON config files with the Oxc parser and walk the
+//! AST. They never run JavaScript. Each plugin implements the [`Plugin`] trait
+//! with static defaults (entry patterns, config file patterns, used exports)
+//! and reads config files for entries, dependencies and setup files.
 
 use std::path::{Path, PathBuf};
 
-use fallow_config::{AutoImportRule, EntryPointRole, PackageJson, UsedClassMemberRule};
+use fallow_config::{
+    AutoImportRule, EntryPointRole, JsxImportSourceRule, PackageJson, UsedClassMemberRule,
+};
 use fallow_types::semantic::SemanticFrameworkContract;
 use regex::Regex;
 
@@ -21,10 +19,12 @@ const TEST_ENTRY_POINT_PLUGINS: &[&str] = &[
     "deno",
     "cucumber",
     "cypress",
+    "jasmine",
     "jest",
     "k6",
     "mocha",
     "playwright",
+    "rstest",
     "tap",
     "tsd",
     "vitest",
@@ -38,12 +38,17 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "browser-extension",
     "convex",
     "docusaurus",
+    "egg",
     "electron",
     "ember",
+    "eve",
     "expo",
     "expo-router",
+    "flue",
     "gatsby",
     "hardhat",
+    "kibana",
+    "module-federation",
     "nestjs",
     "next-intl",
     "nextjs",
@@ -66,15 +71,30 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "tanstack-router",
     "tsdown",
     "tsup",
+    "vercel",
     "vite",
+    "vite-plus",
     "vitepress",
+    "waku",
     "webpack",
     "wrangler",
     "wxt",
 ];
 
+/// Whether an entry rule of `result` matches the project-relative `path`, as
+/// entry point discovery compiles and matches the rules.
+#[cfg(test)]
+pub(crate) fn entry_rules_match(result: &PluginResult, path: &str) -> bool {
+    result
+        .entry_patterns
+        .iter()
+        .filter_map(|rule| CompiledPathRule::for_entry_rule(rule, "entry pattern"))
+        .any(|rule| rule.matches(path))
+}
+
 #[cfg(test)]
 const SUPPORT_ENTRY_POINT_PLUGINS: &[&str] = &[
+    "alchemy",
     "content-collections",
     "contentlayer",
     "danger",
@@ -93,6 +113,108 @@ const SUPPORT_ENTRY_POINT_PLUGINS: &[&str] = &[
     "velite",
 ];
 
+/// Which workspace diagnostic kind a plugin-stage advisory becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginConfigEffect {
+    /// The plugin could not read the key in full, so part of what it declares
+    /// never reached the analysis.
+    Unreadable,
+    /// The plugin read the key and does not model its effect, so a modeled
+    /// default the run would otherwise have applied stood down.
+    NotModeled,
+}
+
+/// One advisory about a config file a plugin read, before it becomes a
+/// [`fallow_config::WorkspaceDiagnostic`].
+///
+/// A plugin knows the fact (which config file, which key, why) but not the root
+/// the message renders against: in a workspace run its own `root` is the package
+/// root, while the diagnostic's path and message are project-root-relative. The
+/// conversion therefore happens once, where every plugin result has converged on
+/// the project root, and `config_path` is kept ABSOLUTE until then so the
+/// registry's canonical dedupe and the serialized root-relative form both work
+/// from one value (issue #2736).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginConfigDiagnostic {
+    /// Absolute path of the config file that was read.
+    pub config_path: PathBuf,
+    /// The plugin that read it, as it labels itself. Module Federation options
+    /// reach four bundler plugins inline, and each names itself rather than the
+    /// reader, because the config file the user must edit is the bundler's.
+    pub plugin: String,
+    /// The config key the advisory is about (`exposes`, `remotes`,
+    /// `components`, `imports`).
+    pub key: String,
+    /// Why, as a kebab-case token from the resulting kind's open set.
+    pub reason: String,
+    /// Which workspace diagnostic kind this becomes.
+    pub effect: PluginConfigEffect,
+}
+
+impl PluginConfigDiagnostic {
+    /// Build an advisory about a key a plugin could not read in full.
+    pub(super) fn unreadable(
+        config_path: &Path,
+        plugin: &str,
+        key: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            plugin: plugin.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+            effect: PluginConfigEffect::Unreadable,
+        }
+    }
+
+    /// Build an advisory about a key whose effect the plugin does not model.
+    pub(crate) fn not_modeled(
+        config_path: &Path,
+        plugin: &str,
+        key: &str,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            config_path: config_path.to_path_buf(),
+            plugin: plugin.to_owned(),
+            key: key.to_owned(),
+            reason: reason.to_owned(),
+            effect: PluginConfigEffect::NotModeled,
+        }
+    }
+
+    /// Render this advisory against the PROJECT root, which is the root every
+    /// consumer's paths are relative to.
+    #[must_use]
+    pub fn into_workspace_diagnostic(self, root: &Path) -> fallow_config::WorkspaceDiagnostic {
+        let Self {
+            config_path,
+            plugin,
+            key,
+            reason,
+            effect,
+        } = self;
+        let kind = match effect {
+            PluginConfigEffect::Unreadable => {
+                fallow_config::WorkspaceDiagnosticKind::PluginConfigUnreadable {
+                    plugin,
+                    key,
+                    reason,
+                }
+            }
+            PluginConfigEffect::NotModeled => {
+                fallow_config::WorkspaceDiagnosticKind::PluginEffectNotModeled {
+                    plugin,
+                    key,
+                    reason,
+                }
+            }
+        };
+        fallow_config::WorkspaceDiagnostic::new(root, config_path, kind)
+    }
+}
+
 /// Result of resolving a plugin's config file.
 #[derive(Debug, Default)]
 pub struct PluginResult {
@@ -103,11 +225,20 @@ pub struct PluginResult {
     /// and Jest treat their config's include/testMatch as a replacement for built-in
     /// defaults, so when the config is explicit the static patterns must be dropped.
     replace_entry_patterns: bool,
+    /// When true, a replacing config removes only the static defaults, and the
+    /// replacing configs of one plugin run add their patterns together. When
+    /// false, the last replacing config of the plugin wins.
+    accumulate_config_entry_patterns: bool,
     /// When true, `used_exports` from config replace the plugin's static
     /// `used_export_rules()` defaults instead of adding to them.
     replace_used_export_rules: bool,
     /// Additional export-usage rules discovered from config.
     used_exports: Vec<UsedExportRule>,
+    /// Exports that the tool reads from the files a config names. These rules
+    /// join the config-file export credit, so they count only under
+    /// `includeEntryExports`. Unlike `used_exports`, they never make an entry
+    /// point reportable when `includeEntryExports` is off.
+    entry_export_credits: Vec<UsedExportRule>,
     /// Class member rules that should never be flagged as unused. Contributed
     /// by plugins that know their framework invokes these methods at runtime
     /// and may scope suppression via `extends` / `implements` constraints when
@@ -115,6 +246,9 @@ pub struct PluginResult {
     used_class_members: Vec<UsedClassMemberRule>,
     /// Dependencies referenced in config files (should not be flagged as unused).
     referenced_dependencies: Vec<String>,
+    /// Dependencies a config credits only to the package that owns it, keyed
+    /// by the path of that package's `package.json`.
+    package_referenced_dependencies: Vec<(PathBuf, String)>,
     /// Additional files that are always considered used.
     always_used_files: Vec<String>,
     /// Path alias mappings discovered from config (prefix -> replacement directory).
@@ -134,12 +268,412 @@ pub struct PluginResult {
     /// URL-to-filesystem static directory mappings discovered from tool config.
     /// Each tuple is `(absolute_source_dir, normalized_url_mount)`.
     static_dir_mappings: Vec<(PathBuf, String)>,
+    framework_static_dir_mappings: Vec<(PathBuf, String)>,
     /// File-scoped dependency providers. Matching imports are considered
     /// available from the framework runtime and are not unlisted dependencies.
     provided_dependencies: Vec<ProvidedDependencyRule>,
+    /// Advisories about the config file this result was read from. A plugin
+    /// records the fact here instead of printing it, so it reaches the report
+    /// and every consumer rather than only a stderr line.
+    config_diagnostics: Vec<PluginConfigDiagnostic>,
+    /// Where a Module Federation config exposes a file or declares a remote
+    /// alias, kept so a trace can name the config (issue #2796).
+    federation_sources: Vec<FederationSource>,
+    /// JSX import sources that the config sets for the files it transforms.
+    /// The resolver adds the runtime edge to each matching file without a
+    /// JSX pragma.
+    jsx_import_sources: Vec<JsxImportSourceRule>,
+    /// Runtime packages that the JSX transform of a config imports when the
+    /// config sets no import source. The analysis credits a package only when
+    /// a matching file has JSX and no pragma. These rules never add a graph
+    /// edge.
+    jsx_package_credits: Vec<JsxImportSourceRule>,
+    /// The directories of the tsconfig files that set the JSX runtime of
+    /// TypeScript files, through `jsxImportSource` or a `jsx` mode that adds
+    /// no automatic runtime import. Vite then does not use the default
+    /// `react` runtime for the TypeScript files below these directories.
+    tsconfig_jsx_dirs: Vec<PathBuf>,
+}
+
+/// What a Module Federation config declares, and where, for the trace output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationSource {
+    /// What the config names.
+    pub target: FederationSourceTarget,
+    /// The absolute path of the config file.
+    pub config_path: PathBuf,
+    /// The plugin that read the config, as it labels itself.
+    pub plugin: String,
+    /// The config key that names the target.
+    pub key: &'static str,
+}
+
+/// The thing a [`FederationSource`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationSourceTarget {
+    /// An `exposes` target, as the entry-point rule it became.
+    Exposed(PathRule),
+    /// A `remotes` alias.
+    Remote(String),
+}
+
+impl FederationSource {
+    #[must_use]
+    fn prefixed(&self, ws_prefix: &str) -> Self {
+        let target = match &self.target {
+            FederationSourceTarget::Exposed(rule) => {
+                FederationSourceTarget::Exposed(rule.prefixed(ws_prefix))
+            }
+            FederationSourceTarget::Remote(alias) => FederationSourceTarget::Remote(alias.clone()),
+        };
+        Self {
+            target,
+            config_path: self.config_path.clone(),
+            plugin: self.plugin.clone(),
+            key: self.key,
+        }
+    }
+}
+
+/// Match the Module Federation sources of one analysis against the discovered
+/// files, for the trace output.
+///
+/// Only a project with a Federation config pays for the match, and it runs
+/// once per analysis, so a trace reads plain data. A remote that a literal
+/// runtime call (`registerRemotes`, `loadRemote`, `init`, `createInstance`) names traces to the source
+/// file, with the function name as the key.
+#[must_use]
+pub fn federation_trace_provenance(
+    root: &Path,
+    files: &[crate::discover::DiscoveredFile],
+    sources: &[FederationSource],
+    modules: &[crate::extract::ModuleInfo],
+) -> fallow_types::trace::TraceProvenance {
+    let mut provenance = fallow_types::trace::TraceProvenance::default();
+    push_runtime_remote_sources(&mut provenance, root, files, modules);
+    if sources.is_empty() {
+        return provenance;
+    }
+    let mut exposed = Vec::new();
+    for source in sources {
+        let config = source
+            .config_path
+            .strip_prefix(root)
+            .unwrap_or(&source.config_path)
+            .to_path_buf();
+        let trace_source = fallow_types::trace::TraceSource {
+            kind: "module-federation".to_owned(),
+            plugin: source.plugin.clone(),
+            config,
+            key: source.key.to_owned(),
+        };
+        match &source.target {
+            FederationSourceTarget::Exposed(rule) => {
+                if let Some(compiled) =
+                    CompiledPathRule::for_entry_rule(rule, "Module Federation exposes target")
+                {
+                    exposed.push((compiled, trace_source));
+                }
+            }
+            FederationSourceTarget::Remote(alias) => {
+                provenance.push_dependency(alias.clone(), trace_source);
+            }
+        }
+    }
+    if exposed.is_empty() {
+        return provenance;
+    }
+    for file in files {
+        let Ok(relative) = file.path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        for (rule, source) in &exposed {
+            if rule.matches(&relative_str) {
+                provenance.push_file(relative.to_path_buf(), source.clone());
+            }
+        }
+    }
+    provenance
+}
+
+/// Export names that frameworks read as configuration, not as code.
+///
+/// A plugin `used_exports` rule can list these names next to real handlers
+/// (Next.js lists `dynamic` next to `GET` and `default`). Only a listed name
+/// with a literal value counts as configuration, so the review brief does not
+/// ask for a test of it. Extend this set when a new plugin adds a
+/// configuration-only export. Never add a name that holds behavior, such as
+/// `generateMetadata`, `loader` or a route handler.
+pub const CONFIG_ONLY_EXPORT_NAMES: &[&str] = &[
+    "dynamic",
+    "dynamicParams",
+    "revalidate",
+    "fetchCache",
+    "runtime",
+    "preferredRegion",
+    "maxDuration",
+    "prerender",
+    "config",
+    "metadata",
+    "viewport",
+];
+
+/// Record why the unused devDependency check credits each plugin tooling
+/// dependency, so `--trace-dependency` explains the credit instead of calling
+/// the dependency unused.
+pub fn push_tooling_trace_credits(
+    provenance: &mut fallow_types::trace::TraceProvenance,
+    root: &Path,
+    workspaces: &[fallow_config::WorkspaceInfo],
+    plugin_result: &AggregatedPluginResult,
+) {
+    for entry in &plugin_result.plugin_tooling {
+        let Some(evidence) = entry.evidence(&plugin_result.script_used_packages) else {
+            continue;
+        };
+        let credit = match evidence {
+            PluginToolingEvidence::OwnConfig(config) => fallow_types::trace::ToolingCredit {
+                reason: "plugin-config".to_owned(),
+                plugin: Some(entry.plugin.clone()),
+                config: Some(config.strip_prefix(root).unwrap_or(config).to_path_buf()),
+                reference: None,
+            },
+            PluginToolingEvidence::Reference(name) => fallow_types::trace::ToolingCredit {
+                reason: "plugin-reference".to_owned(),
+                plugin: Some(entry.plugin.clone()),
+                config: None,
+                reference: Some(name.to_owned()),
+            },
+        };
+        for dependency in &entry.dependencies {
+            provenance.push_tooling_credit(dependency.clone(), credit.clone());
+        }
+    }
+    push_types_trace_credits(provenance, plugin_result);
+    push_catalogue_trace_credits(provenance, root, workspaces, plugin_result);
+}
+
+/// Record why the unused devDependency check credits each catalogue entry in
+/// `devDependencies` that the trace would otherwise call unused: a library
+/// entry by name, a command-line tool by its own config file or its
+/// package.json key, and any entry that the same manifest lists in
+/// `peerDependencies`.
+///
+/// The check reads each declaring manifest on its own, so a credit here comes
+/// from a manifest that declares the name. A config in a sibling workspace
+/// gives no credit.
+fn push_catalogue_trace_credits(
+    provenance: &mut fallow_types::trace::TraceProvenance,
+    root: &Path,
+    workspaces: &[fallow_config::WorkspaceInfo],
+    plugin_result: &AggregatedPluginResult,
+) {
+    let manifests = read_trace_manifests(root, workspaces);
+    let mut names: Vec<&String> = plugin_result.dev_dependency_names.iter().collect();
+    names.sort_unstable();
+    for name in names {
+        let declaring: Vec<&(PathBuf, serde_json::Value)> = manifests
+            .iter()
+            .filter(|(_, manifest)| manifest_lists(manifest, "devDependencies", name))
+            .collect();
+        if let Some(credit) = catalogue_credit(name, root, &declaring) {
+            provenance.push_tooling_credit(name.clone(), credit);
+        }
+        if let Some((path, _)) = declaring
+            .iter()
+            .find(|(_, manifest)| manifest_lists(manifest, "peerDependencies", name))
+        {
+            provenance.push_tooling_credit(
+                name.clone(),
+                fallow_types::trace::ToolingCredit {
+                    reason: "own-peer".to_owned(),
+                    plugin: None,
+                    config: Some(path.strip_prefix(root).unwrap_or(path).to_path_buf()),
+                    reference: None,
+                },
+            );
+        }
+    }
+}
+
+/// The root manifest and each workspace manifest, parsed, root first.
+fn read_trace_manifests(
+    root: &Path,
+    workspaces: &[fallow_config::WorkspaceInfo],
+) -> Vec<(PathBuf, serde_json::Value)> {
+    std::iter::once(root)
+        .chain(
+            workspaces
+                .iter()
+                .map(|ws| ws.root.as_path())
+                .filter(|ws_root| *ws_root != root),
+        )
+        .filter_map(|package_root| {
+            let path = package_root.join("package.json");
+            let content = std::fs::read_to_string(&path).ok()?;
+            serde_json::from_str(&content)
+                .ok()
+                .map(|value| (path, value))
+        })
+        .collect()
+}
+
+fn manifest_lists(manifest: &serde_json::Value, section: &str, name: &str) -> bool {
+    manifest
+        .get(section)
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|deps| deps.contains_key(name))
+}
+
+/// The catalogue credit of `name` from the first declaring manifest that the
+/// unused devDependency check credits.
+fn catalogue_credit(
+    name: &str,
+    root: &Path,
+    declaring: &[&(PathBuf, serde_json::Value)],
+) -> Option<fallow_types::trace::ToolingCredit> {
+    if is_ambient_types_package(name) || types_package_target(name).is_some() {
+        return None;
+    }
+    let Some(patterns) = cli_tooling_config_patterns(name) else {
+        return is_known_tooling_dependency(name).then(|| fallow_types::trace::ToolingCredit {
+            reason: "known-tooling".to_owned(),
+            plugin: None,
+            config: None,
+            reference: None,
+        });
+    };
+    let config = declaring.iter().find_map(|(path, manifest)| {
+        crate::analyze::cli_tool_own_config(name, patterns, root, path, Some(manifest))
+    })?;
+    Some(fallow_types::trace::ToolingCredit {
+        reason: "known-tooling-config".to_owned(),
+        plugin: None,
+        config: Some(config.strip_prefix(root).unwrap_or(&config).to_path_buf()),
+        reference: None,
+    })
+}
+
+/// Record why the unused devDependency check credits each type package in
+/// `devDependencies`: ambient globals, a declared target package, or a
+/// tsconfig `types` entry. A target that the code imports is credited by the trace
+/// itself, which reads the module graph.
+fn push_types_trace_credits(
+    provenance: &mut fallow_types::trace::TraceProvenance,
+    plugin_result: &AggregatedPluginResult,
+) {
+    let declared = plugin_result.dependency_binaries.declared_packages();
+    let mut names: Vec<&String> = plugin_result.dev_dependency_names.iter().collect();
+    names.sort_unstable();
+    for name in names {
+        let credit = if is_ambient_types_package(name) {
+            fallow_types::trace::ToolingCredit {
+                reason: "ambient-types".to_owned(),
+                plugin: None,
+                config: None,
+                reference: None,
+            }
+        } else if let Some(target) = types_package_target(name) {
+            if declared.contains(&target) {
+                fallow_types::trace::ToolingCredit {
+                    reason: "types-target".to_owned(),
+                    plugin: None,
+                    config: None,
+                    reference: Some(target),
+                }
+            } else if plugin_result.referenced_dependencies.contains(name) {
+                fallow_types::trace::ToolingCredit {
+                    reason: "types-config".to_owned(),
+                    plugin: None,
+                    config: None,
+                    reference: None,
+                }
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+        provenance.push_tooling_credit(name.clone(), credit);
+    }
+}
+
+/// Add a trace source for each remote that a literal runtime call names.
+fn push_runtime_remote_sources(
+    provenance: &mut fallow_types::trace::TraceProvenance,
+    root: &Path,
+    files: &[crate::discover::DiscoveredFile],
+    modules: &[crate::extract::ModuleInfo],
+) {
+    for module in modules {
+        let mut file = None;
+        for fact in module.semantic_facts.iter() {
+            let fallow_types::extract::SemanticFact::FederationRuntimeRemote(fact) = fact else {
+                continue;
+            };
+            let Some(remote) = &fact.remote else {
+                continue;
+            };
+            let Some(path) = file.get_or_insert_with(|| {
+                files.get(module.file_id.0 as usize).map(|file| {
+                    file.path
+                        .strip_prefix(root)
+                        .unwrap_or(&file.path)
+                        .to_path_buf()
+                })
+            }) else {
+                break;
+            };
+            provenance.push_dependency(
+                remote.clone(),
+                fallow_types::trace::TraceSource {
+                    kind: "module-federation".to_owned(),
+                    plugin: "module-federation".to_owned(),
+                    config: path.clone(),
+                    key: fact.call.name().to_owned(),
+                },
+            );
+        }
+    }
 }
 
 impl PluginResult {
+    /// Register `entry` values that a bundler reads relative to the directory
+    /// of its config file. The project root run and the workspace run can read
+    /// the same config, so each value is anchored at the config directory. A
+    /// value with a leading `!` excludes its matches from every other value.
+    fn extend_config_dir_entry_patterns(
+        &mut self,
+        values: Vec<String>,
+        config_path: &Path,
+        root: &Path,
+    ) {
+        let (negated, positive): (Vec<String>, Vec<String>) =
+            values.into_iter().partition(|value| value.starts_with('!'));
+        let excluded: Vec<String> = negated
+            .iter()
+            .filter_map(|value| value.strip_prefix('!'))
+            .filter_map(|value| config_parser::normalize_config_path(value, config_path, root))
+            .collect();
+        self.entry_patterns.extend(
+            positive
+                .iter()
+                .filter_map(|value| config_parser::normalize_config_path(value, config_path, root))
+                .map(|pattern| {
+                    PathRule::new(pattern).with_excluded_globs(excluded.iter().cloned())
+                }),
+        );
+    }
+
+    /// Register an entry pattern whose leading `../` segments are relative to
+    /// the plugin root. The workspace prefix resolves them.
+    fn push_parent_relative_entry_pattern(&mut self, pattern: String) {
+        let mut rule = PathRule::new(pattern);
+        rule.parent_relative = true;
+        self.entry_patterns.push(rule);
+    }
+
     fn push_entry_pattern(&mut self, pattern: impl Into<String>) {
         self.entry_patterns
             .push(PathRule::new(normalize_entry_pattern(pattern.into())));
@@ -157,30 +691,144 @@ impl PluginResult {
         );
     }
 
-    fn push_used_export_rule(
+    /// Route each config value to the surface that can use it: a value naming a
+    /// module request credits its package, every other value becomes an entry
+    /// pattern.
+    ///
+    /// A bundler `entry` accepts a project file and a bare module request such as
+    /// `react-hot-loader/patch` in the same list. A module request names no file,
+    /// so a glob built from it matches nothing while the package still needs
+    /// dependency credit. Module Federation `exposes` targets already split the
+    /// two this way (issue #2706); bundler entries now do too (issue #2739).
+    ///
+    /// `resolve_path` maps a path value to its project-relative form, for
+    /// example against a `context` directory. It runs after the value is
+    /// classified, because a joined path such as `app/main` no longer carries
+    /// the `./` that marks it as a path.
+    fn extend_entry_patterns_or_dependencies<I, S>(
         &mut self,
-        pattern: impl Into<String>,
-        exports: impl IntoIterator<Item = impl Into<String>>,
-    ) {
-        self.used_exports
-            .push(UsedExportRule::new(pattern, exports));
+        values: I,
+        resolve_path: impl Fn(String) -> String,
+    ) where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            let value = value.into();
+            if let Some(request) = module_request(&value) {
+                self.referenced_dependencies
+                    .push(crate::resolve::extract_package_name(request));
+                continue;
+            }
+            self.push_entry_path(resolve_path(value));
+        }
     }
 
+    /// Route each value of a rollup-style `input` to both surfaces when it is
+    /// ambiguous.
+    ///
+    /// Rollup, rolldown and vite resolve an `input` value with no importer: a
+    /// resolve plugin can read it as a module request, and without one it is a
+    /// path relative to the working directory. A value without `./`, `../` or
+    /// `/`, without a source extension and without glob syntax can therefore
+    /// name either one. It keeps the entry pattern, and it credits the package
+    /// unless the value names a file under `root`. A value that names a
+    /// project file is a path, so it must not hide an unused package that has
+    /// the same first segment (issue #2753).
+    fn extend_entry_patterns_and_dependencies<I, S>(&mut self, values: I, root: &Path)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            let value = value.into();
+            if let Some(request) = module_request(&value)
+                && !names_project_file(root, request)
+            {
+                self.referenced_dependencies
+                    .push(crate::resolve::extract_package_name(request));
+            }
+            self.push_entry_path(value);
+        }
+    }
+
+    /// Register each value as a bundler entry path.
+    fn extend_entry_paths<I, S>(&mut self, values: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for value in values {
+            self.push_entry_path(value.into());
+        }
+    }
+
+    /// Register a bundler entry path.
+    ///
+    /// A bundler resolves an entry without a source extension the way it
+    /// resolves an import: first as a file with each extension, then as a
+    /// directory through its index file. `./lib` therefore names
+    /// `lib/index.ts`, and `./src/app` names `src/app.ts`. The value as written
+    /// stays a pattern too, so a file without an extension still matches.
+    fn push_entry_path(&mut self, value: String) {
+        if has_glob_syntax(&value) || has_source_extension(&value) {
+            self.push_entry_pattern(value);
+            return;
+        }
+        let base = value.trim_end_matches('/').to_owned();
+        self.push_entry_pattern(value);
+        self.push_entry_pattern(format!("{base}.{REQUEST_EXTENSIONS}"));
+        self.push_entry_pattern(format!("{base}/index.{REQUEST_EXTENSIONS}"));
+    }
+
+    /// Whether this result contributes nothing, which lets the registry skip a
+    /// config file entirely.
+    ///
+    /// A config that yields only a diagnostic is NOT empty: an unreadable
+    /// `exposes` in a config that declares nothing else is exactly the case the
+    /// advisory exists for, and skipping the result would drop it.
     #[must_use]
     const fn is_empty(&self) -> bool {
-        self.entry_patterns.is_empty()
+        self.config_diagnostics.is_empty()
+            && self.entry_patterns.is_empty()
             && self.used_exports.is_empty()
+            && self.entry_export_credits.is_empty()
             && self.used_class_members.is_empty()
             && self.referenced_dependencies.is_empty()
+            && self.package_referenced_dependencies.is_empty()
             && self.always_used_files.is_empty()
             && self.path_aliases.is_empty()
             && self.setup_files.is_empty()
             && self.fixture_patterns.is_empty()
             && self.scss_include_paths.is_empty()
             && self.static_dir_mappings.is_empty()
+            && self.framework_static_dir_mappings.is_empty()
             && self.provided_dependencies.is_empty()
+            && self.federation_sources.is_empty()
+            && self.jsx_import_sources.is_empty()
+            && self.jsx_package_credits.is_empty()
+            && self.tsconfig_jsx_dirs.is_empty()
     }
 }
+
+/// Whether an extensionless value names a file under `root`: the value itself,
+/// the value with a source extension, or the index file of the directory it
+/// names. This is the order in which a bundler resolves a path.
+fn names_project_file(root: &Path, value: &str) -> bool {
+    let base = root.join(value);
+    base.is_file()
+        || crate::discover::SOURCE_EXTENSIONS.iter().any(|extension| {
+            let mut candidate = base.clone().into_os_string();
+            candidate.push(".");
+            candidate.push(extension);
+            Path::new(&candidate).is_file() || base.join(format!("index.{extension}")).is_file()
+        })
+}
+
+/// Brace list of the extensions a bundler tries for a request that names no
+/// extension. Entry patterns are plain globs with no extension expansion, so a
+/// bare `src/Button` would match no file.
+const REQUEST_EXTENSIONS: &str = "{ts,tsx,mts,cts,gts,js,jsx,mjs,cjs,gjs,vue,svelte,astro,mdx}";
 
 fn normalize_entry_pattern(pattern: String) -> String {
     pattern
@@ -189,12 +837,75 @@ fn normalize_entry_pattern(pattern: String) -> String {
         .unwrap_or(pattern)
 }
 
+/// The module request a config value names, or `None` when the value names a
+/// file or a pattern over project files.
+///
+/// A bundler resolves a value without a leading `./`, `../` or `/` and without a
+/// source extension through module resolution, so it names a package. Both
+/// Module Federation `exposes` targets and bundler `entry` values are read this
+/// way. A value carrying glob syntax is a path in every case: no module
+/// resolution accepts a glob, so `src/pages/**` stays an entry pattern. A
+/// resource query is not part of the request, so it is dropped before both
+/// tests and before the package name is taken.
+fn module_request(value: &str) -> Option<&str> {
+    let request = strip_resource_query(value);
+    (config_parser::is_package_specifier(request)
+        && !has_glob_syntax(request)
+        && !has_source_extension(request))
+    .then_some(request)
+}
+
+/// Drop a trailing resource query from a config value.
+///
+/// A bundler hands everything after the first `?` to the loader, so the standard
+/// hot-reload entry `webpack-hot-middleware/client?reload=true` names the
+/// package's `client` module. A `?` is also the single-character glob wildcard,
+/// so what follows it decides: `reload=true` is a query, the `.ts` of
+/// `src/pag?.ts` is not.
+fn strip_resource_query(value: &str) -> &str {
+    match value.split_once('?') {
+        Some((request, query)) if is_resource_query(query) => request,
+        _ => value,
+    }
+}
+
+/// Whether a string is an `&`-separated list of `key` or `key=value` pairs whose
+/// keys read like identifiers.
+fn is_resource_query(query: &str) -> bool {
+    !query.is_empty()
+        && query.split('&').all(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            key.starts_with(|first: char| first.is_ascii_alphanumeric() || first == '_')
+                && key
+                    .chars()
+                    .all(|char| char.is_ascii_alphanumeric() || matches!(char, '_' | '-' | '.'))
+        })
+}
+
+/// Whether a config value carries glob metacharacters, which makes it a pattern
+/// over project files rather than a single path or module request.
+fn has_glob_syntax(value: &str) -> bool {
+    value.contains('*') || value.contains('?') || value.contains('[') || value.contains('{')
+}
+
+/// Whether a config value carries an extension discovery analyzes. Discovery's
+/// own extension set decides, so a value naming a file type discovery does not
+/// analyze stays a module request.
+fn has_source_extension(value: &str) -> bool {
+    Path::new(value)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            crate::discover::SOURCE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        })
+}
+
 /// A file-pattern rule with optional exclusion globs plus path-level or
 /// segment-level regex filters.
 ///
 /// Exclusion regexes are matched against the project-relative path and should be
 /// anchored when generated dynamically so they can be safely workspace-prefixed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct PathRule {
     pub pattern: String,
     pub exclude_globs: Vec<String>,
@@ -203,6 +914,13 @@ pub struct PathRule {
     /// for workspaces because they intentionally operate on segment names rather
     /// than the full project-relative path.
     pub exclude_segment_regexes: Vec<String>,
+    /// Whether the leading `../` segments of `pattern` are relative to the
+    /// plugin root, so the workspace prefix resolves them. Only the Module
+    /// Federation reader sets it, for an `exposes` target in a sibling
+    /// workspace. Other plugins emit patterns relative to a config directory,
+    /// such as the Storybook `../src/**`, which must not climb out of the
+    /// workspace.
+    pub parent_relative: bool,
 }
 
 impl PathRule {
@@ -213,12 +931,38 @@ impl PathRule {
             exclude_globs: Vec::new(),
             exclude_regexes: Vec::new(),
             exclude_segment_regexes: Vec::new(),
+            parent_relative: false,
         }
     }
 
     #[must_use]
     fn from_static(pattern: &'static str) -> Self {
         Self::new(pattern)
+    }
+
+    /// A rule for a tool glob with extglob groups, such as `!(*.spec)`. The
+    /// rule matches at least the paths that the tool matches. Each negated
+    /// group becomes an excluded glob.
+    #[must_use]
+    pub(crate) fn from_extglob(pattern: &str) -> Self {
+        let rewritten = fallow_config::extglob::rewrite_include(pattern);
+        Self::new(rewritten.include).with_excluded_globs(rewritten.excludes)
+    }
+
+    /// Exclude the paths of tool globs with extglob groups. An excluded glob
+    /// never removes more paths than the tool does, so a glob with a negated
+    /// group excludes nothing.
+    #[must_use]
+    pub(crate) fn with_excluded_extglobs<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let excluded: Vec<String> = patterns
+            .into_iter()
+            .filter_map(|pattern| fallow_config::extglob::rewrite_exclude(pattern.as_ref()))
+            .collect();
+        self.with_excluded_globs(excluded)
     }
 
     #[must_use]
@@ -256,12 +1000,19 @@ impl PathRule {
 
     #[must_use]
     fn prefixed(&self, ws_prefix: &str) -> Self {
+        let prefix = |pattern: &str| {
+            if self.parent_relative && pattern.starts_with("../") {
+                resolve_parent_relative_pattern(pattern, ws_prefix)
+            } else {
+                prefix_workspace_pattern(pattern, ws_prefix)
+            }
+        };
         Self {
-            pattern: prefix_workspace_pattern(&self.pattern, ws_prefix),
+            pattern: prefix(&self.pattern),
             exclude_globs: self
                 .exclude_globs
                 .iter()
-                .map(|pattern| prefix_workspace_pattern(pattern, ws_prefix))
+                .map(|pattern| prefix(pattern))
                 .collect(),
             exclude_regexes: self
                 .exclude_regexes
@@ -269,94 +1020,7 @@ impl PathRule {
                 .map(|pattern| prefix_workspace_regex(pattern, ws_prefix))
                 .collect(),
             exclude_segment_regexes: self.exclude_segment_regexes.clone(),
-        }
-    }
-}
-
-/// A used-export rule bound to a file-pattern rule.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UsedExportRule {
-    pub(crate) path: PathRule,
-    pub(crate) exports: Vec<String>,
-}
-
-impl UsedExportRule {
-    #[must_use]
-    pub(crate) fn new(
-        pattern: impl Into<String>,
-        exports: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            path: PathRule::new(pattern),
-            exports: exports.into_iter().map(Into::into).collect(),
-        }
-    }
-
-    #[must_use]
-    fn from_static(pattern: &'static str, exports: &'static [&'static str]) -> Self {
-        Self::new(pattern, exports.iter().copied())
-    }
-
-    #[must_use]
-    fn with_excluded_globs<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.path = self.path.with_excluded_globs(patterns);
-        self
-    }
-
-    #[must_use]
-    fn with_excluded_regexes<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.path = self.path.with_excluded_regexes(patterns);
-        self
-    }
-
-    #[must_use]
-    fn with_excluded_segment_regexes<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.path = self.path.with_excluded_segment_regexes(patterns);
-        self
-    }
-
-    #[must_use]
-    fn prefixed(&self, ws_prefix: &str) -> Self {
-        Self {
-            path: self.path.prefixed(ws_prefix),
-            exports: self.exports.clone(),
-        }
-    }
-}
-
-/// A used-export rule tagged with the plugin that contributed it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginUsedExportRule {
-    pub(crate) plugin_name: String,
-    pub(crate) rule: UsedExportRule,
-}
-
-impl PluginUsedExportRule {
-    #[must_use]
-    pub(crate) fn new(plugin_name: impl Into<String>, rule: UsedExportRule) -> Self {
-        Self {
-            plugin_name: plugin_name.into(),
-            rule,
-        }
-    }
-
-    #[must_use]
-    fn prefixed(&self, ws_prefix: &str) -> Self {
-        Self {
-            plugin_name: self.plugin_name.clone(),
-            rule: self.rule.prefixed(ws_prefix),
+            parent_relative: false,
         }
     }
 }
@@ -412,7 +1076,20 @@ impl ProvidedDependencyRule {
     }
 }
 
+/// Compile the include glob of an entry rule. Its `*` stays in one path
+/// segment, and it accepts an empty alternative, such as `{,m}js`, because
+/// the rewrite of an extglob `?(m)` group gives one.
+pub(crate) fn entry_rule_glob(pattern: &str) -> Result<globset::Glob, globset::Error> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .empty_alternates(true)
+        .build()
+}
+
 /// A compiled path rule matcher shared by entry-point and used-export matching.
+///
+/// Every glob accepts an empty alternative, such as `{,m}js`, because the
+/// rewrite of an extglob `?(m)` group gives one.
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledPathRule {
     include: globset::GlobMatcher,
@@ -423,10 +1100,7 @@ pub(crate) struct CompiledPathRule {
 
 impl CompiledPathRule {
     pub(crate) fn for_entry_rule(rule: &PathRule, rule_kind: &str) -> Option<Self> {
-        let include = match globset::GlobBuilder::new(&rule.pattern)
-            .literal_separator(true)
-            .build()
-        {
+        let include = match entry_rule_glob(&rule.pattern) {
             Ok(glob) => glob.compile_matcher(),
             Err(err) => {
                 tracing::warn!("invalid {rule_kind} '{}': {err}", rule.pattern);
@@ -450,27 +1124,7 @@ impl CompiledPathRule {
     }
 
     pub(crate) fn for_used_export_rule(rule: &PathRule, rule_kind: &str) -> Option<Self> {
-        let include = match globset::Glob::new(&rule.pattern) {
-            Ok(glob) => glob.compile_matcher(),
-            Err(err) => {
-                tracing::warn!("invalid {rule_kind} '{}': {err}", rule.pattern);
-                return None;
-            }
-        };
-        Some(Self {
-            include,
-            exclude_globs: compile_excluded_globs(&rule.exclude_globs, rule_kind, &rule.pattern),
-            exclude_regexes: compile_excluded_regexes(
-                &rule.exclude_regexes,
-                rule_kind,
-                &rule.pattern,
-            ),
-            exclude_segment_regexes: compile_excluded_segment_regexes(
-                &rule.exclude_segment_regexes,
-                rule_kind,
-                &rule.pattern,
-            ),
-        })
+        Self::for_entry_rule(rule, rule_kind)
     }
 
     #[must_use]
@@ -493,6 +1147,35 @@ fn prefix_workspace_pattern(pattern: &str, ws_prefix: &str) -> String {
     }
 }
 
+/// Resolve the leading `../` segments of a parent-relative pattern against the
+/// workspace prefix, so a pattern that names a file in a sibling workspace
+/// matches from the project root. A pattern that climbs past the project root,
+/// or a prefix that is not project-relative, keeps the pattern as written,
+/// which matches no project file.
+fn resolve_parent_relative_pattern(pattern: &str, ws_prefix: &str) -> String {
+    if ws_prefix.starts_with('/') || Path::new(ws_prefix).is_absolute() {
+        return pattern.to_string();
+    }
+    // The workspace prefix comes from a native path, so on Windows its
+    // segments are separated by backslashes.
+    let mut base: Vec<&str> = ws_prefix
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let mut rest = pattern;
+    while let Some(stripped) = rest.strip_prefix("../") {
+        if base.pop().is_none() {
+            return pattern.to_string();
+        }
+        rest = stripped;
+    }
+    if base.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{}/{rest}", base.join("/"))
+    }
+}
+
 fn prefix_workspace_regex(pattern: &str, ws_prefix: &str) -> String {
     if let Some(pattern) = pattern.strip_prefix('^') {
         format!("^{}/{}", regex::escape(ws_prefix), pattern)
@@ -511,6 +1194,7 @@ fn compile_excluded_globs(
         .filter_map(|pattern| {
             match globset::GlobBuilder::new(pattern)
                 .literal_separator(true)
+                .empty_alternates(true)
                 .build()
             {
                 Ok(glob) => Some(glob.compile_matcher()),
@@ -572,8 +1256,10 @@ fn compile_excluded_segment_regexes(
         .collect()
 }
 
+/// Whether a segment of `path` matches one of `regexes`. The path can use the
+/// native separator: on Windows a caller can pass `src\pages\x.tsx`.
 fn matches_segment_regex(path: &str, regexes: &[Regex]) -> bool {
-    path.split('/')
+    path.split(std::path::is_separator)
         .any(|segment| regexes.iter().any(|regex| regex.is_match(segment)))
 }
 
@@ -724,6 +1410,30 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Config patterns whose files do not get the `default` export credit.
+    ///
+    /// Under `includeEntryExports`, the `default` export of a file that one of
+    /// [`Self::config_patterns`] matches counts as used, because the tool loads
+    /// the config file and reads its default export. List a pattern here when
+    /// the tool reads named exports instead, or when the pattern also matches
+    /// ordinary source files. Each entry must be identical to an entry of
+    /// [`Self::config_patterns`].
+    fn config_default_export_opt_out(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Tool config files and the export names that the tool reads from them.
+    ///
+    /// Under `includeEntryExports`, these exports of a matching file count as
+    /// used. `"*"` credits every export. Use this for a config file that is not
+    /// in [`Self::config_patterns`], or for a tool that reads named exports.
+    /// Each pattern is anchored: it gets the workspace prefix but no `**/`
+    /// prefix, so it matches only at the project or workspace package root.
+    /// This credit never changes the output without `includeEntryExports`.
+    fn config_file_exports(&self) -> &'static [(&'static str, &'static [&'static str])] {
+        &[]
+    }
+
     /// Files that are always considered "used" when this plugin is active.
     fn always_used(&self) -> &'static [&'static str] {
         &[]
@@ -836,6 +1546,21 @@ pub trait Plugin: Send + Sync {
         vec![]
     }
 
+    /// Directories this framework serves at a URL mount by convention, so a
+    /// root-absolute reference in ANY HTML document in the project names a file
+    /// inside one.
+    ///
+    /// Called once when plugins are activated, with the project `root`, so a
+    /// plugin can require the directory to exist before claiming it.
+    ///
+    /// Distinct from the config-file mounts a tool declares from
+    /// `resolve_config` (Storybook `staticDirs`), which stay scoped to that
+    /// tool's own documents. A convention here describes how the whole project
+    /// is served, so it is not scoped that way.
+    fn static_dir_mappings(&self, _root: &Path) -> Vec<(std::path::PathBuf, String)> {
+        vec![]
+    }
+
     /// Convention-based auto-imports provided by this framework.
     ///
     /// Returns the names this framework exposes to user code by filesystem
@@ -848,6 +1573,11 @@ pub trait Plugin: Send + Sync {
     /// plugins can scan the convention directories on the filesystem. The table is
     /// a function of which files exist on disk, so it is rebuilt every run and is
     /// never folded into per-file extraction caching. See issue #704.
+    ///
+    /// A rule with an empty `scope` is visible to the files under `root` only.
+    /// A plugin can set `scope` itself to make a rule visible to more roots.
+    /// After the plugin runs, a shared step links a Nuxt app and each layer
+    /// outside it in both directions. See issue #2752.
     fn auto_imports(&self, _root: &Path) -> Vec<AutoImportRule> {
         Vec::new()
     }
@@ -885,6 +1615,48 @@ pub trait Plugin: Send + Sync {
     /// and parsed AST are provided, use [`config_parser`] utilities to extract values.
     fn resolve_config(&self, _config_path: &Path, _source: &str, _root: &Path) -> PluginResult {
         PluginResult::default()
+    }
+
+    /// Parse a config file with the project root known.
+    ///
+    /// `root` is the package root that [`Plugin::resolve_config`] receives. In
+    /// a workspace run it is the workspace package directory. `project_root`
+    /// is the analysis root. A plugin that reads more files from paths that
+    /// the config names must keep each read inside `project_root`, because the
+    /// config comes from the analyzed repository. The default ignores
+    /// `project_root`.
+    fn resolve_config_in_project(
+        &self,
+        config_path: &Path,
+        source: &str,
+        root: &Path,
+        _project_root: &Path,
+    ) -> PluginResult {
+        self.resolve_config(config_path, source, root)
+    }
+
+    /// Parse a config file that a package script passes with `--config` or
+    /// `-c`. The script runs the tool in `root`, also for a config in a
+    /// subdirectory. The default is [`Plugin::resolve_config_in_project`].
+    fn resolve_script_config(
+        &self,
+        config_path: &Path,
+        source: &str,
+        root: &Path,
+        project_root: &Path,
+    ) -> PluginResult {
+        self.resolve_config_in_project(config_path, source, root, project_root)
+    }
+
+    /// Binaries whose `--config` / `-c` argument in a package script names a
+    /// config file of this plugin.
+    ///
+    /// A script such as `vitest run --config vitest.e2e.config.ts` points the
+    /// tool at a file that no `config_patterns()` entry matches. The plugin
+    /// system sends that file to `resolve_config` and credits its default
+    /// export as used.
+    fn script_config_binaries(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// The key name in package.json that holds inline configuration for this tool.
@@ -972,6 +1744,8 @@ macro_rules! define_plugin {
         enablers: $enablers:expr
         $(, entry_patterns: $entry:expr)?
         $(, config_patterns: $config:expr)?
+        $(, config_default_export_opt_out: $config_opt_out:expr)?
+        $(, config_file_exports: $config_exports:expr)?
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
@@ -997,6 +1771,8 @@ macro_rules! define_plugin {
 
             $( fn entry_patterns(&self) -> &'static [&'static str] { $entry } )?
             $( fn config_patterns(&self) -> &'static [&'static str] { $config } )?
+            $( fn config_default_export_opt_out(&self) -> &'static [&'static str] { $config_opt_out } )?
+            $( fn config_file_exports(&self) -> &'static [(&'static str, &'static [&'static str])] { $config_exports } )?
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
@@ -1034,6 +1810,8 @@ macro_rules! define_plugin {
         enablers: $enablers:expr
         $(, entry_patterns: $entry:expr)?
         $(, config_patterns: $config:expr)?
+        $(, config_default_export_opt_out: $config_opt_out:expr)?
+        $(, config_file_exports: $config_exports:expr)?
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
@@ -1043,8 +1821,10 @@ macro_rules! define_plugin {
         $(, generated_type_import_prefixes: $generated_type_prefixes:expr)?
         $(, provided_dependencies: $provided_dependencies:expr)?
         $(, package_json_config_key: $pkg_key:expr)?
+        $(, script_config_binaries: $script_binaries:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         , resolve_config($cp:ident, $src:ident, $root:ident) $body:block
+        $(, resolve_config_in_project($pcp:ident, $psrc:ident, $proot:ident, $pproj:ident) $pbody:block)?
         $(,)?
     ) => {
         pub struct $name;
@@ -1060,6 +1840,8 @@ macro_rules! define_plugin {
 
             $( fn entry_patterns(&self) -> &'static [&'static str] { $entry } )?
             $( fn config_patterns(&self) -> &'static [&'static str] { $config } )?
+            $( fn config_default_export_opt_out(&self) -> &'static [&'static str] { $config_opt_out } )?
+            $( fn config_file_exports(&self) -> &'static [(&'static str, &'static [&'static str])] { $config_exports } )?
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
@@ -1081,6 +1863,8 @@ macro_rules! define_plugin {
                 }
             )?
 
+            $( fn script_config_binaries(&self) -> &'static [&'static str] { $script_binaries } )?
+
             fn resolve_config(
                 &self,
                 $cp: &std::path::Path,
@@ -1088,6 +1872,17 @@ macro_rules! define_plugin {
                 $root: &std::path::Path,
             ) -> PluginResult
             $body
+
+            $(
+                fn resolve_config_in_project(
+                    &self,
+                    $pcp: &std::path::Path,
+                    $psrc: &str,
+                    $proot: &std::path::Path,
+                    $pproj: &std::path::Path,
+                ) -> PluginResult
+                $pbody
+            )?
         }
     };
 
@@ -1096,6 +1891,8 @@ macro_rules! define_plugin {
         enablers: $enablers:expr
         $(, entry_patterns: $entry:expr)?
         $(, config_patterns: $config:expr)?
+        $(, config_default_export_opt_out: $config_opt_out:expr)?
+        $(, config_file_exports: $config_exports:expr)?
         $(, always_used: $always:expr)?
         $(, tooling_dependencies: $tooling:expr)?
         $(, fixture_glob_patterns: $fixtures:expr)?
@@ -1104,6 +1901,7 @@ macro_rules! define_plugin {
         $(, virtual_package_suffixes: $virtual_suffixes:expr)?
         $(, generated_type_import_prefixes: $generated_type_prefixes:expr)?
         $(, provided_dependencies: $provided_dependencies:expr)?
+        $(, package_json_config_key: $pkg_key:expr)?
         $(, used_exports: [$( ($pat:expr, $exports:expr) ),* $(,)?])?
         $(,)?
     ) => {
@@ -1120,6 +1918,8 @@ macro_rules! define_plugin {
 
             $( fn entry_patterns(&self) -> &'static [&'static str] { $entry } )?
             $( fn config_patterns(&self) -> &'static [&'static str] { $config } )?
+            $( fn config_default_export_opt_out(&self) -> &'static [&'static str] { $config_opt_out } )?
+            $( fn config_file_exports(&self) -> &'static [(&'static str, &'static [&'static str])] { $config_exports } )?
             $( fn always_used(&self) -> &'static [&'static str] { $always } )?
             $( fn tooling_dependencies(&self) -> &'static [&'static str] { $tooling } )?
             $( fn fixture_glob_patterns(&self) -> &'static [&'static str] { $fixtures } )?
@@ -1128,6 +1928,12 @@ macro_rules! define_plugin {
             $( fn virtual_package_suffixes(&self) -> &'static [&'static str] { $virtual_suffixes } )?
             $( fn generated_type_import_prefixes(&self) -> &'static [&'static str] { $generated_type_prefixes } )?
             $( fn provided_dependencies(&self) -> Vec<ProvidedDependencyRule> { $provided_dependencies } )?
+
+            $(
+                fn package_json_config_key(&self) -> Option<&'static str> {
+                    Some($pkg_key)
+                }
+            )?
 
             $(
                 fn used_exports(&self) -> Vec<(&'static str, &'static [&'static str])> {
@@ -1140,13 +1946,36 @@ macro_rules! define_plugin {
 
 pub mod config_parser;
 mod config_value_credits;
+mod flue;
+mod jasmine;
 mod manifest;
 pub mod manifest_entries;
+mod mise;
+mod osls;
+mod project_glob;
+mod railway;
 pub mod registry;
+mod rstest;
+mod serverless_framework;
+mod textlint;
 mod tooling;
+mod trace_provenance;
+mod used_export_names;
+mod used_export_rule;
 
-pub use registry::{AggregatedPluginResult, PluginRegistry};
-pub(crate) use tooling::is_known_tooling_dependency;
+pub(crate) use used_export_rule::ConfigExportCredit;
+pub use used_export_rule::{PluginUsedExportRule, UsedExportRule};
+
+pub(crate) use module_federation::runtime_remotes;
+pub use registry::{
+    AggregatedPluginResult, PluginRegistry, PluginToolingDependencies, PluginToolingEvidence,
+};
+pub use tooling::types_package_target;
+pub(crate) use tooling::{
+    cli_tooling_config_patterns, is_ambient_types_package, is_known_tooling_dependency,
+};
+pub use trace_provenance::{ExportCredits, build_trace_provenance};
+pub use used_export_names::UsedExportNames;
 
 fn add_import_referenced_dependencies(result: &mut PluginResult, source: &str, config_path: &Path) {
     let imports = config_parser::extract_imports(source, config_path);
@@ -1198,9 +2027,8 @@ fn credit_config_value(
 ///
 /// Both runners accept the bare name and the package it resolves to, so
 /// `testEnvironment: "jest-environment-jsdom"` and `environment: "jsdom"` select
-/// the same environment. Matching the literal short name only meant the fully
-/// qualified form, which the Jest docs use and projects copy, was treated as a
-/// third-party environment and missed its optional-peer credit.
+/// the same environment. A match on the short name only missed the fully
+/// qualified form that the Jest docs use, so that form lost its credit.
 fn canonical_test_environment(environment: &str) -> &str {
     environment
         .strip_prefix("jest-environment-")
@@ -1209,6 +2037,8 @@ fn canonical_test_environment(environment: &str) -> &str {
 }
 
 mod adonis;
+mod ag_ui;
+mod alchemy;
 mod angular;
 mod astro;
 mod ava;
@@ -1232,15 +2062,19 @@ mod danger;
 mod deno;
 mod dependency_cruiser;
 mod docusaurus;
+mod dotenv;
 mod drizzle;
+mod egg;
 mod electron;
 mod ember;
 mod eslint;
+mod eve;
 mod expo;
 mod expo_router;
 mod firebase;
 mod fumadocs;
 mod gatsby;
+mod github_action;
 mod graphql_codegen;
 mod hardhat;
 mod husky;
@@ -1249,6 +2083,7 @@ mod ionic;
 mod jest;
 mod k6;
 mod karma;
+mod kibana;
 mod knex;
 mod kysely;
 mod lefthook;
@@ -1258,9 +2093,12 @@ mod lit;
 mod markdownlint;
 mod mintlify;
 mod mocha;
+mod module_federation;
 mod msw;
 mod napi_rs;
+mod nest_commander;
 mod nestjs;
+mod nestjs_trpc;
 mod next_intl;
 mod nextjs;
 mod nitro;
@@ -1272,6 +2110,8 @@ mod obsidian;
 mod openapi_ts;
 mod opencode;
 mod opennext_cloudflare;
+mod opentelemetry;
+mod oxfmt;
 mod oxlint;
 mod pandacss;
 mod parcel;
@@ -1290,6 +2130,7 @@ mod react_native;
 mod react_router;
 mod redwoodsdk;
 mod relay;
+mod release_it;
 mod remark;
 mod remix;
 mod rolldown;
@@ -1315,6 +2156,8 @@ mod tailwind;
 mod tanstack_router;
 mod tap;
 mod test_alias;
+#[cfg(test)]
+mod tests;
 mod tsd;
 mod tsdown;
 mod tsup;
@@ -1322,675 +2165,19 @@ mod turborepo;
 mod typedoc;
 mod typeorm;
 mod typescript;
+mod typescript_content_mapper;
 mod unocss;
 mod varlock;
 mod velite;
 mod vercel;
 mod vite;
+pub(crate) mod vite_plus;
 mod vitepress;
 mod vitest;
 mod vscode;
+mod waku;
 mod webdriverio;
 mod webpack;
 mod wrangler;
 mod wuchale;
 mod wxt;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn is_enabled_with_deps_exact_match() {
-        let plugin = nextjs::NextJsPlugin;
-        let deps = vec!["next".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps, Path::new("/project")));
-    }
-
-    #[test]
-    fn is_enabled_with_deps_no_match() {
-        let plugin = nextjs::NextJsPlugin;
-        let deps = vec!["react".to_string()];
-        assert!(!plugin.is_enabled_with_deps(&deps, Path::new("/project")));
-    }
-
-    #[test]
-    fn is_enabled_with_deps_empty_deps() {
-        let plugin = nextjs::NextJsPlugin;
-        let deps: Vec<String> = vec![];
-        assert!(!plugin.is_enabled_with_deps(&deps, Path::new("/project")));
-    }
-
-    #[test]
-    fn environment_optional_peers_come_from_the_credit_catalogue() {
-        for environment in [
-            "jsdom",
-            "jest-environment-jsdom",
-            "vitest-environment-jsdom",
-        ] {
-            let mut result = PluginResult::default();
-            credit_environment_optional_peers(environment, &mut result);
-            assert_eq!(
-                result.referenced_dependencies,
-                vec!["canvas".to_string()],
-                "expected the catalogue credit for {environment}"
-            );
-        }
-    }
-
-    #[test]
-    fn environment_without_a_catalogue_row_credits_nothing() {
-        let mut result = PluginResult::default();
-        credit_environment_optional_peers("happy-dom", &mut result);
-        assert!(result.referenced_dependencies.is_empty());
-    }
-
-    #[test]
-    fn entry_point_role_defaults_are_centralized() {
-        assert_eq!(vite::VitePlugin.entry_point_role(), EntryPointRole::Runtime);
-        assert_eq!(
-            vitest::VitestPlugin.entry_point_role(),
-            EntryPointRole::Test
-        );
-        assert_eq!(
-            storybook::StorybookPlugin.entry_point_role(),
-            EntryPointRole::Support
-        );
-        assert_eq!(
-            obsidian::ObsidianPlugin.entry_point_role(),
-            EntryPointRole::Runtime
-        );
-        assert_eq!(knex::KnexPlugin.entry_point_role(), EntryPointRole::Support);
-    }
-
-    #[test]
-    fn plugins_with_entry_patterns_have_explicit_role_intent() {
-        let runtime_or_test_or_support: rustc_hash::FxHashSet<&'static str> =
-            TEST_ENTRY_POINT_PLUGINS
-                .iter()
-                .chain(RUNTIME_ENTRY_POINT_PLUGINS.iter())
-                .chain(SUPPORT_ENTRY_POINT_PLUGINS.iter())
-                .copied()
-                .collect();
-
-        for plugin in crate::plugins::registry::builtin::create_builtin_plugins() {
-            if plugin.entry_patterns().is_empty() {
-                continue;
-            }
-            assert!(
-                runtime_or_test_or_support.contains(plugin.name()),
-                "plugin '{}' exposes entry patterns but is missing from the entry-point role map",
-                plugin.name()
-            );
-        }
-    }
-
-    #[test]
-    fn plugin_result_is_empty_when_default() {
-        let r = PluginResult::default();
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn plugin_result_not_empty_with_entry_patterns() {
-        let r = PluginResult {
-            entry_patterns: vec!["*.ts".into()],
-            ..Default::default()
-        };
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn plugin_result_not_empty_with_referenced_deps() {
-        let r = PluginResult {
-            referenced_dependencies: vec!["lodash".to_string()],
-            ..Default::default()
-        };
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn plugin_result_not_empty_with_setup_files() {
-        let r = PluginResult {
-            setup_files: vec![PathBuf::from("/setup.ts")],
-            ..Default::default()
-        };
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn plugin_result_not_empty_with_always_used_files() {
-        let r = PluginResult {
-            always_used_files: vec!["**/*.stories.tsx".to_string()],
-            ..Default::default()
-        };
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn plugin_result_not_empty_with_fixture_patterns() {
-        let r = PluginResult {
-            fixture_patterns: vec!["**/__fixtures__/**/*".to_string()],
-            ..Default::default()
-        };
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn is_enabled_with_deps_prefix_match() {
-        let plugin = storybook::StorybookPlugin;
-        let deps = vec!["@storybook/react".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps, Path::new("/project")));
-    }
-
-    #[test]
-    fn is_enabled_with_deps_prefix_no_match_without_slash() {
-        let plugin = storybook::StorybookPlugin;
-        let deps = vec!["@storybookish".to_string()];
-        assert!(!plugin.is_enabled_with_deps(&deps, Path::new("/project")));
-    }
-
-    #[test]
-    fn is_enabled_with_deps_multiple_enablers() {
-        let plugin = vitest::VitestPlugin;
-        let deps_vitest = vec!["vitest".to_string()];
-        let deps_none = vec!["mocha".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_vitest, Path::new("/project")));
-        assert!(!plugin.is_enabled_with_deps(&deps_none, Path::new("/project")));
-    }
-
-    #[test]
-    fn plugin_default_methods_return_empty() {
-        let plugin = commitizen::CommitizenPlugin;
-        assert!(
-            plugin.tooling_dependencies().is_empty() || !plugin.tooling_dependencies().is_empty()
-        );
-        assert!(plugin.virtual_module_prefixes().is_empty());
-        assert!(plugin.virtual_package_suffixes().is_empty());
-        assert!(plugin.path_aliases(Path::new("/project")).is_empty());
-        assert!(
-            plugin.package_json_config_key().is_none()
-                || plugin.package_json_config_key().is_some()
-        );
-    }
-
-    #[test]
-    fn plugin_resolve_config_default_returns_empty() {
-        let plugin = commitizen::CommitizenPlugin;
-        let result = plugin.resolve_config(
-            Path::new("/project/config.js"),
-            "const x = 1;",
-            Path::new("/project"),
-        );
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn is_enabled_with_deps_exact_and_prefix_both_work() {
-        let plugin = storybook::StorybookPlugin;
-        let deps_exact = vec!["storybook".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_exact, Path::new("/project")));
-        let deps_prefix = vec!["@storybook/vue3".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_prefix, Path::new("/project")));
-    }
-
-    #[test]
-    fn is_enabled_with_deps_multiple_enablers_remix() {
-        let plugin = remix::RemixPlugin;
-        let deps_node = vec!["@remix-run/node".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_node, Path::new("/project")));
-        let deps_react = vec!["@remix-run/react".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_react, Path::new("/project")));
-        let deps_cf = vec!["@remix-run/cloudflare".to_string()];
-        assert!(plugin.is_enabled_with_deps(&deps_cf, Path::new("/project")));
-    }
-
-    struct MinimalPlugin;
-    impl Plugin for MinimalPlugin {
-        fn name(&self) -> &'static str {
-            "minimal"
-        }
-    }
-
-    #[test]
-    fn default_enablers_is_empty() {
-        assert!(MinimalPlugin.enablers().is_empty());
-    }
-
-    #[test]
-    fn default_entry_patterns_is_empty() {
-        assert!(MinimalPlugin.entry_patterns().is_empty());
-    }
-
-    #[test]
-    fn default_config_patterns_is_empty() {
-        assert!(MinimalPlugin.config_patterns().is_empty());
-    }
-
-    #[test]
-    fn default_always_used_is_empty() {
-        assert!(MinimalPlugin.always_used().is_empty());
-    }
-
-    #[test]
-    fn default_used_exports_is_empty() {
-        assert!(MinimalPlugin.used_exports().is_empty());
-    }
-
-    #[test]
-    fn default_tooling_dependencies_is_empty() {
-        assert!(MinimalPlugin.tooling_dependencies().is_empty());
-    }
-
-    #[test]
-    fn default_fixture_glob_patterns_is_empty() {
-        assert!(MinimalPlugin.fixture_glob_patterns().is_empty());
-    }
-
-    #[test]
-    fn default_virtual_module_prefixes_is_empty() {
-        assert!(MinimalPlugin.virtual_module_prefixes().is_empty());
-    }
-
-    #[test]
-    fn default_virtual_package_suffixes_is_empty() {
-        assert!(MinimalPlugin.virtual_package_suffixes().is_empty());
-    }
-
-    #[test]
-    fn default_path_aliases_is_empty() {
-        assert!(MinimalPlugin.path_aliases(Path::new("/")).is_empty());
-    }
-
-    #[test]
-    fn default_resolve_config_returns_empty() {
-        let r = MinimalPlugin.resolve_config(
-            Path::new("config.js"),
-            "export default {}",
-            Path::new("/"),
-        );
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn default_package_json_metadata_hooks_are_empty() {
-        let pkg = PackageJson::default();
-        assert!(!MinimalPlugin.is_enabled_with_package_json(&pkg, Path::new("/")));
-        assert!(
-            MinimalPlugin
-                .resolve_package_json(&pkg, Path::new("/"))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn default_package_json_config_key_is_none() {
-        assert!(MinimalPlugin.package_json_config_key().is_none());
-    }
-
-    #[test]
-    fn default_is_enabled_returns_false_when_no_enablers() {
-        let deps = vec!["anything".to_string()];
-        assert!(!MinimalPlugin.is_enabled_with_deps(&deps, Path::new("/")));
-    }
-
-    #[test]
-    fn all_builtin_plugin_names_are_unique() {
-        let plugins = registry::builtin::create_builtin_plugins();
-        let mut seen = std::collections::BTreeSet::new();
-        for p in &plugins {
-            let name = p.name();
-            assert!(seen.insert(name), "duplicate plugin name: {name}");
-        }
-    }
-
-    #[test]
-    fn all_builtin_plugins_have_activation_signals() {
-        // Plugins activated from package metadata or filesystem sentinels rather
-        // than dependency enablers (napi binary name; deno.json presence).
-        const NON_DEPENDENCY_ACTIVATED_PLUGINS: &[&str] = &["napi-rs", "deno"];
-        let plugins = registry::builtin::create_builtin_plugins();
-        for p in &plugins {
-            assert!(
-                !p.enablers().is_empty()
-                    || !p.script_enablers().is_empty()
-                    || NON_DEPENDENCY_ACTIVATED_PLUGINS.contains(&p.name()),
-                "plugin '{}' has no activation signal",
-                p.name()
-            );
-        }
-    }
-
-    #[test]
-    fn plugins_with_config_patterns_have_always_used() {
-        let plugins = registry::builtin::create_builtin_plugins();
-        for p in &plugins {
-            if !p.config_patterns().is_empty() {
-                assert!(
-                    !p.always_used().is_empty(),
-                    "plugin '{}' has config_patterns but no always_used",
-                    p.name()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn framework_plugins_enablers() {
-        let cases: Vec<(&dyn Plugin, &[&str])> = vec![
-            (&nextjs::NextJsPlugin, &["next"]),
-            (&nuxt::NuxtPlugin, &["nuxt"]),
-            (&angular::AngularPlugin, &["@angular/core"]),
-            (&ionic::IonicPlugin, &["@ionic/angular"]),
-            (&sveltekit::SvelteKitPlugin, &["@sveltejs/kit"]),
-            (&gatsby::GatsbyPlugin, &["gatsby"]),
-        ];
-        for (plugin, expected_enablers) in cases {
-            let enablers = plugin.enablers();
-            for expected in expected_enablers {
-                assert!(
-                    enablers.contains(expected),
-                    "plugin '{}' should have '{}'",
-                    plugin.name(),
-                    expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn testing_plugins_enablers() {
-        let cases: Vec<(&dyn Plugin, &str)> = vec![
-            (&jest::JestPlugin, "jest"),
-            (&vitest::VitestPlugin, "vitest"),
-            (&playwright::PlaywrightPlugin, "@playwright/test"),
-            (&cypress::CypressPlugin, "cypress"),
-            (&mocha::MochaPlugin, "mocha"),
-            (&stryker::StrykerPlugin, "@stryker-mutator/core"),
-        ];
-        for (plugin, enabler) in cases {
-            assert!(
-                plugin.enablers().contains(&enabler),
-                "plugin '{}' should have '{}'",
-                plugin.name(),
-                enabler
-            );
-        }
-    }
-
-    #[test]
-    fn bundler_plugins_enablers() {
-        let cases: Vec<(&dyn Plugin, &str)> = vec![
-            (&vite::VitePlugin, "vite"),
-            (&webpack::WebpackPlugin, "webpack"),
-            (&rollup::RollupPlugin, "rollup"),
-        ];
-        for (plugin, enabler) in cases {
-            assert!(
-                plugin.enablers().contains(&enabler),
-                "plugin '{}' should have '{}'",
-                plugin.name(),
-                enabler
-            );
-        }
-    }
-
-    #[test]
-    fn test_plugins_have_test_entry_patterns() {
-        let test_plugins: Vec<&dyn Plugin> = vec![
-            &bun::BunPlugin,
-            &deno::DenoPlugin,
-            &jest::JestPlugin,
-            &vitest::VitestPlugin,
-            &mocha::MochaPlugin,
-            &tap::TapPlugin,
-            &tsd::TsdPlugin,
-        ];
-        for plugin in test_plugins {
-            let patterns = plugin.entry_patterns();
-            assert!(
-                !patterns.is_empty(),
-                "test plugin '{}' should have entry patterns",
-                plugin.name()
-            );
-            assert!(
-                patterns
-                    .iter()
-                    .any(|p| p.contains("test") || p.contains("spec") || p.contains("__tests__")),
-                "test plugin '{}' should have test/spec patterns",
-                plugin.name()
-            );
-        }
-    }
-
-    #[test]
-    fn framework_plugins_have_entry_patterns() {
-        let plugins: Vec<&dyn Plugin> = vec![
-            &nextjs::NextJsPlugin,
-            &nuxt::NuxtPlugin,
-            &angular::AngularPlugin,
-            &sveltekit::SvelteKitPlugin,
-        ];
-        for plugin in plugins {
-            assert!(
-                !plugin.entry_patterns().is_empty(),
-                "framework plugin '{}' should have entry patterns",
-                plugin.name()
-            );
-        }
-    }
-
-    #[test]
-    fn plugins_with_resolve_config_have_config_patterns() {
-        let plugins: Vec<&dyn Plugin> = vec![
-            &jest::JestPlugin,
-            &vitest::VitestPlugin,
-            &babel::BabelPlugin,
-            &eslint::EslintPlugin,
-            &webpack::WebpackPlugin,
-            &storybook::StorybookPlugin,
-            &typescript::TypeScriptPlugin,
-            &postcss::PostCssPlugin,
-            &nextjs::NextJsPlugin,
-            &nuxt::NuxtPlugin,
-            &angular::AngularPlugin,
-            &nx::NxPlugin,
-            &stryker::StrykerPlugin,
-            &wuchale::WuchalePlugin,
-            &rollup::RollupPlugin,
-            &sveltekit::SvelteKitPlugin,
-            &prettier::PrettierPlugin,
-            &contentlayer::ContentlayerPlugin,
-        ];
-        for plugin in plugins {
-            assert!(
-                !plugin.config_patterns().is_empty(),
-                "plugin '{}' with resolve_config should have config_patterns",
-                plugin.name()
-            );
-        }
-    }
-
-    #[test]
-    fn plugin_tooling_deps_include_enabler_package() {
-        let plugins: Vec<&dyn Plugin> = vec![
-            &jest::JestPlugin,
-            &vitest::VitestPlugin,
-            &webpack::WebpackPlugin,
-            &typescript::TypeScriptPlugin,
-            &eslint::EslintPlugin,
-            &prettier::PrettierPlugin,
-            &danger::DangerPlugin,
-            &stryker::StrykerPlugin,
-            &wuchale::WuchalePlugin,
-            &contentlayer::ContentlayerPlugin,
-        ];
-        for plugin in plugins {
-            let tooling = plugin.tooling_dependencies();
-            let enablers = plugin.enablers();
-            assert!(
-                enablers
-                    .iter()
-                    .any(|e| !e.ends_with('/') && tooling.contains(e)),
-                "plugin '{}': at least one non-prefix enabler should be in tooling_dependencies",
-                plugin.name()
-            );
-        }
-    }
-
-    #[test]
-    fn nextjs_has_used_exports_for_pages() {
-        let plugin = nextjs::NextJsPlugin;
-        let exports = plugin.used_exports();
-        assert!(!exports.is_empty());
-        assert!(exports.iter().any(|(_, names)| names.contains(&"default")));
-    }
-
-    #[test]
-    fn remix_has_used_exports_for_routes() {
-        let plugin = remix::RemixPlugin;
-        let exports = plugin.used_exports();
-        assert!(!exports.is_empty());
-        let route_entry = exports.iter().find(|(pat, _)| pat.contains("routes"));
-        assert!(route_entry.is_some());
-        let (_, names) = route_entry.unwrap();
-        assert!(names.contains(&"loader"));
-        assert!(names.contains(&"action"));
-        assert!(names.contains(&"default"));
-    }
-
-    #[test]
-    fn sveltekit_has_used_exports_for_routes() {
-        let plugin = sveltekit::SvelteKitPlugin;
-        let exports = plugin.used_exports();
-        assert!(!exports.is_empty());
-        assert!(exports.iter().any(|(_, names)| names.contains(&"GET")));
-    }
-
-    #[test]
-    fn nuxt_has_hash_virtual_prefix() {
-        assert!(nuxt::NuxtPlugin.virtual_module_prefixes().contains(&"#"));
-    }
-
-    #[test]
-    fn sveltekit_has_dollar_virtual_prefixes() {
-        let prefixes = sveltekit::SvelteKitPlugin.virtual_module_prefixes();
-        assert!(prefixes.contains(&"$app/"));
-        assert!(prefixes.contains(&"$env/"));
-        assert!(prefixes.contains(&"$lib/"));
-    }
-
-    #[test]
-    fn sveltekit_has_lib_path_alias() {
-        let aliases = sveltekit::SvelteKitPlugin.path_aliases(Path::new("/project"));
-        assert!(aliases.iter().any(|(prefix, _)| *prefix == "$lib/"));
-    }
-
-    #[test]
-    fn nuxt_has_tilde_path_alias() {
-        let aliases = nuxt::NuxtPlugin.path_aliases(Path::new("/nonexistent"));
-        assert!(aliases.iter().any(|(prefix, _)| *prefix == "~/"));
-        assert!(aliases.iter().any(|(prefix, _)| *prefix == "~~/"));
-    }
-
-    #[test]
-    fn jest_has_package_json_config_key() {
-        assert_eq!(jest::JestPlugin.package_json_config_key(), Some("jest"));
-    }
-
-    #[test]
-    fn tsd_has_package_json_config_key() {
-        assert_eq!(tsd::TsdPlugin.package_json_config_key(), Some("tsd"));
-    }
-
-    #[test]
-    fn babel_has_package_json_config_key() {
-        assert_eq!(babel::BabelPlugin.package_json_config_key(), Some("babel"));
-    }
-
-    #[test]
-    fn eslint_has_package_json_config_key() {
-        assert_eq!(
-            eslint::EslintPlugin.package_json_config_key(),
-            Some("eslintConfig")
-        );
-    }
-
-    #[test]
-    fn prettier_has_package_json_config_key() {
-        assert_eq!(
-            prettier::PrettierPlugin.package_json_config_key(),
-            Some("prettier")
-        );
-    }
-
-    #[test]
-    fn macro_generated_plugin_basic_properties() {
-        let plugin = msw::MswPlugin;
-        assert_eq!(plugin.name(), "msw");
-        assert!(plugin.enablers().contains(&"msw"));
-        assert!(!plugin.entry_patterns().is_empty());
-        assert!(plugin.config_patterns().is_empty());
-        assert!(!plugin.always_used().is_empty());
-        assert!(!plugin.tooling_dependencies().is_empty());
-    }
-
-    #[test]
-    fn macro_generated_plugin_with_used_exports() {
-        let plugin = remix::RemixPlugin;
-        assert_eq!(plugin.name(), "remix");
-        assert!(!plugin.used_exports().is_empty());
-    }
-
-    #[test]
-    fn macro_passes_through_virtual_package_suffixes() {
-        define_plugin! {
-            struct MacroSuffixSmokePlugin => "macro-suffix-smoke",
-            enablers: &["macro-suffix-smoke"],
-            virtual_package_suffixes: &["/__macro_smoke__"],
-        }
-
-        let plugin = MacroSuffixSmokePlugin;
-        assert_eq!(
-            plugin.virtual_package_suffixes(),
-            &["/__macro_smoke__"],
-            "macro-declared virtual_package_suffixes must propagate to the trait method"
-        );
-    }
-
-    #[test]
-    fn macro_generated_plugin_imports_only_resolve_config() {
-        let plugin = cypress::CypressPlugin;
-        let source = r"
-            import { defineConfig } from 'cypress';
-            import coveragePlugin from '@cypress/code-coverage';
-            export default defineConfig({});
-        ";
-        let result = plugin.resolve_config(
-            Path::new("cypress.config.ts"),
-            source,
-            Path::new("/project"),
-        );
-        assert!(
-            result
-                .referenced_dependencies
-                .contains(&"cypress".to_string())
-        );
-        assert!(
-            result
-                .referenced_dependencies
-                .contains(&"@cypress/code-coverage".to_string())
-        );
-    }
-
-    #[test]
-    fn builtin_plugin_count_is_expected() {
-        let plugins = registry::builtin::create_builtin_plugins();
-        assert!(
-            plugins.len() >= 110,
-            "expected at least 110 built-in plugins, got {}",
-            plugins.len()
-        );
-    }
-}

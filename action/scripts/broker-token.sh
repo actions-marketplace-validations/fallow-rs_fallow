@@ -4,17 +4,46 @@
 # github-actions. Fails safe: on any problem it emits branded=false and the
 # action posts with the default GITHUB_TOKEN. Never exits non-zero, so a broker
 # outage or a workflow without id-token permission never breaks the check.
+#
+# The outcome also goes to $GITHUB_ENV as FALLOW_TOKEN_BRANDED and
+# FALLOW_TOKEN_FALLBACK_REASON. The reason is empty for a branded token, so a
+# second run of the action in one job clears the cause of an earlier fallback. A composite action exposes only
+# its declared outputs, and this internal outcome is not one of them. The
+# pull-request comment smoke test reads it to know which author to expect.
 set -uo pipefail
+
+record_outcome() {
+  [ -n "${GITHUB_ENV:-}" ] || return 0
+  {
+    echo "FALLOW_TOKEN_BRANDED=$1"
+    echo "FALLOW_TOKEN_FALLBACK_REASON=${2:-}"
+  } >>"$GITHUB_ENV"
+}
 
 emit_fallback() {
   echo "fallow: posting unbranded via GITHUB_TOKEN ($1)" >&2
+  fallback_quietly "$1"
+}
+
+fallback_quietly() {
   echo "branded=false" >>"$GITHUB_OUTPUT"
+  record_outcome false "$1"
   exit 0
 }
 
-[ "${BRANDED_TOKEN:-true}" = "false" ] && emit_fallback "branded token disabled"
-[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || emit_fallback "no id-token permission (add 'permissions: id-token: write')"
-[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || emit_fallback "no id-token permission"
+# A missing id-token permission is the normal state of a workflow that never
+# asked for branded posting. Only an explicit `branded-token: true` names it,
+# and no line asks the workflow for more permissions.
+no_id_token() {
+  if [ "${BRANDED_TOKEN:-auto}" = "true" ]; then
+    emit_fallback "no id-token permission"
+  fi
+  fallback_quietly "no id-token permission"
+}
+
+[ "${BRANDED_TOKEN:-auto}" = "false" ] && emit_fallback "branded token disabled"
+[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || no_id_token
+[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] || no_id_token
 command -v jq >/dev/null 2>&1 || emit_fallback "jq unavailable"
 
 broker="${BROKER_URL:-https://api.fallow.cloud}"
@@ -39,4 +68,5 @@ echo "::add-mask::${token}"
   echo "token=${token}"
   echo "branded=true"
 } >>"$GITHUB_OUTPUT"
+record_outcome true
 echo "fallow: posting as the Fallow app (branded)" >&2

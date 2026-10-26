@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use fallow_config::{BoundaryConfig, FallowConfig, OutputFormat};
 use tempfile::TempDir;
 
+#[path = "../../benchmarks/benches/support/threads.rs"]
+mod threads;
+
 #[must_use]
 #[allow(
     dead_code,
@@ -31,6 +34,7 @@ pub fn make_config(root: PathBuf, no_cache: bool) -> fallow_config::ResolvedConf
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -39,8 +43,10 @@ pub fn make_config(root: PathBuf, no_cache: bool) -> fallow_config::ResolvedConf
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: fallow_config::RulesConfig::default(),
         boundaries: BoundaryConfig::default(),
@@ -59,10 +65,19 @@ pub fn make_config(root: PathBuf, no_cache: bool) -> fallow_config::ResolvedConf
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
-    .resolve(root, OutputFormat::Human, 4, no_cache, true, None)
+    .resolve(
+        root,
+        OutputFormat::Human,
+        threads::bench_threads(),
+        no_cache,
+        true,
+        None,
+    )
 }
 
 /// Generate a synthetic project with `file_count` source files.

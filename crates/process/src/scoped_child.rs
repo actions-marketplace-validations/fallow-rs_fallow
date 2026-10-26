@@ -33,12 +33,13 @@ use std::process::{
 use std::sync::Arc;
 
 use super::registry;
+use super::spawn_retry::spawn_retrying_busy_executable;
 
 /// RAII handle wrapping a spawned `Child` with registry tracking.
 pub struct ScopedChild {
     /// `None` after the wrapper has consumed the child (`wait_with_output`,
-    /// `wait`). Drop checks this and reaps non-blockingly if the child
-    /// is still here.
+    /// `wait`). Drop checks this and terminates a still-running child,
+    /// then reaps it with bounded cleanup retries.
     inner: Option<Child>,
     /// Registry key. `None` after deregister so Drop does not redo it.
     id: Option<u64>,
@@ -88,7 +89,7 @@ impl ProcessTreeTerminator {
 impl ScopedChild {
     /// Spawn the command and register the resulting child's PID.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
-        let child = command.spawn()?;
+        let child = spawn_retrying_busy_executable(command)?;
         let id = registry::register(child.id());
         Ok(Self {
             inner: Some(child),
@@ -102,7 +103,7 @@ impl ScopedChild {
     /// tree for process-wide signal cleanup.
     pub fn spawn_process_tree(command: &mut Command) -> io::Result<Self> {
         if crate::process_tree::inherits_managed_process_tree() {
-            let child = command.spawn()?;
+            let child = spawn_retrying_busy_executable(command)?;
             let pid = child.id();
             let id = registry::register(pid);
             return Ok(Self {
@@ -114,7 +115,7 @@ impl ScopedChild {
         }
 
         crate::process_tree::configure_std_command(command);
-        let mut child = command.spawn()?;
+        let mut child = spawn_retrying_busy_executable(command)?;
         let process_tree = match crate::process_tree::ProcessTree::for_std_child(&child) {
             Ok(process_tree) => Arc::new(process_tree),
             Err(error) => {
@@ -179,6 +180,11 @@ impl ScopedChild {
     /// and stderr. The signal handler may have already killed the
     /// child via the registered termination target; in that case wait returns
     /// normally with a non-zero status.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: only the terminal wait methods take the
+    /// child, and each consumes `self`.
     #[expect(
         clippy::expect_used,
         reason = "ScopedChild owns inner until one terminal wait method consumes it"
@@ -195,6 +201,11 @@ impl ScopedChild {
 
     /// Wait for the child to exit, returning the status. Same signal-cleanup
     /// semantics as `wait_with_output`.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice: only the terminal wait methods take the
+    /// child, and each consumes `self`.
     #[expect(
         clippy::expect_used,
         reason = "ScopedChild owns inner until one terminal wait method consumes it"
@@ -260,20 +271,15 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn assert_deregistered(id: u64) {
-        registry::deregister(id);
-    }
-
     #[test]
     #[cfg(unix)]
     fn scoped_child_drop_deregisters() {
         let mut cmd = Command::new("true");
         let child = ScopedChild::spawn(&mut cmd).expect("spawn true");
         let id = child.id.expect("freshly spawned wrapper has an id");
-        assert!(id > 0);
+        assert!(registry::is_registered(id));
         drop(child);
-        assert_deregistered(id);
+        assert!(!registry::is_registered(id));
     }
 
     #[test]
@@ -298,9 +304,24 @@ mod tests {
         let mut cmd = Command::new("true");
         let child = ScopedChild::spawn(&mut cmd).expect("spawn true");
         let id = child.id.expect("freshly spawned wrapper has an id");
+        assert!(registry::is_registered(id));
         let status = child.wait().expect("wait true");
         assert!(status.success());
-        assert_deregistered(id);
+        assert!(!registry::is_registered(id));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scoped_child_wait_with_output_deregisters_and_collects_stdout() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello").stdout(Stdio::piped());
+        let child = ScopedChild::spawn(&mut cmd).expect("spawn echo");
+        let id = child.id.expect("freshly spawned wrapper has an id");
+        assert!(registry::is_registered(id));
+        let output = child.wait_with_output().expect("wait echo");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello\n");
+        assert!(!registry::is_registered(id));
     }
 
     #[test]
@@ -466,6 +487,13 @@ mod tests {
     fn run_windows_job_object_helper(root: &std::path::Path) {
         use std::time::{Duration, Instant};
 
+        // TerminateJobObject only starts termination. On a loaded CI runner the
+        // kernel can need several seconds before the leader handle signals. The
+        // scripts ping for about 29 seconds, so a bound well below that still
+        // proves that termination, not a natural exit, ended the wait.
+        const TERMINATION_BOUND: Duration = Duration::from_secs(10);
+        const STARTUP_BOUND: Duration = Duration::from_secs(10);
+
         let mut command = Command::new("cmd.exe");
         command
             .args(["/D", "/S", "/C", "call leader.cmd"])
@@ -478,7 +506,7 @@ mod tests {
             .process_tree_terminator()
             .expect("Windows process-tree terminator");
         let ready = root.join("descendant-ready");
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let ready_deadline = Instant::now() + STARTUP_BOUND;
         while !ready.exists() && Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -493,18 +521,20 @@ mod tests {
             !status.success(),
             "terminated job leader exited successfully"
         );
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "wait remained blocked after Job Object termination"
+            waited < TERMINATION_BOUND,
+            "wait remained blocked for {waited:?} after Job Object termination"
         );
 
-        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        let exit_deadline = Instant::now() + TERMINATION_BOUND;
         while terminator.is_alive() && Instant::now() < exit_deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
             !terminator.is_alive(),
-            "job descendants survived termination"
+            "job descendants survived termination for {:?}",
+            started.elapsed()
         );
     }
 }

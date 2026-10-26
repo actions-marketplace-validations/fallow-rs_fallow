@@ -1,6 +1,6 @@
 //! Plugin registry helpers and types exposed through the engine boundary.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use fallow_config::{ExternalPluginDef, PackageJson};
 
@@ -12,168 +12,18 @@ pub use crate::core_backend::{
     is_external_plugin_active,
 };
 
-/// Built-in plugin name roster and plugin-regex validation diagnostics.
+/// Built-in plugin name roster.
 pub mod registry {
     use crate::core_backend;
 
-    const BUILTIN_PLUGIN_NAMES: &[&str] = &[
-        "nextjs",
-        "nuxt",
-        "pinia",
-        "remix",
-        "astro",
-        "browser-extension",
-        "wxt",
-        "angular",
-        "react-router",
-        "redwoodsdk",
-        "tanstack-router",
-        "react-native",
-        "expo",
-        "expo-router",
-        "firebase",
-        "nestjs",
-        "adonis",
-        "docusaurus",
-        "gatsby",
-        "sveltekit",
-        "nitro",
-        "capacitor",
-        "ionic",
-        "sanity",
-        "supabase",
-        "vitepress",
-        "rspress",
-        "next-intl",
-        "relay",
-        "electron",
-        "i18next",
-        "qwik",
-        "convex",
-        "lit",
-        "lexical",
-        "obsidian",
-        "content-collections",
-        "contentlayer",
-        "fumadocs",
-        "mintlify",
-        "velite",
-        "ember",
-        "vite",
-        "vscode",
-        "webpack",
-        "rollup",
-        "rolldown",
-        "rspack",
-        "rsbuild",
-        "tsup",
-        "tsdown",
-        "pkg-utils",
-        "parcel",
-        "vitest",
-        "jest",
-        "playwright",
-        "cypress",
-        "mocha",
-        "ava",
-        "tap",
-        "tsd",
-        "k6",
-        "storybook",
-        "stryker",
-        "karma",
-        "cucumber",
-        "webdriverio",
-        "eslint",
-        "biome",
-        "stylelint",
-        "prettier",
-        "oxlint",
-        "markdownlint",
-        "cspell",
-        "remark",
-        "typescript",
-        "babel",
-        "swc",
-        "tailwind",
-        "postcss",
-        "unocss",
-        "pandacss",
-        "prisma",
-        "drizzle",
-        "knex",
-        "typeorm",
-        "kysely",
-        "turborepo",
-        "nx",
-        "changesets",
-        "syncpack",
-        "commitlint",
-        "commitizen",
-        "commit-and-tag-version",
-        "semantic-release",
-        "danger",
-        "hardhat",
-        "vercel",
-        "wrangler",
-        "opennext-cloudflare",
-        "sentry",
-        "husky",
-        "lint-staged",
-        "lefthook",
-        "simple-git-hooks",
-        "size-limit",
-        "svgo",
-        "svgr",
-        "graphql-codegen",
-        "typedoc",
-        "openapi-ts",
-        "plop",
-        "c8",
-        "nyc",
-        "msw",
-        "napi-rs",
-        "opencode",
-        "nodemon",
-        "pm2",
-        "dependency-cruiser",
-        "wuchale",
-        "varlock",
-        "pnpm",
-        "bun",
-    ];
-
-    /// Invalid user-authored regex extracted from a plugin config file.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct PluginRegexValidationError {
-        message: String,
-    }
-
-    impl From<core_backend::BackendPluginRegexValidationError> for PluginRegexValidationError {
-        fn from(inner: core_backend::BackendPluginRegexValidationError) -> Self {
-            Self {
-                message: inner.message(),
-            }
-        }
-    }
-
     /// Names of every built-in framework plugin in registry order.
+    ///
+    /// Delegates to the core registry rather than mirroring it. A hand-kept
+    /// copy drifted here once already, silently omitting `deno`, and nothing
+    /// pinned the two together.
     #[must_use]
     pub fn builtin_plugin_names() -> Vec<&'static str> {
-        BUILTIN_PLUGIN_NAMES.to_vec()
-    }
-
-    /// Format plugin regex validation errors for user-facing diagnostics.
-    #[must_use]
-    pub fn format_plugin_regex_errors(errors: &[PluginRegexValidationError]) -> String {
-        let joined = errors
-            .iter()
-            .map(|error| error.message.as_str())
-            .collect::<Vec<_>>();
-        format!(
-            "invalid plugin regex configuration:\n  - {}\n\nRewrite the plugin config with Rust-compatible regex syntax, or remove unsupported constructs such as JavaScript lookahead and lookbehind.",
-            joined.join("\n  - ")
-        )
+        core_backend::builtin_plugin_names()
     }
 }
 
@@ -190,9 +40,11 @@ impl AggregatedPluginResult {
         self.inner.active_plugins()
     }
 
-    /// Merge active plugin names from another result, preserving insertion order.
-    pub(crate) fn merge_active_plugins_from(&mut self, other: &Self) {
-        self.inner.merge_active_plugins_from(&other.inner);
+    /// The plugin stage's advisories (`plugin-config-unreadable`,
+    /// `plugin-effect-not-modeled`), with paths rendered against `root`.
+    #[must_use]
+    pub fn plugin_diagnostics(&self, root: &Path) -> Vec<fallow_config::WorkspaceDiagnostic> {
+        self.inner.plugin_diagnostics(root)
     }
 
     pub(crate) fn backend(&self) -> &core_backend::BackendAggregatedPluginResult {
@@ -225,19 +77,6 @@ impl PluginRegistry {
     pub(crate) fn discovery_hidden_dirs(&self, pkg: &PackageJson, root: &Path) -> Vec<String> {
         self.inner.discovery_hidden_dirs(pkg, root)
     }
-
-    /// Run all plugins against a project.
-    pub(crate) fn try_run(
-        &self,
-        pkg: &PackageJson,
-        root: &Path,
-        discovered_files: &[PathBuf],
-    ) -> Result<AggregatedPluginResult, Vec<registry::PluginRegexValidationError>> {
-        self.inner
-            .try_run(pkg, root, discovered_files)
-            .map(Into::into)
-            .map_err(|errors| errors.into_iter().map(Into::into).collect())
-    }
 }
 
 impl Default for PluginRegistry {
@@ -247,35 +86,25 @@ impl Default for PluginRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::{AggregatedPluginResult, PluginRegistry};
-
+mod roster_tests {
+    /// The engine mirrored core's roster by hand and the copy drifted, omitting
+    /// `deno`. Delegation removes the copy, so there is nothing left to diverge;
+    /// this pins the name the drift lost and that the roster is really populated.
+    ///
+    /// The roster is read through `core_backend`, not from `fallow_core`
+    /// directly, because the boundary guard requires every crossing to go
+    /// through that adapter.
     #[test]
-    fn plugin_registry_try_run_returns_engine_result() {
-        let registry = PluginRegistry::default();
-        let result = registry
-            .try_run(
-                &fallow_config::PackageJson::default(),
-                &PathBuf::from("/repo"),
-                &[],
-            )
-            .expect("empty package should not produce regex errors");
-
-        assert!(result.active_plugins().is_empty());
-    }
-
-    #[test]
-    fn aggregated_plugin_result_merges_active_plugins() {
-        let mut base = AggregatedPluginResult::default();
-        base.inner.push_active_plugin_for_test("nextjs");
-        let mut incoming = AggregatedPluginResult::default();
-        incoming.inner.push_active_plugin_for_test("nextjs");
-        incoming.inner.push_active_plugin_for_test("vitest");
-
-        base.merge_active_plugins_from(&incoming);
-
-        assert_eq!(base.active_plugins(), ["nextjs", "vitest"]);
+    fn roster_carries_every_registered_plugin() {
+        let names = super::registry::builtin_plugin_names();
+        assert!(
+            names.contains(&"deno"),
+            "deno is registered in core and must reach the roster"
+        );
+        assert!(
+            names.len() > 100,
+            "roster looks truncated: {} names",
+            names.len()
+        );
     }
 }

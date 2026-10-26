@@ -2,8 +2,9 @@
 /**
  * Publish the public Fallow skill contract into the companion skills repo.
  *
- * Canonical source: `npm/fallow/skills/fallow/` in this repository.
- * Public consumer: `<fallow-skills>/fallow/skills/fallow/`.
+ * Canonical source: each released skill `npm/fallow/skills/<name>/` in this
+ * repository.
+ * Public consumer: `<fallow-skills>/fallow/skills/<name>/`.
  *
  * The public plugin strips unsupported `metadata` frontmatter from SKILL.md
  * and may add host interface files outside the source contract. References and
@@ -12,10 +13,12 @@
  * Usage:
  *   node scripts/vendor-skills.mjs
  *   node scripts/vendor-skills.mjs --check
+ *   node scripts/vendor-skills.mjs --help
  *
  * `FALLOW_SKILLS_DIR` may point to the companion repository. Otherwise the
- * script uses `../fallow-skills`. A missing consumer is always an error so
- * cross-repository checks cannot pass by silently skipping.
+ * script uses `fallow-skills` next to the main working tree of this
+ * repository, also from a linked worktree. A missing consumer is always an
+ * error so cross-repository checks cannot pass by silently skipping.
  */
 
 import { execFileSync } from "node:child_process";
@@ -28,12 +31,29 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { RELEASED_SKILLS_ROOT, releasedSkillNames } from "./released-skills.mjs";
+
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const CANONICAL_TREE = join(REPO_ROOT, "npm", "fallow", "skills", "fallow");
-const TARGET_SUBPATH = join("fallow", "skills", "fallow");
+const TARGET_SKILLS_ROOT = join("fallow", "skills");
+/** The skill whose published tree proves that the companion checkout exists. */
+const ANCHOR_SKILL = "fallow";
+
+/**
+ * Pair each released skill with its published tree in the companion checkout.
+ *
+ * @param {string} repoRoot
+ * @param {string} companionRoot
+ * @returns {{ name: string, canonical: string, published: string }[]}
+ */
+export const releasedSkillPairs = (repoRoot, companionRoot) =>
+  releasedSkillNames(repoRoot).map((name) => ({
+    name,
+    canonical: join(repoRoot, ...RELEASED_SKILLS_ROOT, name),
+    published: join(companionRoot, TARGET_SKILLS_ROOT, name),
+  }));
 
 export const listFiles = (dir, base = dir) => {
   const files = [];
@@ -161,10 +181,48 @@ export const runVendor = (canonical, published) => {
   return 0;
 };
 
+// These variables point git at one checkout. The lookup passes its own
+// directory, so an inherited value from a hook must not win.
+export const GIT_LOCATION_VARIABLES = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+];
+
+const mainWorkingTree = (repoRoot, env) => {
+  const gitEnv = { ...process.env, ...env };
+  for (const name of GIT_LOCATION_VARIABLES) {
+    delete gitEnv[name];
+  }
+  try {
+    const commonDir = execFileSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd: repoRoot, env: gitEnv, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    // A linked worktree shares the `.git` directory of the main working tree.
+    return basename(commonDir) === ".git" ? dirname(commonDir) : repoRoot;
+  } catch {
+    return repoRoot;
+  }
+};
+
+/**
+ * Return the companion `fallow-skills` checkout. `FALLOW_SKILLS_DIR` wins.
+ * Otherwise the companion sits next to the main working tree, so a linked
+ * worktree finds the same checkout as the main one.
+ *
+ * @param {{ env?: Record<string, string | undefined>, repoRoot?: string }} [options]
+ * @returns {string}
+ */
+export const companionSkillsRoot = ({ env = process.env, repoRoot = REPO_ROOT } = {}) =>
+  env.FALLOW_SKILLS_DIR || join(dirname(mainWorkingTree(repoRoot, env)), "fallow-skills");
+
 const resolvePublished = () => {
-  const root = process.env.FALLOW_SKILLS_DIR || join(REPO_ROOT, "..", "fallow-skills");
-  const tree = join(root, TARGET_SUBPATH);
-  return { tree, present: existsSync(join(tree, "SKILL.md")) };
+  const root = companionSkillsRoot();
+  const tree = join(root, TARGET_SKILLS_ROOT, ANCHOR_SKILL);
+  return { root, tree, present: existsSync(join(tree, "SKILL.md")) };
 };
 
 export const decide = ({ present, check }) => {
@@ -174,14 +232,35 @@ export const decide = ({ present, check }) => {
   return { action: check ? "check" : "vendor" };
 };
 
+const USAGE = `Usage:
+  node scripts/vendor-skills.mjs          copy the skill contract into fallow-skills
+  node scripts/vendor-skills.mjs --check  compare the two trees and write nothing`;
+
+const KNOWN_ARGUMENTS = new Set(["--check", "--help", "-h"]);
+
 export const main = (argv = process.argv.slice(2)) => {
+  // An unknown argument must not fall through to a write into the companion repo.
+  const unknown = argv.find((arg) => !KNOWN_ARGUMENTS.has(arg));
+  if (unknown !== undefined) {
+    throw new Error(`unknown argument: ${unknown}\n${USAGE}`);
+  }
+  if (argv.includes("--help") || argv.includes("-h")) {
+    console.log(USAGE);
+    return 0;
+  }
   const check = argv.includes("--check");
-  const { tree, present } = resolvePublished();
+  const { root, tree, present } = resolvePublished();
   const { action } = decide({ present, check });
   if (action === "error") {
     throw new Error(`published fallow-skills contract not found at ${tree}`);
   }
-  return action === "check" ? runCheck(CANONICAL_TREE, tree) : runVendor(CANONICAL_TREE, tree);
+  const run = action === "check" ? runCheck : runVendor;
+  // Run every skill, so one call reports all drift instead of the first one.
+  const codes = releasedSkillPairs(REPO_ROOT, root).map(({ name, canonical, published }) => {
+    console.log(`vendor-skills: ${name}`);
+    return run(canonical, published);
+  });
+  return Math.max(0, ...codes);
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

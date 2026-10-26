@@ -4,6 +4,7 @@
   "semantic_schema_version": 3,
   "analysis_operation": "semantic-queries",
   "status_operation": "status",
+  "mutant_typecheck_operation": "mutant-typecheck",
   "query_operations": [
     "symbol-use",
     "symbol-trace",
@@ -17,8 +18,16 @@
   ],
   "backend": {
     "family": "typescript-go",
-    "version": "7.0.2"
+    "version": "7.0.2",
+    "package": "typescript"
   },
+  "experimental_backends": [
+    {
+      "family": "tsrs",
+      "package": "tsrs",
+      "version": "0.18.0-ts7.1.0-dev.20260929"
+    }
+  ],
   "sidecar": {
     "package": "fallow-type-aware",
     "version_source": "workspace-package"

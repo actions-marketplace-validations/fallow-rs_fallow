@@ -15,8 +15,8 @@
 use std::sync::LazyLock;
 
 use fallow_api::{
-    RootEnvelopeMode, RuleDef, all_rules, bare_rule_id, explain_issue_type, rule_command,
-    rule_docs_url, rule_severity_key, serialize_explain_programmatic_json,
+    RuleDef, all_rules, bare_rule_id, explain_issue_type, rule_command, rule_docs_url,
+    rule_severity_key, serialize_explain_programmatic_json,
 };
 use fallow_types::issue_meta::{issue_is_fixable, issue_meta_by_code};
 use fallow_types::mcp_manifest::{
@@ -30,9 +30,13 @@ use rmcp::model::{
 };
 use serde_json::{Map, Value};
 
+use crate::nearest::nearest_names;
+use crate::tool_guides::{TOOL_GUIDE_NOTE, TOOL_GUIDES, ToolGuide, tool_guide};
+
 const FALLOW_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXPLAIN_URI_PREFIX: &str = "fallow://explain/";
 const EXPLAIN_INDEX_URI: &str = "fallow://explain";
+const TOOL_GUIDE_URI_PREFIX: &str = "fallow://tools/";
 const MAX_NEAREST_MATCHES: usize = 5;
 
 /// Priority hints for `annotations.priority`: the tool manifest and the task
@@ -70,6 +74,9 @@ fn render_static_payload(uri: &str) -> Value {
         "fallow://schema/config" => fallow_api::schemas::config_schema(),
         "fallow://schema/plugin" => fallow_api::schemas::plugin_schema(),
         "fallow://schema/rule-pack" => fallow_api::schemas::rule_pack_schema(),
+        "fallow://schema/similar-code-snapshot" => {
+            fallow_api::schemas::similar_code_snapshot_schema()
+        }
         other => unreachable!(
             "MCP_RESOURCES lists {other} but crates/mcp/src/resources.rs has no renderer for it"
         ),
@@ -234,11 +241,90 @@ pub fn read_resource(uri: &str) -> Result<ReadResourceResult, McpError> {
         let issue_type = percent_decode(raw_issue_type);
         return read_explain(uri, &issue_type);
     }
+    if let Some(raw_tool) = uri.strip_prefix(TOOL_GUIDE_URI_PREFIX)
+        && !raw_tool.is_empty()
+    {
+        let tool = percent_decode(raw_tool);
+        return read_tool_guide(uri, &tool);
+    }
     Err(unknown_uri_error(uri))
 }
 
+fn read_tool_guide(uri: &str, tool: &str) -> Result<ReadResourceResult, McpError> {
+    let Some(guide) = tool_guide(tool) else {
+        return Err(missing_tool_guide_error(uri, tool));
+    };
+    Ok(json_result(
+        uri,
+        tool_guide_payload(guide).to_string(),
+        "application/json",
+    ))
+}
+
+/// Refusal for a `fallow://tools/{name}` URI that resolves to no guide.
+///
+/// The two reasons are different problems with different fixes, so they get
+/// different codes: `unknown_tool` means the name is not a fallow MCP tool at
+/// all (a typo, or a tool an agent invented), and the caller should correct the
+/// name; `no_tool_guide` means the tool is real and its `tools/list`
+/// description is the whole contract, so the caller should stop looking. A
+/// single shared body made a typo and a documented-nowhere tool byte-identical.
+fn missing_tool_guide_error(uri: &str, tool: &str) -> McpError {
+    let registered = MCP_TOOLS.iter().any(|info| info.name == tool);
+    let (code, message) = if registered {
+        (
+            "no_tool_guide",
+            format!(
+                "tool '{tool}' has no long-form guide; its tools/list description is the whole contract"
+            ),
+        )
+    } else {
+        (
+            "unknown_tool",
+            format!("'{tool}' is not a fallow MCP tool, so it has no guide"),
+        )
+    };
+    McpError::resource_not_found(
+        message,
+        Some(serde_json::json!({
+            "uri": uri,
+            "tool": tool,
+            "code": code,
+            "registered_tool": registered,
+            "nearest_matches": nearest_tool_guide_uris(tool),
+            "documented_tools": TOOL_GUIDES.iter().map(|guide| guide.tool).collect::<Vec<_>>(),
+            "index": "fallow://tools",
+        })),
+    )
+}
+
+fn tool_guide_payload(guide: &ToolGuide) -> Value {
+    serde_json::json!({
+        "tool": guide.tool,
+        "note": TOOL_GUIDE_NOTE,
+        "sections": guide.sections.iter().map(|section| serde_json::json!({
+            "topic": section.topic,
+            "summary": section.summary,
+            "detail": section.detail,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Tool-guide URIs closest to an unknown tool name, so a near miss (a typo, or
+/// a sibling tool) answers with the guide the caller meant.
+fn nearest_tool_guide_uris(token: &str) -> Vec<String> {
+    nearest_names(
+        token,
+        TOOL_GUIDES.iter().map(|guide| guide.tool),
+        MAX_NEAREST_MATCHES,
+    )
+    .into_iter()
+    .map(|tool| format!("{TOOL_GUIDE_URI_PREFIX}{tool}"))
+    .collect()
+}
+
 fn read_explain(uri: &str, issue_type: &str) -> Result<ReadResourceResult, McpError> {
-    match serialize_explain_programmatic_json(issue_type, RootEnvelopeMode::Tagged, None) {
+    match serialize_explain_programmatic_json(issue_type, None) {
         Ok(value) => Ok(json_result(uri, value.to_string(), "application/json")),
         Err(error) => Err(McpError::resource_not_found(
             error.message,
@@ -272,8 +358,12 @@ fn unknown_uri_error(uri: &str) -> McpError {
         .filter(|info| info.template)
         .map(|info| info.uri)
         .collect();
+    let suggestion = fallow_api::closest_match(uri, known.iter().copied())
+        .map_or_else(String::new, |nearest| {
+            format!("; did you mean '{nearest}'?")
+        });
     McpError::resource_not_found(
-        format!("unknown fallow resource '{uri}'"),
+        format!("unknown fallow resource '{uri}'{suggestion}"),
         Some(serde_json::json!({
             "uri": uri,
             "known_uris": known,
@@ -308,41 +398,25 @@ fn hex_pair(high: u8, low: u8) -> Option<u8> {
     u8::try_from(digit(high)? * 16 + digit(low)?).ok()
 }
 
-/// Explain URIs for the issue types closest to an unknown token: shared
-/// kebab-case words first, then substring overlap, then common prefix.
+/// Explain URIs for the issue types closest to an unknown token.
+///
+/// Rule ids are kebab-case word lists, so the shared word-aligned scorer in
+/// [`crate::nearest`] ranks them, exactly as it ranks the snake_case tool
+/// names above. All this adds is the namespace a caller may have typed
+/// (`fallow/unused-exports`, `security/sql-injection`) and a leading `--`
+/// copied off a CLI flag: `/` is not a word separator the scorer splits on,
+/// so a namespaced token would otherwise align its first word against
+/// `fallow/unused` and match nothing.
 fn nearest_explain_uris(token: &str) -> Vec<String> {
-    let normalized = token.trim().to_ascii_lowercase().replace('_', "-");
-    let normalized = normalized
+    let normalized = token.trim().to_ascii_lowercase();
+    let bare_token = normalized
         .strip_prefix("fallow/")
         .or_else(|| normalized.strip_prefix("security/"))
         .unwrap_or(&normalized)
         .trim_start_matches("--");
-    let words: Vec<&str> = normalized.split('-').filter(|w| !w.is_empty()).collect();
-    let mut scored: Vec<(usize, &'static RuleDef)> = all_rules()
-        .filter_map(|rule| {
-            let bare = bare_rule_id(rule);
-            let shared_words = bare.split('-').filter(|word| words.contains(word)).count();
-            let substring = usize::from(
-                !normalized.is_empty() && (bare.contains(normalized) || normalized.contains(bare)),
-            );
-            let prefix = bare
-                .bytes()
-                .zip(normalized.bytes())
-                .take_while(|(left, right)| left == right)
-                .count();
-            let score = shared_words * 8 + substring * 4 + prefix;
-            (score > 0).then_some((score, rule))
-        })
-        .collect();
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| bare_rule_id(left.1).cmp(bare_rule_id(right.1)))
-    });
-    scored
+    let candidates: Vec<&'static str> = all_rules().map(bare_rule_id).collect();
+    nearest_names(bare_token, candidates, MAX_NEAREST_MATCHES)
         .into_iter()
-        .take(MAX_NEAREST_MATCHES)
-        .map(|(_, rule)| explain_uri(rule))
+        .map(|bare| format!("{EXPLAIN_URI_PREFIX}{bare}"))
         .collect()
 }

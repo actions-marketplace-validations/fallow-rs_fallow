@@ -15,17 +15,31 @@ pub use fallow_output::{RoutingFacts, RoutingUnit};
 use rustc_hash::FxHashSet;
 
 use fallow_config::ResolvedConfig;
-use fallow_engine::churn::{ChurnResult, SinceDuration, analyze_churn};
-use fallow_engine::codeowners::CodeOwners;
+use fallow_engine::churn::{ChurnResult, ChurnWindowUnit, SinceDuration, analyze_churn_cached};
 use fallow_engine::health::ownership::{OwnershipContext, compile_bot_globs, compute_ownership};
 
-/// Default churn window for routing: one year of history is enough to identify
-/// the per-file experts without an unbounded `git log`.
-const ROUTING_CHURN_WINDOW: &str = "1 year ago";
+/// Churn window of the audit brief, in months: enough history to name the
+/// per-file experts and to find hidden change coupling. It matches the
+/// default change coupling window of `fallow health`, so both commands share
+/// one churn cache entry.
+const AUDIT_CHURN_WINDOW_MONTHS: u64 = 12;
+
+/// Read the audit brief churn through the shared churn cache. `None` when git
+/// history is unavailable (not a repository, or a branch without commits).
+#[must_use]
+pub fn audit_churn(root: &Path, config: &ResolvedConfig) -> Option<ChurnResult> {
+    let since = SinceDuration::relative(
+        AUDIT_CHURN_WINDOW_MONTHS,
+        ChurnWindowUnit::Months,
+        format!("{AUDIT_CHURN_WINDOW_MONTHS} months"),
+    );
+    analyze_churn_cached(root, &since, &config.cache_dir, config.no_cache).map(|(churn, _)| churn)
+}
 
 /// Compute the routing section for the changed files. Best-effort: returns an
 /// empty `RoutingFacts` when churn is unavailable (non-git repo, shallow clone
-/// with no history). CODEOWNERS is consulted when present.
+/// with no history). CODEOWNERS is consulted when present: the configured
+/// `codeowners` path when set, else the standard locations.
 #[must_use]
 #[allow(
     clippy::implicit_hasher,
@@ -36,23 +50,36 @@ pub fn compute_routing(
     config: &ResolvedConfig,
     changed_files: &FxHashSet<PathBuf>,
 ) -> RoutingFacts {
-    let since = SinceDuration {
-        git_after: ROUTING_CHURN_WINDOW.to_string(),
-        display: "1 year".to_string(),
-    };
-    let Some(churn_result) = analyze_churn(root, &since) else {
-        return RoutingFacts::default();
-    };
+    audit_churn(root, config).map_or_else(RoutingFacts::default, |churn| {
+        compute_routing_from_churn(root, config, changed_files, &churn)
+    })
+}
 
+/// [`compute_routing`] over a churn pass that the caller already read with
+/// [`audit_churn`], so the audit brief reads the history once.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "callers always pass the audit changed-file FxHashSet; generalizing the hasher adds noise"
+)]
+pub fn compute_routing_from_churn(
+    root: &Path,
+    config: &ResolvedConfig,
+    changed_files: &FxHashSet<PathBuf>,
+    churn_result: &ChurnResult,
+) -> RoutingFacts {
     let ownership_cfg = &config.health.ownership;
     let Ok(bot_globs) = compile_bot_globs(&ownership_cfg.bot_patterns) else {
         return RoutingFacts::default();
     };
-    let codeowners = CodeOwners::load(root, None).ok();
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // The same file the ownership section reads, so both use one owner
+    // vocabulary.
+    let codeowners = crate::ownership::load_codeowners(root, config)
+        .ok()
+        .flatten();
+    // Reuse the churn run's clock so routing and the health ownership block
+    // agree on "now" and neither flips a staleness threshold between runs.
+    let now_secs = churn_result.clock.epoch_secs();
     let ctx = OwnershipContext {
         author_pool: &churn_result.author_pool,
         bot_globs: &bot_globs,
@@ -68,7 +95,7 @@ pub fn compute_routing(
 
     let mut units: Vec<RoutingUnit> = changed_files
         .iter()
-        .filter_map(|abs| route_one(abs, root, &churn_result, &ctx, &self_ids))
+        .filter_map(|abs| route_one(abs, root, churn_result, &ctx, &self_ids))
         .collect();
     units.sort_by(|a, b| a.file.cmp(&b.file));
     RoutingFacts { units }

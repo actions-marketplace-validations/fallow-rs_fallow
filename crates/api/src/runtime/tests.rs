@@ -15,8 +15,6 @@ use crate::runtime_output::HEALTH_SCHEMA_VERSION;
 use crate::{
     AnalysisOptions, CombinedOptions, DeadCodeFilters, DeadCodeOptions, DuplicationOptions,
     FeatureFlagsOptions,
-    analysis_context::resolve_workspace_filters,
-    duplication_filters::{filter_by_diff, filter_by_workspaces},
 };
 
 struct FakeHealthRunner {
@@ -51,6 +49,7 @@ impl ProgrammaticHealthRunner for FakeHealthRunner {
                 audit_changed: false,
             },
             telemetry_analysis_run_id: self.telemetry_analysis_run_id.clone(),
+            request_outcomes: None,
         })
     }
 }
@@ -108,6 +107,50 @@ fn metadata_and_dupes_do_not_inherit_analysis_stage_diagnostics() {
         &dupes,
         "bun-lockb-override-resolution-skipped"
     ));
+}
+
+/// `project_info` runs the analysis plugin stage, so an entry-point listing
+/// carries the plugin diagnostics the analysis records, root-relative, and
+/// names the entry points the analysis uses (issue #2804).
+#[test]
+fn project_info_runs_the_analysis_plugin_stage() {
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("../../tests/fixtures");
+    let listing = |fixture: &str| {
+        crate::serialize_project_info_programmatic_json(
+            crate::run_project_info(&crate::ProjectInfoOptions {
+                analysis: AnalysisOptions {
+                    no_cache: true,
+                    ..analysis_at(&fixtures.join(fixture))
+                },
+                entry_points: true,
+                ..crate::ProjectInfoOptions::default()
+            })
+            .expect("project info"),
+        )
+        .expect("project info json")
+    };
+
+    let unreadable = listing("list-nuxt-auto-imports-unreadable");
+    let plugin_paths: Vec<&str> = unreadable["workspace_diagnostics"]
+        .as_array()
+        .expect("the plugin stage recorded diagnostics")
+        .iter()
+        .filter(|diagnostic| diagnostic["kind"] == "plugin-effect-not-modeled")
+        .filter_map(|diagnostic| diagnostic["path"].as_str())
+        .collect();
+    assert_eq!(plugin_paths, vec!["nuxt.config.ts", "nuxt.config.ts"]);
+
+    let gated = listing("list-nuxt-auto-imports-gate");
+    let entries: Vec<&str> = gated["entry_points"]
+        .as_array()
+        .expect("entry points")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert_eq!(entries, vec!["app/app.vue", "nuxt.config.ts"]);
 }
 
 fn has_diagnostic_kind(output: &serde_json::Value, kind: &str) -> bool {
@@ -437,28 +480,6 @@ fn run_health_with_session_reuses_existing_discovery() {
 }
 
 #[test]
-fn audit_reuses_dead_code_artifacts_when_only_health_scope_matches() {
-    let source = include_str!("audit.rs");
-    assert!(
-        source.contains("fn run_dead_code_and_health_with_session("),
-        "programmatic audit must keep dead-code plus health artifact reuse in one helper"
-    );
-    assert!(
-        source.contains("production_modes.dead_code == production_modes.health"),
-        "programmatic audit must reuse dead-code artifacts when effective health scope matches dead-code scope"
-    );
-    assert!(
-        !source.contains("if options.production_dead_code == options.production_health"),
-        "programmatic audit must not compare raw production overrides before config resolution"
-    );
-    assert!(
-        source.contains("duplication: run_duplication(duplication_options)?")
-            || source.contains("duplication: run_duplication(&duplication_options)?"),
-        "the mixed-scope audit branch must only isolate duplication instead of isolating health too"
-    );
-}
-
-#[test]
 fn effective_production_modes_resolve_per_analysis_config() {
     let project = tempfile::tempdir().expect("temp dir");
     std::fs::write(
@@ -482,17 +503,113 @@ fn effective_production_modes_resolve_per_analysis_config() {
     assert!(!modes.dupes);
 }
 
+/// Standalone duplication must read the `dupes` entry of a per-analysis
+/// `production` config, not the `deadCode` entry.
 #[test]
-fn combined_reuse_uses_effective_production_modes() {
-    let source = include_str!("combined.rs");
-    assert!(
-        source.contains("resolve_effective_production_modes(&resolved, None, None, None)"),
-        "programmatic combined must resolve config-derived production modes before sharing sessions"
-    );
-    assert!(
-        source.contains("production_modes.dead_code == production_modes.health"),
-        "programmatic combined must compare effective production modes before sharing health artifacts"
-    );
+fn run_duplication_follows_the_config_dupes_production_mode() {
+    let sentinel = "export function copied(value: number) {\n  let result = value;\n  if (value > 0) result += 1;\n  if (value > 1) result += 2;\n  return result;\n}\n";
+    for (dead_code, dupes) in [(true, false), (false, true)] {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"dupes-modes","type":"module","main":"src/index.ts"}"#,
+        )
+        .expect("write package");
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            format!(
+                r#"{{"duplicates":{{"minTokens":10,"minLines":2,"ignoreDefaults":false}},"production":{{"deadCode":{dead_code},"health":false,"dupes":{dupes}}}}}"#
+            ),
+        )
+        .expect("write config");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+            .expect("write entry");
+        std::fs::write(root.join("src/copy-a.test.ts"), sentinel).expect("write copy a");
+        std::fs::write(root.join("src/copy-b.test.ts"), sentinel).expect("write copy b");
+
+        let output = run_duplication(&DuplicationOptions {
+            analysis: AnalysisOptions {
+                root: Some(root.to_path_buf()),
+                no_cache: true,
+                ..AnalysisOptions::default()
+            },
+            ..DuplicationOptions::default()
+        })
+        .expect("duplication output");
+
+        assert_eq!(
+            output.report().clone_groups.is_empty(),
+            dupes,
+            "deadCode={dead_code} dupes={dupes}: test-file clones must follow the dupes mode"
+        );
+    }
+}
+
+/// Combined analysis reads the per-section production modes from the config
+/// file. A section may share the dead-code session only when its resolved
+/// mode matches, so each section keeps the file scope of its own mode.
+#[test]
+fn combined_sections_follow_config_production_modes() {
+    let sentinel = r"export function modeSentinel(value: number) {
+  let result = value;
+  if (value > 0) result += 1;
+  if (value > 1) result += 2;
+  if (value > 2) result += 3;
+  if (value > 3) result += 4;
+  return result;
+}
+";
+    for mask in 0_u8..8 {
+        let (dead_code, health, dupes) = (mask & 0b001 != 0, mask & 0b010 != 0, mask & 0b100 != 0);
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"combined-modes","type":"module","main":"src/index.ts"}"#,
+        )
+        .expect("write package");
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            format!(
+                r#"{{"duplicates":{{"minTokens":10,"minLines":2,"ignoreDefaults":false}},"health":{{"maxCyclomatic":2,"maxCognitive":2}},"production":{{"deadCode":{dead_code},"health":{health},"dupes":{dupes}}}}}"#
+            ),
+        )
+        .expect("write config");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(root.join("src/index.ts"), "export const entry = true;\n")
+            .expect("write entry");
+        std::fs::write(root.join("src/mode-sentinel.test.ts"), sentinel).expect("write sentinel");
+        std::fs::write(root.join("src/mode-sentinel-copy.test.ts"), sentinel)
+            .expect("write sentinel copy");
+
+        let output = run_combined(&CombinedOptions {
+            analysis: AnalysisOptions {
+                root: Some(root.to_path_buf()),
+                no_cache: true,
+                ..AnalysisOptions::default()
+            },
+            include_entry_exports: true,
+            health_options: ComplexityOptions {
+                complexity: true,
+                ..ComplexityOptions::default()
+            },
+            ..CombinedOptions::default()
+        })
+        .unwrap_or_else(|error| panic!("combined mask {mask:03b} failed: {error}"));
+        let json = serialize_combined_programmatic_json(output)
+            .unwrap_or_else(|error| panic!("serialize mask {mask:03b}: {error}"));
+
+        for (section, production) in [("check", dead_code), ("health", health), ("dupes", dupes)] {
+            let text = json[section].to_string();
+            assert_eq!(
+                text.contains("mode-sentinel.test.ts"),
+                !production,
+                "{section} scope mismatch for mask {mask:03b}: {text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -539,8 +656,12 @@ fn run_health_with_session_reuses_styling_reference_surface() {
         vec!["really-dead-class"]
     );
 
+    // `slides.md` is read for class references but is not a parsed source,
+    // so its removal leaves the parsed modules as they are. A rebuilt
+    // surface would report `cover-sub` as unreferenced. A changed stylesheet
+    // is a parsed source, and the session parses it again, which also
+    // rebuilds the styling surface, so this probe changes no stylesheet.
     std::fs::remove_file(slides).expect("remove slides after artifact cache");
-    std::fs::write(&stylesheet, ".cover-sub{}\n").expect("change style after artifact cache");
 
     let second = resolved
         .install(|| run_health_with_session(&options, &resolved, &session, None))
@@ -616,6 +737,8 @@ fn run_health_with_session_artifacts_accepts_retained_dead_code_analysis() {
 fn serialize_health_report_json_tags_meta_and_strips_paths() {
     let root = Path::new("/repo");
     let json = serialize_health_report_json(HealthJsonReportInput {
+        gate_outcomes: None,
+        request_outcomes: None,
         report: HealthReport::default(),
         root,
         elapsed: std::time::Duration::ZERO,
@@ -623,6 +746,7 @@ fn serialize_health_report_json_tags_meta_and_strips_paths() {
         type_aware: None,
         grouped_by: None,
         groups: None,
+        group_filter: None,
         workspace_diagnostics: vec![WorkspaceDiagnostic::new(
             Path::new("/repo"),
             PathBuf::from("/repo/package.json"),
@@ -633,7 +757,6 @@ fn serialize_health_report_json_tags_meta_and_strips_paths() {
             command: "fallow health --format json".to_string(),
             reason: "inspect health details".to_string(),
         }],
-        envelope_mode: RootEnvelopeMode::Tagged,
         telemetry_analysis_run_id: Some("run-api-health"),
     })
     .expect("health JSON serializes");
@@ -845,7 +968,6 @@ fn run_duplication_returns_typed_output_before_json() {
     assert!(run.groups().is_none());
     assert_eq!(run.report().stats.clone_groups, 0);
     assert_eq!(run.root, canonical_root(root));
-    assert_eq!(run.envelope_mode, RootEnvelopeMode::Tagged);
 
     let json =
         serialize_duplication_programmatic_json(run).expect("typed duplication output serializes");
@@ -873,6 +995,7 @@ fn run_feature_flags_returns_typed_output_before_json() {
             ..analysis_at(root)
         },
         top: None,
+        retirement: None,
     })
     .expect("feature flags succeeds");
 
@@ -882,7 +1005,6 @@ fn run_feature_flags_returns_typed_output_before_json() {
     );
     assert_eq!(run.output.total_flags, 1);
     assert_eq!(run.output.feature_flags[0].flag_name, "FEATURE_ALPHA");
-    assert_eq!(run.envelope_mode, RootEnvelopeMode::Tagged);
 
     let json = serialize_feature_flags_programmatic_json(run)
         .expect("typed feature-flags output serializes");
@@ -908,6 +1030,7 @@ fn serialized_feature_flags_returns_json_adapter_output() {
     let json = feature_flags_json(&FeatureFlagsOptions {
         analysis: analysis_at(root),
         top: Some(1),
+        retirement: None,
     })
     .expect("feature flags succeeds");
 
@@ -954,11 +1077,58 @@ fn run_dead_code_returns_typed_output_before_json() {
     assert_eq!(run.output.schema_version.0, CHECK_SCHEMA_VERSION);
     assert_eq!(run.results().unused_exports.len(), 2);
     assert_eq!(run.root(), canonical_root(root));
-    assert_eq!(run.envelope_mode, RootEnvelopeMode::Tagged);
 
     let json =
         serialize_dead_code_programmatic_json(run).expect("typed dead-code output serializes");
     assert_eq!(unused_export_names(&json), vec!["deadA", "deadB"]);
+}
+
+/// `src/dead.ts` is an unused file. `src/dead-user.ts`, also unused, imports
+/// `deadUsed`, so the export analysis reports `deadUnused` and `deadUsed`.
+fn cascade_project() -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("temp dir");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("src dir");
+    write_json(
+        root.join("package.json"),
+        r#"{"name":"api-cascade","main":"src/index.ts"}"#,
+    );
+    std::fs::write(root.join("src/index.ts"), "console.log(1);\n").expect("entry");
+    std::fs::write(
+        root.join("src/dead.ts"),
+        "export const deadUsed = 1;\nexport const deadUnused = 2;\n",
+    )
+    .expect("dead");
+    std::fs::write(
+        root.join("src/dead-user.ts"),
+        "import { deadUsed } from './dead';\nconsole.log(deadUsed);\n",
+    )
+    .expect("dead user");
+    project
+}
+
+#[test]
+fn run_dead_code_hides_cascade_findings_only_when_the_file_is_reported() {
+    let project = cascade_project();
+    let run = |filters: DeadCodeFilters| {
+        run_dead_code(&DeadCodeOptions {
+            analysis: analysis_at(project.path()),
+            filters,
+            ..DeadCodeOptions::default()
+        })
+        .expect("dead-code succeeds")
+    };
+
+    let all = run(DeadCodeFilters::default());
+    assert!(all.results().unused_exports.is_empty());
+    assert_eq!(all.results().cascade_hidden, 2);
+
+    let exports_only = run(DeadCodeFilters {
+        unused_exports: true,
+        ..DeadCodeFilters::default()
+    });
+    assert_eq!(exports_only.results().unused_exports.len(), 2);
+    assert_eq!(exports_only.results().cascade_hidden, 0);
 }
 
 #[test]
@@ -989,6 +1159,102 @@ fn run_dead_code_honors_graph_preserving_finding_exclusions() {
             .iter()
             .all(|path| !path.ends_with("src/hidden.ts")),
         "programmatic API leaked an ignored source-owned finding: {unused_paths:?}"
+    );
+}
+
+#[test]
+fn programmatic_dead_code_reports_unmatched_config_patterns_like_the_cli() {
+    let project = finding_exclusion_project(&["src/hidden.ts", "src/hiden.ts"]);
+    let root = project.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"finding-exclusion-api","type":"module","main":"src/index.ts",
+            "dependencies":{"@acme/lib":"1.0.0"}}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"ignoreFindings":["src/hidden.ts","src/hiden.ts"],
+            "ignoreDependencies":["@acme/*","@acm/*"]}"#,
+    )
+    .expect("write config");
+    let unmatched = |filters: DeadCodeFilters| -> Vec<(String, String)> {
+        let json = dead_code_json(&DeadCodeOptions {
+            analysis: analysis_at(root),
+            filters,
+            ..DeadCodeOptions::default()
+        })
+        .expect("dead-code succeeds");
+        json["workspace_diagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("ignore-"))
+            })
+            .map(|entry| {
+                (
+                    entry["kind"].as_str().unwrap_or_default().to_owned(),
+                    entry["pattern"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        unmatched(DeadCodeFilters::default()),
+        vec![
+            (
+                "ignore-findings-pattern-unmatched".to_owned(),
+                "src/hiden.ts".to_owned()
+            ),
+            (
+                "ignore-dependencies-glob-unmatched".to_owned(),
+                "@acm/*".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        unmatched(DeadCodeFilters {
+            unused_files: true,
+            ..DeadCodeFilters::default()
+        }),
+        vec![(
+            "ignore-findings-pattern-unmatched".to_owned(),
+            "src/hiden.ts".to_owned()
+        )],
+        "a run without dependency findings omits the dependency glob"
+    );
+
+    let combined = run_combined(&CombinedOptions {
+        analysis: analysis_at(root),
+        duplication: false,
+        health: false,
+        ..CombinedOptions::default()
+    })
+    .expect("combined output");
+    let combined = serialize_combined_programmatic_json(combined).expect("combined json");
+    let combined_unmatched: Vec<(String, String)> = combined["workspace_diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let kind = entry["kind"].as_str()?;
+            kind.starts_with("ignore-").then(|| {
+                (
+                    kind.to_owned(),
+                    entry["pattern"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        combined_unmatched,
+        unmatched(DeadCodeFilters::default()),
+        "the combined route reports the same entries as dead-code: {}",
+        combined["workspace_diagnostics"]
     );
 }
 
@@ -1181,6 +1447,162 @@ fn serialized_dead_code_diff_file_filters_source_findings() {
     assert_eq!(unused_export_names(&json), vec!["deadA"]);
 }
 
+/// A diff inherited from `FALLOW_DIFF_FILE` that cannot be read stands down
+/// like the CLI: the call succeeds at full scope and the envelope says why,
+/// with the CLI's label, reason token and sentence (issue #2799).
+#[test]
+fn an_unreadable_ambient_diff_stands_down_with_the_cli_outcome() {
+    let project = dead_code_project();
+    let root = project.path();
+    // The context resolves the root to its canonical spelling, and the label
+    // names the root-joined path, as the CLI label does.
+    let missing = canonical_root(root).join("missing.diff");
+
+    let json = dead_code_json(&DeadCodeOptions {
+        analysis: AnalysisOptions {
+            ambient_diff_file: Some(PathBuf::from("missing.diff")),
+            ..analysis_at(root)
+        },
+        filters: DeadCodeFilters {
+            unused_exports: true,
+            ..DeadCodeFilters::default()
+        },
+        ..DeadCodeOptions::default()
+    })
+    .expect("an inherited bad diff must not fail the call");
+
+    let label = format!("$FALLOW_DIFF_FILE {}", missing.display());
+    let expected = fallow_engine::diff_source::read_diff_file(&missing, &label)
+        .expect_err("the file is missing");
+    let entry = &json["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "not-applied", "{entry}");
+    assert_eq!(entry["affects"], "scope", "{entry}");
+    assert_eq!(entry["reason"], "unreadable", "{entry}");
+    assert_eq!(entry["requested"], label.as_str(), "{entry}");
+    assert_eq!(entry["message"], expected.message(), "{entry}");
+    assert!(entry.get("scope_size").is_none(), "{entry}");
+    assert_eq!(
+        unused_export_names(&json),
+        vec!["deadA", "deadB"],
+        "a diff that stood down narrows nothing"
+    );
+}
+
+/// An ambient diff over a file that exceeds the cap stands down with the
+/// `oversize` token, the second case the issue names.
+#[test]
+fn an_oversize_ambient_diff_stands_down_as_oversize() {
+    let project = dead_code_project();
+    let root = project.path();
+    let file = std::fs::File::create(root.join("huge.diff")).expect("create");
+    file.set_len(fallow_output::MAX_DIFF_BYTES + 1)
+        .expect("grow past the cap");
+
+    let json = dead_code_json(&DeadCodeOptions {
+        analysis: AnalysisOptions {
+            ambient_diff_file: Some(root.join("huge.diff")),
+            ..analysis_at(root)
+        },
+        ..DeadCodeOptions::default()
+    })
+    .expect("an inherited oversize diff must not fail the call");
+    let entry = &json["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "not-applied", "{entry}");
+    assert_eq!(entry["reason"], "oversize", "{entry}");
+}
+
+/// A readable ambient diff applies, is placed like the CLI places it, and
+/// states the added lines it left in scope.
+#[test]
+fn a_readable_ambient_diff_applies_and_states_its_scope() {
+    let project = dead_code_project();
+    let root = project.path();
+    std::fs::write(
+        root.join("a.diff"),
+        "diff --git a/src/a.ts b/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+export const deadA = 1;\n",
+    )
+    .expect("diff");
+
+    let json = dead_code_json(&DeadCodeOptions {
+        analysis: AnalysisOptions {
+            ambient_diff_file: Some(PathBuf::from("a.diff")),
+            ..analysis_at(root)
+        },
+        filters: DeadCodeFilters {
+            unused_exports: true,
+            ..DeadCodeFilters::default()
+        },
+        ..DeadCodeOptions::default()
+    })
+    .expect("dead-code succeeds");
+
+    let entry = &json["request_outcomes"]["diff-filter"];
+    assert_eq!(entry["status"], "applied", "{entry}");
+    assert_eq!(entry["scope_size"], 1, "{entry}");
+    assert!(entry.get("reason").is_none(), "{entry}");
+    assert_eq!(unused_export_names(&json), vec!["deadA"]);
+}
+
+/// The caller's own `diff_file` keeps the hard error: a caller can fix its
+/// own argument, and an error is the direct way to tell it.
+#[test]
+fn an_explicit_bad_diff_file_still_fails_the_call() {
+    let project = dead_code_project();
+    let root = project.path();
+    let err = dead_code_json(&DeadCodeOptions {
+        analysis: AnalysisOptions {
+            diff_file: Some(PathBuf::from("missing.diff")),
+            ambient_diff_file: Some(PathBuf::from("also-missing.diff")),
+            ..analysis_at(root)
+        },
+        ..DeadCodeOptions::default()
+    })
+    .expect_err("an explicit bad diff is the caller's mistake");
+    assert_eq!(err.code.as_deref(), Some("FALLOW_INVALID_DIFF_FILE"));
+}
+
+/// The object reaches every typed envelope that carries it: the combined root,
+/// health and duplication.
+#[test]
+fn every_typed_envelope_publishes_the_ambient_diff_outcome() {
+    let project = dead_code_project();
+    let root = project.path();
+    let analysis = || AnalysisOptions {
+        ambient_diff_file: Some(PathBuf::from("missing.diff")),
+        ..analysis_at(root)
+    };
+
+    let combined = serialize_combined_programmatic_json(
+        run_combined(&CombinedOptions {
+            analysis: analysis(),
+            ..CombinedOptions::default()
+        })
+        .expect("combined succeeds"),
+    )
+    .expect("combined JSON");
+    let health = health_json_with_runner(
+        &ComplexityOptions {
+            analysis: analysis(),
+            ..ComplexityOptions::default()
+        },
+        &EngineHealthRunner,
+    )
+    .expect("health succeeds");
+    let dupes = duplication_json(&DuplicationOptions {
+        analysis: analysis(),
+        ..DuplicationOptions::default()
+    })
+    .expect("dupes succeeds");
+
+    for (name, json) in [("combined", combined), ("health", health), ("dupes", dupes)] {
+        assert_eq!(
+            json["request_outcomes"]["diff-filter"]["reason"], "unreadable",
+            "`{name}` must publish the outcome: {}",
+            json["request_outcomes"]
+        );
+    }
+}
+
 #[test]
 fn serialized_circular_dependencies_keeps_dead_code_envelope_but_filters_other_findings() {
     let project = dead_code_project();
@@ -1243,7 +1665,7 @@ fn diff_file_filters_clone_groups() {
         "diff --git a/src/a.ts b/src/a.ts\n+++ b/src/a.ts\n@@ -1,3 +1,3 @@\n+added\n context\n",
     );
 
-    filter_by_diff(&mut report, &diff, &root);
+    fallow_engine::diff_scope::filter_duplication_by_diff(&mut report, &diff, &root);
 
     assert_eq!(report.clone_groups.len(), 1);
     assert_eq!(
@@ -1253,13 +1675,12 @@ fn diff_file_filters_clone_groups() {
 }
 
 #[test]
-fn workspace_scope_filters_clone_groups() {
+fn workspace_scope_keeps_a_clone_group_whole_when_one_instance_is_in_scope() {
     let root = PathBuf::from("/repo");
     let mut report = DuplicationReport {
         clone_groups: vec![
             group(vec![
                 instance("/repo/packages/app/a.ts", 1, 3),
-                instance("/repo/packages/app/b.ts", 1, 3),
                 instance("/repo/packages/shared/b.ts", 1, 3),
             ]),
             group(vec![
@@ -1268,51 +1689,42 @@ fn workspace_scope_filters_clone_groups() {
             ]),
         ],
         stats: DuplicationStats {
-            total_files: 5,
+            total_files: 4,
             total_lines: 100,
             total_tokens: 100,
             clone_groups: 2,
-            clone_instances: 5,
+            clone_instances: 4,
             ..DuplicationStats::default()
         },
         ..DuplicationReport::default()
     };
 
-    filter_by_workspaces(&mut report, &[root.join("packages/app")], &root);
+    fallow_engine::duplicates::filter_to_workspaces(
+        &mut report,
+        &[root.join("packages/app")],
+        &root,
+    );
 
     assert_eq!(report.clone_groups.len(), 1);
+    let files = report.clone_groups[0]
+        .instances
+        .iter()
+        .map(|instance| instance.file.clone())
+        .collect::<Vec<_>>();
     assert_eq!(
-        report.clone_groups[0].instances[0].file,
-        root.join("packages/app/a.ts")
+        files,
+        vec![
+            root.join("packages/app/a.ts"),
+            root.join("packages/shared/b.ts")
+        ],
+        "the instance in packages/shared stays: a group is in scope when one \
+         of its instances is"
     );
-    assert_eq!(report.clone_groups[0].instances.len(), 2);
-    assert!(
-        report.clone_groups[0]
-            .instances
-            .iter()
-            .all(|instance| instance.file.starts_with(root.join("packages/app")))
-    );
-}
-
-#[test]
-fn workspace_patterns_match_names_paths_and_negation() {
-    let project = tempfile::tempdir().expect("temp dir");
-    let root = project.path();
-    write_json(
-        root.join("package.json"),
-        r#"{"workspaces":["packages/*"]}"#,
-    );
-    write_workspace(root, "packages/app", "@scope/app");
-    write_workspace(root, "packages/docs", "docs");
-
-    let roots = resolve_workspace_filters(root, &["packages/*".to_string(), "!docs".to_string()])
-        .expect("workspace filters resolve");
-
-    assert_eq!(roots, vec![root.join("packages/app")]);
 }
 
 fn instance(path: &str, start_line: usize, end_line: usize) -> CloneInstance {
     CloneInstance {
+        is_symlink: false,
         file: PathBuf::from(path),
         start_line,
         end_line,
@@ -1331,7 +1743,7 @@ fn group(instances: Vec<CloneInstance>) -> fallow_types::duplicates::CloneGroup 
     }
 }
 
-fn dead_code_project() -> tempfile::TempDir {
+pub(super) fn dead_code_project() -> tempfile::TempDir {
     let project = tempfile::tempdir().expect("temp dir");
     let root = project.path();
     std::fs::create_dir(root.join("src")).expect("src dir");
@@ -1380,12 +1792,209 @@ fn unused_export_names(json: &serde_json::Value) -> Vec<&str> {
         .collect()
 }
 
-fn write_workspace(root: &Path, relative: &str, name: &str) {
-    let dir = root.join(relative);
-    std::fs::create_dir_all(&dir).expect("workspace dir");
-    write_json(dir.join("package.json"), &format!(r#"{{"name":"{name}"}}"#));
-}
-
 fn write_json(path: PathBuf, json: &str) {
     std::fs::write(path, json).expect("json file");
+}
+
+/// Project with one unused export under `src/ui` and one under `src/lib`,
+/// optionally scoping `unused-exports` off for `src/ui/**`.
+fn rule_override_project(with_override: bool) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("temp dir");
+    let root = project.path();
+    std::fs::create_dir_all(root.join("src/ui")).expect("ui dir");
+    std::fs::create_dir_all(root.join("src/lib")).expect("lib dir");
+    write_json(
+        root.join("package.json"),
+        r#"{"name":"api-rule-overrides","main":"src/index.ts"}"#,
+    );
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import './ui/kit';\nimport './lib/util';\nexport const entry = 1;\nconsole.log(entry);\n",
+    )
+    .expect("entry");
+    std::fs::write(root.join("src/ui/kit.ts"), "export const uiDead = 1;\n").expect("kit");
+    std::fs::write(root.join("src/lib/util.ts"), "export const libDead = 1;\n").expect("util");
+
+    let mut config = serde_json::json!({ "rules": { "unused-exports": "warn" } });
+    if with_override {
+        config["overrides"] = serde_json::json!([{
+            "files": ["src/ui/**"],
+            "rules": { "unused-exports": "off" }
+        }]);
+    }
+    write_json(
+        root.join(".fallowrc.json"),
+        &serde_json::to_string(&config).expect("serialize config"),
+    );
+    project
+}
+
+fn unused_export_paths(run: &DeadCodeProgrammaticOutput) -> Vec<PathBuf> {
+    run.results()
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect()
+}
+
+#[test]
+fn run_dead_code_honors_per_path_rule_overrides() {
+    let project = rule_override_project(true);
+
+    let run = run_dead_code(&DeadCodeOptions {
+        analysis: analysis_at(project.path()),
+        ..DeadCodeOptions::default()
+    })
+    .expect("dead-code succeeds");
+    let paths = unused_export_paths(&run);
+
+    assert!(
+        paths.iter().any(|path| path.ends_with("lib/util.ts")),
+        "the control finding outside the override must stay reported: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path.ends_with("ui/kit.ts")),
+        "a path whose override turns the rule off must not be reported: {paths:?}"
+    );
+}
+
+/// The decision surface judges the base revision by the head configuration,
+/// as the CLI's base worktree pass does, so the severity pass must take the
+/// configuration it is handed over the one the base session loaded from disk.
+#[test]
+fn decision_analysis_resolves_severity_against_the_given_config() {
+    let project = rule_override_project(true);
+    let resolved = resolve_programmatic_analysis_context(&analysis_at(project.path()))
+        .expect("context resolves");
+
+    let own = super::decision_surface::run_decision_analysis(&resolved, None, None)
+        .expect("analysis with the session's own config");
+    let own_paths: Vec<PathBuf> = own
+        .results
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect();
+    assert!(
+        own_paths.iter().all(|path| !path.ends_with("ui/kit.ts")),
+        "the session's own override turns the rule off for ui/: {own_paths:?}"
+    );
+
+    let mut head_config = own.config;
+    head_config.overrides.clear();
+    let judged =
+        super::decision_surface::run_decision_analysis(&resolved, None, Some(&head_config))
+            .expect("analysis judged by another config");
+    let judged_paths: Vec<PathBuf> = judged
+        .results
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.clone())
+        .collect();
+    assert!(
+        judged_paths.iter().any(|path| path.ends_with("ui/kit.ts")),
+        "the configuration handed in must win over the session's own: {judged_paths:?}"
+    );
+}
+
+#[test]
+fn run_dead_code_without_overrides_is_unchanged() {
+    let project = rule_override_project(false);
+
+    let run = run_dead_code(&DeadCodeOptions {
+        analysis: analysis_at(project.path()),
+        ..DeadCodeOptions::default()
+    })
+    .expect("dead-code succeeds");
+    let paths = unused_export_paths(&run);
+
+    assert!(
+        paths.iter().any(|path| path.ends_with("lib/util.ts")),
+        "default configuration must keep every unused export: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path.ends_with("ui/kit.ts")),
+        "default configuration must keep every unused export: {paths:?}"
+    );
+}
+
+/// A project with one import cycle and one unused export.
+fn architecture_project() -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("temp dir");
+    let root = project.path();
+    std::fs::create_dir(root.join("src")).expect("src dir");
+    write_json(
+        root.join("package.json"),
+        r#"{"name":"api-architecture","main":"src/index.ts"}"#,
+    );
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { a } from './a';\nconsole.log(a);\n",
+    )
+    .expect("entry");
+    std::fs::write(
+        root.join("src/a.ts"),
+        "import { b } from './b';\nexport const a = b + 1;\nexport const unusedA = 1;\n",
+    )
+    .expect("a");
+    std::fs::write(
+        root.join("src/b.ts"),
+        "import { a } from './a';\nexport const b = 1;\nexport const useA = () => a;\n",
+    )
+    .expect("b");
+    project
+}
+
+#[test]
+fn run_architecture_keeps_only_architecture_findings_and_its_own_envelope() {
+    let project = architecture_project();
+    let root = project.path();
+    let output = run_architecture(&crate::ArchitectureOptions {
+        analysis: AnalysisOptions {
+            explain: true,
+            ..analysis_at(root)
+        },
+        ..crate::ArchitectureOptions::default()
+    })
+    .expect("architecture run");
+    let _: &crate::ArchitectureOutput = &output.output;
+    assert_eq!(output.results().circular_dependencies.len(), 1);
+    assert!(output.results().unused_exports.is_empty());
+    assert_eq!(
+        output.output.schema_version.0,
+        fallow_output::ARCHITECTURE_SCHEMA_VERSION
+    );
+
+    let json = crate::runtime_json::serialize_architecture_programmatic_json(output).expect("json");
+    assert_eq!(json["kind"], "architecture");
+    assert_eq!(
+        json["schema_version"],
+        fallow_output::ARCHITECTURE_SCHEMA_VERSION
+    );
+    assert_eq!(json["_meta"]["docs"], fallow_output::ARCHITECTURE_DOCS);
+    assert!(json["_meta"]["rules"].get("unused-export").is_none());
+
+    let policy_only = run_architecture(&crate::ArchitectureOptions {
+        analysis: analysis_at(root),
+        policy: true,
+        ..crate::ArchitectureOptions::default()
+    })
+    .expect("policy run");
+    assert!(policy_only.results().circular_dependencies.is_empty());
+}
+
+#[test]
+fn architecture_selectors_map_onto_the_dead_code_filters() {
+    let all = crate::ArchitectureOptions::default().dead_code_filters();
+    assert!(all.circular_deps && all.re_export_cycles && all.package_cycles);
+    assert!(all.boundary_violations && all.policy_violations);
+    assert!(!all.unused_exports && !all.unused_files);
+
+    let cycles = crate::ArchitectureOptions {
+        cycles: true,
+        ..crate::ArchitectureOptions::default()
+    }
+    .dead_code_filters();
+    assert!(cycles.circular_deps && cycles.re_export_cycles && cycles.package_cycles);
+    assert!(!cycles.boundary_violations && !cycles.policy_violations);
 }

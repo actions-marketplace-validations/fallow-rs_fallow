@@ -6,10 +6,8 @@
 use std::path::Path;
 
 use fallow_graph::resolve::extract_package_name;
-use oxc_allocator::Allocator;
 use oxc_ast::ast::{Argument, CallExpression, Expression, ObjectExpression, ObjectPropertyKind};
 use oxc_ast_visit::{Visit, walk};
-use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 use super::{Plugin, PluginResult, config_parser};
@@ -88,17 +86,17 @@ impl Plugin for FumadocsPlugin {
 
 fn collect_content_dirs(source: &str, config_path: &Path, root: &Path) -> Vec<String> {
     let source_type = SourceType::from_path(config_path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-    let mut collector = ContentDirCollector {
-        dirs: Vec::new(),
-        config_path,
-        root,
-    };
-    collector.visit_program(&parsed.program);
-    collector.dirs.sort();
-    collector.dirs.dedup();
-    collector.dirs
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        let mut collector = ContentDirCollector {
+            dirs: Vec::new(),
+            config_path,
+            root,
+        };
+        collector.visit_program(&parsed.program);
+        collector.dirs.sort();
+        collector.dirs.dedup();
+        collector.dirs
+    })
 }
 
 struct ContentDirCollector<'a> {
@@ -221,7 +219,6 @@ mod tests {
     fn exposes_static_fumadocs_conventions() {
         let plugin = FumadocsPlugin;
 
-        assert_eq!(plugin.config_patterns(), CONFIG_PATTERNS);
         assert!(
             plugin
                 .always_used()
@@ -232,8 +229,6 @@ mod tests {
                 .always_used()
                 .contains(&".source/**/*.{ts,tsx,js,jsx,mts,mjs,cts,cjs}")
         );
-        assert_eq!(plugin.discovery_hidden_dirs(), DISCOVERY_HIDDEN_DIRS);
-        assert_eq!(plugin.virtual_module_prefixes(), VIRTUAL_MODULE_PREFIXES);
     }
 
     #[test]

@@ -13,17 +13,15 @@ const sortedUniqueStrings = (values) => {
 const validateSupplementalContext = (artifact, context, dependencies) => {
   const { fail, isObject } = dependencies;
   requireValid(
-    [isObject(artifact), artifact.schema_version === 6].every(Boolean),
+    isObject(artifact) && artifact.schema_version === 6,
     "supplemental artifact schema_version must be 6",
     fail,
   );
   requireValid(
-    [
-      isObject(context),
-      /^[0-9a-f]{64}$/.test(context.fallowSha256),
-      /^[0-9a-f]{64}$/.test(context.sidecarSha256),
+    isObject(context) &&
+      /^[0-9a-f]{64}$/.test(context.fallowSha256) &&
+      /^[0-9a-f]{64}$/.test(context.sidecarSha256) &&
       typeof context.sourceRoot === "string",
-    ].every(Boolean),
     "supplemental validation requires runtime hashes and a source root",
     fail,
   );
@@ -63,14 +61,12 @@ const supplementalReviewBindingsValid = (
   reviewedKeys,
   candidateSetDigest,
 ) =>
-  [
-    Boolean(review),
-    artifact.project.commit === review.commit,
-    artifact.independent_review.verdict === "approved",
-    artifact.independent_review.reviewed_candidate_count === reviewedKeys.length,
-    artifact.independent_review.reviewed_candidate_set_sha256 === candidateSetDigest(reviewedKeys),
-    equalJson(reviewedKeys, review.candidate_keys),
-  ].every(Boolean);
+  Boolean(review) &&
+  artifact.project.commit === review.commit &&
+  artifact.independent_review.verdict === "approved" &&
+  artifact.independent_review.reviewed_candidate_count === reviewedKeys.length &&
+  artifact.independent_review.reviewed_candidate_set_sha256 === candidateSetDigest(reviewedKeys) &&
+  equalJson(reviewedKeys, review.candidate_keys);
 
 const supplementalResultCountsValid = (artifact, confirmedKeys, reviewedKeys, candidateSetDigest) =>
   [
@@ -161,7 +157,7 @@ export const validateSupplementalArtifactData = (artifact, decisions, context, d
   validateSupplementalReview(artifact, decisions, confirmedKeys, reviewedKeys, dependencies);
   const sourceRuns = artifact.artifacts.source_runs;
   requireValid(
-    [Array.isArray(sourceRuns), sourceRuns.length === 4].every(Boolean),
+    Array.isArray(sourceRuns) && sourceRuns.length === 4,
     "supplemental artifact requires two baseline and two refined source runs",
     dependencies.fail,
   );
@@ -175,7 +171,7 @@ export const validateSupplementalArtifactData = (artifact, decisions, context, d
 const validateCapabilitiesHeader = (artifact, context, dependencies) => {
   const { fail, isObject, requiredCapabilities } = dependencies;
   requireValid(
-    [isObject(artifact), artifact.schema_version === 3].every(Boolean),
+    isObject(artifact) && artifact.schema_version === 3,
     "semantic capabilities artifact schema_version must be 3",
     fail,
   );
@@ -296,14 +292,12 @@ const validateApiCapability = (repository, root, dependencies) => {
 const validateImpactCapability = (repository, root, dependencies) => {
   const capability = repository.capabilities["semantic-impact-targeted-tests"];
   requireValid(
-    [
-      capability.assertion === "consumers-found",
-      ["complete", "partial"].includes(capability.status),
-      capability.direct_consumer_count > 0,
-      capability.targeted_test_count > 0,
-      Array.isArray(capability.targeted_tests),
+    capability.assertion === "consumers-found" &&
+      ["complete", "partial"].includes(capability.status) &&
+      capability.direct_consumer_count > 0 &&
+      capability.targeted_test_count > 0 &&
+      Array.isArray(capability.targeted_tests) &&
       capability.targeted_tests.length > 0,
-    ].every(Boolean),
     `${repository.id} has no impact or targeted-test proof`,
     dependencies.fail,
   );
@@ -326,15 +320,13 @@ const couplingSummaryValid = (summary) =>
 const validateCouplingCapability = (repository, root, dependencies) => {
   const capability = repository.capabilities["public-type-coupling"];
   requireValid(
-    [
-      capability.assertion === "coupling-found",
-      ["complete", "partial"].includes(capability.status),
-      couplingSummaryValid(capability.summary),
-      Array.isArray(capability.top_contributors),
-      capability.top_contributors.length > 0,
-      Array.isArray(capability.cycles),
+    capability.assertion === "coupling-found" &&
+      ["complete", "partial"].includes(capability.status) &&
+      couplingSummaryValid(capability.summary) &&
+      Array.isArray(capability.top_contributors) &&
+      capability.top_contributors.length > 0 &&
+      Array.isArray(capability.cycles) &&
       capability.cycles.length > 0,
-    ].every(Boolean),
     `${repository.id} has no rich public type-coupling proof`,
     dependencies.fail,
   );
@@ -354,13 +346,11 @@ export const validateCapabilitiesArtifactData = (artifact, context, dependencies
   validateCapabilitiesHeader(artifact, context, dependencies);
   const repositories = artifact.repositories;
   requireValid(
-    [
-      Array.isArray(repositories),
+    Array.isArray(repositories) &&
       equalJson(
         repositories.map(({ id }) => id),
         ["astro", "vitest"],
       ),
-    ].every(Boolean),
     "semantic capabilities artifact requires Astro and Vitest in stable order",
     dependencies.fail,
   );
@@ -372,7 +362,7 @@ export const validateCapabilitiesArtifactData = (artifact, context, dependencies
 
 const validateMeasurementHeader = (discovery, measurements, fail, isObject) => {
   requireValid(
-    [isObject(measurements), measurements.schema_version === 1].every(Boolean),
+    isObject(measurements) && measurements.schema_version === 1,
     "measurement artifact schema_version must be 1",
     fail,
   );
@@ -398,7 +388,7 @@ const validateMeasurementHeader = (discovery, measurements, fail, isObject) => {
 const validateMeasurementRunShape = (projectId, run, measurements, dependencies) => {
   const { fail, isObject, platform } = dependencies;
   requireValid(
-    [isObject(run), typeof run.warmup === "boolean"].every(Boolean),
+    isObject(run) && typeof run.warmup === "boolean",
     `${projectId} measurement warmup must be a boolean`,
     fail,
   );
@@ -465,7 +455,7 @@ const completeMeasurementPair = (modes) =>
 const validateMeasurementProject = (project, discovered, measurements, dependencies) => {
   const expectedRunCount = 2 * (measurements.warmups + measurements.measured_pairs);
   requireValid(
-    [Array.isArray(project.runs), project.runs.length === expectedRunCount].every(Boolean),
+    Array.isArray(project.runs) && project.runs.length === expectedRunCount,
     `${project.id} measurements have an incomplete run matrix`,
     dependencies.fail,
   );
@@ -496,10 +486,7 @@ export const validateMeasurements = (discovery, measurements, dependencies) => {
   validateMeasurementHeader(discovery, measurements, dependencies.fail, dependencies.isObject);
   const expectedProjects = new Map(discovery.projects.map((project) => [project.id, project]));
   requireValid(
-    [
-      Array.isArray(measurements.projects),
-      measurements.projects.length === expectedProjects.size,
-    ].every(Boolean),
+    Array.isArray(measurements.projects) && measurements.projects.length === expectedProjects.size,
     "measurements must contain every discovery project exactly once",
     dependencies.fail,
   );

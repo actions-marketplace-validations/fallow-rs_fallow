@@ -21,7 +21,9 @@
 //! `unrendered-component` detectors use, kept in the graph crate so the review
 //! brief (cli) can call it directly off the retained graph.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use super::relativize;
 
 use fallow_types::discover::FileId;
 use rustc_hash::FxHashSet;
@@ -145,17 +147,6 @@ impl ModuleGraph {
 
     /// Direct declaration bindings exposed through public entries, including
     /// declarations nested under public namespace-object exports.
-    #[must_use]
-    pub fn public_export_declaration_bindings(
-        &self,
-        public_api_entry_points: &FxHashSet<FileId>,
-    ) -> FxHashSet<EffectiveExportBinding> {
-        self.public_export_declaration_bindings_in_namespace(
-            public_api_entry_points,
-            ExportNamespace::Value,
-        )
-    }
-
     fn public_export_declaration_bindings_in_namespace(
         &self,
         public_api_entry_points: &FxHashSet<FileId>,
@@ -244,13 +235,6 @@ impl ModuleGraph {
     }
 }
 
-/// Strip `root` and forward-slash-normalize a module path (mirrors
-/// `impact_closure::relativize` for cross-platform key parity).
-fn relativize(path: &Path, root: &Path) -> String {
-    let rel: PathBuf = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-    rel.to_string_lossy().replace('\\', "/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +264,8 @@ mod tests {
             members: vec![],
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -516,7 +502,10 @@ mod tests {
             }],
         );
 
-        let declarations = graph.public_export_declaration_bindings(&public_entries);
+        let declarations = graph.public_export_declaration_bindings_in_namespace(
+            &public_entries,
+            ExportNamespace::Value,
+        );
 
         assert_eq!(declarations.len(), 1);
         let binding = *declarations.iter().next().expect("public Client binding");

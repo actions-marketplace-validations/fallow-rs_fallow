@@ -5,7 +5,7 @@ use fallow_config::OutputFormat;
 use super::{Cli, Command, setup_tracing};
 use crate::cli_format::FormatConfig;
 use crate::exit_codes::{COVERAGE_UPLOAD_AUTH_REJECTED_EXIT_CODE, RESOURCE_UNAVAILABLE_EXIT_CODE};
-use crate::{api, cache_notice, output_runtime, telemetry, update_check};
+use crate::{api, cache_notice, claude_code_hint, output_runtime, telemetry, update_check};
 
 #[derive(Clone, Copy)]
 pub struct TelemetryRun {
@@ -21,6 +21,7 @@ pub fn record_run_epilogue(
     exit_code: ExitCode,
     failure_reason: Option<telemetry::FailureReason>,
     parent_run: Option<&str>,
+    hint_root: Option<&std::path::Path>,
 ) -> ExitCode {
     let cache_notice_printed = cache_notice::maybe_print_created_notice();
     let effective_failure_reason = failure_reason
@@ -36,9 +37,20 @@ pub fn record_run_epilogue(
         parent_run,
         context: run.context,
     });
-    if exit_code == ExitCode::SUCCESS {
-        let note_printed = telemetry::maybe_print_opt_in_note(run.output, run.quiet);
-        update_check::maybe_nudge(run.output, run.quiet, note_printed || cache_notice_printed);
+    let success = exit_code == ExitCode::SUCCESS;
+    let note_printed = success && telemetry::maybe_print_opt_in_note(run.output, run.quiet);
+    let mut notice_printed = note_printed || cache_notice_printed;
+    if !notice_printed {
+        notice_printed = claude_code_hint::maybe_emit(
+            run.output,
+            run.quiet,
+            hint_root,
+            parent_run.is_some(),
+            success || exit_code == ExitCode::from(1),
+        );
+    }
+    if success {
+        update_check::maybe_nudge(run.output, run.quiet, notice_printed);
     }
     exit_code
 }
@@ -77,7 +89,7 @@ pub fn fallback_failure_reason_for(
 }
 
 pub fn start_telemetry_run(cli: &Cli, fmt: &FormatConfig) -> TelemetryRun {
-    setup_tracing();
+    setup_tracing(fmt.quiet);
     let run = TelemetryRun {
         workflow: telemetry_workflow_for_command(cli.command.as_ref(), fmt.output),
         output: fmt.output,
@@ -85,6 +97,7 @@ pub fn start_telemetry_run(cli: &Cli, fmt: &FormatConfig) -> TelemetryRun {
         start: std::time::Instant::now(),
         context: telemetry_context_for_command(cli, cli.command.as_ref(), fmt.output),
     };
+    output_runtime::reset_run_state();
     output_runtime::set_telemetry_analysis_run_id(
         matches!(fmt.output, OutputFormat::Json).then(telemetry::new_analysis_run_id),
     );
@@ -135,6 +148,7 @@ fn command_is_file_scoped(command: Option<&Command>) -> bool {
         command,
         Some(
             Command::Check { file, .. }
+                | Command::Architecture { file, .. }
                 | Command::Security { file, .. }
                 | Command::Suppressions { file, .. }
         ) if !file.is_empty()
@@ -146,6 +160,7 @@ fn command_runs_full_project_analysis(command: Option<&Command>) -> bool {
         command,
         None | Some(
             Command::Check { .. }
+                | Command::Architecture { .. }
                 | Command::Dupes { .. }
                 | Command::Health { .. }
                 | Command::Flags { .. }
@@ -192,24 +207,29 @@ fn telemetry_analysis_mode_for_command(command: Option<&Command>) -> telemetry::
         Some(Command::Security { .. }) => telemetry::AnalysisMode::Security,
         Some(Command::SimilarCode { .. }) => telemetry::AnalysisMode::SimilarCode,
         Some(Command::Fix { .. }) => telemetry::AnalysisMode::Fix,
-        Some(Command::Health {
-            runtime_coverage: Some(_),
-            ..
-        })
-        | Some(Command::Audit {
-            runtime_coverage: Some(_),
-            ..
-        })
-        | Some(Command::Coverage { .. }) => telemetry::AnalysisMode::ProductionCoverage,
-        Some(Command::Health {
-            coverage: Some(_), ..
-        })
-        | Some(Command::Audit {
-            coverage: Some(_), ..
-        }) => telemetry::AnalysisMode::RuntimeCoverage,
+        Some(
+            Command::Health {
+                runtime_coverage: Some(_),
+                ..
+            }
+            | Command::Audit {
+                runtime_coverage: Some(_),
+                ..
+            }
+            | Command::Coverage { .. },
+        ) => telemetry::AnalysisMode::ProductionCoverage,
+        Some(
+            Command::Health {
+                coverage: Some(_), ..
+            }
+            | Command::Audit {
+                coverage: Some(_), ..
+            },
+        ) => telemetry::AnalysisMode::RuntimeCoverage,
         None
         | Some(
             Command::Check { .. }
+            | Command::Architecture { .. }
             | Command::Dupes { .. }
             | Command::Health { .. }
             | Command::Audit { .. }
@@ -230,6 +250,7 @@ pub fn telemetry_workflow_for_command(
             telemetry::Workflow::CodeQualityReview
         }
         Some(Command::Check { .. }) => telemetry::Workflow::DeadCode,
+        Some(Command::Architecture { .. }) => telemetry::Workflow::Architecture,
         Some(Command::Dupes { .. }) => telemetry::Workflow::Dupes,
         Some(Command::Health { .. }) => telemetry::Workflow::Health,
         Some(Command::Audit { .. } | Command::DecisionSurface { .. }) => telemetry::Workflow::Audit,
@@ -254,12 +275,16 @@ pub fn telemetry_workflow_for_command(
                 ),
             ..
         }) => telemetry::Workflow::SimilarCode,
+        // Mutation testing has no telemetry workflow yet; adding one changes
+        // the telemetry contract.
+        Some(Command::Mutation { .. }) => telemetry::Workflow::Unknown,
         Some(Command::Fix { .. }) => telemetry::Workflow::Fix,
         Some(Command::Explain { .. }) => telemetry::Workflow::Explain,
         Some(
             Command::Inspect { .. }
             | Command::Guard { .. }
             | Command::Trace { .. }
+            | Command::TraceError { .. }
             | Command::List { .. }
             | Command::Workspaces
             | Command::Suppressions { .. }
@@ -283,8 +308,10 @@ pub fn telemetry_workflow_for_command(
             | Command::Migrate { .. }
             | Command::Telemetry { .. }
             | Command::TypeAware { .. }
+            | Command::Doctor
             | Command::SetupHooks { .. }
-            | Command::AuditCache { .. },
+            | Command::AuditCache { .. }
+            | Command::Baselines { .. },
         ) => telemetry::Workflow::Setup,
     }
 }

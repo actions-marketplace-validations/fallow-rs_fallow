@@ -105,6 +105,10 @@ pub struct SimilarCodeCliInput<'a> {
     pub(crate) min_lines: Option<usize>,
     pub(crate) top: Option<usize>,
     pub(crate) files: Vec<PathBuf>,
+    /// Positional `[PATH]` scope. A file scope narrows inference through
+    /// `files`; a directory scope retains reported pairs touching the scope
+    /// (the full corpus is still compared). `None` means whole-project scope.
+    pub(crate) scope: Option<crate::scope_path::ScopePath>,
     pub(crate) subcommand: Option<SimilarCodeSubcommand>,
 }
 
@@ -135,12 +139,7 @@ pub fn run(input: SimilarCodeCliInput<'_>) -> ExitCode {
             ) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    return failure(
-                        &error.message,
-                        error.exit_code,
-                        input.output,
-                        input.json_style,
-                    );
+                    return programmatic_failure(&error, input.output, input.json_style);
                 }
             };
             let options = SimilarCodeInspectOptions {
@@ -149,12 +148,7 @@ pub fn run(input: SimilarCodeCliInput<'_>) -> ExitCode {
             };
             match inspect_similar_code(&options) {
                 Ok(output) => emit_inspect(output, input.output, input.json_style),
-                Err(error) => failure(
-                    &error.message,
-                    error.exit_code,
-                    input.output,
-                    input.json_style,
-                ),
+                Err(error) => programmatic_failure(&error, input.output, input.json_style),
             }
         }
         Some(SimilarCodeSubcommand::Review {
@@ -191,13 +185,12 @@ pub fn run(input: SimilarCodeCliInput<'_>) -> ExitCode {
                 }
             }
             match run_similar_code(&similar_code_options) {
-                Ok(output) => emit_discovery(output, input.output, input.json_style),
-                Err(error) => failure(
-                    &error.message,
-                    error.exit_code,
+                Ok(output) => emit_discovery(
+                    filter_discovery_to_scope(output, &input),
                     input.output,
                     input.json_style,
                 ),
+                Err(error) => programmatic_failure(&error, input.output, input.json_style),
             }
         }
     }
@@ -310,6 +303,12 @@ fn review_file_error(message: impl Into<String>) -> fallow_api::ProgrammaticErro
 }
 
 fn options(input: &SimilarCodeCliInput<'_>) -> SimilarCodeOptions {
+    let mut files = input.files.clone();
+    if let Some(scope) = input.scope.as_ref().filter(|scope| !scope.is_dir)
+        && let Ok(relative) = scope.absolute.strip_prefix(input.root)
+    {
+        files.push(relative.to_path_buf());
+    }
     SimilarCodeOptions {
         analysis: AnalysisOptions {
             root: Some(input.root.to_path_buf()),
@@ -327,9 +326,39 @@ fn options(input: &SimilarCodeCliInput<'_>) -> SimilarCodeOptions {
         threshold: input.threshold,
         min_lines: input.min_lines,
         top: input.top,
-        files: input.files.clone(),
+        files,
         adapter_provider_path: None,
     }
+}
+
+/// Retain only discovery candidates touching a directory scope.
+///
+/// File scopes narrow inference through `files` in [`options`] instead, so
+/// they never reach this filter. The full corpus is still compared; only
+/// reported pairs are narrowed, mirroring every other positional scope.
+fn filter_discovery_to_scope(
+    mut output: SimilarCodeOutput,
+    input: &SimilarCodeCliInput<'_>,
+) -> SimilarCodeOutput {
+    let Some(scope) = input.scope.as_ref().filter(|scope| scope.is_dir) else {
+        return output;
+    };
+    output
+        .candidates
+        .retain(|candidate| candidate_touches_scope(candidate, input.root, &scope.absolute));
+    output
+}
+
+/// True when either side of a candidate lives inside the scope. Candidate
+/// paths are root-relative; the scope is a canonical absolute path.
+fn candidate_touches_scope(
+    candidate: &fallow_output::SimilarCodeCandidate,
+    root: &std::path::Path,
+    scope: &std::path::Path,
+) -> bool {
+    [&candidate.left.path, &candidate.right.path]
+        .iter()
+        .any(|relative| crate::scope_path::scope_covers(scope, &root.join(relative)))
 }
 
 fn run_status(output: OutputFormat, json_style: JsonStyle) -> ExitCode {
@@ -451,10 +480,7 @@ fn run_cache_clear(
                     removed,
                     model_removed: false,
                 };
-                match serialize_similar_code_cache_clear_json_output(
-                    result,
-                    crate::output_runtime::current_root_envelope_mode(),
-                ) {
+                match serialize_similar_code_cache_clear_json_output(result) {
                     Ok(value) => emit_json(&value, json_style),
                     Err(error) => failure(
                         &format!("failed to serialize similar-code cache output: {error}"),
@@ -504,10 +530,7 @@ fn status_output(
 }
 
 fn emit_status_json(output: SimilarCodeStatusOutput, style: JsonStyle) -> ExitCode {
-    match serialize_similar_code_status_json_output(
-        output,
-        crate::output_runtime::current_root_envelope_mode(),
-    ) {
+    match serialize_similar_code_status_json_output(output) {
         Ok(value) => emit_json(&value, style),
         Err(error) => failure(
             &format!("failed to serialize similar-code status output: {error}"),
@@ -521,10 +544,7 @@ fn emit_status_json(output: SimilarCodeStatusOutput, style: JsonStyle) -> ExitCo
 fn emit_discovery(output: SimilarCodeOutput, format: OutputFormat, style: JsonStyle) -> ExitCode {
     crate::telemetry::note_result_count(output.candidates.len());
     if matches!(format, OutputFormat::Json) {
-        return match serialize_similar_code_json_output(
-            output,
-            crate::output_runtime::current_root_envelope_mode(),
-        ) {
+        return match serialize_similar_code_json_output(output) {
             Ok(value) => emit_json(&value, style),
             Err(error) => failure(
                 &format!("failed to serialize similar-code output: {error}"),
@@ -606,7 +626,8 @@ fn inspect_command(candidate_id: &str) -> String {
     arguments.join(" ")
 }
 
-fn render_cli_argument(argument: &str) -> String {
+/// Quotes one argument of a suggested command for the current shell.
+pub fn render_cli_argument(argument: &str) -> String {
     if !argument.is_empty()
         && argument
             .bytes()
@@ -639,10 +660,7 @@ fn emit_inspect(
 ) -> ExitCode {
     crate::telemetry::note_result_count(1);
     if matches!(format, OutputFormat::Json) {
-        return match serialize_similar_code_inspect_json_output(
-            output,
-            crate::output_runtime::current_root_envelope_mode(),
-        ) {
+        return match serialize_similar_code_inspect_json_output(output) {
             Ok(value) => emit_json(&value, style),
             Err(error) => failure(
                 &format!("failed to serialize similar-code inspect output: {error}"),
@@ -689,10 +707,7 @@ fn emit_review(
 ) -> ExitCode {
     crate::telemetry::note_result_count(output.candidates.len());
     if matches!(format, OutputFormat::Json) {
-        return match serialize_similar_code_review_json_output(
-            output,
-            crate::output_runtime::current_root_envelope_mode(),
-        ) {
+        return match serialize_similar_code_review_json_output(output) {
             Ok(value) => emit_json(&value, style),
             Err(error) => failure(
                 &format!("failed to serialize similar-code review output: {error}"),
@@ -843,6 +858,16 @@ fn failure(message: &str, code: u8, output: OutputFormat, style: JsonStyle) -> E
     emit_error_with_style(message, code, output, style)
 }
 
+/// Emit a similar-code API failure with its stable code and remediation hint
+/// intact, instead of collapsing the three fields into one message string.
+fn programmatic_failure(
+    error: &fallow_api::ProgrammaticError,
+    output: OutputFormat,
+    style: JsonStyle,
+) -> ExitCode {
+    crate::error::emit_programmatic_error(error, output, style)
+}
+
 #[cfg(test)]
 mod tests {
     use fallow_output::{
@@ -852,9 +877,9 @@ mod tests {
     };
 
     use super::{
-        MAX_CANDIDATE_INPUT_BYTES, inspect_command, read_bounded_candidate_file,
-        read_bounded_verdict_file, render_posix_argument, render_powershell_argument,
-        render_reviewed_candidate, review_summary,
+        MAX_CANDIDATE_INPUT_BYTES, candidate_touches_scope, inspect_command,
+        read_bounded_candidate_file, read_bounded_verdict_file, render_posix_argument,
+        render_powershell_argument, render_reviewed_candidate, review_summary,
     };
 
     fn reviewed_candidate(
@@ -1049,5 +1074,35 @@ mod tests {
             review_summary(2, 1, fallow_output::SimilarCodeCompletionStatus::Partial),
             "\nReviewed: 2 candidates, 1 matched verdict, 1 unmatched candidate\nSource completion: partial\n"
         );
+    }
+
+    #[test]
+    fn scope_matches_candidates_touching_either_side() {
+        let reviewed = reviewed_candidate(
+            None,
+            SimilarCodeVerdictMatch::CandidateId,
+            SimilarCodeDomainOutcome::NeedsHumanReview,
+        );
+        let root = std::path::Path::new("/project");
+        assert!(candidate_touches_scope(
+            &reviewed.candidate,
+            root,
+            &root.join("src")
+        ));
+        assert!(candidate_touches_scope(
+            &reviewed.candidate,
+            root,
+            &root.join("src/left.ts")
+        ));
+        assert!(!candidate_touches_scope(
+            &reviewed.candidate,
+            root,
+            &root.join("other")
+        ));
+        assert!(!candidate_touches_scope(
+            &reviewed.candidate,
+            root,
+            &root.join("src-extra")
+        ));
     }
 }

@@ -1,5 +1,263 @@
 use super::common::{create_config, create_config_with_ignore_decorators, fixture_path};
 
+const DIRECT_OBJECT_TARGET_CAP: usize = 4096;
+
+#[test]
+fn destructured_class_members_credit_reads_and_opaque_patterns() {
+    let config = create_config(fixture_path("destructured-class-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(unused, [("Foo", "unused")]);
+}
+
+#[test]
+fn destructured_fields_of_typed_parameters_credit_their_classes() {
+    let config = create_config(fixture_path("typed-destructured-class-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(
+        unused,
+        [
+            ("Client", "unused"),
+            ("Service", "unused"),
+            ("Store", "unused")
+        ]
+    );
+}
+
+/// A destructure in a parameter with a class type annotation reads the class
+/// members, and so does a destructuring assignment from a class instance. Both
+/// forms must get the same credit as `const { m } = instance`. A signature
+/// without a body reads nothing, so it gives no credit.
+#[test]
+fn parameter_and_assignment_destructures_credit_class_members() {
+    let config = create_config(fixture_path("parameter-destructured-class-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(
+        unused,
+        [
+            ("Service", "dead"),
+            ("Service", "signatureOnly"),
+            ("Service", "untypedOnly")
+        ]
+    );
+}
+
+/// A destructure of an imported instance or of a `this.field` reads the same
+/// members as `shared.m` and `this.svc.m`. Declarations, assignments, parameter
+/// defaults and `typeof` annotations all get that credit. A dynamic key in a
+/// namespace destructure can select any export, so every export stays used. A
+/// rest element or a dynamic key on a local that shadows the import gives no
+/// credit.
+#[test]
+fn imported_instance_and_this_field_destructures_credit_class_members() {
+    let config = create_config(fixture_path("instance-path-destructured-class-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(unused, [("Shadowed", "hidden"), ("Svc", "dead")]);
+    let unused_exports: Vec<&str> = results
+        .unused_exports
+        .iter()
+        .map(|item| item.export.export_name.as_str())
+        .collect();
+    assert!(unused_exports.is_empty(), "{unused_exports:?}");
+}
+
+/// A nested binding that provably holds no class instance shadows the module
+/// instance of the same name. A read through the shadow gives no credit to the
+/// class. A class instance that is declared in the nested scope keeps its
+/// credit, and so does a parameter typed by a type literal, because a class
+/// instance satisfies that type.
+#[test]
+fn nested_non_instance_shadow_gives_no_class_member_credit() {
+    let config = create_config(fixture_path("shadowed-class-binding-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(
+        unused,
+        [
+            ("Service", "shadowBeforeVar"),
+            ("Service", "shadowBlock"),
+            ("Service", "shadowComputed"),
+            ("Service", "shadowDestructure"),
+            ("Service", "shadowInner"),
+            ("Service", "shadowLocal"),
+            ("Service", "shadowTypeof"),
+            ("Service", "toFixed"),
+            ("Service", "toLowerCase"),
+            ("Service", "toUpperCase")
+        ]
+    );
+}
+
+#[test]
+fn type_guard_subject_member_access_credits_only_its_predicate_class() {
+    let project = tempfile::tempdir().expect("create project");
+    let source_dir = project.path().join("src");
+    let utils_dir = source_dir.join("utils");
+    std::fs::create_dir_all(&utils_dir).expect("create source directories");
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"type-guard-member-access","main":"src/index.ts"}"#,
+    )
+    .expect("write package manifest");
+    std::fs::write(
+        source_dir.join("errors.ts"),
+        "export class AppError extends Error {\n\
+             get isAppError(): true { return true; }\n\
+             get dormant(): true { return true; }\n\
+         }\n\
+         export class OtherError extends Error {\n\
+             get isAppError(): true { return true; }\n\
+         }\n",
+    )
+    .expect("write error classes");
+    std::fs::write(
+        utils_dir.join("type-guards.ts"),
+        "import type { AppError as DeclaredError } from '../errors';\n\
+         export function isAppError(error: unknown): error is DeclaredError {\n\
+             return (error as any)?.['isAppError'] === true\n\
+                 && ((error: unknown) => (error as any)?.dormant === true)(error);\n\
+         }\n",
+    )
+    .expect("write type guard");
+    std::fs::write(
+        source_dir.join("index.ts"),
+        "import { OtherError } from './errors';\n\
+         new OtherError();\n\
+         export { isAppError } from './utils/type-guards';\n",
+    )
+    .expect("write entry point");
+
+    let config = create_config(project.path().to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused_class_members: Vec<(String, String)> = results
+        .unused_class_members
+        .iter()
+        .map(|finding| {
+            (
+                finding.member.parent_name.clone(),
+                finding.member.member_name.clone(),
+            )
+        })
+        .filter(|(parent, _)| matches!(parent.as_str(), "AppError" | "OtherError"))
+        .collect();
+    unused_class_members.sort_unstable();
+
+    assert_eq!(
+        unused_class_members,
+        [
+            ("AppError".to_string(), "dormant".to_string()),
+            ("OtherError".to_string(), "isAppError".to_string()),
+        ],
+        "the type predicate should credit its own class member while preserving unused same-name members"
+    );
+}
+
+#[test]
+fn generic_type_predicates_only_credit_members_of_actual_call_arguments() {
+    for (call, expected_unused) in [
+        ("", vec!["arrowOnly", "functionOnly"]),
+        ("arrowGuard(new AppError());", vec!["functionOnly"]),
+        ("functionGuard(new AppError());", vec!["arrowOnly"]),
+    ] {
+        let project = tempfile::tempdir().expect("create project");
+        let source_dir = project.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source directory");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"generic-guard-members","main":"src/index.ts"}"#,
+        )
+        .expect("write package manifest");
+        std::fs::write(
+            source_dir.join("errors.ts"),
+            "export class AppError {\n\
+                 get arrowOnly(): true { return true; }\n\
+                 get functionOnly(): true { return true; }\n\
+             }\n",
+        )
+        .expect("write class");
+        std::fs::write(
+            source_dir.join("index.ts"),
+            format!(
+                "import {{ AppError }} from './errors';\n\
+                 new AppError();\n\
+                 export const arrowGuard = <AppError>(error: unknown): error is AppError =>\n\
+                     (error as any).arrowOnly === true;\n\
+                 export const functionGuard = function <AppError>(error: unknown): error is AppError {{\n\
+                     return (error as any).functionOnly === true;\n\
+                 }};\n{call}\n"
+            ),
+        )
+        .expect("write entry point");
+
+        let results = fallow_core::analyze(&create_config(project.path().to_path_buf()))
+            .expect("analysis should succeed");
+        let mut unused: Vec<&str> = results
+            .unused_class_members
+            .iter()
+            .filter(|finding| finding.member.parent_name == "AppError")
+            .map(|finding| finding.member.member_name.as_str())
+            .collect();
+        unused.sort_unstable();
+        assert_eq!(
+            unused, expected_unused,
+            "generic type names must not bind to imported classes; actual calls must still credit reads: {call}"
+        );
+    }
+}
+
 #[test]
 fn enum_class_members_detects_unused_members() {
     let root = fixture_path("enum-class-members");
@@ -40,6 +298,70 @@ fn enum_class_members_detects_unused_members() {
     assert!(
         unused_class_member_names.contains(&"name"),
         "name should be detected as unused class property, found: {unused_class_member_names:?}"
+    );
+
+    assert!(
+        !unused_class_member_names.contains(&"usedThroughObject"),
+        "usedThroughObject should be credited through an object property, found: {unused_class_member_names:?}"
+    );
+    for used_member in [
+        "usedThroughPropertyAlias",
+        "usedThroughObjectAlias",
+        "usedThroughDestructure",
+        "usedThroughComputed",
+        "usedThroughDynamicKey",
+        "usedThroughQualifiedConstructor",
+        "usedThroughCrossModuleContainer",
+    ] {
+        assert!(
+            !unused_class_member_names.contains(&used_member),
+            "{used_member} should be credited through its object property access form, found: {unused_class_member_names:?}"
+        );
+    }
+    assert!(
+        unused_class_member_names.contains(&"unusedThroughObject"),
+        "unusedThroughObject should remain unused, found: {unused_class_member_names:?}"
+    );
+}
+
+#[test]
+fn direct_object_target_cap_conservatively_credits_tail_class() {
+    use std::fmt::Write as _;
+
+    let project = tempfile::tempdir().expect("create project");
+    let source_dir = project.path().join("src");
+    std::fs::create_dir_all(&source_dir).expect("create source directory");
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"direct-object-target-cap","main":"src/index.ts"}"#,
+    )
+    .expect("write package manifest");
+
+    let mut source = String::new();
+    for index in 0..DIRECT_OBJECT_TARGET_CAP {
+        let _ = writeln!(source, "class Service{index} {{}}");
+    }
+    source.push_str("export class Tail { live(): void {} unused(): void {} }\n");
+    source.push_str("const holder = {\n");
+    for index in 0..DIRECT_OBJECT_TARGET_CAP {
+        let _ = writeln!(source, "  service{index}: new Service{index}(),");
+    }
+    source.push_str("  tail: new Tail(),\n};\nholder.tail.live();\n");
+    std::fs::write(source_dir.join("index.ts"), source).expect("write source");
+
+    let config = create_config(project.path().to_path_buf());
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    assert!(
+        !results
+            .unused_class_members
+            .iter()
+            .any(|finding| finding.member.parent_name == "Tail"),
+        "a class target discovered after the cap must receive whole-object credit, found: {:?}",
+        results
+            .unused_class_members
+            .iter()
+            .filter(|finding| finding.member.parent_name == "Tail")
+            .collect::<Vec<_>>()
     );
 }
 
@@ -538,6 +860,99 @@ fn playwright_fixture_getter_chain_credits_nested_fixture_methods() {
 }
 
 #[test]
+fn playwright_chained_merge_tests_extend_credits_pom_methods() {
+    // Issue #3462: `mergeTests(appTest).extend(...)` with the `mergeTests` call
+    // as the direct receiver of `.extend`, an aliased `merge(...).extend<T>`, a
+    // helper that returns the chain, `.extend<T>` on a local merged const, and
+    // a chain of two `.extend<T>` calls on one `mergeTests(...)` call.
+    let root = fixture_path("issue-3462-playwright-mergetests-chained-extend");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let mut unused_class_members: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+    unused_class_members.sort();
+
+    assert_eq!(
+        unused_class_members,
+        vec![
+            "AuditPage.unusedAuditAction".to_string(),
+            "ChartPage.unusedChartAction".to_string(),
+            "DashboardPage.legacyAction".to_string(),
+            "ExportPage.unusedExportAction".to_string(),
+            "ReportsPage.unusedReportAction".to_string(),
+            "SettingsPage.unusedSettingsAction".to_string(),
+        ],
+        "only the genuinely unused POM methods should be reported"
+    );
+}
+
+#[test]
+fn playwright_extend_of_imported_test_credits_pom_methods() {
+    // `bTest = appTest.extend<{ b: BPage }>({})` where `appTest` is imported:
+    // a typed base, an untyped `base.extend({})` base, a two-file chain, a
+    // same-file chain, a re-exported base, and a helper that returns the
+    // extend. An imported non-Playwright `framework.extend<T>()` must credit
+    // nothing.
+    let root = fixture_path("playwright-imported-base-extend");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let mut unused_class_members: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+    unused_class_members.sort();
+
+    assert_eq!(
+        unused_class_members,
+        vec![
+            "AppPage.unusedAppAction".to_string(),
+            "BPage.unusedBAction".to_string(),
+            "CPage.unusedCAction".to_string(),
+            "DPage.unusedDAction".to_string(),
+            "EPage.unusedEAction".to_string(),
+            "FPage.unusedFAction".to_string(),
+            "GPage.unusedGAction".to_string(),
+            "HelperPage.unusedHelperAction".to_string(),
+            "OtherPage.openOther".to_string(),
+            "OtherPage.unusedOtherAction".to_string(),
+        ],
+        "only the genuinely unused POM methods should be reported"
+    );
+}
+
+#[test]
+fn playwright_test_subpath_import_credits_pom_methods() {
+    // The `playwright` package exports the test runner at `playwright/test`.
+    // A `mergeTests(...).extend<T>` chain and a raw `test.extend<T>` from that
+    // source must credit fixture methods the same as `@playwright/test`.
+    let root = fixture_path("playwright-test-subpath-import");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let mut unused_class_members: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+    unused_class_members.sort();
+
+    assert_eq!(
+        unused_class_members,
+        vec![
+            "AdminPage.unusedAdminAction".to_string(),
+            "ReportsPage.unusedReportAction".to_string(),
+        ],
+        "only the genuinely unused POM methods should be reported"
+    );
+}
+
+#[test]
 fn playwright_wrapper_fixtures_credit_nested_fixture_methods() {
     let root = fixture_path("issue-1210-playwright-wrapper-fixtures");
     let config = create_config_with_ignore_decorators(root, vec!["@step".to_string()]);
@@ -657,6 +1072,27 @@ fn fluent_builder_chain_credits_intermediate_setters() {
     assert!(
         unused_class_members.contains(&"EventBuilder.fakeFromNonFactory".to_string()),
         "fluent-chain credit must not piggy-back on a non-factory root method, found: {unused_class_members:?}"
+    );
+}
+
+#[test]
+fn long_new_rooted_fluent_chain_credits_every_step() {
+    // The chain has more steps than the receiver-name cap of 64 links.
+    const STEPS: usize = 70;
+    let root = fixture_path("long-fluent-builder-chain");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused_class_members: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+
+    assert_eq!(
+        unused_class_members,
+        vec!["Builder.unusedStep".to_string()],
+        "every one of the {STEPS} chained steps must be credited"
     );
 }
 
@@ -948,5 +1384,83 @@ fn ignore_decorators_applies_to_declaring_class_only() {
     assert!(
         admin_findings.is_empty(),
         "AdminPage has no own members; no findings should be attributed to it, found: {admin_findings:?}"
+    );
+}
+
+#[test]
+fn nullish_fallback_and_nullable_ternary_inits_credit_class_members() {
+    let config = create_config(fixture_path("fallback-init-class-members"));
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<(&str, &str)> = results
+        .unused_class_members
+        .iter()
+        .map(|item| {
+            (
+                item.member.parent_name.as_str(),
+                item.member.member_name.as_str(),
+            )
+        })
+        .collect();
+    unused.sort_unstable();
+    assert_eq!(
+        unused,
+        [
+            ("Cache", "unused"),
+            ("Link", "unused"),
+            ("Pool", "unused"),
+            ("Queue", "unused"),
+        ]
+    );
+}
+
+#[test]
+fn map_value_type_credits_class_members_read_through_get() {
+    let root = fixture_path("map-value-class-members");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let mut unused: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+    unused.sort();
+
+    assert_eq!(
+        unused,
+        vec![
+            "Entry.unused".to_string(),
+            "Item.unused".to_string(),
+            "Session.unused".to_string(),
+            "Slot.unused".to_string(),
+        ],
+        "a member called on a Map value must credit the value class"
+    );
+}
+
+#[test]
+fn map_iteration_credits_values_without_crediting_keys_or_other_receivers() {
+    let root = fixture_path("map-iteration-class-members");
+    let config = create_config(root);
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let mut unused: Vec<String> = results
+        .unused_class_members
+        .iter()
+        .map(|m| format!("{}.{}", m.member.parent_name, m.member.member_name))
+        .collect();
+    unused.sort();
+    assert_eq!(
+        unused,
+        [
+            "Item.catchOnly",
+            "Item.forInOnly",
+            "Item.keyOnly",
+            "Item.namespaceRestOnly",
+            "Item.never",
+            "Item.restOnly",
+            "Item.unknownOnly",
+            "Item.unsupportedOnly",
+        ],
+        "Map iteration must bind the value position within its lexical scope"
     );
 }

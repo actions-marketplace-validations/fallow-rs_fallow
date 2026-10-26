@@ -103,7 +103,7 @@ pub fn cache_root() -> Result<PathBuf, String> {
     Err("cannot determine the user cache directory; set FALLOW_SIMILAR_CODE_CACHE_DIR".to_string())
 }
 
-pub fn inspect_cache(paths: &ModelPaths, verify_hashes: bool) -> CacheStatus {
+pub fn inspect_cache(paths: &ModelPaths) -> CacheStatus {
     let manifest = match read_manifest(&paths.manifest) {
         Ok(manifest) => manifest,
         Err(problem) => {
@@ -126,7 +126,7 @@ pub fn inspect_cache(paths: &ModelPaths, verify_hashes: bool) -> CacheStatus {
                 problem: Some("the protocol manifest contains an unsupported artifact".to_string()),
             };
         };
-        if let Err(problem) = verify_artifact(path, artifact.size, artifact.sha256, verify_hashes) {
+        if let Err(problem) = verify_artifact(path, artifact.size, artifact.sha256) {
             return CacheStatus {
                 ready: false,
                 problem: Some(problem),
@@ -227,12 +227,7 @@ fn read_manifest(path: &Path) -> Result<InstalledManifest, String> {
         .map_err(|error| format!("failed to parse model manifest: {error}"))
 }
 
-fn verify_artifact(
-    path: &Path,
-    expected_size: u64,
-    expected_sha256: &str,
-    verify_hash: bool,
-) -> Result<(), String> {
+fn verify_artifact(path: &Path, expected_size: u64, expected_sha256: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| format!("model artifact `{}` is missing", file_label(path)))?;
     if !metadata.file_type().is_file() {
@@ -247,7 +242,7 @@ fn verify_artifact(
             file_label(path)
         ));
     }
-    if verify_hash && sha256_file(path)? != expected_sha256 {
+    if sha256_file(path)? != expected_sha256 {
         return Err(format!(
             "model artifact `{}` failed SHA-256 verification",
             file_label(path)
@@ -321,22 +316,65 @@ mod tests {
     fn missing_cache_is_not_ready_without_creating_it() {
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = ModelPaths::from_cache_root(directory.path());
-        let status = inspect_cache(&paths, true);
+        let status = inspect_cache(&paths);
         assert!(!status.ready);
         assert!(!paths.directory.exists());
     }
 
     #[test]
-    fn expected_manifest_tracks_protocol_artifacts() {
-        let manifest = expected_manifest();
-        assert_eq!(manifest.schema_version, INSTALLED_MANIFEST_SCHEMA_VERSION);
-        assert_eq!(manifest.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(
-            manifest.embedding_semantics_version,
-            EMBEDDING_SEMANTICS_VERSION
+    fn matching_manifest_and_sizes_do_not_make_corrupted_cache_ready() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = ModelPaths::from_cache_root(directory.path());
+        fs::create_dir_all(&paths.directory).expect("cache directory");
+        write_manifest(&paths.manifest).expect("matching manifest");
+        // Sparse zero-filled files preserve the real protocol sizes without
+        // downloading model data. Only content verification can reject them.
+        for artifact in ARTIFACTS {
+            File::create(paths.artifact(artifact.path).expect("artifact path"))
+                .expect("artifact file")
+                .set_len(artifact.size)
+                .expect("matching artifact size");
+        }
+
+        let status = inspect_cache(&paths);
+        assert!(!status.ready);
+        assert!(
+            status
+                .problem
+                .expect("integrity error")
+                .contains("SHA-256 verification")
         );
-        assert_eq!(manifest.model_revision, MODEL_REVISION);
-        assert_eq!(manifest.artifacts.len(), ARTIFACTS.len());
+    }
+
+    #[test]
+    fn stale_installed_manifest_is_not_ready() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = ModelPaths::from_cache_root(directory.path());
+        fs::create_dir_all(&paths.directory).expect("cache directory");
+        let mut stale = expected_manifest();
+        stale.protocol_version += 1;
+        fs::write(
+            &paths.manifest,
+            serde_json::to_vec_pretty(&stale).expect("stale manifest"),
+        )
+        .expect("write stale manifest");
+        // The artifacts have the protocol sizes, so only the manifest
+        // comparison can reject this cache before content verification.
+        for artifact in ARTIFACTS {
+            File::create(paths.artifact(artifact.path).expect("artifact path"))
+                .expect("artifact file")
+                .set_len(artifact.size)
+                .expect("matching artifact size");
+        }
+
+        let status = inspect_cache(&paths);
+        assert!(!status.ready);
+        assert!(
+            status
+                .problem
+                .expect("manifest error")
+                .contains("does not match this sidecar")
+        );
     }
 
     #[test]

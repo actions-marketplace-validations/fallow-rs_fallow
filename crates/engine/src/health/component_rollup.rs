@@ -203,9 +203,14 @@ fn component_template_owner(
     }
 }
 
+/// Whether a finding is a candidate for the class half of a `<component>`
+/// rollup: a real method on a `.ts`-family component file. Every synthetic
+/// name is rejected, including the module-scope unit, which is aggregate-only
+/// and must never become the "worst class method" a rollup is anchored at.
 fn is_component_class_finding(finding: &ComplexityViolation) -> bool {
     finding.name != COMPONENT_ROLLUP_NAME
         && !fallow_types::extract::is_synthetic_template_unit(&finding.name)
+        && !fallow_types::extract::is_synthetic_module_unit(&finding.name)
         && finding
             .path
             .extension()
@@ -247,6 +252,11 @@ fn make_component_rollup_violation(
         line: worst.line,
         col: worst.col,
         cyclomatic: totals.rollup_cyc,
+        // Template units never carry membership flags, so only the class half
+        // can change under `health.cyclomaticPolicy`.
+        standard_cyclomatic: worst
+            .standard_cyclomatic
+            .map(|standard| standard.saturating_add(template.cyclomatic)),
         cognitive: totals.rollup_cog,
         line_count: totals.rollup_lines,
         param_count: 0,
@@ -255,6 +265,7 @@ fn make_component_rollup_violation(
             totals.exceeds_cognitive,
             false,
         ),
+        effective_severity: None,
         severity: compute_finding_severity(
             totals.rollup_cog,
             totals.rollup_cyc,
@@ -265,6 +276,7 @@ fn make_component_rollup_violation(
             DEFAULT_CYCLOMATIC_CRITICAL,
         ),
         crap: None,
+        mutation: None,
         coverage_pct: None,
         coverage_tier: None,
         coverage_source: None,

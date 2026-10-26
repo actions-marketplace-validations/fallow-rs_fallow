@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   assertChangelogRelease,
@@ -148,6 +150,45 @@ test("the changelog gate refuses a duplicated section", () => {
     () => assertChangelogRelease(duplicated, "v3.21.0"),
     /exactly one "## \[3\.21\.0\]" section, found 2/u,
   );
+});
+
+test("the changelog gate refuses a heading that a merge left twice in the section", () => {
+  const body = [
+    "### Added",
+    "",
+    "- **One.**",
+    "",
+    "### Fixed",
+    "",
+    "- **Two.**",
+    "",
+    "### Added",
+    "",
+    "- **Three.**",
+    "",
+  ].join("\n");
+
+  // The 3.21.0 heading is on line 6, so its first "### Added" is on line 8.
+  assert.throws(
+    () => assertChangelogRelease(changelog({ body }), "v3.21.0"),
+    /the 3\.21\.0 section repeats "### Added" on lines 8 and 16, so merge each/u,
+  );
+
+  const twice = `${body}### Fixed\n\n- **Four.**\n\n### Added\n\n- **Five.**\n`;
+  assert.throws(
+    () => assertChangelogRelease(changelog({ body: twice }), "v3.21.0"),
+    /repeats "### Added" on lines 8, 16 and 23; "### Fixed" on lines 12 and 19/u,
+  );
+});
+
+test("the heading check ignores code samples, Unreleased and older sections", () => {
+  const fenced = ["### Added", "", "```md", "### Added", "```", ""].join("\n");
+  assert.doesNotThrow(() => assertChangelogRelease(changelog({ body: fenced }), "v3.21.0"));
+
+  const repeated = "### Fixed\n\n- **A.**\n\n### Fixed\n\n- **B.**\n";
+  assert.doesNotThrow(() => assertChangelogRelease(changelog({ unreleased: repeated }), "v3.21.0"));
+  const olderRepeat = changelog().replace("- **Something earlier.**", `- **X.**\n\n${repeated}`);
+  assert.doesNotThrow(() => assertChangelogRelease(olderRepeat, "v3.21.0"));
 });
 
 test("the changelog gate requires a real release date", () => {
@@ -376,7 +417,19 @@ test("the entry point reads both surfaces from disk and names what it verified",
   assert.deepEqual(verifyReleaseMetadata({ tag: "v3.21.0", root }), [
     "CHANGELOG.md section 3.21.0 (compares back to v3.20.0)",
     "an empty CHANGELOG.md [Unreleased] section",
+    "no fragments in changelog.d/",
   ]);
+
+  // A fragment that the release did not collect blocks the dispatch only.
+  mkdirSync(join(root, "changelog.d"));
+  writeFileSync(join(root, "changelog.d", "README.md"), "# Fragments\n");
+  assert.doesNotThrow(() => verifyReleaseMetadata({ tag: "v3.21.0", root }));
+  writeFileSync(join(root, "changelog.d", "late.md"), "### Fixed\n\n- **Late fix.**\n");
+  assert.throws(
+    () => verifyReleaseMetadata({ tag: "v3.21.0", root }),
+    /changelog\.d\/ still holds fragments, so they would ship uncredited/u,
+  );
+  assert.doesNotThrow(() => verifyReleaseMetadata({ tag: "v3.21.0", releaseJson, root }));
   assert.deepEqual(verifyReleaseMetadata({ tag: "v3.21.0", releaseJson, root }), [
     "CHANGELOG.md section 3.21.0 (compares back to v3.20.0)",
     "published GitHub Release title and body",
@@ -400,4 +453,20 @@ test("the entry point reads both surfaces from disk and names what it verified",
   );
 
   rmSync(root, { recursive: true, force: true });
+});
+
+test("node scripts/verify-release-metadata.mjs runs main and checks the changelog", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  // No release has tag v0.0.0, so the run fails after it reads CHANGELOG.md.
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-release-metadata.mjs", "--tag", "v0.0.0"],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.match(
+    result.stderr,
+    /^CHANGELOG\.md must hold exactly one "## \[0\.0\.0\]" section, found 0$/mu,
+  );
 });

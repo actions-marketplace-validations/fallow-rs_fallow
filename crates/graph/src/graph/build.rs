@@ -2,14 +2,17 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::resolve::{ResolvedImport, ResolvedModule};
+use crate::resolve::InlineLoaderRequest;
+use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule};
 use fallow_types::discover::{DiscoveredFile, FileId};
-use fallow_types::extract::{ExportName, ImportedName, ModuleLoadMechanism, VisibilityTag};
+use fallow_types::extract::{
+    ExportName, ImportLoadKind, ImportedName, ModuleLoadMechanism, SemanticFact, VisibilityTag,
+};
 
 use super::narrowing::{AttachContext, ReferenceDedup, attach_symbol_reference};
 use super::types::{ExportSymbol, ReExportEdge};
 use super::types::{ModuleNode, ReferencePathInterner};
-use super::{Edge, ImportedSymbol, ModuleGraph};
+use super::{EagerPackageImport, Edge, ImportedSymbol, ModuleGraph};
 
 pub(super) struct PopulateEdgesInput<'a> {
     pub(super) files: &'a [DiscoveredFile],
@@ -32,11 +35,86 @@ pub(super) struct NamespaceFeatures {
 }
 
 /// Mutable accumulator state shared across all files during edge population.
-struct EdgeAccumulator {
+struct EdgeAccumulator<'a> {
+    /// Discovered files, to read the path of an import target.
+    files: &'a [DiscoveredFile],
     package_usage: FxHashMap<String, Vec<FileId>>,
     type_only_package_usage: FxHashMap<String, Vec<FileId>>,
+    asset_package_usage: FxHashMap<String, Vec<FileId>>,
+    eager_package_imports: FxHashMap<FileId, Vec<EagerPackageImport>>,
     namespace_imported: fixedbitset::FixedBitSet,
     total_capacity: usize,
+}
+
+impl EdgeAccumulator<'_> {
+    /// The inline loader request that `source` resolved through to `target`,
+    /// or `None` when `source` resolved as a plain path.
+    fn loader_request<'s>(
+        &self,
+        source: &'s str,
+        target: &ResolveResult,
+    ) -> Option<InlineLoaderRequest<'s>> {
+        InlineLoaderRequest::resolved_to(source, target, |target_id| {
+            file_path(self.files, target_id)
+        })
+    }
+}
+
+/// How a webpack inline loader changes an edge to its resource.
+#[derive(Clone, Copy)]
+struct LoaderEdge {
+    /// Whether the edge goes through a loader. The loader replaces the
+    /// exports of the resource, so the edge credits the whole resource.
+    through_loader: bool,
+    /// When the resource loads relative to the importer, and whether it runs.
+    load_kind: ImportLoadKind,
+}
+
+impl LoaderEdge {
+    /// The effect of `request` on an edge whose target loads as `load_kind`
+    /// without a loader. A loader that reads its resource as an asset gives
+    /// the edge [`ImportLoadKind::AssetReference`], also inside a thread
+    /// loader, because the resource never runs. A loader that runs its
+    /// resource in another thread gives the edge the same load kind as
+    /// `new Worker(new URL(...))`.
+    fn new(request: Option<&InlineLoaderRequest<'_>>, load_kind: ImportLoadKind) -> Self {
+        let Some(request) = request else {
+            return Self {
+                through_loader: false,
+                load_kind,
+            };
+        };
+        let load_kind = if request.reads_resource_as_asset() {
+            ImportLoadKind::AssetReference
+        } else if request.runs_resource_in_another_thread() {
+            ImportLoadKind::OutOfThread
+        } else {
+            load_kind
+        };
+        Self {
+            through_loader: true,
+            load_kind,
+        }
+    }
+}
+
+/// The path of a discovered file.
+fn file_path(files: &[DiscoveredFile], file_id: FileId) -> Option<&std::path::Path> {
+    files
+        .get(file_id.0 as usize)
+        .filter(|file| file.id == file_id)
+        .or_else(|| files.iter().find(|file| file.id == file_id))
+        .map(|file| file.path.as_path())
+}
+
+/// The webpack inline loader request that `source` resolved through to the
+/// file `target_id`, or `None` when `source` resolved as a plain path.
+fn loader_request<'s>(
+    files: &[DiscoveredFile],
+    source: &'s str,
+    target_id: FileId,
+) -> Option<InlineLoaderRequest<'s>> {
+    InlineLoaderRequest::resolved(source, || file_path(files, target_id))
 }
 
 /// Insert into the namespace-imported bitset with bounds checking.
@@ -53,7 +131,7 @@ fn record_namespace_import(
 
 /// Track that a file uses an npm package, and optionally record type-only usage.
 fn record_package_usage(
-    acc: &mut EdgeAccumulator,
+    acc: &mut EdgeAccumulator<'_>,
     name: &str,
     file_id: FileId,
     is_type_only: bool,
@@ -79,22 +157,62 @@ fn collect_import_edge(
     import: &ResolvedImport,
     file_id: FileId,
     edges_by_target: &mut FxHashMap<FileId, Vec<ImportedSymbol>>,
-    acc: &mut EdgeAccumulator,
+    acc: &mut EdgeAccumulator<'_>,
 ) {
+    collect_import_edge_with_kind(
+        import,
+        file_id,
+        ImportLoadKind::Static,
+        edges_by_target,
+        acc,
+    );
+}
+
+/// [`collect_import_edge`] for an edge whose target loads as `load_kind`.
+fn collect_import_edge_with_kind(
+    import: &ResolvedImport,
+    file_id: FileId,
+    load_kind: ImportLoadKind,
+    edges_by_target: &mut FxHashMap<FileId, Vec<ImportedSymbol>>,
+    acc: &mut EdgeAccumulator<'_>,
+) {
+    let loader = LoaderEdge::new(
+        acc.loader_request(&import.info.source, &import.target)
+            .as_ref(),
+        load_kind,
+    );
     if let Some(package_name) = import.target.package_usage_name() {
-        record_package_usage(acc, package_name, file_id, import.info.is_type_only);
+        record_package_import(
+            acc,
+            package_name,
+            &import.info.source,
+            file_id,
+            import.info.is_type_only,
+            loader,
+        );
     }
 
     if let Some(target_id) = import.target.internal_file_id() {
-        if matches!(import.info.imported_name, ImportedName::Namespace) {
+        // A webpack inline loader replaces the exports of its resource, so the
+        // imported bindings name loader output, not resource exports. Credit
+        // the whole resource, like a dynamic import pattern match.
+        let (imported_name, local_name) = if loader.through_loader {
+            (ImportedName::Namespace, String::new())
+        } else {
+            (
+                import.info.imported_name.clone(),
+                import.info.local_name.clone(),
+            )
+        };
+        if matches!(imported_name, ImportedName::Namespace) {
             record_namespace_import(target_id, &mut acc.namespace_imported, acc.total_capacity);
         }
         edges_by_target
             .entry(target_id)
             .or_default()
             .push(ImportedSymbol {
-                imported_name: import.info.imported_name.clone(),
-                local_name: import.info.local_name.clone(),
+                imported_name,
+                local_name,
                 import_span: import.info.span,
                 is_type_only: import.info.is_type_only,
                 is_type_only_star: import.info.is_type_only_star,
@@ -103,8 +221,86 @@ fn collect_import_edge(
                 } else {
                     ModuleLoadMechanism::EsModule
                 },
+                load_kind: loader.load_kind,
             });
     }
+}
+
+/// Record the package side of an import or a re-export of `specifier`.
+///
+/// Every import uses the package. An import through an asset loader reads a
+/// file of the package at build time, so it is also recorded as a build-time
+/// use. A static value import that runs the package is startup weight.
+fn record_package_import(
+    acc: &mut EdgeAccumulator<'_>,
+    package_name: &str,
+    specifier: &str,
+    file_id: FileId,
+    is_type_only: bool,
+    loader: LoaderEdge,
+) {
+    record_package_usage(acc, package_name, file_id, is_type_only);
+    if loader.load_kind == ImportLoadKind::AssetReference && !is_type_only {
+        acc.asset_package_usage
+            .entry(package_name.to_owned())
+            .or_default()
+            .push(file_id);
+    }
+    if loader.load_kind.is_eager_value(is_type_only) {
+        record_eager_package_import(acc, package_name, specifier, file_id);
+    }
+}
+
+/// Record a static, value-carrying package import or re-export for the
+/// startup weight report.
+fn record_eager_package_import(
+    acc: &mut EdgeAccumulator<'_>,
+    package_name: &str,
+    specifier: &str,
+    file_id: FileId,
+) {
+    let imports = acc.eager_package_imports.entry(file_id).or_default();
+    if imports
+        .iter()
+        .any(|existing| existing.specifier == specifier)
+    {
+        return;
+    }
+    imports.push(EagerPackageImport {
+        package: package_name.to_owned(),
+        specifier: specifier.to_owned(),
+    });
+}
+
+/// The load kinds that extraction recorded for dynamic imports and patterns
+/// whose kind differs from the default of their list, keyed by span start.
+fn import_load_kind_overrides(resolved: &ResolvedModule) -> FxHashMap<u32, ImportLoadKind> {
+    resolved
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            SemanticFact::ImportLoadKindOverride(fact) => Some((fact.span_start, fact.kind)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The load kind of the matches of one dynamic import pattern.
+///
+/// `require.context` bundles its matches with the importer, so it is static.
+/// An `import.meta.glob(..., { eager: true })` has a `Static` override from
+/// extraction. Every other pattern loads its matches on demand.
+fn pattern_load_kind(
+    pattern: &fallow_types::extract::DynamicImportPattern,
+    overrides: &FxHashMap<u32, ImportLoadKind>,
+) -> ImportLoadKind {
+    if matches!(pattern.mechanism, ModuleLoadMechanism::CommonJsRequire) {
+        return ImportLoadKind::Static;
+    }
+    overrides
+        .get(&pattern.span.start)
+        .copied()
+        .unwrap_or(ImportLoadKind::DynamicPattern)
 }
 
 /// Collect edges from a resolved module's static imports, re-exports, dynamic imports,
@@ -114,7 +310,7 @@ fn collect_import_edge(
 fn collect_edges_for_module(
     resolved: &ResolvedModule,
     file_id: FileId,
-    acc: &mut EdgeAccumulator,
+    acc: &mut EdgeAccumulator<'_>,
 ) -> Vec<(FileId, Vec<ImportedSymbol>)> {
     let mut edges_by_target: FxHashMap<FileId, Vec<ImportedSymbol>> = FxHashMap::default();
 
@@ -123,26 +319,53 @@ fn collect_edges_for_module(
     }
 
     for re_export in &resolved.re_exports {
+        let loader = LoaderEdge::new(
+            acc.loader_request(&re_export.info.source, &re_export.target)
+                .as_ref(),
+            ImportLoadKind::Static,
+        );
         if let Some(package_name) = re_export.target.package_usage_name() {
-            record_package_usage(acc, package_name, file_id, re_export.info.is_type_only);
+            record_package_import(
+                acc,
+                package_name,
+                &re_export.info.source,
+                file_id,
+                re_export.info.is_type_only,
+                loader,
+            );
         }
         if let Some(target_id) = re_export.target.internal_file_id() {
+            // A re-export through an inline loader re-exports loader output,
+            // not resource exports. `build_re_export_edges` drops it, and this
+            // edge credits the whole resource, the same as a loader import.
+            let imported_name = if loader.through_loader {
+                record_namespace_import(target_id, &mut acc.namespace_imported, acc.total_capacity);
+                ImportedName::Namespace
+            } else {
+                ImportedName::SideEffect
+            };
             edges_by_target
                 .entry(target_id)
                 .or_default()
                 .push(ImportedSymbol {
-                    imported_name: ImportedName::SideEffect,
+                    imported_name,
                     local_name: String::new(),
                     import_span: oxc_span::Span::new(0, 0),
                     is_type_only: re_export.info.is_type_only,
                     is_type_only_star: false,
                     mechanism: ModuleLoadMechanism::EsModule,
+                    load_kind: loader.load_kind,
                 });
         }
     }
 
+    let load_kind_overrides = import_load_kind_overrides(resolved);
     for import in &resolved.resolved_dynamic_imports {
-        collect_import_edge(import, file_id, &mut edges_by_target, acc);
+        let load_kind = load_kind_overrides
+            .get(&import.info.span.start)
+            .copied()
+            .unwrap_or(ImportLoadKind::Dynamic);
+        collect_import_edge_with_kind(import, file_id, load_kind, &mut edges_by_target, acc);
     }
 
     // Patterns from `import()`, `import.meta.glob`, and `require.context` each
@@ -152,11 +375,16 @@ fn collect_edges_for_module(
     // mechanism: matches with the same mechanism carry no additional information,
     // while ESM and CommonJS matches must remain distinct for mock-aware coverage.
     // The set is per-file, so different importers still create their own edges.
-    let mut credited_pattern_targets: FxHashSet<(FileId, ModuleLoadMechanism)> =
+    //
+    // The load kind is part of the key too: an eager `import.meta.glob` and a
+    // lazy template `import()` that match the same file must both stay, so the
+    // eager match keeps the target on the startup path.
+    let mut credited_pattern_targets: FxHashSet<(FileId, ModuleLoadMechanism, ImportLoadKind)> =
         FxHashSet::default();
     for (pattern, matched_ids) in &resolved.resolved_dynamic_patterns {
+        let load_kind = pattern_load_kind(pattern, &load_kind_overrides);
         for target_id in matched_ids {
-            if !credited_pattern_targets.insert((*target_id, pattern.mechanism)) {
+            if !credited_pattern_targets.insert((*target_id, pattern.mechanism, load_kind)) {
                 continue;
             }
             record_namespace_import(*target_id, &mut acc.namespace_imported, acc.total_capacity);
@@ -170,6 +398,7 @@ fn collect_edges_for_module(
                     is_type_only: false,
                     is_type_only_star: false,
                     mechanism: pattern.mechanism,
+                    load_kind,
                 });
         }
     }
@@ -181,6 +410,7 @@ fn collect_edges_for_module(
 
 /// Build a `ModuleNode` for a file, including exports, re-export edges, and metadata.
 fn build_module_node(
+    files: &[DiscoveredFile],
     file: &DiscoveredFile,
     module_by_id: &FxHashMap<FileId, &ResolvedModule>,
     entry_point_ids: &FxHashSet<FileId>,
@@ -194,7 +424,7 @@ fn build_module_node(
     }
 
     let has_cjs_exports = resolved.is_some_and(|m| m.has_cjs_exports);
-    let (re_export_edges, has_namespace_re_exports) = build_re_export_edges(resolved);
+    let (re_export_edges, has_namespace_re_exports) = build_re_export_edges(files, resolved);
     let has_namespace_aliases = resolved.is_some_and(|m| !m.namespace_object_aliases.is_empty());
 
     (
@@ -230,6 +460,8 @@ fn build_export_symbols(resolved: Option<&ResolvedModule>) -> Vec<ExportSymbol> 
                     is_side_effect_used: e.is_side_effect_used,
                     visibility: e.visibility,
                     expected_unused_reason: e.expected_unused_reason.clone(),
+                    deprecated: e.deprecated,
+                    deprecated_reason: e.deprecated_reason.clone(),
                     span: e.span,
                     references: Vec::new(),
                     reference_paths: Vec::new(),
@@ -320,12 +552,21 @@ fn push_re_export_stub(
         references: Vec::new(),
         reference_paths: Vec::new(),
         members: Vec::new(),
+        deprecated: false,
+        deprecated_reason: None,
     });
 }
 
 /// Build the internal re-export edge list for a module (external re-export
 /// targets are dropped here; they are handled via package usage).
-fn build_re_export_edges(resolved: Option<&ResolvedModule>) -> (Vec<ReExportEdge>, bool) {
+///
+/// A re-export through a webpack inline loader is dropped too. The loader
+/// replaces the exports of its resource, so the re-exported names do not name
+/// resource exports. The module edge credits the whole resource instead.
+fn build_re_export_edges(
+    files: &[DiscoveredFile],
+    resolved: Option<&ResolvedModule>,
+) -> (Vec<ReExportEdge>, bool) {
     let Some(resolved) = resolved else {
         return (Vec::new(), false);
     };
@@ -334,9 +575,13 @@ fn build_re_export_edges(resolved: Option<&ResolvedModule>) -> (Vec<ReExportEdge
         .re_exports
         .iter()
         .filter_map(|re| {
+            let target_id = re.target.internal_file_id();
+            if target_id.is_some_and(|id| loader_request(files, &re.info.source, id).is_some()) {
+                return None;
+            }
             has_namespace_re_exports |=
                 re.info.imported_name == "*" && re.info.exported_name != "*";
-            re.target.internal_file_id().map(|target_id| ReExportEdge {
+            target_id.map(|target_id| ReExportEdge {
                 source_file: target_id,
                 imported_name: re.info.imported_name.clone(),
                 exported_name: re.info.exported_name.clone(),
@@ -366,8 +611,11 @@ impl ModuleGraph {
         let mut reverse_deps = vec![Vec::new(); total_capacity];
         let mut namespace_features = NamespaceFeatures::default();
         let mut acc = EdgeAccumulator {
+            files,
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
+            asset_package_usage: FxHashMap::default(),
+            eager_package_imports: FxHashMap::default(),
             namespace_imported: fixedbitset::FixedBitSet::with_capacity(total_capacity),
             total_capacity,
         };
@@ -393,8 +641,13 @@ impl ModuleGraph {
 
             let edge_end = all_edges.len();
 
-            let (module, features) =
-                build_module_node(file, module_by_id, entry_point_ids, edge_start..edge_end);
+            let (module, features) = build_module_node(
+                files,
+                file,
+                module_by_id,
+                entry_point_ids,
+                edge_start..edge_end,
+            );
             namespace_features.has_aliases |= features.has_aliases;
             namespace_features.has_re_exports |= features.has_re_exports;
             modules.push(module);
@@ -406,6 +659,8 @@ impl ModuleGraph {
                 edges: all_edges,
                 package_usage: acc.package_usage,
                 type_only_package_usage: acc.type_only_package_usage,
+                asset_package_usage: acc.asset_package_usage,
+                eager_package_imports: acc.eager_package_imports,
                 entry_points: entry_point_ids.clone(),
                 runtime_entry_points: runtime_entry_point_ids.clone(),
                 test_entry_points: test_entry_point_ids.clone(),
@@ -666,6 +921,8 @@ mod tests {
             references: Vec::new(),
             reference_paths: Vec::new(),
             members: Vec::new(),
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 
@@ -925,8 +1182,11 @@ mod tests {
     #[test]
     fn record_package_usage_non_type_only() {
         let mut acc = EdgeAccumulator {
+            files: &[],
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
+            asset_package_usage: FxHashMap::default(),
+            eager_package_imports: FxHashMap::default(),
             namespace_imported: fixedbitset::FixedBitSet::with_capacity(4),
             total_capacity: 4,
         };
@@ -938,8 +1198,11 @@ mod tests {
     #[test]
     fn record_package_usage_type_only() {
         let mut acc = EdgeAccumulator {
+            files: &[],
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
+            asset_package_usage: FxHashMap::default(),
+            eager_package_imports: FxHashMap::default(),
             namespace_imported: fixedbitset::FixedBitSet::with_capacity(4),
             total_capacity: 4,
         };
@@ -951,8 +1214,11 @@ mod tests {
     #[test]
     fn record_package_usage_multiple_files() {
         let mut acc = EdgeAccumulator {
+            files: &[],
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
+            asset_package_usage: FxHashMap::default(),
+            eager_package_imports: FxHashMap::default(),
             namespace_imported: fixedbitset::FixedBitSet::with_capacity(4),
             total_capacity: 4,
         };
@@ -962,10 +1228,13 @@ mod tests {
         assert_eq!(acc.type_only_package_usage["lodash"], vec![FileId(1)]);
     }
 
-    fn make_acc(cap: usize) -> EdgeAccumulator {
+    fn make_acc(cap: usize) -> EdgeAccumulator<'static> {
         EdgeAccumulator {
+            files: &[],
             package_usage: FxHashMap::default(),
             type_only_package_usage: FxHashMap::default(),
+            asset_package_usage: FxHashMap::default(),
+            eager_package_imports: FxHashMap::default(),
             namespace_imported: fixedbitset::FixedBitSet::with_capacity(cap),
             total_capacity: cap,
         }
@@ -1239,6 +1508,51 @@ mod tests {
         assert_eq!(acc.package_usage["react"], vec![FileId(0)]);
     }
 
+    fn package_re_export(
+        source: &str,
+        imported_name: &str,
+        is_type_only: bool,
+    ) -> crate::resolve::ResolvedReExport {
+        crate::resolve::ResolvedReExport {
+            info: fallow_types::extract::ReExportInfo {
+                source: source.to_string(),
+                imported_name: imported_name.to_string(),
+                exported_name: imported_name.to_string(),
+                is_type_only,
+                span: oxc_span::Span::default(),
+                statement_span: oxc_span::Span::new(0, 0),
+                source_span: oxc_span::Span::new(0, 0),
+            },
+            target: ResolveResult::NpmPackage(source.to_string()),
+        }
+    }
+
+    #[test]
+    fn collect_edges_value_package_re_exports_load_eagerly() {
+        let resolved = ResolvedModule {
+            file_id: FileId(0),
+            path: std::path::PathBuf::from("/project/barrel.ts"),
+            re_exports: vec![
+                package_re_export("pkg-a", "x", false),
+                package_re_export("pkg-b", "*", false),
+                package_re_export("pkg-types", "Shape", true),
+            ],
+            ..Default::default()
+        };
+        let mut acc = make_acc(4);
+        collect_edges_for_module(&resolved, FileId(0), &mut acc);
+
+        let eager: Vec<&str> = acc.eager_package_imports[&FileId(0)]
+            .iter()
+            .map(|import| import.specifier.as_str())
+            .collect();
+        assert_eq!(
+            eager,
+            ["pkg-a", "pkg-b"],
+            "a type-only re-export does not load its package"
+        );
+    }
+
     #[test]
     fn collect_edges_dynamic_patterns_set_namespace() {
         let pattern = fallow_types::extract::DynamicImportPattern {
@@ -1246,6 +1560,7 @@ mod tests {
             suffix: Some(".json".to_string()),
             span: oxc_span::Span::new(0, 10),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         let resolved = ResolvedModule {
             file_id: FileId(0),
@@ -1272,6 +1587,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::new(0, 1),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         let resolved = ResolvedModule {
             file_id: FileId(0),
@@ -1311,6 +1627,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::new(0, 1),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         let importer_a = ResolvedModule {
             file_id: FileId(0),
@@ -1349,6 +1666,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::new(0, 1),
             mechanism,
+            excludes: Vec::new(),
         };
         let resolved = ResolvedModule {
             file_id: FileId(0),
@@ -1427,6 +1745,8 @@ mod tests {
                     members: vec![],
                     is_side_effect_used: false,
                     super_class: None,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }]
                 .into(),
                 ..Default::default()
@@ -1465,6 +1785,8 @@ mod tests {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             }]
             .into(),
             re_exports: vec![crate::resolve::ResolvedReExport {

@@ -4,9 +4,9 @@ use super::knip::migrate_knip;
 use super::stylelint::migrate_stylelint;
 use super::toml_gen::generate_toml;
 use super::{
-    MigrationResult, MigrationWarning, OutputFormat, load_json_or_jsonc, migrate_auto_detect,
-    migrate_from_file, should_emit_glob_caveat, source_head, string_or_array,
-    strip_trailing_commas,
+    KNIP_GLOB_ENGINE_NOTE, KNIP_IGNORE_SCOPE_NOTE, MigrationResult, MigrationWarning, OutputFormat,
+    load_json_or_jsonc, migrate_auto_detect, migrate_from_file, should_emit_glob_caveat,
+    source_head, string_or_array,
 };
 
 fn empty_config() -> serde_json::Map<String, serde_json::Value> {
@@ -371,27 +371,23 @@ fn warning_display_with_suggestion() {
 }
 
 #[test]
-fn string_or_array_with_string_value() {
-    let val = serde_json::json!("single");
-    assert_eq!(string_or_array(&val), vec!["single"]);
-}
-
-#[test]
-fn string_or_array_with_array_value() {
-    let val = serde_json::json!(["a", "b", "c"]);
-    assert_eq!(string_or_array(&val), vec!["a", "b", "c"]);
-}
-
-#[test]
-fn string_or_array_with_non_string_non_array() {
-    let val = serde_json::json!(42);
-    assert!(string_or_array(&val).is_empty());
-}
-
-#[test]
-fn string_or_array_with_mixed_array_filters_non_strings() {
-    let val = serde_json::json!(["valid", 123, "also-valid", null]);
-    assert_eq!(string_or_array(&val), vec!["valid", "also-valid"]);
+fn string_or_array_reads_strings_and_string_arrays() {
+    let cases = [
+        (serde_json::json!("single"), vec!["single"]),
+        (serde_json::json!(["a", "b", "c"]), vec!["a", "b", "c"]),
+        (
+            serde_json::json!(["valid", 123, "also-valid", null]),
+            vec!["valid", "also-valid"],
+        ),
+        (serde_json::json!([]), vec![]),
+        (serde_json::json!(42), vec![]),
+        (serde_json::json!(null), vec![]),
+        (serde_json::json!(true), vec![]),
+        (serde_json::json!({"key": "value"}), vec![]),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(string_or_array(&value), expected, "{value}");
+    }
 }
 
 #[test]
@@ -477,50 +473,6 @@ fn load_json_or_jsonc_handles_comments_and_trailing_commas_together() {
         value.get("ignore").unwrap(),
         &serde_json::json!(["dist/**"])
     );
-}
-
-#[test]
-fn strip_trailing_commas_drops_simple_object_comma() {
-    assert_eq!(strip_trailing_commas(r#"{"a":1,}"#), r#"{"a":1}"#);
-}
-
-#[test]
-fn strip_trailing_commas_drops_simple_array_comma() {
-    assert_eq!(strip_trailing_commas(r"[1,2,3,]"), r"[1,2,3]");
-}
-
-#[test]
-fn strip_trailing_commas_preserves_malformed_leading_comma() {
-    assert_eq!(strip_trailing_commas(r"{,}"), r"{,}");
-    assert_eq!(strip_trailing_commas(r"[, ]"), r"[, ]");
-}
-
-#[test]
-fn strip_trailing_commas_preserves_separator_commas() {
-    assert_eq!(
-        strip_trailing_commas(r#"{"a":1,"b":2}"#),
-        r#"{"a":1,"b":2}"#,
-    );
-}
-
-#[test]
-fn strip_trailing_commas_ignores_commas_inside_strings() {
-    let input = r#"{"msg":"hello, world,"}"#;
-    assert_eq!(strip_trailing_commas(input), input);
-}
-
-#[test]
-fn strip_trailing_commas_handles_escaped_quote_in_string() {
-    let input = r#"{"msg":"he said \"hi,\",","n":1,}"#;
-    let expected = r#"{"msg":"he said \"hi,\",","n":1}"#;
-    assert_eq!(strip_trailing_commas(input), expected);
-}
-
-#[test]
-fn strip_trailing_commas_handles_whitespace_before_brace() {
-    let input = "{\n  \"a\": 1,\n}";
-    let expected = "{\n  \"a\": 1\n}";
-    assert_eq!(strip_trailing_commas(input), expected);
 }
 
 #[test]
@@ -1267,30 +1219,6 @@ fn toml_output_ignore_exports_used_in_file_kind_form() {
 }
 
 #[test]
-fn string_or_array_with_empty_array() {
-    let val = serde_json::json!([]);
-    assert!(string_or_array(&val).is_empty());
-}
-
-#[test]
-fn string_or_array_with_null() {
-    let val = serde_json::json!(null);
-    assert!(string_or_array(&val).is_empty());
-}
-
-#[test]
-fn string_or_array_with_bool() {
-    let val = serde_json::json!(true);
-    assert!(string_or_array(&val).is_empty());
-}
-
-#[test]
-fn string_or_array_with_object() {
-    let val = serde_json::json!({"key": "value"});
-    assert!(string_or_array(&val).is_empty());
-}
-
-#[test]
 fn glob_caveat_emitted_for_knip_with_entry() {
     let result = MigrationResult {
         config: serde_json::json!({"entry": ["src/**"]}),
@@ -1452,4 +1380,23 @@ fn knip_glob_equivalence_question_mark_single_char() {
     let paths = &["a.ts", "ab.ts", "/ts"];
     let matched = matches_set("?.ts", paths);
     assert_eq!(matched, vec!["a.ts"]);
+}
+
+#[test]
+fn knip_notes_fit_eighty_columns_with_the_docs_url_on_its_own_line() {
+    const DOCS_URL: &str = "https://fallow.tools/docs/migration/from-knip/";
+    for note in [KNIP_IGNORE_SCOPE_NOTE, KNIP_GLOB_ENGINE_NOTE] {
+        let lines: Vec<&str> = note.lines().collect();
+        assert_eq!(lines.last(), Some(&DOCS_URL), "{note}");
+        for line in &lines[..lines.len() - 1] {
+            assert!(
+                line.chars().count() <= 80,
+                "wider than 80 columns: {line:?}"
+            );
+            assert!(
+                !line.contains(DOCS_URL),
+                "URL not on its own line: {line:?}"
+            );
+        }
+    }
 }

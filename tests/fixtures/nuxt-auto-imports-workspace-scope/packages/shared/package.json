@@ -1,0 +1,9 @@
+{
+  "name": "shared",
+  "private": true,
+  "dependencies": {
+    "@pinia/nuxt": "^0.11.0",
+    "nuxt": "^4.0.0",
+    "pinia": "^3.0.0"
+  }
+}

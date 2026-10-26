@@ -5,52 +5,68 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_semantic::ScopeFlags;
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 
 use crate::{
-    ComputedEnumKeyUseFact, DefaultImportWholeObjectUseFact, DynamicImportInfo,
+    AngularComponentFieldArrayTypeFact, AngularThisSpreadFact, ComputedEnumKeyUseFact,
+    DefaultImportWholeObjectUseFact, DynamicCustomElementRenderFact, DynamicImportInfo,
     DynamicImportPattern, ExportInfo, ExportName, ImportInfo, ImportedName, MemberAccess,
-    ModuleLoadMechanism, ReExportInfo, RequireCallInfo, RequiredTypeMemberFact, SemanticFact,
-    VisibilityTag,
+    ModuleLoadMechanism, PlaywrightFixtureUseFact, ReExportInfo, RequireCallInfo,
+    RequiredTypeMemberFact, SemanticFact, VisibilityTag,
+    js_text::{JsText, static_name_text},
 };
 use fallow_types::extract::{
     AngularComponentSelector, CalleeUse, ClassHeritageInfo, DiFramework, DiKeySite, DiRole,
-    LocalTypeDeclaration, MisplacedDirectiveSite, PublicSignatureTypeReference,
+    ImportLoadKind, ImportedCallSite, LocalTypeDeclaration, MisplacedDirectiveSite,
+    PublicSignatureTypeReference,
 };
 
 use crate::asset_url::normalize_asset_url;
+use crate::function_body::BodyRef;
 use crate::html::is_remote_url;
 
 use super::helpers::{
-    array_element_type_from_type, extract_angular_component_metadata,
+    array_element_type_from_type, escape_glob_literal, extract_angular_component_metadata,
     extract_angular_inputs_outputs, extract_angular_signal_query,
     extract_class_generic_instance_bindings, extract_class_members,
     extract_class_type_parameter_names, extract_concat_parts, extract_custom_element_tag_reference,
     extract_custom_elements_define, extract_implemented_interface_names,
-    extract_nested_type_bindings, extract_query_list_element_type, extract_super_class_name,
-    extract_super_class_type_args, extract_type_annotation_name, extract_type_reference_name,
-    has_angular_class_decorator, has_angular_plural_query_decorator,
-    infer_array_binding_element_type, is_meta_url_arg, lit_custom_element_decorator,
-    lit_custom_element_tag, regex_pattern_to_suffix, return_type_element_name,
-    ts_import_type_qualifier_root,
+    extract_query_list_element_type, extract_super_class_name, extract_super_class_type_args,
+    extract_type_annotation_name, extract_type_reference_name, has_angular_class_decorator,
+    has_angular_plural_query_decorator, is_meta_url_arg, lit_custom_element_decorator,
+    lit_custom_element_tag, map_value_type_from_new, map_value_type_from_type,
+    regex_pattern_to_suffix, return_type_element_name, ts_import_type_qualifier_root,
 };
 use super::{
-    BindingTarget, ModuleInfoExtractor, PendingLocalExportSpecifier, ROUTE_LOADER_DATA_OBJECT,
-    SideEffectRegistrationTarget, collect_static_import_specifiers, extract_import_expression,
-    try_extract_arrow_wrapped_import, try_extract_import_then_callback,
-    try_extract_property_callback_import, try_extract_require,
+    BindingTarget, ModuleInfoExtractor, PendingBindingForward, PendingLocalExportSpecifier,
+    ROUTE_LOADER_DATA_OBJECT, SideEffectRegistrationTarget, collect_static_import_specifiers,
+    extract_import_expression, extract_promise_all_elements, is_unawaited_import,
+    ssr_load_module_call, ssr_load_module_source, try_extract_arrow_wrapped_import,
+    try_extract_import_then_callback, try_extract_property_callback_import, try_extract_require,
 };
 
+#[path = "visit_impl_callback_properties.rs"]
+mod visit_callback_properties;
+#[path = "visit_impl_chain_names.rs"]
+mod visit_chain_names;
+#[path = "visit_impl_constructor_alternatives.rs"]
+mod visit_constructor_alternatives;
 #[path = "visit_impl_di.rs"]
 mod visit_di;
 #[path = "visit_impl_dynamic_imports.rs"]
 mod visit_dynamic_imports;
+#[path = "visit_impl_factory_properties.rs"]
+mod visit_factory_properties;
 #[path = "visit_impl_factory_returns.rs"]
 mod visit_factory_returns;
 #[path = "visit_impl_helpers.rs"]
 mod visit_helpers;
+#[path = "visit_impl_jsx_runtime.rs"]
+mod visit_jsx_runtime;
+#[path = "visit_impl_member_destructuring.rs"]
+mod visit_member_destructuring;
 #[path = "visit_impl_node_runtime.rs"]
 mod visit_node_runtime;
 #[path = "visit_impl_object_bindings.rs"]
@@ -63,6 +79,12 @@ mod visit_package_resolution;
 mod visit_pinia;
 #[path = "visit_impl_playwright.rs"]
 mod visit_playwright;
+#[path = "visit_impl_program_facts.rs"]
+mod visit_program_facts;
+#[path = "visit_impl_projections.rs"]
+pub(super) mod visit_projections;
+#[path = "visit_impl_reflection.rs"]
+mod visit_reflection;
 #[path = "visit_impl_scope_bindings.rs"]
 mod visit_scope_bindings;
 #[path = "visit_impl_security_classifiers.rs"]
@@ -75,8 +97,14 @@ mod visit_security_routes;
 mod visit_security_sanitizers;
 #[path = "visit_impl_security_sinks.rs"]
 mod visit_security_sinks;
+#[path = "visit_impl_server_actions.rs"]
+mod visit_server_actions;
 #[path = "visit_impl_signature.rs"]
 mod visit_signature;
+#[path = "visit_impl_source_paths.rs"]
+mod visit_source_paths;
+#[path = "visit_impl_spy_calls.rs"]
+mod visit_spy_calls;
 #[path = "visit_impl_structural.rs"]
 mod visit_structural;
 #[path = "visit_impl_svelte_events.rs"]
@@ -86,6 +114,10 @@ mod visit_sveltekit_load;
 #[path = "visit_impl_taint_sources.rs"]
 mod visit_taint_sources;
 
+pub(super) use visit_chain_names::jsx_member_object_name;
+pub use visit_chain_names::push_member_tag_accesses;
+use visit_chain_names::{static_member_object_name, type_name_member_path};
+pub(super) use visit_dynamic_imports::ComponentLoaderImport;
 pub(super) use visit_factory_returns::count_returns_in_statements;
 use visit_factory_returns::{
     FactoryReturnFunctionInput, classify_factory_assigned_value, collect_self_scope_assignments,
@@ -98,6 +130,11 @@ use visit_package_resolution::*;
 use visit_security_classifiers::*;
 pub(super) use visit_security_routes::function_body_has_use_server;
 use visit_security_routes::*;
+pub(super) use visit_source_paths::join_member_path;
+use visit_source_paths::{
+    binding_source_path_candidates, flatten_member_path, push_unique_string, source_path_candidates,
+};
+pub(super) use visit_spy_calls::SpyApi;
 
 /// Array iteration methods whose callback's FIRST parameter is an element of the
 /// receiver array (so it can be typed to the receiver's element class). `reduce`
@@ -165,34 +202,44 @@ impl ModuleInfoExtractor {
         // factories are excluded from the STRICT (cross-module) map; the same-file
         // (loose) maps below are unaffected. See #1441 (Part A).
         let strict_eligible = !input.is_async && !input.is_generator;
-        if let Some(class_name) = function_body_returns_new_class(body, input.is_expression_body) {
+        // An `async` factory hands back a promise of the class. It is exported
+        // through its own strict map and binds only an awaited call result.
+        let returns_promise = input.is_async && !input.is_generator;
+        if returns_promise {
+            self.promise_factory_functions.insert(name.to_string());
+        } else if input.is_generator {
+            self.generator_factory_functions.insert(name.to_string());
+        }
+        if let Some(class_name) = function_body_returns_new_class(body) {
             // An all-paths-unanimous, non-falling-through proof additionally
             // qualifies this factory for cross-module export (see
             // `strict_factory_return_functions`); the same-file map below keeps
             // the looser last-return semantics.
             if strict_eligible
-                && let Some(unanimous_class) =
-                    function_body_returns_new_class_unanimous(body, input.is_expression_body)
+                && let Some(unanimous_class) = function_body_returns_new_class_unanimous(body)
             {
                 self.strict_factory_return_functions
+                    .insert(name.to_string(), unanimous_class);
+            } else if returns_promise
+                && let Some(unanimous_class) = function_body_returns_new_class_unanimous(body)
+            {
+                self.strict_async_factory_return_functions
                     .insert(name.to_string(), unanimous_class);
             }
             self.factory_return_functions
                 .insert(name.to_string(), class_name);
-        } else if let Some(returned_id) =
-            function_body_returns_identifier(body, input.params, input.is_expression_body)
-        {
+        } else if let Some(returned_id) = function_body_returns_identifier(body, input.params) {
             // The alias is eligible for STRICT promotion only when it returns
             // synchronously and the body cannot fall through to `undefined`. The
             // class is value-proven later in `resolve_factory_return_aliases`.
-            if strict_eligible && function_body_is_terminal(body, input.is_expression_body) {
+            if strict_eligible && function_body_is_terminal(body) {
                 self.strict_alias_eligible.insert(name.to_string());
                 // Collect assignments to the returned id from THIS function's own
                 // body (not nested functions), tying the value-proof to the alias
                 // function, an assignment in a sibling/unrelated function must not
                 // prove it. See #1441 (Part A).
                 let mut assignments = Vec::new();
-                collect_self_scope_assignments(&body.statements, &returned_id, &mut assignments);
+                collect_self_scope_assignments(body.statements(), &returned_id, &mut assignments);
                 if !assignments.is_empty() {
                     self.alias_in_body_assignments
                         .insert(name.to_string(), assignments);
@@ -221,6 +268,16 @@ impl ModuleInfoExtractor {
                 .insert(name.to_string(), class_name.clone());
             self.factory_return_functions
                 .insert(name.to_string(), class_name);
+        } else if returns_promise
+            && let Some(return_type) = input.return_type
+            && let Some(class_name) = return_type_element_name(&return_type.type_annotation)
+        {
+            // `async function load(): Promise<Gauge>`: the same compiler-checked
+            // contract as the sync arm above, for the awaited value.
+            self.strict_async_factory_return_functions
+                .insert(name.to_string(), class_name.clone());
+            self.factory_return_functions
+                .insert(name.to_string(), class_name);
         }
 
         // Object-literal return (`return { orders: factory.ordersPage }`): capture
@@ -229,21 +286,110 @@ impl ModuleInfoExtractor {
         // is checked unconditionally. Strict (cross-module) eligibility additionally
         // requires a terminal body, so `const ui = createUi()` cannot bind a value
         // the factory only returns on some paths. See issue #1858.
-        if let Some(properties) = function_body_returns_object_shape(body, input.is_expression_body)
-        {
-            let is_strict_eligible =
-                strict_eligible && function_body_is_terminal(body, input.is_expression_body);
+        if self.capture_factory_properties && strict_eligible && function_body_is_terminal(body) {
+            self.prepare_factory_property_observations(input.binding_span, input.params, body);
+            self.prepare_factory_result_observation(name, input.binding_span, body);
+        }
+        let properties = function_body_returns_object_shape(body);
+        if let Some(properties) = &properties {
+            let is_strict_eligible = strict_eligible && function_body_is_terminal(body);
             self.factory_return_object_candidates
                 .push(super::FactoryReturnObjectCandidate {
                     fn_name: name.to_string(),
                     is_strict_eligible,
-                    properties,
+                    properties: properties.clone(),
                 });
+        }
+        self.record_factory_binding_producer(name, input, body, properties, returns_promise);
+        if strict_eligible
+            && (self.strict_factory_return_functions.contains_key(name)
+                || self.strict_alias_eligible.contains(name))
+            && let Some(callback) =
+                self.callback_body_proof(body, input.params.span, input.return_type)
+        {
+            self.retain_callback_result(name, input.binding_span, callback);
         }
     }
 
-    /// Capture `const local = callee(...)` (bare-identifier callee) as a factory
-    /// return candidate. `resolve_factory_return_candidates` keeps only those
+    fn record_factory_binding_producer(
+        &mut self,
+        name: &str,
+        input: FactoryReturnFunctionInput<'_, '_>,
+        body: BodyRef<'_, '_>,
+        properties: Option<Vec<(String, super::ObjectPropValueRef)>>,
+        returns_promise: bool,
+    ) {
+        if self.capture_subclass_provenance || self.capture_factory_properties {
+            self.record_binding_declaration(name, input.binding_span);
+            let result = visit_factory_returns::function_body_returns_new_class_target(body)
+                .map(
+                    |(target_name, target_reference_span)| super::BindingClassProof {
+                        builtin_containers: std::sync::Arc::default(),
+                        target_name,
+                        target_reference_span,
+                        requirements: super::BindingRequirements::Empty,
+                    },
+                )
+                .or_else(|| {
+                    input.return_type.and_then(|annotation| {
+                        let (target_name, target_reference_span) = if returns_promise {
+                            let (name, origin) = super::helpers::return_type_element_target(
+                                &annotation.type_annotation,
+                            )?;
+                            (name, origin?)
+                        } else {
+                            (
+                                extract_type_annotation_name(annotation)?,
+                                super::helpers::extract_type_reference_origin(
+                                    &annotation.type_annotation,
+                                )?,
+                            )
+                        };
+                        Some(super::BindingClassProof {
+                            builtin_containers: std::sync::Arc::default(),
+                            target_name,
+                            target_reference_span,
+                            requirements: super::BindingRequirements::Empty,
+                        })
+                    })
+                });
+            let shape = properties
+                .into_iter()
+                .flatten()
+                .filter_map(|(path, value)| {
+                    let super::ObjectPropValueRef::Class(target_name, Some(target_reference_span)) =
+                        value
+                    else {
+                        return None;
+                    };
+                    Some((
+                        path,
+                        super::BindingClassProof {
+                            builtin_containers: std::sync::Arc::default(),
+                            target_name,
+                            target_reference_span,
+                            requirements: super::BindingRequirements::Empty,
+                        },
+                    ))
+                })
+                .collect();
+            self.register_binding_producer(
+                name,
+                super::BindingProducer {
+                    name: name.to_string(),
+                    declaration_span: input.binding_span,
+                    result,
+                    shape,
+                    is_async: input.is_async,
+                    is_generator: input.is_generator,
+                    is_static_method: false,
+                },
+            );
+        }
+    }
+
+    /// Capture `const local = callee(...)` or `const local = await callee(...)`
+    /// (bare-identifier callee) as a factory return candidate. `resolve_factory_return_candidates` keeps only those
     /// whose callee is a known same-file `new Class()` factory or an imported
     /// callee (cross-module). See issue #1441.
     ///
@@ -255,7 +401,11 @@ impl ModuleInfoExtractor {
         declarator: &VariableDeclarator<'_>,
         init: &Expression<'_>,
     ) {
-        let Some(callee_name) = Self::bare_call_callee_name(init) else {
+        let (call, awaited) = match init {
+            Expression::AwaitExpression(await_expr) => (&await_expr.argument, true),
+            _ => (init, false),
+        };
+        let Some(callee_name) = Self::bare_call_callee_name(self.class_carrying_init(call)) else {
             return;
         };
 
@@ -267,10 +417,29 @@ impl ModuleInfoExtractor {
             BindingPattern::BindingIdentifier(id)
                 if self.factory_return_candidates.len() < MAX_FACTORY_RETURN_CANDIDATES =>
             {
+                if self.capture_subclass_provenance {
+                    let call = match unwrap_static_expr(init) {
+                        Expression::AwaitExpression(expression) => {
+                            unwrap_static_expr(&expression.argument)
+                        }
+                        expression => expression,
+                    };
+                    if let Expression::CallExpression(call) = call
+                        && let Expression::Identifier(reference) = &call.callee
+                        && let Some(value) = self.capture_binding_producer_call(
+                            reference.name.as_str(),
+                            reference.span,
+                            awaited,
+                        )
+                    {
+                        self.attach_captured_binding_value(id.name.as_str(), value);
+                    }
+                }
                 self.factory_return_candidates
                     .push(super::FactoryReturnCandidate {
                         local_name: id.name.to_string(),
                         callee_name,
+                        awaited,
                     });
             }
             // `const { a, b } = useApi()`. The instance is never named, so queue one
@@ -280,12 +449,42 @@ impl ModuleInfoExtractor {
             BindingPattern::ObjectPattern(pattern) => {
                 let Some(keys) = super::destructured_factory_keys(pattern) else {
                     // A rest element or computed key can read any property.
-                    self.factory_whole_object_candidates.push(callee_name);
+                    if !awaited {
+                        self.factory_whole_object_candidates.push(callee_name);
+                    }
                     return;
                 };
+                let call = match unwrap_static_expr(init) {
+                    Expression::AwaitExpression(expression) => {
+                        unwrap_static_expr(&expression.argument)
+                    }
+                    expression => expression,
+                };
+                let captured = if let Expression::CallExpression(call) = call
+                    && let Expression::Identifier(reference) = &call.callee
+                {
+                    self.capture_binding_producer_call(
+                        reference.name.as_str(),
+                        reference.span,
+                        awaited,
+                    )
+                } else {
+                    None
+                };
                 for key in keys {
+                    if let Some(id) = captured {
+                        self.pending_subclass_member_accesses.push(
+                            super::PendingSubclassMemberAccess {
+                                proof: super::SubclassAccessProof::Value {
+                                    id,
+                                    requirements: super::BindingRequirements::Empty,
+                                },
+                                member: key.clone(),
+                            },
+                        );
+                    }
                     self.factory_unnamed_result_accesses
-                        .push((callee_name.clone(), key));
+                        .push((callee_name.clone(), key, awaited));
                 }
             }
             _ => {}
@@ -413,54 +612,25 @@ impl ModuleInfoExtractor {
             return Some(type_name.to_string());
         };
         match frame.get(type_name) {
-            Some(Some(constraint)) => Some(constraint.clone()),
+            Some(Some(constraint)) => Some(constraint.name.clone()),
             Some(None) => None,
             None => Some(type_name.to_string()),
         }
     }
 
-    /// Emit typed fluent-chain facts for chained calls.
-    fn try_record_fluent_chain_access(&mut self, expr: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &expr.callee else {
-            return;
-        };
-        let Expression::CallExpression(_) = &member.object else {
-            return;
-        };
-        let this_method = member.property.name.as_str();
-        let mut chain_prefix_reversed: Vec<String> = Vec::new();
-        let mut current = &member.object;
-        loop {
-            let Expression::CallExpression(call) = current else {
-                return;
-            };
-            let Expression::StaticMemberExpression(inner_member) = &call.callee else {
-                return;
-            };
-            if let Expression::Identifier(root_id) = &inner_member.object {
-                chain_prefix_reversed.reverse();
-                self.record_fluent_chain_member_fact(
-                    root_id.name.to_string(),
-                    inner_member.property.name.to_string(),
-                    chain_prefix_reversed,
-                    this_method.to_string(),
-                );
-                return;
-            }
-            if let Expression::NewExpression(new_expr) = &inner_member.object
-                && let Expression::Identifier(class_id) = &new_expr.callee
-            {
-                chain_prefix_reversed.push(inner_member.property.name.to_string());
-                chain_prefix_reversed.reverse();
-                self.record_fluent_chain_new_member_fact(
-                    class_id.name.to_string(),
-                    chain_prefix_reversed,
-                    this_method.to_string(),
-                );
-                return;
-            }
-            chain_prefix_reversed.push(inner_member.property.name.to_string());
-            current = &inner_member.object;
+    fn resolve_class_type_param_origin(
+        &self,
+        type_name: &str,
+        origin: Option<Span>,
+    ) -> Option<Span> {
+        match self
+            .class_type_param_constraints
+            .last()
+            .and_then(|frame| frame.get(type_name))
+        {
+            Some(Some(constraint)) => constraint.reference_span,
+            Some(None) => None,
+            None => origin,
         }
     }
 
@@ -488,7 +658,12 @@ impl ModuleInfoExtractor {
         // A `this.<field>()` / `this.<field>` iteration receiver is class-scoped
         // so it matches the same class's qualified query-list key (issue #1821).
         let receiver_name = self.qualify_this_scope(&receiver_name);
-        let Some(element_type) = self.iterable_element_type_for(&receiver_name) else {
+        let map_value_type = (method_name == "forEach")
+            .then(|| self.map_value_type_for(&receiver_name))
+            .flatten();
+        let Some(element_type) =
+            map_value_type.or_else(|| self.iterable_element_type_for(&receiver_name))
+        else {
             return;
         };
         let Some(first_arg) = expr.arguments.first() else {
@@ -497,20 +672,41 @@ impl ModuleInfoExtractor {
         let param_name = match first_arg {
             Argument::ArrowFunctionExpression(arrow) => {
                 arrow.params.items.first().and_then(|p| match &p.pattern {
-                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    BindingPattern::BindingIdentifier(id) => Some((id.name.to_string(), id.span)),
                     _ => None,
                 })
             }
             Argument::FunctionExpression(func) => {
                 func.params.items.first().and_then(|p| match &p.pattern {
-                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    BindingPattern::BindingIdentifier(id) => Some((id.name.to_string(), id.span)),
                     _ => None,
                 })
             }
             _ => None,
         };
-        if let Some(name) = param_name {
-            self.insert_class_binding_target(name, element_type);
+        if let Some((name, declaration_span)) = param_name {
+            {
+                let proof = self.iteration_binding_class_proof(
+                    &receiver_name,
+                    iteration_source_reference(receiver_expr),
+                );
+                self.map_callback_value_bindings.insert(
+                    first_arg.span().start,
+                    (name, declaration_span, element_type, proof),
+                );
+            }
+        }
+    }
+
+    fn bind_map_callback_value(&mut self, start: u32) {
+        if let Some((binding, declaration_span, class_name, proof)) =
+            self.map_callback_value_bindings.remove(&start)
+        {
+            self.record_binding_declaration(&binding, declaration_span);
+            if let Some(proof) = proof {
+                self.record_captured_binding_class_proof(&binding, proof);
+            }
+            self.record_scoped_class_binding(&binding, class_name);
         }
     }
 
@@ -529,6 +725,80 @@ impl ModuleInfoExtractor {
                     .find_map(|scope| scope.get(receiver_name))
             })
             .cloned()
+            .or_else(|| self.binding_iteration_target(receiver_name, false))
+            .or_else(|| {
+                let map_name = receiver_name.strip_suffix(".values()")?;
+                self.map_value_type_for(map_name)
+            })
+    }
+
+    fn preseed_class_array_fields(&mut self, class: &Class<'_>) {
+        for element in &class.body.body {
+            if let ClassElement::PropertyDefinition(prop) = element {
+                if prop.r#static {
+                    continue;
+                }
+                let name = prop.key.static_name().map_or_else(
+                    || match &prop.key {
+                        PropertyKey::PrivateIdentifier(id) => Some(format!("#{}", id.name)),
+                        _ => None,
+                    },
+                    |name| Some(name.text().into_owned()),
+                );
+                if let Some(name) = name
+                    && let Some(annotation) = prop.type_annotation.as_deref()
+                    && let Some(element_type) =
+                        array_element_type_from_type(&annotation.type_annotation)
+                {
+                    self.iterable_element_types
+                        .insert(self.this_member_key(&name), element_type);
+                }
+                continue;
+            }
+            let ClassElement::MethodDefinition(method) = element else {
+                continue;
+            };
+            if method.kind != MethodDefinitionKind::Constructor {
+                continue;
+            }
+            for param in &method.value.params.items {
+                if param.accessibility.is_none() && !param.readonly {
+                    continue;
+                }
+                let BindingPattern::BindingIdentifier(id) = &param.pattern else {
+                    continue;
+                };
+                let Some(annotation) = param.type_annotation.as_deref() else {
+                    continue;
+                };
+                if let Some(element_type) =
+                    array_element_type_from_type(&annotation.type_annotation)
+                {
+                    self.iterable_element_types
+                        .insert(self.this_member_key(id.name.as_str()), element_type);
+                }
+            }
+        }
+    }
+
+    fn array_type_origin(ty: &TSType<'_>) -> Option<Span> {
+        match ty {
+            TSType::TSArrayType(array) => {
+                super::helpers::extract_type_reference_origin(&array.element_type)
+            }
+            TSType::TSTypeReference(reference) => reference
+                .type_arguments
+                .as_deref()?
+                .params
+                .first()
+                .and_then(super::helpers::extract_type_reference_origin),
+            TSType::TSParenthesizedType(paren) => Self::array_type_origin(&paren.type_annotation),
+            TSType::TSTypeOperatorType(operator) => {
+                Self::array_type_origin(&operator.type_annotation)
+            }
+            TSType::TSUnionType(union) => union.types.iter().find_map(Self::array_type_origin),
+            _ => None,
+        }
     }
 
     fn record_array_binding_element_type(&mut self, binding: String, element: String) {
@@ -537,6 +807,129 @@ impl ModuleInfoExtractor {
         } else if let Some(scope) = self.scoped_array_binding_element_types.last_mut() {
             scope.insert(binding, element);
         }
+    }
+
+    fn record_map_binding_value_type(&mut self, binding: String, value: String) {
+        let root = binding
+            .split_once('.')
+            .map_or(binding.as_str(), |(root, _)| root);
+        if let Some(index) = self
+            .scoped_direct_object_binding_roots
+            .iter()
+            .rposition(|roots| roots.contains(root))
+        {
+            self.scoped_map_binding_value_types[index].insert(binding, value);
+        } else {
+            self.map_binding_value_types.insert(binding, value);
+        }
+    }
+
+    /// The value class of a map-typed receiver name (already `this`-qualified).
+    fn map_value_type_for(&self, receiver_name: &str) -> Option<String> {
+        let root = receiver_name
+            .split_once('.')
+            .map_or(receiver_name, |(root, _)| root);
+        for (scope, roots) in self
+            .scoped_map_binding_value_types
+            .iter()
+            .zip(&self.scoped_direct_object_binding_roots)
+            .rev()
+        {
+            if let Some(value) = scope.get(receiver_name) {
+                return Some(value.clone());
+            }
+            if roots.contains(root) {
+                return None;
+            }
+        }
+        self.map_binding_value_types
+            .get(receiver_name)
+            .cloned()
+            .or_else(|| self.binding_iteration_target(receiver_name, true))
+    }
+
+    /// The value class `V` of a `map.get(key)` expression when `map` is a
+    /// binding typed `Map<K, V>`. Looks through `( )`, `!` and `?.` so
+    /// `map.get(key)?.m()` and `map.get(key)!.m()` both resolve.
+    fn map_get_value_type(&self, expr: &Expression<'_>) -> Option<String> {
+        let call = match expr {
+            Expression::ParenthesizedExpression(paren) => {
+                return self.map_get_value_type(&paren.expression);
+            }
+            Expression::TSNonNullExpression(non_null) => {
+                return self.map_get_value_type(&non_null.expression);
+            }
+            Expression::CallExpression(call) => call.as_ref(),
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::CallExpression(call) => call.as_ref(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let Expression::StaticMemberExpression(callee) = &call.callee else {
+            return None;
+        };
+        if callee.property.name != "get" || call.arguments.len() != 1 {
+            return None;
+        }
+        let receiver_name = static_member_object_name(&callee.object)?;
+        self.map_value_type_for(&self.qualify_this_scope(&receiver_name))
+    }
+
+    /// Record the value class of a binding typed `Map<K, V>` or initialized
+    /// with `new Map<K, V>()`. The annotation wins over the initializer.
+    fn record_map_binding_from_declaration(
+        &mut self,
+        binding: String,
+        type_annotation: Option<&TSTypeAnnotation<'_>>,
+        init: Option<&Expression<'_>>,
+    ) {
+        let value = match type_annotation {
+            Some(annotation) => map_value_type_from_type(&annotation.type_annotation),
+            None => init.and_then(map_value_type_from_new),
+        };
+        if let Some(value) = value.and_then(|value| self.resolve_class_type_param(&value)) {
+            if self.capture_subclass_provenance {
+                let origin = type_annotation
+                    .and_then(|annotation| Self::map_type_origin(&annotation.type_annotation))
+                    .or_else(|| match init.map(unwrap_static_expr) {
+                        Some(Expression::NewExpression(expression)) => expression
+                            .type_arguments
+                            .as_deref()
+                            .and_then(|arguments| arguments.params.get(1))
+                            .and_then(super::helpers::extract_type_reference_origin),
+                        _ => None,
+                    });
+                let raw = type_annotation
+                    .and_then(|annotation| map_value_type_from_type(&annotation.type_annotation))
+                    .or_else(|| init.and_then(map_value_type_from_new));
+                let origin = raw
+                    .as_deref()
+                    .and_then(|raw| self.resolve_class_type_param_origin(raw, origin));
+                self.record_binding_iteration_proof(&binding, &value, origin, true);
+            }
+            self.record_map_binding_value_type(binding, value);
+        }
+    }
+
+    fn map_type_origin(ty: &TSType<'_>) -> Option<Span> {
+        match ty {
+            TSType::TSTypeReference(reference) => reference
+                .type_arguments
+                .as_deref()?
+                .params
+                .get(1)
+                .and_then(super::helpers::extract_type_reference_origin),
+            TSType::TSParenthesizedType(parenthesized) => {
+                Self::map_type_origin(&parenthesized.type_annotation)
+            }
+            TSType::TSUnionType(union) => union.types.iter().find_map(Self::map_type_origin),
+            _ => None,
+        }
+    }
+
+    fn is_vue_array_wrapper_call(call: &CallExpression<'_>) -> bool {
+        matches!(&call.callee, Expression::Identifier(callee) if matches!(callee.name.as_str(), "ref" | "shallowRef" | "computed"))
     }
 
     fn record_vue_ref_value_array_binding_type(
@@ -571,7 +964,7 @@ impl ModuleInfoExtractor {
             let TSSignature::TSPropertySignature(prop) = member else {
                 continue;
             };
-            let Some(property_name) = prop.key.static_name() else {
+            let Some(property_name) = prop.key.static_name().map(static_name_text) else {
                 continue;
             };
             let Some(property_type) = prop.type_annotation.as_deref() else {
@@ -580,6 +973,12 @@ impl ModuleInfoExtractor {
             let Some(element) = array_element_type_from_type(&property_type.type_annotation) else {
                 continue;
             };
+            self.record_binding_iteration_proof(
+                &format!("{binding}.{property_name}"),
+                &element,
+                Self::array_type_origin(&property_type.type_annotation),
+                false,
+            );
             self.record_array_binding_element_type(format!("{binding}.{property_name}"), element);
         }
     }
@@ -604,7 +1003,48 @@ impl ModuleInfoExtractor {
         if let Some(declarator) = decl.declarations.first()
             && let BindingPattern::BindingIdentifier(id) = &declarator.id
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            {
+                self.bind_iteration_class_proof(
+                    receiver_name
+                        .strip_suffix(".values()")
+                        .unwrap_or(&receiver_name),
+                    id.name.as_str(),
+                    iteration_source_reference(&stmt.right),
+                );
+            }
             self.insert_class_binding_target(id.name.to_string(), element_type);
+        }
+    }
+
+    /// `Map.entries()` yields `[key, value]`; only the second binding has `V`.
+    fn bind_for_of_map_value(&mut self, stmt: &ForOfStatement<'_>) {
+        let Some(receiver_name) = static_member_object_name(&stmt.right) else {
+            return;
+        };
+        let Some(map_name) = receiver_name.strip_suffix(".entries()") else {
+            return;
+        };
+        let Some(value_type) = self.map_value_type_for(&self.qualify_this_scope(map_name)) else {
+            return;
+        };
+        let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left else {
+            return;
+        };
+        let Some(declarator) = declaration.declarations.first() else {
+            return;
+        };
+        let BindingPattern::ArrayPattern(pattern) = &declarator.id else {
+            return;
+        };
+        if let Some(Some(BindingPattern::BindingIdentifier(value))) = pattern.elements.get(1) {
+            self.record_binding_declaration(value.name.as_str(), value.span);
+            self.bind_iteration_class_proof(
+                &self.qualify_this_scope(map_name),
+                value.name.as_str(),
+                iteration_source_reference(&stmt.right),
+            );
+            self.record_scoped_class_binding(value.name.as_str(), value_type);
         }
     }
 
@@ -709,7 +1149,7 @@ impl ModuleInfoExtractor {
             && !self.handled_require_spans.contains(&expr.span)
         {
             self.require_calls.push(RequireCallInfo {
-                source: lit.value.to_string(),
+                source: lit.value.text().into_owned(),
                 span: expr.span,
                 source_span: lit.span,
                 destructured_names: Vec::new(),
@@ -749,6 +1189,25 @@ impl ModuleInfoExtractor {
                         continue;
                     };
                     for specifier in specifiers {
+                        if !decl.import_kind.is_type() {
+                            let runtime_local = match specifier {
+                                ImportDeclarationSpecifier::ImportSpecifier(named)
+                                    if !named.import_kind.is_type() =>
+                                {
+                                    Some(named.local.name.as_str())
+                                }
+                                ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
+                                    Some(default.local.name.as_str())
+                                }
+                                ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
+                                    Some(namespace.local.name.as_str())
+                                }
+                                ImportDeclarationSpecifier::ImportSpecifier(_) => None,
+                            };
+                            if let Some(local) = runtime_local {
+                                self.runtime_import_locals.insert(local.to_owned());
+                            }
+                        }
                         match specifier {
                             ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace) => {
                                 self.namespace_import_locals
@@ -758,7 +1217,7 @@ impl ModuleInfoExtractor {
                                 let local = default.local.name.to_string();
                                 self.default_import_locals.insert(local.clone());
                                 if crate::template_expression_scan::is_css_module_source(
-                                    decl.source.value.as_str(),
+                                    &decl.source.value.text(),
                                 ) {
                                     self.namespace_import_locals.insert(local);
                                 }
@@ -769,7 +1228,7 @@ impl ModuleInfoExtractor {
                                 let local = named.local.name.to_string();
                                 self.default_import_locals.insert(local.clone());
                                 if crate::template_expression_scan::is_css_module_source(
-                                    decl.source.value.as_str(),
+                                    &decl.source.value.text(),
                                 ) {
                                     self.namespace_import_locals.insert(local);
                                 }
@@ -781,8 +1240,8 @@ impl ModuleInfoExtractor {
                 Statement::TSImportEqualsDeclaration(decl) => {
                     self.record_import_equals_namespace_local(decl);
                 }
-                Statement::ExportNamedDeclaration(decl) => {
-                    if let Some(Declaration::TSImportEqualsDeclaration(inner)) = &decl.declaration {
+                Statement::ExportDeclaration(decl) => {
+                    if let Declaration::TSImportEqualsDeclaration(inner) = &decl.declaration {
                         self.record_import_equals_namespace_local(inner);
                     }
                 }
@@ -1004,11 +1463,9 @@ impl ModuleInfoExtractor {
                 self.record_local_type_declaration(&enumd.id.name, enumd.id.span);
                 self.record_string_enum_member_values(enumd);
             }
-            Declaration::TSModuleDeclaration(module) => {
-                if let TSModuleDeclarationName::Identifier(id) = &module.id {
-                    self.record_local_declaration_name(&id.name);
-                    self.record_local_type_declaration(&id.name, id.span);
-                }
+            Declaration::TSNamespaceDeclaration(namespace) => {
+                self.record_local_declaration_name(&namespace.id.name);
+                self.record_local_type_declaration(&namespace.id.name, namespace.id.span);
             }
             _ => {}
         }
@@ -1016,6 +1473,26 @@ impl ModuleInfoExtractor {
 
     fn record_top_level_class_declaration(&mut self, class: &Class<'_>) {
         if let Some(id) = class.id.as_ref() {
+            let super_reference_span = class.heritage.as_ref().and_then(|base| {
+                match unwrap_static_expr(&base.expression) {
+                    Expression::Identifier(reference) => Some(reference.span),
+                    Expression::StaticMemberExpression(member) => {
+                        if let Expression::Identifier(reference) = &member.object {
+                            Some(reference.span)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            });
+            self.subclass_declarations.insert(
+                id.name.to_string(),
+                super::SubclassDeclaration {
+                    binding_span: id.span,
+                    super_reference_span,
+                },
+            );
             self.record_local_declaration_name(&id.name);
             self.record_sanitizer_binding(id.name.as_str(), None);
             self.record_literal_allowlist_binding(id.name.as_str(), false);
@@ -1025,20 +1502,46 @@ impl ModuleInfoExtractor {
             self.record_local_type_declaration(&id.name, id.span);
             let is_angular = has_angular_class_decorator(class);
             self.record_angular_inputs_outputs(class, is_angular);
-            let instance_bindings = super::helpers::extract_class_instance_bindings(
-                class,
-                |local_name, source, imported_name| {
-                    self.is_named_import_from(local_name, source, imported_name)
-                },
-            );
+            let (instance_bindings, binding_origins) =
+                super::helpers::extract_class_instance_bindings_with_origins(
+                    class,
+                    |local_name, source, imported_name| {
+                        self.is_named_import_from(local_name, source, imported_name)
+                    },
+                );
+            let members = extract_class_members(class, is_angular);
+            self.record_factory_property_class(id);
+            if self.capture_subclass_provenance {
+                self.record_binding_declaration(id.name.as_str(), id.span);
+                for member in &members {
+                    if member.is_instance_returning_static
+                        && member.kind == fallow_types::extract::MemberKind::ClassMethod
+                    {
+                        self.register_binding_producer(
+                            &format!("{}.{}", id.name, member.name),
+                            super::BindingProducer {
+                                name: id.name.to_string(),
+                                declaration_span: id.span,
+                                result: None,
+                                shape: Vec::new(),
+                                is_async: false,
+                                is_generator: false,
+                                is_static_method: true,
+                            },
+                        );
+                    }
+                }
+            }
             self.record_local_class_export(
                 id.name.to_string(),
                 super::LocalClassExportInfo {
-                    members: extract_class_members(class, is_angular),
+                    members,
                     super_class: extract_super_class_name(class),
                     implemented_interfaces: extract_implemented_interface_names(class),
                     type_parameters: extract_class_type_parameter_names(class),
                     instance_bindings,
+                    binding_origins,
+                    binding_span: id.span,
                     super_class_type_args: extract_super_class_type_args(class),
                     generic_instance_bindings: extract_class_generic_instance_bindings(class),
                 },
@@ -1086,8 +1589,9 @@ impl ModuleInfoExtractor {
             self.record_local_structural_function(
                 id.name.as_str(),
                 &function.params,
-                function.body.as_deref(),
+                function.body.as_deref().map(BodyRef::Block),
                 None,
+                function.return_type.as_deref(),
             );
             if type_parameter_scope_pushed {
                 self.pop_function_type_alias_scope();
@@ -1095,9 +1599,9 @@ impl ModuleInfoExtractor {
             self.record_factory_return_function(
                 id.name.as_str(),
                 FactoryReturnFunctionInput {
+                    binding_span: id.span,
                     params: &function.params,
-                    body: function.body.as_deref(),
-                    is_expression_body: false,
+                    body: function.body.as_deref().map(BodyRef::Block),
                     is_async: function.r#async,
                     is_generator: function.generator,
                     return_type: function.return_type.as_deref(),
@@ -1135,18 +1639,14 @@ impl ModuleInfoExtractor {
         self.record_local_type_declaration(&alias.id.name, alias.id.span);
         self.record_type_alias_surface_targets(alias);
         self.record_playwright_fixture_type_alias(alias);
-        if let Some(factory) = Self::store_factory_from_return_type(&alias.type_annotation) {
-            // `type CounterStore = ReturnType<typeof useCounterStore>`: remember the
-            // store factory so a param typed `CounterStore` credits store members
-            // (issue #1489 Case 2).
-            self.type_alias_store_factory
-                .insert(alias.id.name.to_string(), factory);
-        }
         let refs = Self::collect_type_alias_signature_refs(alias);
         self.record_local_signature_refs(&alias.id.name, refs);
         if let TSType::TSTypeLiteral(type_lit) = &alias.type_annotation {
             self.record_required_type_members(&alias.id.name, &type_lit.members);
-            let properties = collect_object_type_property_types(&type_lit.members);
+            let mut properties = collect_object_type_property_types(&type_lit.members);
+            for target in properties.values_mut() {
+                target.owner_span = Some(alias.id.span);
+            }
             if !properties.is_empty() {
                 self.interface_property_types
                     .insert(alias.id.name.to_string(), properties);
@@ -1169,7 +1669,10 @@ impl ModuleInfoExtractor {
         let refs = Self::collect_interface_signature_refs(iface);
         self.record_local_signature_refs(&iface.id.name, refs);
         self.record_required_type_members(&iface.id.name, &iface.body.body);
-        let properties = collect_object_type_property_types(&iface.body.body);
+        let mut properties = collect_object_type_property_types(&iface.body.body);
+        for target in properties.values_mut() {
+            target.owner_span = Some(iface.id.span);
+        }
         if !properties.is_empty() {
             self.interface_property_types
                 .insert(iface.id.name.to_string(), properties);
@@ -1199,7 +1702,7 @@ impl ModuleInfoExtractor {
                 self.semantic_facts.push(SemanticFact::RequiredTypeMember(
                     RequiredTypeMemberFact {
                         type_name: type_name.to_string(),
-                        member: member.to_string(),
+                        member: member.text().into_owned(),
                     },
                 ));
             }
@@ -1222,7 +1725,7 @@ impl ModuleInfoExtractor {
             let Some(property_name) = prop.key.static_name() else {
                 continue;
             };
-            props.push((property_name.to_string(), prop.span.start));
+            props.push((property_name.text().into_owned(), prop.span.start));
         }
         if !props.is_empty() {
             self.react_object_type_props
@@ -1233,17 +1736,28 @@ impl ModuleInfoExtractor {
     fn record_nested_declaration(&mut self, decl: &Declaration<'_>) {
         match decl {
             Declaration::VariableDeclaration(var) => {
-                for declarator in &var.declarations {
+                if var.kind.is_lexical() {
+                    self.record_direct_object_binding_scope_roots(
+                        var.declarations
+                            .iter()
+                            .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                            .map(|id| id.name.to_string()),
+                    );
+                }
+                for declarator in nested_scope_declarators(var) {
                     self.record_nested_declaration_names(declarator.id.get_binding_identifiers());
                 }
+                self.record_non_instance_declarators(var);
             }
             Declaration::ClassDeclaration(class) => {
                 if let Some(id) = class.id.as_ref() {
+                    self.record_direct_object_binding_scope_roots([id.name.to_string()]);
                     self.record_nested_named_declaration(id);
                 }
             }
             Declaration::FunctionDeclaration(function) => {
                 if let Some(id) = function.id.as_ref() {
+                    self.record_direct_object_binding_scope_roots([id.name.to_string()]);
                     self.record_nested_named_declaration(id);
                 }
             }
@@ -1259,6 +1773,40 @@ impl ModuleInfoExtractor {
         }
     }
 
+    fn preseed_direct_object_binding_scope_roots(&mut self, statements: &[Statement<'_>]) {
+        for statement in statements {
+            let declaration = match statement {
+                Statement::ExportDeclaration(export) => Some(&export.declaration),
+                _ => statement.as_declaration(),
+            };
+            let Some(declaration) = declaration else {
+                continue;
+            };
+            match declaration {
+                Declaration::VariableDeclaration(variable) if variable.kind.is_lexical() => {
+                    self.record_direct_object_binding_scope_roots(
+                        variable
+                            .declarations
+                            .iter()
+                            .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                            .map(|id| id.name.to_string()),
+                    );
+                }
+                Declaration::ClassDeclaration(class) => {
+                    if let Some(id) = class.id.as_ref() {
+                        self.record_direct_object_binding_scope_roots([id.name.to_string()]);
+                    }
+                }
+                Declaration::FunctionDeclaration(function) => {
+                    if let Some(id) = function.id.as_ref() {
+                        self.record_direct_object_binding_scope_roots([id.name.to_string()]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn record_nested_named_declaration(&mut self, id: &BindingIdentifier<'_>) {
         self.record_nested_declaration_names(std::iter::once(id));
         self.record_sanitizer_binding(id.name.as_str(), None);
@@ -1268,11 +1816,137 @@ impl ModuleInfoExtractor {
         self.record_path_relative_binding(id.name.as_str(), None);
     }
 
+    fn capture_subclass_producer_member_access(
+        &mut self,
+        object: &Expression<'_>,
+        member: &str,
+    ) -> bool {
+        if let Expression::CallExpression(call) = object {
+            let source = match &call.callee {
+                Expression::Identifier(reference) => {
+                    Some((reference.name.to_string(), reference.span))
+                }
+                Expression::StaticMemberExpression(callee) => {
+                    static_member_object_name(&callee.object).and_then(|root| {
+                        iteration_source_reference(&callee.object)
+                            .map(|span| (format!("{root}.{}", callee.property.name), span))
+                    })
+                }
+                _ => None,
+            };
+            if let Some((source, reference)) = source
+                && let Some(id) = self.capture_binding_producer_call(&source, reference, false)
+            {
+                if let Expression::StaticMemberExpression(callee) = &call.callee
+                    && let Expression::Identifier(root) = &callee.object
+                {
+                    self.set_static_binding_call_origin(id, root.name.as_str(), root.span);
+                }
+                self.pending_subclass_member_accesses
+                    .push(super::PendingSubclassMemberAccess {
+                        proof: super::SubclassAccessProof::Value {
+                            id,
+                            requirements: super::BindingRequirements::Empty,
+                        },
+                        member: member.to_string(),
+                    });
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record_subclass_member_access(&mut self, object: &Expression<'_>, member: &str) {
+        if !self.capture_subclass_provenance {
+            return;
+        }
+        let object = unwrap_static_expr(object);
+        if let Some(path) = static_member_object_name(object)
+            && !matches!(
+                object,
+                Expression::CallExpression(_) | Expression::NewExpression(_)
+            )
+        {
+            let path = self.qualify_this_scope(&path);
+            if !(path.starts_with("this@") && self.independent_this_depth > 0)
+                && self.capture_subclass_binding_access(
+                    &path,
+                    subclass_receiver_reference(object).map(|(reference, _)| reference.span),
+                    member,
+                )
+            {
+                return;
+            }
+        }
+        if self.capture_subclass_producer_member_access(object, member) {
+            return;
+        }
+        let map_proof = self.map_get_value_type(object).and_then(|_| {
+            let Expression::CallExpression(call) = object else {
+                return None;
+            };
+            let Expression::StaticMemberExpression(member) = &call.callee else {
+                return None;
+            };
+            let source = self.qualify_this_scope(&static_member_object_name(&member.object)?);
+            if source.starts_with("this@") && self.independent_this_depth > 0 {
+                return None;
+            }
+            self.iteration_binding_class_proof(&source, iteration_source_reference(&member.object))
+        });
+        let proof = map_proof.or_else(|| match object {
+            Expression::NewExpression(expression) => {
+                let Expression::Identifier(reference) = &expression.callee else {
+                    return None;
+                };
+                Some(super::BindingClassProof {
+                    builtin_containers: std::sync::Arc::default(),
+                    target_name: reference.name.to_string(),
+                    target_reference_span: reference.span,
+                    requirements: super::BindingRequirements::Empty,
+                })
+            }
+            Expression::Identifier(reference) => self
+                .direct_binding_class_proof(reference.name.as_str(), Some(reference.span))
+                .or_else(|| {
+                    Some(super::BindingClassProof {
+                        builtin_containers: std::sync::Arc::default(),
+                        target_name: reference.name.to_string(),
+                        target_reference_span: reference.span,
+                        requirements: super::BindingRequirements::Empty,
+                    })
+                }),
+            _ => {
+                let path = static_member_object_name(object)?;
+                let path = self.qualify_this_scope(&path);
+                if path.starts_with("this@") && self.independent_this_depth > 0 {
+                    return None;
+                }
+                self.direct_binding_class_proof(
+                    &path,
+                    subclass_receiver_reference(object).map(|(reference, _)| reference.span),
+                )
+            }
+        });
+        if let Some(proof) = proof {
+            self.pending_subclass_member_accesses
+                .push(super::PendingSubclassMemberAccess {
+                    proof: super::SubclassAccessProof::Known(proof),
+                    member: member.to_string(),
+                });
+        }
+    }
+
     fn record_variable_declarator_metadata(&mut self, declarator: &VariableDeclarator<'_>) {
+        for id in declarator.id.get_binding_identifiers() {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+        }
         if self.is_module_scope() {
             let refs = Self::collect_variable_signature_refs(declarator);
+            let satisfies_refs = Self::collect_variable_satisfies_refs(declarator);
             for id in declarator.id.get_binding_identifiers() {
                 self.record_local_signature_refs(&id.name, refs.clone());
+                self.record_local_satisfies_refs(&id.name, satisfies_refs.clone());
             }
         }
 
@@ -1448,8 +2122,8 @@ impl<'a> ModuleInfoExtractor {
     fn record_misplaced_directive_statement(&mut self, stmt: &ExpressionStatement<'a>) {
         if let Expression::StringLiteral(lit) = &stmt.expression {
             let is_server = match lit.value.as_str() {
-                "use server" => Some(true),
-                "use client" => Some(false),
+                Some("use server") => Some(true),
+                Some("use client") => Some(false),
                 _ => None,
             };
             if let Some(is_server) = is_server {
@@ -1470,14 +2144,8 @@ impl<'a> ModuleInfoExtractor {
                     self.record_source_returning_function_declaration(function);
                     self.record_sanitizer_function_declaration(function);
                 }
-                Statement::ExportNamedDeclaration(export)
-                    if export.source.is_none()
-                        && matches!(
-                            export.declaration,
-                            Some(Declaration::FunctionDeclaration(_))
-                        ) =>
-                {
-                    if let Some(Declaration::FunctionDeclaration(function)) = &export.declaration {
+                Statement::ExportDeclaration(export) => {
+                    if let Declaration::FunctionDeclaration(function) = &export.declaration {
                         self.record_source_returning_function_declaration(function);
                         self.record_sanitizer_function_declaration(function);
                     }
@@ -1498,14 +2166,8 @@ impl<'a> ModuleInfoExtractor {
                 Statement::FunctionDeclaration(function) => {
                     self.record_sanitizer_function_declaration(function);
                 }
-                Statement::ExportNamedDeclaration(export)
-                    if export.source.is_none()
-                        && matches!(
-                            export.declaration,
-                            Some(Declaration::FunctionDeclaration(_))
-                        ) =>
-                {
-                    if let Some(Declaration::FunctionDeclaration(function)) = &export.declaration {
+                Statement::ExportDeclaration(export) => {
+                    if let Declaration::FunctionDeclaration(function) = &export.declaration {
                         self.record_sanitizer_function_declaration(function);
                     }
                 }
@@ -1530,19 +2192,17 @@ impl<'a> ModuleInfoExtractor {
                         self.record_local_const_function_return_type(declarator);
                     }
                 }
-                Statement::ExportNamedDeclaration(export) if export.source.is_none() => {
-                    match &export.declaration {
-                        Some(Declaration::FunctionDeclaration(function)) => {
-                            self.record_local_function_return_type(function);
-                        }
-                        Some(Declaration::VariableDeclaration(decl)) => {
-                            for declarator in &decl.declarations {
-                                self.record_local_const_function_return_type(declarator);
-                            }
-                        }
-                        _ => {}
+                Statement::ExportDeclaration(export) => match &export.declaration {
+                    Declaration::FunctionDeclaration(function) => {
+                        self.record_local_function_return_type(function);
                     }
-                }
+                    Declaration::VariableDeclaration(decl) => {
+                        for declarator in &decl.declarations {
+                            self.record_local_const_function_return_type(declarator);
+                        }
+                    }
+                    _ => {}
+                },
                 Statement::ExportDefaultDeclaration(export) => {
                     if let ExportDefaultDeclarationKind::FunctionDeclaration(function) =
                         &export.declaration
@@ -1620,6 +2280,26 @@ impl<'a> ModuleInfoExtractor {
         self.local_function_return_types.get(&callee_name).cloned()
     }
 
+    /// Record an import declaration that binds no name as a side-effect import
+    /// of `source`.
+    fn push_side_effect_import(
+        &mut self,
+        decl: &ImportDeclaration<'_>,
+        source: String,
+        is_type_only: bool,
+    ) {
+        self.imports.push(ImportInfo {
+            source,
+            imported_name: ImportedName::SideEffect,
+            local_name: String::new(),
+            is_type_only,
+            is_type_only_star: false,
+            from_style: false,
+            span: decl.span,
+            source_span: decl.source.span,
+        });
+    }
+
     /// Record a named import specifier (`import { fork } from ...`), tracking the
     /// `child_process.fork` and `node:url` `fileURLToPath` provenance bindings.
     fn handle_import_specifier(
@@ -1640,6 +2320,12 @@ impl<'a> ModuleInfoExtractor {
         {
             self.node_url_file_url_to_path_bindings
                 .insert(s.local.name.to_string());
+        }
+        if matches!(source, "vue" | "@vue/reactivity") {
+            self.module_direct_object_binding_targets
+                .entry(s.local.name.to_string())
+                .or_default()
+                .declaration_span = Some(s.local.span);
         }
         self.imports.push(ImportInfo {
             source: source.to_string(),
@@ -1705,6 +2391,12 @@ impl<'a> ModuleInfoExtractor {
                 .insert(local.clone());
         }
         self.record_namespace_binding_name(local.clone());
+        if matches!(source, "vue" | "@vue/reactivity") {
+            self.module_direct_object_binding_targets
+                .entry(s.local.name.to_string())
+                .or_default()
+                .declaration_span = Some(s.local.span);
+        }
         self.imports.push(ImportInfo {
             source: source.to_string(),
             imported_name: ImportedName::Namespace,
@@ -1717,14 +2409,121 @@ impl<'a> ModuleInfoExtractor {
         });
     }
 
+    /// `export { NS }` hands the namespace object to consumers the graph
+    /// cannot enumerate, and `narrow_namespace_references` already puts that
+    /// binding on mark-all through its own re-export test (issue #2373), so
+    /// the specifier local is not a bare pass to record again (issue #2377).
+    fn mark_export_specifier_namespace_references(&mut self, specifiers: &[ExportSpecifier<'a>]) {
+        for specifier in specifiers {
+            if let ModuleExportName::IdentifierReference(local) = &specifier.local {
+                self.mark_structured_namespace_reference(local);
+            }
+        }
+    }
+
+    /// Walk a `namespace` or `declare module` body inside its own direct
+    /// object binding scope. The scope holds the `var` roots of the body and
+    /// the namespace name.
+    fn with_module_body_binding_scope(
+        &mut self,
+        body_statements: Option<&oxc_allocator::Vec<'a, Statement<'a>>>,
+        name: Option<&str>,
+        walk_body: impl FnOnce(&mut Self),
+    ) {
+        let mut direct_roots =
+            body_statements.map_or_else(FxHashSet::default, |body| Self::var_binding_roots(body));
+        if let Some(name) = name {
+            direct_roots.insert(name.to_string());
+        }
+        self.push_var_owner_direct_object_binding_scope(direct_roots);
+        if let Some(body) = body_statements {
+            self.preseed_direct_object_binding_scope_roots(body);
+            self.preseed_direct_object_binding_targets(body);
+        }
+        walk_body(self);
+        self.pop_direct_object_binding_scope();
+    }
+
+    /// Record `<object_name>.<member>` for a static member read whose receiver
+    /// is a name path (`a`, `a.b`, `this`).
+    fn record_named_member_access(&mut self, object_name: &str, member: &str) {
+        if self.route_loader_data_bindings.contains(object_name) {
+            self.member_accesses.push(MemberAccess {
+                object: ROUTE_LOADER_DATA_OBJECT.to_string(),
+                member: member.to_string(),
+            });
+        }
+        // Qualify a `this.<field>` receiver with the enclosing class scope so
+        // it resolves against the same class's binding key (issue #1821);
+        // stripped back to `this.` before emission. A bare `this` object and
+        // any non-`this` receiver pass through unchanged.
+        if !self.namespace_like_binding_is_shadowed(object_name)
+            && !self.namespace_import_root_is_shadowed(object_name)
+        {
+            let object = self.qualify_this_scope(object_name);
+            if !self.record_walk_order_member_access(&object, member) {
+                self.push_receiver_member_access(object, member.to_string());
+            }
+        }
+    }
+
+    /// Walk an interface heritage name as the member expression it was before
+    /// Oxc 0.151 (`extends ns.Base`), so it records the same member accesses
+    /// and namespace marks as `visit_static_member_expression`.
+    fn visit_heritage_type_name(&mut self, name: &TSTypeName<'a>) {
+        let TSTypeName::QualifiedName(qualified) = name else {
+            self.visit_ts_type_name(name);
+            return;
+        };
+        if let Some(object_name) = type_name_member_path(&qualified.left) {
+            self.record_named_member_access(&object_name, qualified.right.name.as_str());
+        }
+        if let TSTypeName::IdentifierReference(object) = &qualified.left {
+            self.mark_structured_namespace_reference(object);
+        }
+        self.visit_heritage_type_name(&qualified.left);
+        self.visit_identifier_name(&qualified.right);
+    }
+
+    /// Walk a function or arrow body. A concise arrow body walks its
+    /// expression the way the old single-statement body did: it declares
+    /// nothing, preseeds nothing and is not a fail-closed guard.
+    fn visit_body(&mut self, body: BodyRef<'_, 'a>) {
+        let statements = body.statements();
+        let type_alias_scope_pushed =
+            self.namespace_depth == 0 && self.push_function_type_alias_scope(statements);
+        if let Some(var_roots) = self.deferred_function_var_binding_roots.last() {
+            self.record_direct_object_binding_scope_roots(var_roots.clone());
+        }
+        if self.namespace_depth == 0 {
+            self.scoped_array_binding_element_types
+                .push(FxHashMap::default());
+            self.preseed_nested_declarations(statements);
+        }
+        self.preseed_direct_object_binding_targets(statements);
+        match body {
+            BodyRef::Block(_) => {
+                for statement in statements {
+                    self.visit_statement(statement);
+                    if self.namespace_depth == 0 {
+                        self.record_fail_closed_guard_after_statement(statement);
+                    }
+                }
+            }
+            BodyRef::Concise(expr) => self.visit_expression(expr),
+        }
+        if type_alias_scope_pushed {
+            self.pop_function_type_alias_scope();
+        }
+        if self.namespace_depth == 0 {
+            self.scoped_array_binding_element_types.pop();
+        }
+    }
+
     /// Record `export { x } from './src'` re-export specifiers, abstaining the
     /// SvelteKit load-data harvest on a re-exported `load`.
-    fn record_export_re_exports(
-        &mut self,
-        decl: &ExportNamedDeclaration<'a>,
-        source: &oxc_ast::ast::StringLiteral<'a>,
-        is_type_only: bool,
-    ) {
+    fn record_export_re_exports(&mut self, decl: &ExportFromDeclaration<'a>, is_type_only: bool) {
+        let source = &decl.source;
         for spec in &decl.specifiers {
             // `export { load } from './x'` re-exports the load: the terminal
             // object is not a direct literal here, so the load-data harvest
@@ -1736,7 +2535,7 @@ impl<'a> ModuleInfoExtractor {
                 self.has_unharvestable_load = true;
             }
             self.re_exports.push(ReExportInfo {
-                source: source.value.to_string(),
+                source: source.value.text().into_owned(),
                 imported_name: spec.local.name().to_string(),
                 exported_name: spec.exported.name().to_string(),
                 is_type_only: is_type_only || spec.export_kind.is_type(),
@@ -1747,19 +2546,21 @@ impl<'a> ModuleInfoExtractor {
         }
     }
 
-    /// Record local declaration exports and `export { x }` local specifiers
-    /// (no source), abstaining the load-data harvest on a bare `export { load }`.
+    /// Record the exports of an `export <declaration>` statement.
+    fn record_export_declaration(&mut self, declaration: &Declaration<'a>, is_type_only: bool) {
+        self.extract_declaration_exports(declaration, is_type_only);
+        if !is_type_only {
+            self.try_harvest_load_export(declaration);
+        }
+    }
+
+    /// Record `export { x }` local specifiers (no source), abstaining the
+    /// load-data harvest on a bare `export { load }`.
     fn record_export_local_specifiers(
         &mut self,
         decl: &ExportNamedDeclaration<'a>,
         is_type_only: bool,
     ) {
-        if let Some(declaration) = &decl.declaration {
-            self.extract_declaration_exports(declaration, is_type_only);
-            if !is_type_only {
-                self.try_harvest_load_export(declaration);
-            }
-        }
         for spec in &decl.specifiers {
             let local_name_str = spec.local.name().as_str();
             let spec_type_only = is_type_only || spec.export_kind.is_type();
@@ -1818,6 +2619,54 @@ impl<'a> ModuleInfoExtractor {
         }
     }
 
+    fn record_declarator_receiver_aliases(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id
+            && !matches!(
+                unwrap_static_expr(init),
+                Expression::NewExpression(_) | Expression::CallExpression(_)
+            )
+            && let Some(source) = static_member_object_name(unwrap_static_expr(init))
+        {
+            let source = self.qualify_this_scope(&source);
+            self.copy_direct_binding_proof(
+                &source,
+                id.name.as_str(),
+                subclass_receiver_reference(unwrap_static_expr(init))
+                    .map(|(reference, _)| reference.span),
+            );
+            if let Some(BindingTarget::Class(type_name)) = self.resolve_bound_object_name(&source) {
+                self.insert_class_binding_target(id.name.to_string(), type_name);
+            }
+        }
+
+        // `const { service } = input` is the destructure form of
+        // `const service = input.service`. Resolve each destructured path the
+        // same way, so a typed source path (for example a parameter typed by
+        // an inline type literal) binds the local to its class.
+        if let BindingPattern::ObjectPattern(pattern) = &declarator.id
+            && let Some(source) = static_member_object_name(unwrap_static_expr(init))
+        {
+            let source = self.qualify_this_scope(&source);
+            for (local, path) in extract_object_pattern_bindings(pattern) {
+                self.copy_direct_binding_proof(
+                    &format!("{source}.{path}"),
+                    &local,
+                    subclass_receiver_reference(unwrap_static_expr(init))
+                        .map(|(reference, _)| reference.span),
+                );
+                if let Some(BindingTarget::Class(type_name)) =
+                    self.resolve_bound_object_name(&format!("{source}.{path}"))
+                {
+                    self.insert_class_binding_target(local, type_name);
+                }
+            }
+        }
+    }
+
     /// Record `binding_target_names` / factory-call candidates from an
     /// initialized declarator: a `new Class()` RHS, a Svelte `$derived(new ...)`,
     /// a factory `[svc] = wrap(...)` array destructure, a `useMemo(() => new ...)`
@@ -1827,32 +2676,54 @@ impl<'a> ModuleInfoExtractor {
         declarator: &VariableDeclarator<'a>,
         init: &Expression<'a>,
     ) {
-        if let BindingPattern::BindingIdentifier(id) = &declarator.id
-            && let Some(source) = static_member_object_name(unwrap_static_expr(init))
-        {
-            let source = self.qualify_this_scope(&source);
-            if let Some(BindingTarget::Class(type_name)) = self.resolve_bound_object_name(&source) {
-                self.insert_class_binding_target(id.name.to_string(), type_name);
-            }
-        }
+        self.record_declarator_member_destructuring(declarator, init);
 
+        // `a ?? new A()`, `f ? new A() : null` and similar inits hold the
+        // class instance in one operand. Bind through that operand.
+        let original_init = init;
+        let init = self.class_carrying_init(init);
+
+        self.record_declarator_receiver_aliases(declarator, init);
+
+        // `f ? (value as T) : null` binds `T`. A plain `value as T` init
+        // stays out: only an unwrapped nullable operand reads the assertion.
         if let BindingPattern::BindingIdentifier(id) = &declarator.id
-            && let Some(type_name) = self.nullable_asserted_type_name(init)
+            && !std::ptr::eq(init, original_init)
+            && let Some(type_name) = self.asserted_receiver_type_name(init)
         {
+            let origin = asserted_receiver_type(init)
+                .and_then(super::helpers::extract_type_reference_origin);
+            self.record_binding_class_proof(id.name.as_str(), &type_name, origin);
             self.insert_class_binding_target(id.name.to_string(), type_name);
         }
 
-        if let Expression::NewExpression(new_expr) = init
-            && let Expression::Identifier(callee) = &new_expr.callee
-            && let BindingPattern::BindingIdentifier(id) = &declarator.id
-            && !super::helpers::is_builtin_constructor(callee.name.as_str())
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id
+            && let Some(class_name) = constructed_class_name(init)
         {
-            self.insert_class_binding_target(id.name.to_string(), callee.name.to_string());
+            self.insert_class_binding_target(id.name.to_string(), class_name.to_string());
+            if let Expression::NewExpression(expression) = unwrap_static_expr(init)
+                && let Expression::Identifier(reference) = &expression.callee
+            {
+                self.record_binding_class_proof(id.name.as_str(), class_name, Some(reference.span));
+                self.retain_new_constructor(id.name.as_str(), reference);
+            }
         }
 
         if let BindingPattern::BindingIdentifier(id) = &declarator.id
             && let Some(class_name) = Self::svelte_derived_new_class(init)
         {
+            let origin = match init {
+                Expression::CallExpression(call) => match call.arguments.first() {
+                    Some(Argument::NewExpression(expr)) => match &expr.callee {
+                        Expression::Identifier(id) => Some(id.span),
+                        _ => None,
+                    },
+                    _ => super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                        .map(|(_, span)| span),
+                },
+                _ => None,
+            };
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target(id.name.to_string(), class_name);
         }
 
@@ -1861,6 +2732,10 @@ impl<'a> ModuleInfoExtractor {
             && let Some(Some(BindingPattern::BindingIdentifier(id))) = arr_pat.elements.first()
             && let Some(class_name) = super::helpers::try_extract_factory_new_class(&call.arguments)
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            let origin = super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                .map(|(_, span)| span);
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target(id.name.to_string(), class_name);
         }
 
@@ -1874,6 +2749,9 @@ impl<'a> ModuleInfoExtractor {
             && is_value_returning_memo_callee(&call.callee)
             && let Some(class_name) = super::helpers::try_extract_factory_new_class(&call.arguments)
         {
+            let origin = super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                .map(|(_, span)| span);
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target_if_absent(id.name.to_string(), class_name);
         }
 
@@ -1882,6 +2760,19 @@ impl<'a> ModuleInfoExtractor {
             && let Expression::StaticMemberExpression(member) = &call.callee
             && let Expression::Identifier(callee_object) = &member.object
         {
+            if self.capture_subclass_provenance {
+                let path = format!("{}.{}", callee_object.name, member.property.name);
+                if let Some(value) =
+                    self.capture_binding_producer_call(&path, callee_object.span, false)
+                {
+                    self.set_static_binding_call_origin(
+                        value,
+                        callee_object.name.as_str(),
+                        callee_object.span,
+                    );
+                    self.attach_captured_binding_value(id.name.as_str(), value);
+                }
+            }
             self.factory_call_candidates
                 .push(super::FactoryCallCandidate {
                     local_name: id.name.to_string(),
@@ -1906,23 +2797,55 @@ impl<'a> ModuleInfoExtractor {
         extract_type_reference_name(type_annotation)
     }
 
-    fn nullable_asserted_type_name(&self, expr: &Expression<'_>) -> Option<String> {
-        let Expression::ConditionalExpression(conditional) = unwrap_static_expr(expr) else {
-            return None;
-        };
-        if matches!(
-            unwrap_static_expr(&conditional.alternate),
-            Expression::NullLiteral(_)
-        ) {
-            return self.asserted_receiver_type_name(&conditional.consequent);
+    /// The operand of a declarator init that holds the class instance.
+    ///
+    /// - `f ? X : null` (or `undefined`, or `void 0`) gives `X`.
+    /// - `a ?? new A()` and `a || new A()` give `new A()` when `a` has no
+    ///   bound class, or when `a` is bound to the same class `A`.
+    /// - `a ?? fallback` gives `a` when `a` has a bound class and the
+    ///   fallback constructs no class.
+    ///
+    /// Any other init, and a fallback whose two operands give two different
+    /// classes, comes back unchanged. The binding arms then match nothing.
+    fn class_carrying_init<'e, 'b>(&self, init: &'b Expression<'e>) -> &'b Expression<'e> {
+        match unwrap_static_expr(init) {
+            Expression::ConditionalExpression(conditional) => {
+                if is_nullish_value(&conditional.alternate) {
+                    self.class_carrying_init(&conditional.consequent)
+                } else if is_nullish_value(&conditional.consequent) {
+                    self.class_carrying_init(&conditional.alternate)
+                } else {
+                    init
+                }
+            }
+            Expression::LogicalExpression(logical)
+                if matches!(
+                    logical.operator,
+                    LogicalOperator::Coalesce | LogicalOperator::Or
+                ) =>
+            {
+                let right = unwrap_static_expr(&logical.right);
+                let right_class = constructed_class_name(right);
+                let left_class = self.bound_class_name(&logical.left);
+                match (left_class, right_class) {
+                    (Some(left), Some(right_name)) if left == right_name => right,
+                    (None, Some(_)) => right,
+                    (Some(_), None) => &logical.left,
+                    _ => init,
+                }
+            }
+            _ => init,
         }
-        if matches!(
-            unwrap_static_expr(&conditional.consequent),
-            Expression::NullLiteral(_)
-        ) {
-            return self.asserted_receiver_type_name(&conditional.alternate);
+    }
+
+    /// The class bound to an identifier or static member receiver, if any.
+    fn bound_class_name(&self, expr: &Expression<'_>) -> Option<String> {
+        let source = static_member_object_name(unwrap_static_expr(expr))?;
+        let source = self.qualify_this_scope(&source);
+        match self.resolve_bound_object_name(&source) {
+            Some(BindingTarget::Class(class_name)) => Some(class_name),
+            _ => None,
         }
-        None
     }
 
     fn record_route_loader_data_declarator(
@@ -1952,7 +2875,7 @@ impl<'a> ModuleInfoExtractor {
                     };
                     self.member_accesses.push(MemberAccess {
                         object: ROUTE_LOADER_DATA_OBJECT.to_string(),
-                        member: name.to_string(),
+                        member: name.text().into_owned(),
                     });
                 }
             }
@@ -2010,9 +2933,17 @@ impl<'a> ModuleInfoExtractor {
         declarator: &VariableDeclarator<'a>,
     ) {
         self.record_variable_declarator_metadata(declarator);
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+            self.record_map_binding_from_declaration(
+                id.name.to_string(),
+                declarator.type_annotation.as_deref(),
+                declarator.init.as_ref(),
+            );
+        }
 
         let Some(init) = &declarator.init else {
             self.record_uninitialized_variable_bindings(declarator);
+            self.record_projection_declarator(declarator);
             return;
         };
 
@@ -2034,26 +2965,7 @@ impl<'a> ModuleInfoExtractor {
                 .push(classify_factory_assigned_value(init));
         }
 
-        // Type array / reactive-array bindings to their element class so
-        // iteration callbacks and `for...of` loops can credit item member
-        // accesses. Module-scope entries remain visible to template scanners;
-        // function/block locals stay scoped to the active visitor stack.
-        if let BindingPattern::BindingIdentifier(id) = &declarator.id
-            && let Some(element) =
-                infer_array_binding_element_type(declarator.type_annotation.as_deref(), Some(init))
-                    .or_else(|| self.promise_all_map_element_type(init))
-        {
-            let binding = id.name.to_string();
-            self.record_vue_ref_value_array_binding_type(&binding, init, &element);
-            self.record_array_binding_element_type(binding, element);
-        }
-
-        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
-            self.record_object_array_member_binding_types(
-                id.name.as_str(),
-                declarator.type_annotation.as_deref(),
-            );
-        }
+        self.record_declarator_collection_bindings(declarator, init);
 
         // FP-1 (unused-load-data-key): `const X = data` passes the whole
         // SvelteKit `data` prop opaquely, so a child could read any key the
@@ -2082,13 +2994,15 @@ impl<'a> ModuleInfoExtractor {
         }
 
         if let Some((call, source)) = try_extract_require(init) {
-            self.record_dompurify_require_binding(declarator, source);
-            self.record_child_process_require_binding(declarator, source);
-            self.handle_require_declaration(declarator, call, source);
+            self.record_dompurify_require_binding(declarator, &source);
+            self.record_child_process_require_binding(declarator, &source);
+            self.handle_require_declaration(declarator, call, &source);
             return;
         }
 
         self.record_declarator_instance_bindings(declarator, init);
+        self.record_projection_declarator(declarator);
+        self.record_factory_property_declarator(declarator, init);
 
         if let Expression::Identifier(ident) = init
             && self
@@ -2123,6 +3037,93 @@ impl<'a> ModuleInfoExtractor {
             return;
         }
 
+        self.record_dynamic_import_declarator(declarator, init);
+    }
+
+    fn record_declarator_collection_bindings(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
+        // Type array / reactive-array bindings to their element class so
+        // iteration callbacks and `for...of` loops can credit item member
+        // accesses. Module-scope entries remain visible to template scanners;
+        // function/block locals stay scoped to the active visitor stack.
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id
+            && let Some((element, origin)) = super::helpers::infer_array_binding_element_target(
+                declarator.type_annotation.as_deref(),
+                Some(init),
+            )
+            .or_else(|| {
+                self.promise_all_map_element_type(init)
+                    .map(|name| (name, None))
+            })
+        {
+            let binding = id.name.to_string();
+            self.record_vue_ref_value_array_binding_type(&binding, init, &element);
+            let origin = self.resolve_class_type_param_origin(&element, origin);
+            self.record_binding_iteration_proof(&binding, &element, origin, false);
+            if let Expression::CallExpression(call) = init
+                && Self::is_vue_array_wrapper_call(call)
+            {
+                self.record_binding_iteration_proof(
+                    &format!("{binding}.value"),
+                    &element,
+                    origin,
+                    false,
+                );
+            }
+            self.record_array_binding_element_type(binding, element);
+        }
+
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+            self.record_object_array_member_binding_types(
+                id.name.as_str(),
+                declarator.type_annotation.as_deref(),
+            );
+            if declarator.type_annotation.is_none()
+                && let Some(value) = self.map_get_value_type(init)
+            {
+                let object = unwrap_static_expr(init);
+                if let Expression::CallExpression(call) = object
+                    && let Expression::StaticMemberExpression(member) = &call.callee
+                    && let Some(source) = static_member_object_name(&member.object)
+                    && let Some(proof) = self.iteration_binding_class_proof(
+                        &self.qualify_this_scope(&source),
+                        iteration_source_reference(&member.object),
+                    )
+                {
+                    self.record_captured_binding_class_proof(id.name.as_str(), proof);
+                }
+                self.insert_class_binding_target(id.name.to_string(), value);
+            }
+        }
+    }
+
+    /// Record the dynamic-import edges of a declarator init: a
+    /// `Promise.all([import(...)])` array destructure, a call of a local
+    /// loader function, or a direct `import(...)`.
+    fn record_dynamic_import_declarator(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
+        if let BindingPattern::ArrayPattern(pattern) = &declarator.id
+            && let Some(elements) = extract_promise_all_elements(init)
+        {
+            self.handle_promise_all_dynamic_imports(pattern, elements);
+            return;
+        }
+
+        if self.record_loader_call_declaration(declarator, init) {
+            return;
+        }
+
+        if let Some((span, source)) = ssr_load_module_call(init) {
+            self.handle_dynamic_import_declaration(&declarator.id, span, &[source]);
+            return;
+        }
+
         let Some(import_expr) = extract_import_expression(init) else {
             return;
         };
@@ -2131,7 +3132,12 @@ impl<'a> ModuleInfoExtractor {
         if sources.is_empty() {
             return;
         }
-        self.handle_dynamic_import_declaration(declarator, import_expr, &sources);
+        self.handle_dynamic_import_declaration(&declarator.id, import_expr.span, &sources);
+        if is_unawaited_import(init)
+            && let BindingPattern::BindingIdentifier(id) = &declarator.id
+        {
+            self.promise_import_bindings.insert(id.name.to_string());
+        }
     }
 
     /// Record a CommonJS named export (`module.exports.X = ...` /
@@ -2149,6 +3155,8 @@ impl<'a> ModuleInfoExtractor {
             members: vec![],
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         });
     }
 
@@ -2363,7 +3371,7 @@ impl<'a> ModuleInfoExtractor {
                         if let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property
                             && let Some(name) = property.key.static_name()
                         {
-                            self.push_cjs_named_export(name.to_string(), property.span);
+                            self.push_cjs_named_export(name.text().into_owned(), property.span);
                         }
                     }
                 }
@@ -2409,6 +3417,73 @@ impl<'a> ModuleInfoExtractor {
         if let Expression::Identifier(ident) = &expr.right {
             let target = self.this_member_key(member_name);
             self.copy_nested_binding_targets(ident.name.as_str(), target.as_str());
+        }
+    }
+
+    fn invalidate_assignment_target_proof(&mut self, target: &AssignmentTarget<'_>) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.invalidate_direct_binding_path(id.name.as_str(), false);
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    self.invalidate_direct_binding_path(
+                        &format!("{path}.{}", member.property.name),
+                        false,
+                    );
+                }
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    if let Some(key) = member.static_property_name().map(JsText::text) {
+                        self.invalidate_direct_binding_path(&format!("{path}.{key}"), false);
+                    } else {
+                        self.invalidate_direct_binding_path(&path, true);
+                    }
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.invalidate_assignment_target_default_proof(element);
+                }
+                if let Some(rest) = &array.rest {
+                    self.invalidate_assignment_target_proof(&rest.target);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            self.invalidate_direct_binding_path(
+                                property.binding.name.as_str(),
+                                false,
+                            );
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            self.invalidate_assignment_target_default_proof(&property.binding);
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.invalidate_assignment_target_proof(&rest.target);
+                }
+            }
+            _ => {
+                if let Some(name) = assignment_target_identifier_name(target) {
+                    self.invalidate_direct_binding_path(name, false);
+                }
+            }
+        }
+    }
+
+    fn invalidate_assignment_target_default_proof(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+    ) {
+        if let AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) = target {
+            self.invalidate_assignment_target_proof(&default.binding);
+        } else if let Some(target) = target.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
         }
     }
 
@@ -2566,7 +3641,13 @@ impl<'a> ModuleInfoExtractor {
 
     fn record_angular_component_field_array_types(&mut self, class: &Class<'_>) {
         for (field, element_class) in super::helpers::collect_component_field_array_types(class) {
-            self.record_angular_component_field_array_type_fact(field, element_class);
+            self.semantic_facts
+                .push(SemanticFact::AngularComponentFieldArrayType(
+                    AngularComponentFieldArrayTypeFact {
+                        field,
+                        element_class,
+                    },
+                ));
         }
     }
 
@@ -2593,35 +3674,72 @@ impl<'a> ModuleInfoExtractor {
 
 impl<'a> Visit<'a> for ModuleInfoExtractor {
     fn visit_program(&mut self, program: &Program<'a>) {
-        // Capture file-level string directives (`"use client"`, `"use server"`)
-        // for the security client-server-leak detector. `directive.directive` is
-        // the cooked directive text without surrounding quotes.
-        for directive in &program.directives {
-            self.directives
-                .push(directive.directive.as_str().to_string());
-        }
+        // An SFC or Astro file visits each script with one extractor, and its
+        // spans can repeat, so a mark must not reach the next program.
+        self.fluent_chain_inner_calls.clear();
+        self.record_top_level_runtime_statement(program);
+        self.record_program_directives(program);
+        self.is_server_action_module = visit_server_actions::is_server_action_module(program);
+        self.is_module_file = program_has_module_syntax(program);
+        self.has_global_declarations =
+            program_has_global_declarations(program, self.is_module_file);
+        self.triple_slash_reference_paths = triple_slash_reference_paths(program);
+        self.capture_subclass_provenance = program.body.iter().any(|statement| match statement {
+            Statement::ClassDeclaration(class) => class.heritage.is_some(),
+            Statement::ExportDeclaration(export) => matches!(&export.declaration, Declaration::ClassDeclaration(class) if class.heritage.is_some()),
+            _ => false,
+        });
+        self.capture_factory_properties =
+            visit_factory_properties::program_has_object_factory(program)
+                || visit_factory_properties::program_has_captured_callback(program);
+        self.prepare_factory_property_imports(program);
         self.record_program_namespace_import_locals(program);
-        self.record_program_function_type_aliases(program);
+        self.record_program_spy_api_locals(program);
+        self.record_program_type_aliases(program);
         self.record_program_prologue(program);
         self.record_program_sanitizer_functions(program);
         self.record_local_function_return_types(program);
+        self.preseed_direct_object_binding_targets(&program.body);
+        self.record_program_local_import_loaders(program);
+        self.record_program_component_loader_imports(program);
         walk::walk_program(self, program);
+        self.finish_local_import_loaders();
+        self.finish_promise_import_bindings();
+        self.record_jsx_import_source_pragma(program);
     }
 
     fn visit_formal_parameter(&mut self, param: &FormalParameter<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &param.pattern
             && let Some(type_annotation) = param.type_annotation.as_deref()
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            if let Some(name) = extract_type_annotation_name(type_annotation)
+                && let Some(target) = self.resolve_class_type_param(&name)
+            {
+                let origin = self.resolve_class_type_param_origin(
+                    &name,
+                    super::helpers::extract_type_reference_origin(&type_annotation.type_annotation),
+                );
+                self.record_binding_class_proof(id.name.as_str(), &target, origin);
+            }
             // The parameter itself is resolved by the scope-owned body collector.
             // Only nested paths remain in the module fallback for consumers such
             // as typed store properties; conflicting scopes become Ambiguous.
             self.record_typed_nested_bindings(id.name.as_str(), type_annotation);
+            if let Some((element, origin)) =
+                super::helpers::array_element_target_from_type(&type_annotation.type_annotation)
+            {
+                self.record_binding_iteration_proof(id.name.as_str(), &element, origin, false);
+            }
             if param.accessibility.is_some() {
                 let key = self.this_member_key(id.name.as_str());
                 self.record_typed_binding(key.as_str(), type_annotation);
             }
         }
 
+        for id in param.pattern.get_binding_identifiers() {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+        }
         if let BindingPattern::ObjectPattern(obj_pat) = &param.pattern
             && let Some(type_annotation) = param.type_annotation.as_deref()
         {
@@ -2630,7 +3748,20 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
 
         self.record_angular_param_inject(param);
 
+        if let BindingPattern::BindingIdentifier(id) = &param.pattern
+            && let Some(annotation) = param.type_annotation.as_deref()
+        {
+            self.record_projection_contract(id.name.as_str(), id.span, &annotation.type_annotation);
+        }
         walk::walk_formal_parameter(self, param);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        let previous_span = self.class_method_function_span.replace(method.value.span);
+        let previous_depth = std::mem::replace(&mut self.independent_this_depth, 0);
+        walk::walk_method_definition(self, method);
+        self.independent_this_depth = previous_depth;
+        self.class_method_function_span = previous_span;
     }
 
     fn visit_property_definition(&mut self, prop: &PropertyDefinition<'a>) {
@@ -2644,7 +3775,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 PropertyKey::PrivateIdentifier(id) => Some(format!("#{}", id.name)),
                 _ => None,
             },
-            |name| Some(name.to_string()),
+            |name| Some(name.text().into_owned()),
         );
 
         if let Some(name) = member_key.as_deref() {
@@ -2662,11 +3793,18 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 }
             }
 
+            self.record_map_binding_from_declaration(
+                this_key.clone(),
+                prop.type_annotation.as_deref(),
+                prop.value.as_ref(),
+            );
+
             if let Some(Expression::NewExpression(new_expr)) = &prop.value
                 && let Expression::Identifier(callee) = &new_expr.callee
                 && !super::helpers::is_builtin_constructor(callee.name.as_str())
             {
                 self.insert_class_binding_target(this_key.clone(), callee.name.to_string());
+                self.record_binding_class_proof(&this_key, callee.name.as_str(), Some(callee.span));
             }
 
             if let Some(Expression::CallExpression(call)) = &prop.value
@@ -2693,7 +3831,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         if let Some(name) = prop.key.static_name()
             && let Some(value) = prop.value.as_ref()
         {
-            self.capture_hardcoded_secret_literal_sink(name.as_ref(), value, prop.span);
+            self.capture_hardcoded_secret_literal_sink(&name.text(), value, prop.span);
         }
 
         walk::walk_property_definition(self, prop);
@@ -2703,8 +3841,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.block_depth += 1;
         let type_alias_scope_pushed =
             self.namespace_depth == 0 && self.push_function_type_alias_scope(&stmt.body);
+        self.push_direct_object_binding_scope(FxHashSet::default());
+        self.preseed_direct_object_binding_scope_roots(&stmt.body);
         if self.namespace_depth == 0 {
             self.nested_declaration_stack.push(FxHashSet::default());
+            self.scoped_non_instance_bindings.push(FxHashSet::default());
             self.scoped_namespace_binding_names
                 .push(FxHashSet::default());
             self.scoped_array_binding_element_types
@@ -2717,6 +3858,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.path_relative_binding_stack.push(FxHashMap::default());
             self.preseed_nested_declarations(&stmt.body);
         }
+        self.preseed_direct_object_binding_targets(&stmt.body);
         for statement in &stmt.body {
             self.visit_statement(statement);
             if self.namespace_depth == 0 {
@@ -2728,6 +3870,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
         if self.namespace_depth == 0 {
             self.nested_declaration_stack.pop();
+            self.scoped_non_instance_bindings.pop();
             self.scoped_namespace_binding_names.pop();
             self.scoped_array_binding_element_types.pop();
             self.sanitizer_binding_stack.pop();
@@ -2736,6 +3879,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.path_sink_binding_stack.pop();
             self.path_relative_binding_stack.pop();
         }
+        self.pop_direct_object_binding_scope();
         self.block_depth -= 1;
     }
 
@@ -2750,13 +3894,45 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
     }
 
+    fn visit_switch_cases(&mut self, cases: &oxc_allocator::Vec<'a, SwitchCase<'a>>) {
+        self.push_direct_object_binding_scope(FxHashSet::default());
+        for case in cases {
+            self.preseed_direct_object_binding_scope_roots(&case.consequent);
+            self.preseed_direct_object_binding_targets(&case.consequent);
+        }
+        for case in cases {
+            let values = self.push_conditional_binding_scope(&[]);
+            self.visit_switch_case(case);
+            self.pop_optional_binding_scope(values);
+        }
+        self.pop_direct_object_binding_scope();
+    }
+
     fn visit_static_block(&mut self, block: &StaticBlock<'a>) {
         let type_alias_scope_pushed =
             self.namespace_depth == 0 && self.push_function_type_alias_scope(&block.body);
+        let var_roots = Self::var_binding_roots(&block.body);
+        self.push_var_owner_direct_object_binding_scope(var_roots);
+        self.preseed_direct_object_binding_scope_roots(&block.body);
+        self.preseed_direct_object_binding_targets(&block.body);
         walk::walk_static_block(self, block);
+        self.pop_direct_object_binding_scope();
         if type_alias_scope_pushed {
             self.pop_function_type_alias_scope();
         }
+    }
+
+    fn visit_catch_clause(&mut self, clause: &CatchClause<'a>) {
+        let roots = clause
+            .param
+            .as_ref()
+            .into_iter()
+            .flat_map(|param| param.pattern.get_binding_identifiers())
+            .map(|id| id.name.to_string())
+            .collect();
+        self.push_direct_object_binding_scope(roots);
+        walk::walk_catch_clause(self, clause);
+        self.pop_direct_object_binding_scope();
     }
 
     fn visit_declaration(&mut self, decl: &Declaration<'a>) {
@@ -2770,102 +3946,183 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
+        let constructor_function = self.active_constructor_function.replace(func.span);
+        let independent_this = self.class_method_function_span != Some(func.span);
+        if independent_this {
+            self.independent_this_depth += 1;
+        }
         self.record_next_function_param_sources(func);
         let type_parameter_scope_pushed = func
             .type_parameters
             .as_deref()
             .is_some_and(|params| self.push_function_type_parameter_scope(params));
-        self.record_scoped_typed_parameter_accesses(&func.params, func.body.as_deref());
+        self.record_function_member_destructuring(func);
+        self.record_scoped_typed_parameter_accesses(
+            &func.params,
+            func.body.as_deref().map(BodyRef::Block),
+            func.return_type.as_deref(),
+        );
+        let var_roots = func
+            .body
+            .as_deref()
+            .map_or_else(FxHashSet::default, |body| {
+                Self::var_binding_roots(&body.statements)
+            });
+        let self_roots = func
+            .id
+            .as_ref()
+            .map(|id| FxHashSet::from_iter([id.name.to_string()]))
+            .unwrap_or_default();
+        let mut direct_roots = self_roots;
+        for param in &func.params.items {
+            direct_roots.extend(
+                param
+                    .pattern
+                    .get_binding_identifiers()
+                    .into_iter()
+                    .map(|id| id.name.to_string()),
+            );
+        }
+        self.push_var_owner_direct_object_binding_scope(direct_roots);
+        self.direct_object_binding_function_scopes
+            .push(self.scoped_direct_object_binding_targets.len() - 1);
         self.push_function_declaration_scope(&func.params);
+        self.bind_map_callback_value(func.span.start);
+        self.bind_then_callback_namespace(func.span.start);
+        self.deferred_function_var_binding_roots.push(var_roots);
         self.function_depth += 1;
         let component_pushed = self.react_enter_function(func);
         walk::walk_function(self, func, flags);
         self.react_exit_component(component_pushed);
         self.function_depth -= 1;
+        self.deferred_function_var_binding_roots.pop();
         if type_parameter_scope_pushed {
             self.pop_function_type_alias_scope();
         }
         self.pop_function_declaration_scope();
+        self.direct_object_binding_function_scopes.pop();
+        self.pop_direct_object_binding_scope();
+        if independent_this {
+            self.independent_this_depth -= 1;
+        }
+        self.active_constructor_function = constructor_function;
     }
 
     fn visit_arrow_function_expression(&mut self, expr: &ArrowFunctionExpression<'a>) {
+        let constructor_function = self.active_constructor_function.replace(expr.span);
         self.record_next_arrow_param_sources(expr);
         let type_parameter_scope_pushed = expr
             .type_parameters
             .as_deref()
             .is_some_and(|params| self.push_function_type_parameter_scope(params));
-        self.record_scoped_typed_parameter_accesses(&expr.params, Some(expr.body.as_ref()));
+        self.record_parameter_member_destructuring(&expr.params);
+        self.record_scoped_typed_parameter_accesses(
+            &expr.params,
+            Some(BodyRef::arrow(&expr.body)),
+            expr.return_type.as_deref(),
+        );
+        // A concise body holds no `var` declaration outside the nested functions
+        // and classes that the root collector skips.
+        let var_roots = expr
+            .body
+            .as_function_body()
+            .map_or_else(FxHashSet::default, |body| {
+                Self::var_binding_roots(&body.statements)
+            });
+        let direct_roots = expr
+            .params
+            .items
+            .iter()
+            .flat_map(|param| param.pattern.get_binding_identifiers())
+            .map(|id| id.name.to_string())
+            .collect();
+        self.push_var_owner_direct_object_binding_scope(direct_roots);
+        self.direct_object_binding_function_scopes
+            .push(self.scoped_direct_object_binding_targets.len() - 1);
         self.push_function_declaration_scope(&expr.params);
+        self.bind_map_callback_value(expr.span.start);
+        self.bind_then_callback_namespace(expr.span.start);
+        self.deferred_function_var_binding_roots.push(var_roots);
         self.function_depth += 1;
         let component_pushed = self.react_enter_arrow(expr);
         walk::walk_arrow_function_expression(self, expr);
         self.react_exit_component(component_pushed);
         self.function_depth -= 1;
+        self.deferred_function_var_binding_roots.pop();
         if type_parameter_scope_pushed {
             self.pop_function_type_alias_scope();
         }
         self.pop_function_declaration_scope();
+        self.direct_object_binding_function_scopes.pop();
+        self.pop_direct_object_binding_scope();
+        self.active_constructor_function = constructor_function;
+    }
+
+    fn visit_arrow_function_body(&mut self, body: &ArrowFunctionBody<'a>) {
+        self.visit_body(BodyRef::arrow(body));
     }
 
     fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-        let type_alias_scope_pushed =
-            self.namespace_depth == 0 && self.push_function_type_alias_scope(&body.statements);
-        if self.namespace_depth == 0 {
-            self.scoped_array_binding_element_types
-                .push(FxHashMap::default());
-            self.preseed_nested_declarations(&body.statements);
-        }
-        for statement in &body.statements {
-            self.visit_statement(statement);
-            if self.namespace_depth == 0 {
-                self.record_fail_closed_guard_after_statement(statement);
-            }
-        }
-        if type_alias_scope_pushed {
-            self.pop_function_type_alias_scope();
-        }
-        if self.namespace_depth == 0 {
-            self.scoped_array_binding_element_types.pop();
-        }
+        self.visit_body(BodyRef::Block(body));
     }
 
     fn visit_import_declaration(&mut self, decl: &ImportDeclaration<'a>) {
-        let source = decl.source.value.to_string();
+        let source = decl.source.value.text().into_owned();
         let is_type_only = decl.import_kind.is_type();
 
         let source_span = decl.source.span;
 
-        if let Some(specifiers) = &decl.specifiers {
-            for spec in specifiers {
-                match spec {
-                    ImportDeclarationSpecifier::ImportSpecifier(s) => {
-                        self.handle_import_specifier(s, &source, is_type_only, source_span);
-                    }
-                    ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
-                        self.handle_import_default_specifier(s, &source, is_type_only, source_span);
-                    }
-                    ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
-                        self.handle_import_namespace_specifier(
-                            s,
-                            &source,
-                            is_type_only,
-                            source_span,
-                        );
+        match &decl.specifiers {
+            // `import {} from 'x'` and `import type {} from 'x'` bind nothing
+            // but still name the module, so record them as side-effect
+            // imports. The type-only form keeps its type-only flag.
+            Some(specifiers) if specifiers.is_empty() => {
+                self.push_side_effect_import(decl, source, is_type_only);
+            }
+            Some(specifiers) => {
+                for spec in specifiers {
+                    match spec {
+                        ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                            self.handle_import_specifier(s, &source, is_type_only, source_span);
+                        }
+                        ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                            self.handle_import_default_specifier(
+                                s,
+                                &source,
+                                is_type_only,
+                                source_span,
+                            );
+                        }
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                            self.handle_import_namespace_specifier(
+                                s,
+                                &source,
+                                is_type_only,
+                                source_span,
+                            );
+                        }
                     }
                 }
             }
-        } else {
-            self.imports.push(ImportInfo {
-                source,
-                imported_name: ImportedName::SideEffect,
-                local_name: String::new(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: decl.span,
-                source_span,
-            });
+            None => self.push_side_effect_import(decl, source, false),
         }
+    }
+
+    fn visit_ts_export_assignment(&mut self, decl: &TSExportAssignment<'a>) {
+        // `export = x` inside `declare module` or a namespace body describes
+        // that declaration, not this file.
+        if self.ambient_module_depth == 0
+            && self.namespace_depth == 0
+            && self.local_namespace_depth == 0
+            && let Expression::Identifier(identifier) = &decl.expression
+        {
+            self.pending_binding_forwards
+                .push(PendingBindingForward::ExportAssignment {
+                    local_name: identifier.name.to_string(),
+                    span: decl.span,
+                });
+        }
+        walk::walk_ts_export_assignment(self, decl);
     }
 
     fn visit_ts_import_equals_declaration(&mut self, decl: &TSImportEqualsDeclaration<'a>) {
@@ -2873,18 +4130,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         walk::walk_ts_import_equals_declaration(self, decl);
     }
 
-    fn visit_export_named_declaration(&mut self, decl: &ExportNamedDeclaration<'a>) {
-        // `export { NS }` hands the namespace object to consumers the graph
-        // cannot enumerate, and `narrow_namespace_references` already puts that
-        // binding on mark-all through its own re-export test (issue #2373), so
-        // the specifier local is not a bare pass to record again (issue #2377).
-        for specifier in &decl.specifiers {
-            if let ModuleExportName::IdentifierReference(local) = &specifier.local {
-                self.mark_structured_namespace_reference(local);
-            }
-        }
-
-        let is_namespace = matches!(&decl.declaration, Some(Declaration::TSModuleDeclaration(_)));
+    fn visit_export_declaration(&mut self, decl: &ExportDeclaration<'a>) {
+        let is_namespace = matches!(
+            &decl.declaration,
+            Declaration::TSNamespaceDeclaration(_) | Declaration::TSExternalModuleDeclaration(_)
+        );
 
         // Exports inside a namespace declared without the `export` keyword are
         // members of that local binding, not exports of the containing file
@@ -2893,20 +4143,18 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // to attach members to: nothing is recorded here and nothing is queued
         // in `pending_namespace_members`. The body is still walked so imports
         // referenced inside it keep their credit and nested namespaces reach
-        // `visit_ts_module_declaration`.
+        // `visit_ts_namespace_declaration`.
         if self.local_namespace_depth > 0 {
-            walk::walk_export_named_declaration(self, decl);
+            walk::walk_export_declaration(self, decl);
             return;
         }
 
         if self.namespace_depth > 0 {
-            if let Some(declaration) = &decl.declaration {
-                self.extract_namespace_members(declaration);
-            }
+            self.extract_namespace_members(&decl.declaration);
             if is_namespace {
                 self.namespace_depth += 1;
             }
-            walk::walk_export_named_declaration(self, decl);
+            walk::walk_export_declaration(self, decl);
             if is_namespace {
                 self.namespace_depth -= 1;
             }
@@ -2917,62 +4165,90 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // named module; they are not exports of the containing file, so they
         // must not feed unused-export/unused-type findings (issue #2349). The
         // body is still walked so `typeof import()` references and type usage
-        // keep extracting (#396/#397). A named re-export becomes one type-space
-        // import per specifier (mirroring `visit_ts_import_type`) so the target
-        // file stays reachable AND each re-exported symbol keeps its export
-        // credit; a bare `export {} from '...'` falls back to a side-effect
-        // reference for reachability alone.
+        // keep extracting (#396/#397).
         if self.ambient_module_depth > 0 {
-            if let Some(source) = &decl.source {
-                if decl.specifiers.is_empty() {
-                    self.imports.push(ImportInfo {
-                        source: source.value.to_string(),
-                        imported_name: ImportedName::SideEffect,
-                        local_name: String::new(),
-                        is_type_only: true,
-                        is_type_only_star: false,
-                        from_style: false,
-                        span: decl.span,
-                        source_span: source.span,
-                    });
-                } else {
-                    for spec in &decl.specifiers {
-                        self.imports.push(ImportInfo {
-                            source: source.value.to_string(),
-                            imported_name: ImportedName::Named(spec.local.name().to_string()),
-                            local_name: String::new(),
-                            is_type_only: true,
-                            is_type_only_star: false,
-                            from_style: false,
-                            span: spec.span,
-                            source_span: source.span,
-                        });
-                    }
-                }
-            }
-            walk::walk_export_named_declaration(self, decl);
+            walk::walk_export_declaration(self, decl);
             return;
         }
 
-        let is_type_only = decl.export_kind.is_type();
-
-        if let Some(source) = &decl.source {
-            self.record_export_re_exports(decl, source, is_type_only);
-        } else {
-            self.record_export_local_specifiers(decl, is_type_only);
-        }
+        self.record_export_declaration(&decl.declaration, decl.export_kind().is_type());
 
         if is_namespace {
             self.namespace_depth += 1;
             self.pending_namespace_members.clear();
         }
-        walk::walk_export_named_declaration(self, decl);
+        walk::walk_export_declaration(self, decl);
         if is_namespace {
             self.namespace_depth -= 1;
             if let Some(ns_export) = self.exports.last_mut() {
                 ns_export.members = std::mem::take(&mut self.pending_namespace_members);
             }
         }
+    }
+
+    fn visit_export_named_declaration(&mut self, decl: &ExportNamedDeclaration<'a>) {
+        self.mark_export_specifier_namespace_references(&decl.specifiers);
+        // See the local-namespace, namespace and ambient-module guards in
+        // `visit_export_declaration`.
+        if self.local_namespace_depth > 0
+            || self.namespace_depth > 0
+            || self.ambient_module_depth > 0
+        {
+            walk::walk_export_named_declaration(self, decl);
+            return;
+        }
+        self.record_export_local_specifiers(decl, decl.export_kind.is_type());
+        walk::walk_export_named_declaration(self, decl);
+    }
+
+    fn visit_export_from_declaration(&mut self, decl: &ExportFromDeclaration<'a>) {
+        self.mark_export_specifier_namespace_references(&decl.specifiers);
+        // See the local-namespace and namespace guards in
+        // `visit_export_declaration`.
+        if self.local_namespace_depth > 0 || self.namespace_depth > 0 {
+            walk::walk_export_from_declaration(self, decl);
+            return;
+        }
+
+        // Inside `declare module '<specifier>'` (see `visit_export_declaration`)
+        // a named re-export becomes one type-space import per specifier
+        // (mirroring `visit_ts_import_type`) so the target file stays reachable
+        // AND each re-exported symbol keeps its export credit; a bare
+        // `export {} from '...'` falls back to a side-effect reference for
+        // reachability alone.
+        if self.ambient_module_depth > 0 {
+            let source = &decl.source;
+            if decl.specifiers.is_empty() {
+                self.imports.push(ImportInfo {
+                    source: source.value.text().into_owned(),
+                    imported_name: ImportedName::SideEffect,
+                    local_name: String::new(),
+                    is_type_only: true,
+                    is_type_only_star: false,
+                    from_style: false,
+                    span: decl.span,
+                    source_span: source.span,
+                });
+            } else {
+                for spec in &decl.specifiers {
+                    self.imports.push(ImportInfo {
+                        source: source.value.text().into_owned(),
+                        imported_name: ImportedName::Named(spec.local.name().to_string()),
+                        local_name: String::new(),
+                        is_type_only: true,
+                        is_type_only_star: false,
+                        from_style: false,
+                        span: spec.span,
+                        source_span: source.span,
+                    });
+                }
+            }
+            walk::walk_export_from_declaration(self, decl);
+            return;
+        }
+
+        self.record_export_re_exports(decl, decl.export_kind.is_type());
+        walk::walk_export_from_declaration(self, decl);
     }
 
     fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
@@ -3009,6 +4285,13 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             }
             ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
                 function.id.as_ref().map(|id| id.name.to_string())
+            }
+            ExportDefaultDeclarationKind::Identifier(identifier) => {
+                self.pending_binding_forwards
+                    .push(PendingBindingForward::ExportDefault {
+                        local_name: identifier.name.to_string(),
+                    });
+                Some(identifier.name.to_string())
             }
             _ => None,
         };
@@ -3050,39 +4333,49 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             span: decl.span,
             members,
             super_class,
+            deprecated: false,
+            deprecated_reason: None,
         });
 
         walk::walk_export_default_declaration(self, decl);
     }
 
-    fn visit_ts_module_declaration(&mut self, decl: &TSModuleDeclaration<'a>) {
+    fn visit_ts_external_module_declaration(&mut self, decl: &TSExternalModuleDeclaration<'a>) {
         // A string-literal module name (`declare module './library'`,
         // `declare module 'pkg'`) marks a module augmentation or ambient
         // module declaration. Track the depth so export visitors skip
         // file-level recording inside the body (issue #2349).
-        let is_ambient_specifier = matches!(&decl.id, TSModuleDeclarationName::StringLiteral(_));
-        // An identifier-named namespace reached outside an exported namespace
-        // body (`export namespace Foo` raises `namespace_depth` before its
+        self.record_module_augmentation(decl);
+        self.ambient_module_depth += 1;
+        let body_statements = decl.body.as_ref().map(|block| &block.body);
+        self.with_module_body_binding_scope(body_statements, None, |visitor| {
+            walk::walk_ts_external_module_declaration(visitor, decl);
+        });
+        self.ambient_module_depth -= 1;
+    }
+
+    fn visit_ts_namespace_declaration(&mut self, decl: &TSNamespaceDeclaration<'a>) {
+        // A namespace reached outside an exported namespace body
+        // (`export namespace Foo` raises `namespace_depth` before its
         // declaration is walked) and outside an ambient module is a local
         // binding: `namespace Foo {}`, `declare namespace Foo {}`, legacy
         // `module Foo {}`, each segment of a dotted `namespace A.B.C {}`, and a
         // namespace nested in one of those or in `declare global`. Its inner
         // `export` statements are members of the local binding, not file
         // exports (issue #2356).
-        let is_local_namespace =
-            !is_ambient_specifier && self.namespace_depth == 0 && self.ambient_module_depth == 0;
-        if is_ambient_specifier {
-            self.ambient_module_depth += 1;
-        }
+        let is_local_namespace = self.namespace_depth == 0 && self.ambient_module_depth == 0;
         if is_local_namespace {
             self.local_namespace_depth += 1;
         }
-        walk::walk_ts_module_declaration(self, decl);
+        let body_statements = match &decl.body {
+            TSNamespaceDeclarationBody::TSModuleBlock(block) => Some(&block.body),
+            TSNamespaceDeclarationBody::TSNamespaceDeclaration(_) => None,
+        };
+        self.with_module_body_binding_scope(body_statements, Some(&decl.id.name), |visitor| {
+            walk::walk_ts_namespace_declaration(visitor, decl);
+        });
         if is_local_namespace {
             self.local_namespace_depth -= 1;
-        }
-        if is_ambient_specifier {
-            self.ambient_module_depth -= 1;
         }
     }
 
@@ -3103,7 +4396,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // names with every value meaning erased, so the graph credits that
         // surface in the type namespace alone instead of in both.
         if self.ambient_module_depth > 0 {
-            let source = decl.source.value.to_string();
+            let source = decl.source.value.text().into_owned();
             let is_type_only_star = decl.export_kind.is_type();
             self.imports.push(ImportInfo {
                 source: source.clone(),
@@ -3137,7 +4430,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             .map_or_else(|| "*".to_string(), |e| e.name().to_string());
 
         self.re_exports.push(ReExportInfo {
-            source: decl.source.value.to_string(),
+            source: decl.source.value.text().into_owned(),
             imported_name: "*".to_string(),
             exported_name,
             is_type_only: decl.export_kind.is_type(),
@@ -3147,6 +4440,21 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         });
 
         walk::walk_export_all_declaration(self, decl);
+    }
+
+    fn visit_await_expression(&mut self, expr: &AwaitExpression<'a>) {
+        // A module-level `await import('./x')` holds module evaluation until
+        // the target has loaded, so the target loads eagerly, like a static
+        // import. Inside a function the import runs on demand. The top level
+        // of a component body (Vue `<script setup>`, Svelte instance script,
+        // Astro frontmatter) is a function after compilation, so it is lazy.
+        if self.function_depth == 0
+            && !self.top_level_is_component_body
+            && let Expression::ImportExpression(import_expr) = expr.argument.without_parentheses()
+        {
+            self.mark_import_load_kind(import_expr.span, ImportLoadKind::Static);
+        }
+        walk::walk_await_expression(self, expr);
     }
 
     fn visit_import_expression(&mut self, expr: &ImportExpression<'a>) {
@@ -3161,9 +4469,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // (substitution templates and `'./x/' + y` concatenations).
         let mut sources = Vec::new();
         collect_static_import_specifiers(&expr.source, &mut sources);
-        if !sources.is_empty() {
-            self.push_dynamic_import_branches(&sources, expr.span, &[], None);
-        } else {
+        if sources.is_empty() {
             match &expr.source {
                 Expression::TemplateLiteral(tpl)
                     if !tpl.quasis.is_empty() && !tpl.expressions.is_empty() =>
@@ -3181,14 +4487,28 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             suffix,
                             span: expr.span,
                             mechanism: ModuleLoadMechanism::EsModule,
+                            excludes: Vec::new(),
                         });
                     }
                 }
                 _ => {}
             }
+        } else {
+            self.push_unbound_dynamic_import_branches(&sources, expr.span);
         }
 
         walk::walk_import_expression(self, expr);
+    }
+
+    fn visit_expression_statement(&mut self, statement: &ExpressionStatement<'a>) {
+        self.record_discarded_dynamic_import(&statement.expression);
+        walk::walk_expression_statement(self, statement);
+    }
+
+    fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
+        walk::walk_return_statement(self, statement);
+        self.complete_projection_array_return(statement);
+        self.complete_factory_property_return(statement);
     }
 
     fn visit_variable_declaration(&mut self, decl: &VariableDeclaration<'a>) {
@@ -3196,6 +4516,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // the function-body walk (below) can push the component stack with the
         // binding name. Runs before the body is walked. No-op on non-JSX files.
         self.react_prescan_variable_declaration(decl);
+        // Export-wrapped declarations are not visible in the surrounding
+        // statement pre-scan, so seed their direct object targets here too.
+        // Ordinary declarations are idempotent because target sets deduplicate.
+        self.preseed_direct_object_binding_declaration(decl);
         for declarator in &decl.declarations {
             self.record_variable_declarator(decl, declarator);
         }
@@ -3203,6 +4527,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'a>) {
+        self.capture_factory_property_observation(&prop.value);
         self.record_graphql_resolver_args_source(&prop.value);
 
         if let Some((import_expr, sources)) = try_extract_property_callback_import(prop) {
@@ -3216,7 +4541,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
 
         if let Some(name) = prop.key.static_name() {
-            self.capture_hardcoded_secret_literal_sink(name.as_ref(), &prop.value, prop.span);
+            self.capture_hardcoded_secret_literal_sink(&name.text(), &prop.value, prop.span);
         }
 
         self.record_angular_entry_component_refs(prop);
@@ -3250,17 +4575,21 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.record_string_coercion_to_string(arg_expr);
         }
         self.clear_literal_allowlist_on_mutating_member_call(expr);
+        self.record_filesystem_path_new_url_arguments(expr);
+        self.record_og_image_template_call(expr);
         self.record_framework_callback_param_sources(expr);
         self.react_record_hook_call(expr);
 
         if let Some(test_name) = playwright_test_callee_name(&expr.callee) {
             let fixture_uses = collect_playwright_fixture_member_uses(&expr.arguments);
             for access in &fixture_uses {
-                self.record_playwright_fixture_use_fact(
-                    test_name.clone(),
-                    access.fixture_name.clone(),
-                    access.member.clone(),
-                );
+                self.semantic_facts.push(SemanticFact::PlaywrightFixtureUse(
+                    PlaywrightFixtureUseFact {
+                        test_name: test_name.clone(),
+                        fixture_name: access.fixture_name.clone(),
+                        member: access.member.clone(),
+                    },
+                ));
             }
         }
 
@@ -3294,12 +4623,17 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.try_record_node_module_register(expr);
         self.try_record_child_process_fork(expr);
         self.try_record_package_path_reference(expr);
+        self.try_record_relative_require_resolve(expr);
         self.record_bare_require_call(expr);
         self.record_whole_object_call_use(expr);
+        self.record_reflective_whole_object_use(expr);
+        self.record_namespace_spy_call(expr);
         self.record_import_meta_glob_patterns(expr);
         self.record_require_context_pattern(expr);
         self.record_import_callback_dynamic_imports(expr);
+        self.record_parameterless_then_import(expr);
         self.record_arrow_wrapped_dynamic_import(expr);
+        self.record_ssr_load_module(expr);
 
         self.try_record_fluent_chain_access(expr);
         self.record_pinia_map_helpers(expr);
@@ -3316,26 +4650,107 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_angular_dynamic_providers(expr);
 
         self.record_callee_use(expr);
+        self.record_imported_call_site(expr);
 
         walk::walk_call_expression(self, expr);
     }
 
-    fn visit_for_of_statement(&mut self, stmt: &ForOfStatement<'a>) {
-        self.bind_for_of_element(stmt);
+    fn visit_for_statement(&mut self, stmt: &ForStatement<'a>) {
+        let mut roots = FxHashSet::default();
+        if let Some(ForStatementInit::VariableDeclaration(declaration)) = &stmt.init
+            && declaration.kind.is_lexical()
+        {
+            roots.extend(
+                declaration
+                    .declarations
+                    .iter()
+                    .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                    .map(|id| id.name.to_string()),
+            );
+        }
+        self.push_direct_object_binding_scope(roots);
+        if let Some(ForStatementInit::VariableDeclaration(declaration)) = &stmt.init {
+            self.preseed_direct_object_binding_declaration(declaration);
+        }
+        if let Some(init) = &stmt.init {
+            self.visit_for_statement_init(init);
+        }
+        if let Some(test) = &stmt.test {
+            self.visit_expression(test);
+        }
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(update) = &stmt.update {
+            let update_values = self.push_conditional_binding_scope(&[]);
+            self.start_loop_update_observations();
+            self.visit_expression(update);
+            let observations = self.finish_loop_update_observations();
+            let update_branch = self.pop_conditional_binding_scope(update_values);
+            self.join_conditional_binding_scopes(
+                &update_branch,
+                &super::DirectObjectBindingBranch::default(),
+            );
+            self.visit_statement(&stmt.body);
+            self.replay_loop_update_observations(observations);
+            self.join_conditional_binding_scopes(
+                &update_branch,
+                &super::DirectObjectBindingBranch::default(),
+            );
+        } else {
+            self.visit_statement(&stmt.body);
+        }
+        self.pop_optional_binding_scope(values);
+        self.pop_direct_object_binding_scope();
+    }
 
-        if let Some((strings, objects)) = self.static_package_loop_bindings(stmt) {
+    fn visit_for_of_statement(&mut self, stmt: &ForOfStatement<'a>) {
+        let static_bindings = self.static_package_loop_bindings(stmt);
+        let has_static_bindings = static_bindings.is_some();
+        if let Some((strings, objects)) = static_bindings {
             self.loop_string_bindings.push(strings);
             self.loop_object_property_values.push(objects);
-            walk::walk_for_of_statement(self, stmt);
-            self.loop_object_property_values.pop();
-            self.loop_string_bindings.pop();
-            return;
         }
 
-        walk::walk_for_of_statement(self, stmt);
+        let mut roots = FxHashSet::default();
+        if let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left
+            && declaration.kind.is_lexical()
+        {
+            roots.extend(
+                declaration
+                    .declarations
+                    .iter()
+                    .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                    .map(|id| id.name.to_string()),
+            );
+        }
+        self.push_direct_object_binding_scope(roots);
+        self.visit_for_statement_left(&stmt.left);
+        self.visit_expression(&stmt.right);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(target) = stmt.left.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
+        }
+        self.bind_for_of_element(stmt);
+        self.bind_for_of_map_value(stmt);
+        self.record_for_of_member_destructuring(stmt);
+        self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
+        self.pop_direct_object_binding_scope();
+
+        if has_static_bindings {
+            self.loop_object_property_values.pop();
+            self.loop_string_bindings.pop();
+        }
+    }
+
+    fn visit_string_literal(&mut self, lit: &StringLiteral<'a>) {
+        self.record_bin_path_references(&lit.value.text());
+        walk::walk_string_literal(self, lit);
     }
 
     fn visit_template_literal(&mut self, tpl: &TemplateLiteral<'a>) {
+        for quasi in &tpl.quasis {
+            self.record_bin_path_references(quasi.value.raw.as_str());
+        }
         let suppress = self.in_tagged_template_quasi;
         self.in_tagged_template_quasi = false;
         if !suppress {
@@ -3362,23 +4777,28 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_queue_worker_constructor_param_sources(expr);
 
         if let Some(source) = new_url_import_source(expr) {
-            // A `new URL(specifier, import.meta.url)` whose specifier has no file
-            // extension may refer to a directory rather than a module (e.g.
-            // `new URL("./services", import.meta.url)` to obtain the directory URL
-            // via `fileURLToPath(...)`). Such a specifier cannot be resolved to a
-            // module, so marking it speculative causes the resolver to silently drop
-            // it when the target is unresolvable. Specifiers with an extension
-            // (e.g. `./worker.js`) keep `is_speculative = false` so genuinely
-            // missing files are still reported as `unresolved-import`.
-            // See issue #840.
-            let is_speculative = PathBuf::from(&source).extension().is_none();
+            // A speculative reference credits its target when it resolves, and
+            // the resolver drops it silently when it does not. Two rules make a
+            // `new URL(specifier, import.meta.url)` speculative:
+            // - The specifier has no file extension, so it may name a directory
+            //   (`new URL("./services", import.meta.url)`). See issue #840.
+            // - The expression is a direct argument of a filesystem call or of
+            //   `fileURLToPath`, so it names a file on disk. The file can be an
+            //   output that does not exist yet, or a probe for an optional file.
+            // Other specifiers with an extension (`new Worker(new URL("./worker.js",
+            // import.meta.url))`) keep `is_speculative = false`, so a missing file
+            // is still reported as `unresolved-import`.
+            let is_speculative = PathBuf::from(&source).extension().is_none()
+                || self.filesystem_path_new_url_spans.contains(&expr.span);
             self.dynamic_imports.push(DynamicImportInfo {
                 source,
                 span: expr.span,
                 destructured_names: Vec::new(),
                 local_name: None,
                 is_speculative,
+                value_escapes: false,
             });
+            self.mark_import_load_kind(expr.span, ImportLoadKind::OutOfThread);
         }
 
         self.capture_declarative_validation_new_expression(expr);
@@ -3396,7 +4816,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     /// `TSImportType` node has no extractor, so the referenced files end up
     /// flagged as `unused-files`. See issues #396 and #397.
     fn visit_ts_import_type(&mut self, node: &oxc_ast::ast::TSImportType<'a>) {
-        let source = node.source.value.to_string();
+        let source = node.source.value.text().into_owned();
         let source_span = node.source.span;
 
         let imported_name = node.qualifier.as_ref().map_or_else(
@@ -3441,6 +4861,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
 
         self.record_assignment_target_bindings(&expr.left);
+        self.record_assignment_member_destructuring(expr);
 
         // Track writes to a bare identifier for the alias value-proof. POISON
         // (any scope, ANY operator): a write that can leave the binding holding a
@@ -3484,10 +4905,88 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.handle_this_member_assignment(format!("#{}", member.field.name).as_str(), expr);
         }
         self.capture_member_assign_sink(expr);
+        // `tool = await import("./tool")`: mark the import span handled before
+        // the walk so `visit_import_expression` does not record it again.
+        if matches!(expr.operator, AssignmentOperator::Assign)
+            && let AssignmentTarget::AssignmentTargetIdentifier(ident) = &expr.left
+        {
+            self.handle_dynamic_import_assignment(ident, &expr.right);
+        }
         walk::walk_assignment_expression(self, expr);
+        if self.invalidate_projected_assignment(&expr.left) {
+            return;
+        }
+
+        let is_plain_assignment = matches!(expr.operator, AssignmentOperator::Assign);
+        match &expr.left {
+            AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+                self.record_direct_object_binding_assignment(
+                    ident.name.as_str(),
+                    &expr.right,
+                    is_plain_assignment,
+                );
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                if let Some(object_name) = static_member_object_name(&member.object) {
+                    self.record_direct_object_binding_assignment(
+                        &format!("{object_name}.{}", member.property.name),
+                        &expr.right,
+                        is_plain_assignment,
+                    );
+                }
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                if let Some(object_name) = static_member_object_name(&member.object) {
+                    if let Some(property_name) = member.static_property_name() {
+                        self.record_direct_object_binding_assignment(
+                            &format!("{object_name}.{}", property_name.text()),
+                            &expr.right,
+                            is_plain_assignment,
+                        );
+                    } else {
+                        self.invalidate_direct_binding_path(&object_name, true);
+                    }
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(_)
+            | AssignmentTarget::ArrayAssignmentTarget(_) => {
+                self.invalidate_assignment_target_proof(&expr.left);
+            }
+            _ => {}
+        }
     }
 
     fn visit_update_expression(&mut self, expr: &UpdateExpression<'a>) {
+        match &expr.argument {
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                if !self.invalidate_projected_property(
+                    &member.object,
+                    Some(member.property.name.as_str()),
+                ) && let Some(path) = static_member_object_name(&member.object)
+                {
+                    self.invalidate_direct_binding_path(
+                        &format!("{path}.{}", member.property.name),
+                        false,
+                    );
+                }
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                if !self.invalidate_projected_computed_property(member)
+                    && let Some(path) = static_member_object_name(&member.object)
+                {
+                    match member.static_property_name().map(JsText::text) {
+                        Some(key) => {
+                            self.invalidate_direct_binding_path(&format!("{path}.{key}"), false);
+                        }
+                        None => self.invalidate_direct_binding_path(&path, true),
+                    }
+                }
+            }
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(reference) => {
+                self.invalidate_direct_binding_path(reference.name.as_str(), false);
+            }
+            _ => {}
+        }
         let mutates_cjs_exports = match &expr.argument {
             SimpleAssignmentTarget::StaticMemberExpression(member) => {
                 Self::is_static_cjs_assignment_target(member)
@@ -3504,6 +5003,38 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_unary_expression(&mut self, expr: &UnaryExpression<'a>) {
+        if matches!(expr.operator, UnaryOperator::Delete) {
+            match &expr.argument {
+                Expression::StaticMemberExpression(member) => {
+                    if !self.invalidate_projected_property(
+                        &member.object,
+                        Some(member.property.name.as_str()),
+                    ) && let Some(path) = static_member_object_name(&member.object)
+                    {
+                        self.invalidate_direct_binding_path(
+                            &format!("{path}.{}", member.property.name),
+                            false,
+                        );
+                    }
+                }
+                Expression::ComputedMemberExpression(member) => {
+                    if !self.invalidate_projected_computed_property(member)
+                        && let Some(path) = static_member_object_name(&member.object)
+                    {
+                        match member.static_property_name() {
+                            Some(key) => {
+                                self.invalidate_direct_binding_path(
+                                    &format!("{path}.{}", key.text()),
+                                    false,
+                                );
+                            }
+                            None => self.invalidate_direct_binding_path(&path, true),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if matches!(expr.operator, UnaryOperator::Delete)
             && Self::is_cjs_mutation_expression(&expr.argument)
         {
@@ -3513,6 +5044,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
+        self.capture_factory_property_access(&expr.object, expr.property.name.as_str());
+        self.record_projected_member_access(&expr.object, expr.property.name.as_str());
+        self.record_subclass_member_access(&expr.object, expr.property.name.as_str());
+        self.record_awaited_dynamic_import_member(&expr.object, expr.property.name.as_str());
         if is_import_meta_env_object(&expr.object) {
             self.member_accesses.push(MemberAccess {
                 object: "import.meta.env".to_string(),
@@ -3525,6 +5060,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 member: expr.property.name.to_string(),
             });
         }
+        if let Some(type_name) = self.map_get_value_type(&expr.object) {
+            self.member_accesses.push(MemberAccess {
+                object: type_name,
+                member: expr.property.name.to_string(),
+            });
+        }
         if let Some(callee_name) = Self::bare_call_callee_name(&expr.object)
             && Self::inline_store_factory_receiver(&expr.object).is_none()
         {
@@ -3532,8 +5073,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             // first-level member belongs to the factory's class: in `f().a.b`, `b` is
             // read off whatever type `a` has, and the outer member expression's
             // object is a member expression, not a call, so it never matches here.
-            self.factory_unnamed_result_accesses
-                .push((callee_name, expr.property.name.to_string()));
+            self.factory_unnamed_result_accesses.push((
+                callee_name,
+                expr.property.name.to_string(),
+                false,
+            ));
         }
         if let Some(store_factory) = Self::inline_store_factory_receiver(&expr.object) {
             // `useFooStore().member` with no bound local: the generic receiver
@@ -3546,35 +5090,35 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 member: expr.property.name.to_string(),
             });
         } else if let Some(object_name) = static_member_object_name(&expr.object) {
-            if self
-                .route_loader_data_bindings
-                .contains(object_name.as_str())
-            {
-                self.member_accesses.push(MemberAccess {
-                    object: ROUTE_LOADER_DATA_OBJECT.to_string(),
-                    member: expr.property.name.to_string(),
-                });
-            }
-            // Qualify a `this.<field>` receiver with the enclosing class scope so
-            // it resolves against the same class's binding key (issue #1821);
-            // stripped back to `this.` before emission. A bare `this` object and
-            // any non-`this` receiver pass through unchanged.
-            if !self.namespace_like_binding_is_shadowed(&object_name) {
-                let object = self.qualify_this_scope(&object_name);
-                self.record_walk_order_member_access(&object, expr.property.name.as_str());
-                self.member_accesses.push(MemberAccess {
-                    object,
-                    member: expr.property.name.to_string(),
-                });
-            }
+            self.record_named_member_access(&object_name, expr.property.name.as_str());
+        } else if let Expression::ComputedMemberExpression(receiver) = &expr.object
+            && receiver.static_property_name().is_none()
+            && let Some(object_name) = static_member_object_name(&receiver.object)
+        {
+            self.record_dynamic_direct_object_binding_member_access(
+                &object_name,
+                expr.property.name.as_str(),
+            );
         }
         if matches!(expr.object, Expression::Super(_))
-            && let Some(Some(super_local)) = self.class_super_stack.last()
+            && let Some(Some((super_local, origin))) = self.class_super_stack.last().cloned()
         {
             self.member_accesses.push(MemberAccess {
                 object: super_local.clone(),
                 member: expr.property.name.to_string(),
             });
+            if let Some(target_reference_span) = origin {
+                self.pending_subclass_member_accesses
+                    .push(super::PendingSubclassMemberAccess {
+                        proof: super::SubclassAccessProof::Known(super::BindingClassProof {
+                            builtin_containers: std::sync::Arc::default(),
+                            target_name: super_local,
+                            target_reference_span,
+                            requirements: super::BindingRequirements::Empty,
+                        }),
+                        member: expr.property.name.to_string(),
+                    });
+            }
         }
         if let Expression::Identifier(object) = &expr.object {
             self.mark_structured_namespace_reference(object);
@@ -3583,6 +5127,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'a>) {
+        if let Some(member) = expr.static_property_name() {
+            self.record_subclass_member_access(&expr.object, &member.text());
+        }
+        if let Some(member) = expr.static_property_name() {
+            self.record_awaited_dynamic_import_member(&expr.object, &member.text());
+        }
         if let Expression::StaticMemberExpression(key) = &expr.expression
             && let Expression::Identifier(key_object) = &key.object
         {
@@ -3603,22 +5153,26 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             {
                 self.member_accesses.push(MemberAccess {
                     object: ROUTE_LOADER_DATA_OBJECT.to_string(),
-                    member: lit.value.to_string(),
+                    member: lit.value.text().into_owned(),
                 });
             }
             if let Expression::StringLiteral(lit) = &expr.expression
                 && !shadowed
             {
-                self.member_accesses.push(MemberAccess {
-                    object: obj.name.to_string(),
-                    member: lit.value.to_string(),
-                });
+                self.push_receiver_member_access(obj.name.to_string(), lit.value.text().into());
                 self.mark_structured_namespace_reference(obj);
             } else if !shadowed {
                 self.record_whole_object_identifier_use(obj.name.as_str());
             }
         }
         walk::walk_computed_member_expression(self, expr);
+    }
+
+    fn visit_ts_interface_heritage(&mut self, it: &TSInterfaceHeritage<'a>) {
+        self.visit_heritage_type_name(&it.type_name);
+        if let Some(type_arguments) = &it.type_arguments {
+            self.visit_ts_type_parameter_instantiation(type_arguments);
+        }
     }
 
     fn visit_ts_qualified_name(&mut self, it: &TSQualifiedName<'a>) {
@@ -3667,10 +5221,58 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         if let Expression::Identifier(ident) = &stmt.right {
             self.record_whole_object_identifier_use(ident.name.as_str());
         }
-        walk::walk_for_in_statement(self, stmt);
+        self.visit_for_statement_left(&stmt.left);
+        self.visit_expression(&stmt.right);
+
+        let mut roots = FxHashSet::default();
+        if let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left
+            && declaration.kind.is_lexical()
+        {
+            roots.extend(
+                declaration
+                    .declarations
+                    .iter()
+                    .flat_map(|declarator| declarator.id.get_binding_identifiers())
+                    .map(|id| id.name.to_string()),
+            );
+        }
+        self.push_direct_object_binding_scope(roots);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(target) = stmt.left.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
+        }
+        self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
+        self.pop_direct_object_binding_scope();
+    }
+
+    fn visit_while_statement(&mut self, stmt: &WhileStatement<'a>) {
+        self.visit_expression(&stmt.test);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
+    }
+
+    fn visit_logical_expression(&mut self, expr: &LogicalExpression<'a>) {
+        self.visit_expression(&expr.left);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.right);
+        self.pop_optional_binding_scope(values);
+    }
+
+    fn visit_conditional_expression(&mut self, expr: &ConditionalExpression<'a>) {
+        self.visit_expression(&expr.test);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.consequent);
+        let consequent = self.pop_conditional_binding_scope(values);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.alternate);
+        let alternate = self.pop_conditional_binding_scope(values);
+        self.join_conditional_binding_scopes(&consequent, &alternate);
     }
 
     fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
+        self.capture_origin_guard_observation(stmt);
         // Record `x instanceof ClassName` narrowings from the test condition so
         // that method calls on `x` inside the body (e.g. `x.getMessage()`) are
         // credited as uses of `ClassName.getMessage`, preventing false
@@ -3680,10 +5282,19 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // positives.
         let mut narrowings = Vec::new();
         collect_instanceof_narrowings(&stmt.test, &mut narrowings);
-        for (local, class_name) in narrowings {
-            self.insert_class_binding_target_if_absent(local, class_name);
+        for (local, class_name, _, _) in &narrowings {
+            self.insert_class_binding_target_if_absent(local.clone(), class_name.clone());
         }
-        walk::walk_if_statement(self, stmt);
+        self.visit_expression(&stmt.test);
+        let values = self.push_conditional_binding_scope(&narrowings);
+        self.visit_statement(&stmt.consequent);
+        let consequent = self.pop_conditional_binding_scope(values);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(alternate) = &stmt.alternate {
+            self.visit_statement(alternate);
+        }
+        let alternate = self.pop_conditional_binding_scope(values);
+        self.join_conditional_binding_scopes(&consequent, &alternate);
     }
 
     fn visit_spread_element(&mut self, elem: &SpreadElement<'a>) {
@@ -3695,7 +5306,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             // pattern" convention spreads `this` into a behavior pattern). Record
             // a typed fact so the Angular input/output detectors abstain the
             // whole component instead of false-flagging spread inputs.
-            Expression::ThisExpression(_) => self.record_angular_this_spread_fact(),
+            Expression::ThisExpression(_) => {
+                self.semantic_facts
+                    .push(SemanticFact::AngularThisSpread(AngularThisSpreadFact));
+            }
             _ => {}
         }
         walk::walk_spread_element(self, elem);
@@ -3716,9 +5330,18 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.record_angular_template_members(&meta);
         }
         self.class_super_stack
-            .push(super::helpers::extract_super_class_name(class));
-        self.class_type_param_constraints
-            .push(super::helpers::collect_class_type_param_constraints(class));
+            .push(super::helpers::extract_super_class_name(class).map(|name| {
+                (
+                    name,
+                    class
+                        .heritage
+                        .as_ref()
+                        .and_then(|base| iteration_source_reference(&base.expression)),
+                )
+            }));
+        self.class_type_param_constraints.push(
+            super::helpers::collect_class_type_param_constraint_origins(class),
+        );
         // Assign this class body a unique scope id so its `this.<field>` binding
         // keys are qualified per-class (issue #1821, Fix B). A nested class
         // pushes its own id, so `this` inside the inner body binds to the inner
@@ -3726,7 +5349,16 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.class_scope_counter += 1;
         let class_scope_id = self.class_scope_counter;
         self.class_scope_stack.push(class_scope_id);
+        // Iteration consumers can precede their fields or constructor in source order.
+        self.preseed_class_array_fields(class);
+        let direct_scope_roots = class
+            .id
+            .as_ref()
+            .map(|id| FxHashSet::from_iter([id.name.to_string()]))
+            .unwrap_or_default();
+        self.push_direct_object_binding_scope(direct_scope_roots);
         walk::walk_class(self, class);
+        self.pop_direct_object_binding_scope();
         self.record_class_this_facts(
             class,
             class_scope_id,
@@ -3765,15 +5397,14 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 let text = quasi
                     .value
                     .cooked
-                    .as_ref()
-                    .map_or_else(|| quasi.value.raw.as_str(), |c| c.as_str());
-                for raw in crate::html::collect_asset_refs(text) {
+                    .map_or_else(|| quasi.value.raw.as_str().into(), JsText::text);
+                for raw in crate::html::collect_asset_refs(&text) {
                     self.push_html_template_asset_import(&raw);
                 }
                 // Record custom-element tags rendered in the template
                 // (`<x-foo>`), feeding the Lit `unrendered-component` arm's
                 // project-wide rendered-tag union.
-                for tag in crate::html::collect_custom_element_tags(text) {
+                for tag in crate::html::collect_custom_element_tags(&text) {
                     self.used_custom_element_tags.insert(tag);
                 }
             }
@@ -3797,10 +5428,12 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 let text = quasi
                     .value
                     .cooked
-                    .as_ref()
-                    .map_or_else(|| quasi.value.raw.as_str(), |c| c.as_str());
+                    .map_or_else(|| quasi.value.raw.as_str().into(), JsText::text);
                 if text.ends_with('<') || text.ends_with("</") {
-                    self.record_dynamic_custom_element_render_fact();
+                    self.semantic_facts
+                        .push(SemanticFact::DynamicCustomElementRender(
+                            DynamicCustomElementRenderFact,
+                        ));
                 }
             }
         }
@@ -3816,7 +5449,13 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         walk::walk_jsx_attribute(self, attr);
     }
 
+    fn visit_jsx_fragment(&mut self, fragment: &oxc_ast::ast::JSXFragment<'a>) {
+        self.has_jsx = true;
+        walk::walk_jsx_fragment(self, fragment);
+    }
+
     fn visit_jsx_element(&mut self, element: &oxc_ast::ast::JSXElement<'a>) {
+        self.has_jsx = true;
         // Record a render edge for a component tag (capitalized or
         // member-expression) plus the passed attribute names + spread presence.
         // Lowercase host elements are skipped for render purposes. No-op on
@@ -3844,7 +5483,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+        self.complete_factory_result_observation(ident);
         self.record_bare_namespace_reference(ident);
+        self.count_local_import_loader_reference(ident.name.as_str());
         walk::walk_identifier_reference(self, ident);
     }
 }
@@ -3914,13 +5555,10 @@ fn arrow_expression_body<'a, 'b>(value: &'b Expression<'a>) -> Option<&'b Expres
 fn arrow_fn_expression_body<'a, 'b>(
     arrow: &'b oxc_ast::ast::ArrowFunctionExpression<'a>,
 ) -> Option<&'b Expression<'a>> {
-    if arrow.expression {
-        return match arrow.body.statements.first() {
-            Some(Statement::ExpressionStatement(stmt)) => Some(&stmt.expression),
-            _ => None,
-        };
-    }
-    match arrow.body.statements.first() {
+    let ArrowFunctionBody::FunctionBody(body) = &arrow.body else {
+        return arrow.body.as_expression();
+    };
+    match body.statements.first() {
         Some(Statement::ReturnStatement(ret)) => ret.argument.as_ref(),
         Some(Statement::ExpressionStatement(stmt)) => Some(&stmt.expression),
         _ => None,
@@ -4011,6 +5649,29 @@ fn is_string_literal_array(array: &ArrayExpression<'_>) -> bool {
         .elements
         .iter()
         .all(|element| matches!(element, ArrayExpressionElement::StringLiteral(_)))
+}
+
+/// `null`, `undefined` or `void <expr>`: a value that holds no instance.
+fn is_nullish_value(expr: &Expression<'_>) -> bool {
+    match unwrap_static_expr(expr) {
+        Expression::NullLiteral(_) => true,
+        Expression::Identifier(id) => id.name == "undefined",
+        Expression::UnaryExpression(unary) => unary.operator == UnaryOperator::Void,
+        _ => false,
+    }
+}
+
+/// The class name of a `new X()` expression, when `X` is a plain identifier
+/// and not a builtin constructor.
+fn constructed_class_name<'e>(expr: &Expression<'e>) -> Option<&'e str> {
+    let Expression::NewExpression(new_expr) = expr else {
+        return None;
+    };
+    let Expression::Identifier(callee) = &new_expr.callee else {
+        return None;
+    };
+    let name = callee.name.as_str();
+    (!super::helpers::is_builtin_constructor(name)).then_some(name)
 }
 
 fn unwrap_static_expr<'a, 'b>(mut expr: &'b Expression<'a>) -> &'b Expression<'a> {
@@ -4111,6 +5772,8 @@ fn is_string_coercion_sibling(expr: &Expression<'_>) -> bool {
     )
 }
 
+/// The class name in a `new Class()` expression, or `None` for a non-`new`
+/// expression, a non-identifier callee, or a builtin constructor.
 fn new_expression_class_name(expr: &Expression<'_>) -> Option<String> {
     let Expression::NewExpression(new_expr) = expr else {
         return None;
@@ -4131,16 +5794,10 @@ fn new_expression_class_name(expr: &Expression<'_>) -> Option<String> {
 /// Promise.all element inference conservative. See issue #1793.
 fn map_callback_returned_call_name(arg: &Argument<'_>) -> Option<String> {
     let returned = match arg {
-        Argument::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                let Statement::ExpressionStatement(stmt) = arrow.body.statements.first()? else {
-                    return None;
-                };
-                &stmt.expression
-            } else {
-                single_return_expr(&arrow.body)?
-            }
-        }
+        Argument::ArrowFunctionExpression(arrow) => match &arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => single_return_expr(body)?,
+            body => body.as_expression()?,
+        },
         Argument::FunctionExpression(function) => single_return_expr(function.body.as_deref()?)?,
         _ => return None,
     };
@@ -4190,14 +5847,29 @@ fn unwrap_parens<'a, 'b>(mut expr: &'b Expression<'a>) -> &'b Expression<'a> {
 /// identifiers and static member chains (no call/new forms), so the catalogue
 /// matcher sees a clean dotted callee path. Returns `None` for dynamic dispatch,
 /// computed members, or aliased call forms (those count as blind spots).
-fn flatten_callee_path(expr: &Expression<'_>) -> Option<String> {
-    match unwrap_parens(expr) {
-        Expression::Identifier(ident) => Some(ident.name.to_string()),
-        Expression::StaticMemberExpression(member) => Some(format!(
-            "{}.{}",
-            flatten_callee_path(&member.object)?,
-            member.property.name
-        )),
+fn flatten_callee_path(mut expr: &Expression<'_>) -> Option<String> {
+    let mut properties = Vec::new();
+    let root = loop {
+        crate::cost::walk_step();
+        match unwrap_parens(expr) {
+            Expression::Identifier(ident) => break ident.name.as_str(),
+            Expression::StaticMemberExpression(member) => {
+                properties.push(member.property.name.as_str());
+                expr = &member.object;
+            }
+            _ => return None,
+        }
+    };
+    Some(visit_source_paths::join_member_path(root, &properties))
+}
+
+/// Root reference of a static callee without optional or computed members.
+fn imported_callee_root<'a>(expression: &'a Expression<'a>) -> Option<&'a IdentifierReference<'a>> {
+    match unwrap_parens(expression) {
+        Expression::Identifier(identifier) => Some(identifier),
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            imported_callee_root(&member.object)
+        }
         _ => None,
     }
 }
@@ -4217,119 +5889,6 @@ fn callee_method_name<'a>(
         return callee_path.rsplit_once('.').map(|(_, method)| method);
     }
     terminal_static_member_name(callee)
-}
-
-/// Flatten an expression to a dotted member path, unwrapping `await` and parens.
-/// Returns `None` for anything that is not an identifier-rooted static-member
-/// chain (call results, computed members, etc. are not flattened: a conservative
-/// miss, never a wrong source link).
-fn flatten_member_path(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::ParenthesizedExpression(paren) => flatten_member_path(&paren.expression),
-        Expression::AwaitExpression(await_expr) => flatten_member_path(&await_expr.argument),
-        Expression::Identifier(ident) => Some(ident.name.to_string()),
-        // `import.meta` is a MetaProperty, not a member chain; flattening it as
-        // `import.meta` lets `import.meta.env.X` reads be modeled as a source the
-        // same way `process.env.X` is (issue #890, Vite secrets).
-        Expression::MetaProperty(meta) => {
-            Some(format!("{}.{}", meta.meta.name, meta.property.name))
-        }
-        Expression::StaticMemberExpression(member) => Some(format!(
-            "{}.{}",
-            flatten_member_path(&member.object)?,
-            member.property.name
-        )),
-        _ => None,
-    }
-}
-
-/// The source path for a DIRECT binding (`const id = req.query.id`): the OBJECT
-/// path of the member-access init, i.e. the chain with its final property
-/// dropped (`req.query`). A bare-identifier init (`const x = req`) has no object
-/// to drop and is not a source binding on its own (`None`). A PUBLIC env var
-/// (`process.env.NEXT_PUBLIC_X`, `import.meta.env.VITE_Y`) is build-inlined and
-/// is NOT a secret source, so it is dropped here (issue #890).
-fn tainted_source_path(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::ParenthesizedExpression(paren) => tainted_source_path(&paren.expression),
-        Expression::AwaitExpression(await_expr) => tainted_source_path(&await_expr.argument),
-        Expression::StaticMemberExpression(member) => {
-            if let Some(full) = flatten_member_path(expr)
-                && fallow_types::extract::is_public_env_path(&full)
-            {
-                return None;
-            }
-            flatten_member_path(&member.object)
-        }
-        _ => None,
-    }
-}
-
-fn push_unique_string(out: &mut Vec<String>, value: String) {
-    if !out.iter().any(|existing| existing == &value) {
-        out.push(value);
-    }
-}
-
-fn source_path_candidates(expr: &Expression<'_>) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(path) = flatten_member_path(expr) {
-        push_unique_string(&mut out, path);
-    }
-    if let Some(path) = tainted_source_path(expr) {
-        push_unique_string(&mut out, path);
-    }
-    out
-}
-
-fn binding_source_path_candidates(expr: &Expression<'_>) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_binding_source_path_candidates(expr, &mut out);
-    out
-}
-
-fn collect_binding_source_path_candidates(expr: &Expression<'_>, out: &mut Vec<String>) {
-    for path in source_path_candidates(expr) {
-        push_unique_string(out, path);
-    }
-
-    match expr {
-        Expression::ParenthesizedExpression(paren) => {
-            collect_binding_source_path_candidates(&paren.expression, out);
-        }
-        Expression::TSAsExpression(ts_as) => {
-            collect_binding_source_path_candidates(&ts_as.expression, out);
-        }
-        Expression::TSSatisfiesExpression(ts_sat) => {
-            collect_binding_source_path_candidates(&ts_sat.expression, out);
-        }
-        Expression::TSNonNullExpression(ts_non_null) => {
-            collect_binding_source_path_candidates(&ts_non_null.expression, out);
-        }
-        Expression::AwaitExpression(await_expr) => {
-            collect_binding_source_path_candidates(&await_expr.argument, out);
-        }
-        Expression::TemplateLiteral(template) => {
-            for expression in &template.expressions {
-                collect_binding_source_path_candidates(expression, out);
-            }
-        }
-        Expression::BinaryExpression(binary)
-            if binary.operator == oxc_ast::ast::BinaryOperator::Addition =>
-        {
-            collect_binding_source_path_candidates(&binary.left, out);
-            collect_binding_source_path_candidates(&binary.right, out);
-        }
-        Expression::ObjectExpression(object) => {
-            for property in &object.properties {
-                let ObjectPropertyKind::ObjectProperty(property) = property else {
-                    continue;
-                };
-                collect_binding_source_path_candidates(&property.value, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Collect bare identifier references from a declarator initializer for the
@@ -4444,19 +6003,16 @@ fn extract_function_body_final_return_expr<'a, 'b>(
 fn extract_arrow_return_expr<'a, 'b>(
     arrow: &'b oxc_ast::ast::ArrowFunctionExpression<'a>,
 ) -> Option<&'b Expression<'a>> {
-    if arrow.expression {
-        if arrow.body.statements.len() != 1 {
-            return None;
+    let expression = match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => {
+            return extract_function_body_final_return_expr(body);
         }
-        let Statement::ExpressionStatement(stmt) = arrow.body.statements.first()? else {
-            return None;
-        };
-        if let Expression::ParenthesizedExpression(paren) = &stmt.expression {
-            return Some(&paren.expression);
-        }
-        return Some(&stmt.expression);
+        body => body.as_expression()?,
+    };
+    if let Expression::ParenthesizedExpression(paren) = expression {
+        return Some(&paren.expression);
     }
-    extract_function_body_final_return_expr(&arrow.body)
+    Some(expression)
 }
 
 fn unwrap_paren_expr<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
@@ -4499,42 +6055,28 @@ fn destructure_source_path(expr: &Expression<'_>) -> Option<String> {
     flatten_member_path(expr)
 }
 
-fn static_member_object_name(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::Identifier(obj) => Some(obj.name.to_string()),
-        Expression::ThisExpression(_) => Some("this".to_string()),
-        Expression::StaticMemberExpression(member) => Some(format!(
-            "{}.{}",
-            static_member_object_name(&member.object)?,
-            member.property.name
-        )),
-        // `#`-private field receiver (`this.#dep`): oxc's `PrivateIdentifier.name`
-        // excludes the leading `#`, so spell the key `this.#dep` to match the
-        // binding key `visit_property_definition` / the assignment arms record
-        // for private fields (issue #1821).
-        Expression::PrivateFieldExpression(member) => Some(format!(
-            "{}.#{}",
-            static_member_object_name(&member.object)?,
-            member.field.name
-        )),
-        Expression::CallExpression(call) if call.arguments.is_empty() => {
-            Some(format!("{}()", static_member_object_name(&call.callee)?))
+fn subclass_receiver_reference<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<(&'b IdentifierReference<'a>, Vec<String>)> {
+    match unwrap_static_expr(expression) {
+        Expression::Identifier(reference) => Some((reference, Vec::new())),
+        Expression::NewExpression(new) => {
+            let Expression::Identifier(reference) = unwrap_static_expr(&new.callee) else {
+                return None;
+            };
+            Some((reference, Vec::new()))
         }
-        Expression::NewExpression(new_expr) => match &new_expr.callee {
-            Expression::Identifier(callee) => Some(callee.name.to_string()),
-            _ => None,
-        },
-        Expression::ChainExpression(chain) => match &chain.expression {
-            ChainElement::CallExpression(call) if call.arguments.is_empty() => {
-                Some(format!("{}()", static_member_object_name(&call.callee)?))
-            }
-            ChainElement::StaticMemberExpression(member) => Some(format!(
-                "{}.{}",
-                static_member_object_name(&member.object)?,
-                member.property.name
-            )),
-            _ => None,
-        },
+        Expression::StaticMemberExpression(member) => {
+            let (reference, mut path) = subclass_receiver_reference(&member.object)?;
+            path.push(member.property.name.to_string());
+            Some((reference, path))
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let name = member.static_property_name()?;
+            let (reference, mut path) = subclass_receiver_reference(&member.object)?;
+            path.push(name.text().into_owned());
+            Some((reference, path))
+        }
         _ => None,
     }
 }
@@ -4555,11 +6097,7 @@ fn is_import_meta_env_object(expr: &Expression<'_>) -> bool {
         expr,
         Expression::StaticMemberExpression(member)
             if member.property.name == "env"
-                && matches!(
-                    &member.object,
-                    Expression::MetaProperty(meta)
-                        if meta.meta.name == "import" && meta.property.name == "meta"
-                )
+                && matches!(&member.object, Expression::ImportMeta(_))
     )
 }
 
@@ -4619,13 +6157,21 @@ fn is_html_tagged_template(tag: &Expression<'_>) -> bool {
 /// Recurses through `&&`-chained conditions so `a instanceof A && b instanceof B`
 /// yields both pairs. Only simple identifier left-hand sides (`x instanceof Cls`)
 /// are collected; complex left-hand expressions are skipped conservatively.
-fn collect_instanceof_narrowings<'a>(expr: &'a Expression<'a>, out: &mut Vec<(String, String)>) {
+fn collect_instanceof_narrowings<'a>(
+    expr: &'a Expression<'a>,
+    out: &mut Vec<(String, String, Span, Span)>,
+) {
     match expr {
         Expression::BinaryExpression(bin) if bin.operator == BinaryOperator::Instanceof => {
             if let Expression::Identifier(left) = &bin.left
                 && let Expression::Identifier(right) = &bin.right
             {
-                out.push((left.name.to_string(), right.name.to_string()));
+                out.push((
+                    left.name.to_string(),
+                    right.name.to_string(),
+                    left.span,
+                    right.span,
+                ));
             }
         }
         Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::And => {
@@ -4727,6 +6273,37 @@ impl ModuleInfoExtractor {
         }
     }
 
+    /// Capture each static call and defer lexical import admission to semantics.
+    fn record_imported_call_site(&mut self, call: &CallExpression<'_>) {
+        if call.optional || self.runtime_import_locals.is_empty() {
+            return;
+        }
+        let Some(root) = imported_callee_root(&call.callee) else {
+            return;
+        };
+        if !self.runtime_import_locals.contains(root.name.as_str()) {
+            return;
+        }
+        let Some(path) = flatten_callee_path(&call.callee) else {
+            return;
+        };
+        let member_path = path.split_once('.').map_or("", |(_, rest)| rest).to_owned();
+        let first_argument = call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(static_string_literal_value);
+        self.pending_imported_call_sites.push((
+            root.span,
+            ImportedCallSite {
+                local_name: root.name.to_string(),
+                member_path,
+                first_argument,
+                span_start: call.span.start,
+            },
+        ));
+    }
+
     /// Push an HTML-template-sourced asset reference onto `imports`, mirroring
     /// the HTML parser's remote-url, normalization, and `SideEffect` pipeline.
     fn push_html_template_asset_import(&mut self, raw: &str) {
@@ -4744,5 +6321,14 @@ impl ModuleInfoExtractor {
             span: oxc_span::Span::default(),
             source_span: oxc_span::Span::default(),
         });
+    }
+}
+
+fn iteration_source_reference(expression: &Expression<'_>) -> Option<Span> {
+    match unwrap_static_expr(expression) {
+        Expression::Identifier(reference) => Some(reference.span),
+        Expression::StaticMemberExpression(member) => iteration_source_reference(&member.object),
+        Expression::CallExpression(call) => iteration_source_reference(&call.callee),
+        _ => None,
     }
 }

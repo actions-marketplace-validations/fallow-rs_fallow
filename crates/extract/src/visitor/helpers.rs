@@ -1,13 +1,18 @@
 use oxc_ast::ast::{
-    Argument, ArrayExpressionElement, BinaryExpression, BindingPattern, CallExpression, Class,
-    ClassElement, Expression, MethodDefinitionKind, ObjectPropertyKind, PropertyDefinition,
-    PropertyKey, Statement, TSAccessibility, TSSignature, TSType, TSTypeAnnotation, TSTypeName,
+    Argument, ArrayExpressionElement, ArrowFunctionBody, BinaryExpression, BindingPattern,
+    CallExpression, Class, ClassElement, Expression, MethodDefinitionKind, ObjectPropertyKind,
+    PropertyDefinition, PropertyKey, Statement, TSAccessibility, TSSignature, TSType,
+    TSTypeAnnotation, TSTypeName, TSTypeParameterInstantiation,
 };
 use oxc_span::{GetSpan, Span};
 use rustc_hash::FxHashMap;
 
+#[path = "helpers_heritage_names.rs"]
+mod heritage_names;
+use crate::js_text::JsText;
 use crate::{MemberInfo, MemberKind};
 use fallow_types::extract::{AngularInputMember, AngularOutputMember};
+use heritage_names::{extract_static_expression_name, extract_type_name};
 
 pub struct AngularComponentMetadata {
     pub template_url: Option<String>,
@@ -110,7 +115,7 @@ fn extract_decorator_metadata(
         let Some(key_name) = p.key.static_name() else {
             continue;
         };
-        apply_decorator_property(&mut acc, key_name.as_ref(), p, is_component);
+        apply_decorator_property(&mut acc, &key_name.text(), p, is_component);
     }
 
     acc.has_data().then(|| acc.into_metadata(decorator.span()))
@@ -126,25 +131,25 @@ fn apply_decorator_property(
     match key_name {
         "selector" if is_component => {
             if let Expression::StringLiteral(lit) = &p.value {
-                acc.selector = Some(lit.value.to_string());
+                acc.selector = Some(lit.value.text().into_owned());
             }
         }
         "templateUrl" => {
             if let Expression::StringLiteral(lit) = &p.value {
-                acc.template_url = Some(lit.value.to_string());
+                acc.template_url = Some(lit.value.text().into_owned());
             }
         }
         "template" => apply_inline_template(acc, p),
         "styleUrl" => {
             if let Expression::StringLiteral(lit) = &p.value {
-                acc.style_urls.push(lit.value.to_string());
+                acc.style_urls.push(lit.value.text().into_owned());
             }
         }
         "styleUrls" => {
             if let Expression::ArrayExpression(arr) = &p.value {
                 for elem in &arr.elements {
                     if let ArrayExpressionElement::StringLiteral(lit) = elem {
-                        acc.style_urls.push(lit.value.to_string());
+                        acc.style_urls.push(lit.value.text().into_owned());
                     }
                 }
             }
@@ -170,7 +175,7 @@ fn apply_inline_template(
     p: &oxc_ast::ast::ObjectProperty<'_>,
 ) {
     if let Expression::StringLiteral(lit) = &p.value {
-        acc.inline_template = Some(lit.value.to_string());
+        acc.inline_template = Some(lit.value.text().into_owned());
         acc.inline_template_offset = Some(lit.span.start.saturating_add(1));
     } else if let Expression::TemplateLiteral(tpl) = &p.value
         && tpl.expressions.is_empty()
@@ -179,9 +184,8 @@ fn apply_inline_template(
         let source = quasi
             .value
             .cooked
-            .as_ref()
-            .map_or_else(|| quasi.value.raw.as_str(), |c| c.as_str())
-            .to_string();
+            .map_or_else(|| quasi.value.raw.as_str().into(), JsText::text)
+            .into_owned();
         acc.inline_template = Some(source);
         acc.inline_template_offset = Some(p.value.span().start.saturating_add(1));
     }
@@ -193,7 +197,7 @@ fn extract_host_member_refs(host_obj: &oxc_ast::ast::ObjectExpression<'_>, refs:
             continue;
         };
         if let Expression::StringLiteral(lit) = &p.value {
-            extract_identifiers_from_host_expr(&lit.value, refs);
+            extract_identifiers_from_host_expr(&lit.value.text(), refs);
         }
     }
 }
@@ -207,7 +211,7 @@ fn extract_query_members(value: &Expression<'_>, members: &mut Vec<String>) {
             continue;
         };
         if let Some(name) = p.key.static_name() {
-            let name = name.to_string();
+            let name = name.text().into_owned();
             if !name.is_empty() {
                 members.push(name);
             }
@@ -223,13 +227,8 @@ fn extract_input_output_members(value: &Expression<'_>, members: &mut Vec<String
         let ArrayExpressionElement::StringLiteral(lit) = elem else {
             continue;
         };
-        let member = lit
-            .value
-            .as_ref()
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .trim();
+        let text = lit.value.text();
+        let member = text.split(':').next().unwrap_or_default().trim();
         if !member.is_empty() {
             members.push(member.to_string());
         }
@@ -389,7 +388,7 @@ pub(super) fn lit_custom_element_tag(class: &Class<'_>) -> Option<String> {
             return None;
         }
         match call.arguments.first()? {
-            Argument::StringLiteral(lit) => Some(lit.value.to_string()),
+            Argument::StringLiteral(lit) => Some(lit.value.text().into_owned()),
             _ => None,
         }
     })
@@ -410,7 +409,7 @@ pub fn extract_custom_elements_define(
         return None;
     }
     let tag = match call.arguments.first()? {
-        Argument::StringLiteral(lit) => lit.value.to_string(),
+        Argument::StringLiteral(lit) => lit.value.text().into_owned(),
         _ => return None,
     };
     let class_name = match call.arguments.get(1)? {
@@ -451,7 +450,7 @@ pub(super) fn extract_custom_element_tag_reference(
     let Argument::StringLiteral(lit) = call.arguments.first()? else {
         return None;
     };
-    let tag = lit.value.as_str();
+    let tag = &*lit.value.text();
     tag.contains('-').then(|| tag.to_string())
 }
 
@@ -599,10 +598,15 @@ const VUE_REACTIVITY_WRAPPERS: &[&str] = &[
 /// non-builtin identifier type reference (a class / interface whose members the
 /// analyze layer can credit); `number[]`, `string[]`, `Map[]`, etc. yield `None`.
 pub(super) fn array_element_type_from_type(ty: &TSType<'_>) -> Option<String> {
+    array_element_target_from_type(ty).map(|(name, _)| name)
+}
+
+pub(super) fn array_element_target_from_type(ty: &TSType<'_>) -> Option<(String, Option<Span>)> {
     match ty {
         TSType::TSArrayType(arr) => {
             let name = extract_type_reference_name(&arr.element_type)?;
-            (!is_builtin_constructor(&name)).then_some(name)
+            (!is_builtin_constructor(&name))
+                .then(|| (name, extract_type_reference_origin(&arr.element_type)))
         }
         TSType::TSTypeReference(type_ref) => {
             let name = extract_type_name(&type_ref.type_name)?;
@@ -611,14 +615,51 @@ pub(super) fn array_element_type_from_type(ty: &TSType<'_>) -> Option<String> {
             }
             let first = type_ref.type_arguments.as_deref()?.params.first()?;
             let element = extract_type_reference_name(first)?;
-            (!is_builtin_constructor(&element)).then_some(element)
+            (!is_builtin_constructor(&element))
+                .then(|| (element, extract_type_reference_origin(first)))
         }
         TSType::TSTypeOperatorType(op)
             if op.operator == oxc_ast::ast::TSTypeOperatorOperator::Readonly =>
         {
-            array_element_type_from_type(&op.type_annotation)
+            array_element_target_from_type(&op.type_annotation)
         }
-        TSType::TSParenthesizedType(paren) => array_element_type_from_type(&paren.type_annotation),
+        TSType::TSParenthesizedType(paren) => {
+            array_element_target_from_type(&paren.type_annotation)
+        }
+        TSType::TSUnionType(union) => {
+            let mut found: Option<(String, Option<Span>)> = None;
+            for branch in &union.types {
+                match branch {
+                    TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_) => {}
+                    other => {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = array_element_target_from_type(other);
+                        found.as_ref()?;
+                    }
+                }
+            }
+            found
+        }
+        _ => None,
+    }
+}
+
+/// Extract the value type name of a map-shaped TS type: `Map<K, V>`,
+/// `ReadonlyMap<K, V>`, a parenthesized form, and a nullable union of those.
+/// Returns the value name only when it is a non-builtin identifier type
+/// reference, so `Map<string, number>` yields `None`.
+pub(super) fn map_value_type_from_type(ty: &TSType<'_>) -> Option<String> {
+    match ty {
+        TSType::TSTypeReference(type_ref) => {
+            let name = extract_type_name(&type_ref.type_name)?;
+            if name != "Map" && name != "ReadonlyMap" {
+                return None;
+            }
+            map_value_type_from_args(type_ref.type_arguments.as_deref())
+        }
+        TSType::TSParenthesizedType(paren) => map_value_type_from_type(&paren.type_annotation),
         TSType::TSUnionType(union) => {
             let mut found: Option<String> = None;
             for branch in &union.types {
@@ -628,7 +669,7 @@ pub(super) fn array_element_type_from_type(ty: &TSType<'_>) -> Option<String> {
                         if found.is_some() {
                             return None;
                         }
-                        found = array_element_type_from_type(other);
+                        found = map_value_type_from_type(other);
                         found.as_ref()?;
                     }
                 }
@@ -637,6 +678,33 @@ pub(super) fn array_element_type_from_type(ty: &TSType<'_>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The value type name of a `new Map<K, V>()` initializer, under the same
+/// non-builtin rule as `map_value_type_from_type`.
+pub(super) fn map_value_type_from_new(expr: &Expression<'_>) -> Option<String> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => map_value_type_from_new(&paren.expression),
+        Expression::NewExpression(new_expr) => {
+            let Expression::Identifier(callee) = &new_expr.callee else {
+                return None;
+            };
+            if callee.name != "Map" {
+                return None;
+            }
+            map_value_type_from_args(new_expr.type_arguments.as_deref())
+        }
+        _ => None,
+    }
+}
+
+fn map_value_type_from_args(args: Option<&TSTypeParameterInstantiation<'_>>) -> Option<String> {
+    let args = args?;
+    if args.params.len() != 2 {
+        return None;
+    }
+    let value = extract_type_reference_name(&args.params[1])?;
+    (!is_builtin_constructor(&value)).then_some(value)
 }
 
 /// Infer the element class of an array-shaped binding from its optional type
@@ -649,13 +717,20 @@ pub(super) fn infer_array_binding_element_type(
     type_annotation: Option<&TSTypeAnnotation<'_>>,
     init: Option<&Expression<'_>>,
 ) -> Option<String> {
+    infer_array_binding_element_target(type_annotation, init).map(|(name, _)| name)
+}
+
+pub(super) fn infer_array_binding_element_target(
+    type_annotation: Option<&TSTypeAnnotation<'_>>,
+    init: Option<&Expression<'_>>,
+) -> Option<(String, Option<Span>)> {
     if let Some(annotation) = type_annotation {
-        return array_element_type_from_type(&annotation.type_annotation);
+        return array_element_target_from_type(&annotation.type_annotation);
     }
     infer_array_element_from_init(init?)
 }
 
-fn infer_array_element_from_init(expr: &Expression<'_>) -> Option<String> {
+fn infer_array_element_from_init(expr: &Expression<'_>) -> Option<(String, Option<Span>)> {
     match expr {
         Expression::ParenthesizedExpression(paren) => {
             infer_array_element_from_init(&paren.expression)
@@ -676,22 +751,27 @@ fn infer_array_element_from_init(expr: &Expression<'_>) -> Option<String> {
 /// builtin element and any non-reference shape. Used by the issue #1793
 /// `Promise.all(arr.map(cb))` inference pre-pass.
 pub(super) fn return_type_element_name(ty: &TSType<'_>) -> Option<String> {
+    return_type_element_target(ty).map(|(name, _)| name)
+}
+
+pub(super) fn return_type_element_target(ty: &TSType<'_>) -> Option<(String, Option<Span>)> {
     match ty {
-        TSType::TSParenthesizedType(paren) => return_type_element_name(&paren.type_annotation),
+        TSType::TSParenthesizedType(paren) => return_type_element_target(&paren.type_annotation),
         TSType::TSTypeReference(type_ref) => {
             let name = extract_type_name(&type_ref.type_name)?;
             if name == "Promise" {
                 let first = type_ref.type_arguments.as_deref()?.params.first()?;
                 return extract_type_reference_name(first)
-                    .filter(|inner| !is_builtin_constructor(inner));
+                    .filter(|inner| !is_builtin_constructor(inner))
+                    .map(|inner| (inner, extract_type_reference_origin(first)));
             }
-            (!is_builtin_constructor(&name)).then_some(name)
+            (!is_builtin_constructor(&name)).then(|| (name, extract_type_reference_origin(ty)))
         }
         _ => None,
     }
 }
 
-fn reactivity_wrapper_element_type(call: &CallExpression<'_>) -> Option<String> {
+fn reactivity_wrapper_element_type(call: &CallExpression<'_>) -> Option<(String, Option<Span>)> {
     let Expression::Identifier(callee) = &call.callee else {
         return None;
     };
@@ -700,24 +780,21 @@ fn reactivity_wrapper_element_type(call: &CallExpression<'_>) -> Option<String> 
     }
     if let Some(type_args) = call.type_arguments.as_deref()
         && let Some(first) = type_args.params.first()
-        && let Some(element) = array_element_type_from_type(first)
+        && let Some(element) = array_element_target_from_type(first)
     {
         return Some(element);
     }
     callback_returned_array_element(call.arguments.first()?)
 }
 
-fn callback_returned_array_element(arg: &Argument<'_>) -> Option<String> {
+pub(super) fn callback_returned_array_element(
+    arg: &Argument<'_>,
+) -> Option<(String, Option<Span>)> {
     match arg {
-        Argument::ArrowFunctionExpression(arrow) => {
-            if arrow.expression {
-                let Statement::ExpressionStatement(stmt) = arrow.body.statements.first()? else {
-                    return None;
-                };
-                return array_literal_element_type_of_expr(&stmt.expression);
-            }
-            function_body_returned_array_element(&arrow.body)
-        }
+        Argument::ArrowFunctionExpression(arrow) => match &arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => function_body_returned_array_element(body),
+            body => array_literal_element_type_of_expr(body.as_expression()?),
+        },
         Argument::FunctionExpression(func) => {
             function_body_returned_array_element(func.body.as_deref()?)
         }
@@ -725,7 +802,9 @@ fn callback_returned_array_element(arg: &Argument<'_>) -> Option<String> {
     }
 }
 
-fn function_body_returned_array_element(body: &oxc_ast::ast::FunctionBody<'_>) -> Option<String> {
+fn function_body_returned_array_element(
+    body: &oxc_ast::ast::FunctionBody<'_>,
+) -> Option<(String, Option<Span>)> {
     let Statement::ReturnStatement(ret) = body.statements.last()? else {
         return None;
     };
@@ -745,7 +824,7 @@ fn unwrap_returned_expr<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> 
     }
 }
 
-fn array_literal_element_type_of_expr(expr: &Expression<'_>) -> Option<String> {
+fn array_literal_element_type_of_expr(expr: &Expression<'_>) -> Option<(String, Option<Span>)> {
     match expr {
         Expression::ParenthesizedExpression(paren) => {
             array_literal_element_type_of_expr(&paren.expression)
@@ -758,8 +837,10 @@ fn array_literal_element_type_of_expr(expr: &Expression<'_>) -> Option<String> {
 /// The element class of an array literal whose elements are ALL `new Class()`
 /// with the same non-builtin `Class`. Empty arrays, mixed classes, and any
 /// non-`new` element yield `None` (no confident single element type).
-fn array_literal_element_type(arr: &oxc_ast::ast::ArrayExpression<'_>) -> Option<String> {
-    let mut element: Option<String> = None;
+fn array_literal_element_type(
+    arr: &oxc_ast::ast::ArrayExpression<'_>,
+) -> Option<(String, Option<Span>)> {
+    let mut element: Option<(String, Option<Span>)> = None;
     for item in &arr.elements {
         let ArrayExpressionElement::NewExpression(new_expr) = item else {
             return None;
@@ -772,9 +853,9 @@ fn array_literal_element_type(arr: &oxc_ast::ast::ArrayExpression<'_>) -> Option
             return None;
         }
         match &element {
-            Some(existing) if existing != name => return None,
+            Some((existing, _)) if existing != name => return None,
             Some(_) => {}
-            None => element = Some(name.to_string()),
+            None => element = Some((name.to_string(), Some(callee.span))),
         }
     }
     element
@@ -783,7 +864,10 @@ fn array_literal_element_type(arr: &oxc_ast::ast::ArrayExpression<'_>) -> Option
 /// Scan a function body's top-level statements for `const/let <name>: T[]` and
 /// return the array element class of its annotation. Used when a reactivity
 /// callback returns a locally-declared, array-annotated binding.
-fn local_typed_array_element(statements: &[Statement<'_>], name: &str) -> Option<String> {
+fn local_typed_array_element(
+    statements: &[Statement<'_>],
+    name: &str,
+) -> Option<(String, Option<Span>)> {
     for stmt in statements {
         let Statement::VariableDeclaration(decl) = stmt else {
             continue;
@@ -796,7 +880,7 @@ fn local_typed_array_element(statements: &[Statement<'_>], name: &str) -> Option
                 continue;
             }
             if let Some(annotation) = declarator.type_annotation.as_deref() {
-                return array_element_type_from_type(&annotation.type_annotation);
+                return array_element_target_from_type(&annotation.type_annotation);
             }
         }
     }
@@ -828,7 +912,7 @@ pub(super) fn collect_component_field_array_types(class: &Class<'_>) -> FxHashMa
         if let Some(element_type) =
             infer_array_binding_element_type(prop.type_annotation.as_deref(), prop.value.as_ref())
         {
-            field_types.insert(name.to_string(), element_type);
+            field_types.insert(name.text().into_owned(), element_type);
         }
     }
     field_types
@@ -850,16 +934,23 @@ pub(super) fn has_angular_plural_query_decorator(
 
 pub fn extract_class_members(class: &Class<'_>, is_angular_class: bool) -> Vec<MemberInfo> {
     let class_name = class.id.as_ref().map(|id| id.name.as_str());
+    let heritage_root = class
+        .heritage
+        .as_ref()
+        .and_then(|heritage| heritage_root_name(&heritage.expression));
+    let override_base = |is_override: bool| heritage_root.clone().filter(|_| is_override);
     let mut members = Vec::new();
     for element in &class.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
-                if let Some(member) = build_method_member(method, class_name) {
+                if let Some(mut member) = build_method_member(method, class_name) {
+                    member.override_base = override_base(method.r#override);
                     members.push(member);
                 }
             }
             ClassElement::PropertyDefinition(prop) => {
-                if let Some(member) = build_property_member(prop, is_angular_class) {
+                if let Some(mut member) = build_property_member(prop, is_angular_class) {
+                    member.override_base = override_base(prop.r#override);
                     members.push(member);
                 }
             }
@@ -869,12 +960,65 @@ pub fn extract_class_members(class: &Class<'_>, is_angular_class: bool) -> Vec<M
     members
 }
 
+/// Whether a heritage call argument is data and not a class to mix in.
+///
+/// Literals and object literals without a spread are data. An object
+/// property can name a schema (`{ user: User }` in an Effect error), so object
+/// values are not checked. An array counts only when no element is a bare
+/// identifier, member expression or spread, because `Mixin([LocalBase])`
+/// lists classes.
+fn is_heritage_data_argument(arg: &Argument<'_>) -> bool {
+    match arg {
+        Argument::StringLiteral(_)
+        | Argument::NumericLiteral(_)
+        | Argument::BooleanLiteral(_)
+        | Argument::NullLiteral(_)
+        | Argument::TemplateLiteral(_) => true,
+        Argument::ObjectExpression(object) => object
+            .properties
+            .iter()
+            .all(|property| matches!(property, ObjectPropertyKind::ObjectProperty(_))),
+        Argument::ArrayExpression(array) => array.elements.iter().all(|element| {
+            !matches!(
+                element,
+                ArrayExpressionElement::Identifier(_)
+                    | ArrayExpressionElement::StaticMemberExpression(_)
+                    | ArrayExpressionElement::SpreadElement(_)
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Root identifier of a class `extends` expression.
+///
+/// `Base` for `extends Base`, `ns` for `extends ns.Base`, `Schema` for
+/// `extends Schema.TaggedError<E>()("E", {...})`. A call returns `None` unless
+/// every argument is a literal, an object literal or an array literal: a
+/// mixin such as `Mixin(LocalBase)` can take a project class that declares
+/// the overridden member.
+fn heritage_root_name(expr: &Expression<'_>) -> Option<String> {
+    match expr {
+        Expression::Identifier(ident) => Some(ident.name.to_string()),
+        Expression::StaticMemberExpression(member) => heritage_root_name(&member.object),
+        Expression::CallExpression(call) => {
+            if !call.arguments.iter().all(is_heritage_data_argument) {
+                return None;
+            }
+            heritage_root_name(&call.callee)
+        }
+        Expression::TSInstantiationExpression(inst) => heritage_root_name(&inst.expression),
+        Expression::ParenthesizedExpression(paren) => heritage_root_name(&paren.expression),
+        _ => None,
+    }
+}
+
 /// Build a `MemberInfo` for a non-constructor, non-private/protected method.
 fn build_method_member(
     method: &oxc_ast::ast::MethodDefinition<'_>,
     class_name: Option<&str>,
 ) -> Option<MemberInfo> {
-    let name_str = method.key.static_name()?.to_string();
+    let name_str = method.key.static_name()?.text().into_owned();
     if name_str == "constructor"
         || matches!(method.key, PropertyKey::PrivateIdentifier(_))
         || matches!(
@@ -901,6 +1045,7 @@ fn build_method_member(
         decorator_names,
         is_instance_returning_static,
         is_self_returning,
+        override_base: None,
     })
 }
 
@@ -931,13 +1076,14 @@ fn build_property_member(
         .map(|d| decorator_path(&d.expression))
         .collect();
     Some(MemberInfo {
-        name: name.to_string(),
+        name: name.text().into_owned(),
         kind: MemberKind::ClassProperty,
         span: prop.span,
         has_decorator,
         decorator_names,
         is_instance_returning_static: false,
         is_self_returning: false,
+        override_base: None,
     })
 }
 
@@ -974,7 +1120,7 @@ pub fn extract_angular_inputs_outputs(
         if let Some(role) = angular_decorator_member_role(prop) {
             match role {
                 AngularMemberRole::Input => inputs.push(AngularInputMember {
-                    name: name.to_string(),
+                    name: name.text().into_owned(),
                     span_start,
                 }),
                 // Only an `@Output()` initialized by `new EventEmitter(...)` emits
@@ -985,7 +1131,7 @@ pub fn extract_angular_inputs_outputs(
                 AngularMemberRole::Output => {
                     if output_is_event_emitter(prop.value.as_ref()) {
                         outputs.push(AngularOutputMember {
-                            name: name.to_string(),
+                            name: name.text().into_owned(),
                             span_start,
                         });
                     }
@@ -1003,11 +1149,11 @@ pub fn extract_angular_inputs_outputs(
         {
             match signal_name {
                 "input" | "model" => inputs.push(AngularInputMember {
-                    name: name.to_string(),
+                    name: name.text().into_owned(),
                     span_start,
                 }),
                 "output" | "outputFromObservable" => outputs.push(AngularOutputMember {
-                    name: name.to_string(),
+                    name: name.text().into_owned(),
                     span_start,
                 }),
                 _ => {}
@@ -1146,7 +1292,7 @@ fn is_self_construction_expression(expr: &Expression<'_>, class_name: Option<&st
 }
 
 pub fn extract_super_class_name(class: &Class<'_>) -> Option<String> {
-    extract_static_expression_name(class.super_class.as_ref()?)
+    extract_static_expression_name(&class.heritage.as_ref()?.expression)
 }
 
 #[must_use]
@@ -1163,19 +1309,18 @@ pub fn extract_type_annotation_name(type_annotation: &TSTypeAnnotation<'_>) -> O
     extract_type_reference_name(&type_annotation.type_annotation)
 }
 
-#[must_use]
-pub fn extract_nested_type_bindings(
+pub(super) fn extract_nested_type_bindings(
     type_annotation: &TSTypeAnnotation<'_>,
-) -> Vec<(String, String)> {
+) -> Vec<(String, String, Option<Span>)> {
     let mut bindings = Vec::new();
     collect_nested_type_bindings(&type_annotation.type_annotation, None, &mut bindings);
     bindings
 }
 
-fn collect_nested_type_bindings(
+pub(super) fn collect_nested_type_bindings(
     ty: &TSType<'_>,
     prefix: Option<&str>,
-    bindings: &mut Vec<(String, String)>,
+    bindings: &mut Vec<(String, String, Option<Span>)>,
 ) {
     match ty {
         TSType::TSTypeLiteral(type_lit) => {
@@ -1187,15 +1332,19 @@ fn collect_nested_type_bindings(
                     continue;
                 };
                 let path = if let Some(prefix) = prefix {
-                    format!("{prefix}.{property_name}")
+                    format!("{prefix}.{}", property_name.text())
                 } else {
-                    property_name.to_string()
+                    property_name.text().into_owned()
                 };
                 let Some(type_annotation) = prop.type_annotation.as_deref() else {
                     continue;
                 };
                 if let Some(type_name) = extract_type_annotation_name(type_annotation) {
-                    bindings.push((path, type_name));
+                    bindings.push((
+                        path,
+                        type_name,
+                        extract_type_reference_origin(&type_annotation.type_annotation),
+                    ));
                 } else {
                     collect_nested_type_bindings(
                         &type_annotation.type_annotation,
@@ -1220,6 +1369,16 @@ pub fn extract_class_instance_bindings<F>(
 where
     F: Fn(&str, &str, &str) -> bool,
 {
+    extract_class_instance_bindings_with_origins(class, is_named_import_from).0
+}
+
+pub(super) fn extract_class_instance_bindings_with_origins<F>(
+    class: &Class<'_>,
+    is_named_import_from: F,
+) -> (Vec<(String, String)>, FxHashMap<String, Span>)
+where
+    F: Fn(&str, &str, &str) -> bool,
+{
     let type_param_constraints = collect_class_type_param_constraints(class);
     let resolve = |raw: String| -> Option<String> {
         if let Some(replacement) = type_param_constraints.get(raw.as_str()) {
@@ -1227,23 +1386,62 @@ where
         }
         Some(raw)
     };
+    let constraints = collect_class_type_param_constraint_origins(class);
+    let resolve_origin = |ty: &TSType<'_>| -> Option<Span> {
+        let name = extract_type_reference_name(ty)?;
+        match constraints.get(&name) {
+            Some(Some(target)) => target.reference_span,
+            Some(None) => None,
+            None => extract_type_reference_origin(ty),
+        }
+    };
+    let mut origins = FxHashMap::default();
     let mut bindings: Vec<(String, String)> = Vec::new();
     for element in &class.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
                 if matches!(method.kind, MethodDefinitionKind::Constructor) {
-                    collect_constructor_param_bindings(method, &resolve, &mut bindings);
+                    collect_constructor_param_bindings(
+                        method,
+                        &resolve,
+                        &resolve_origin,
+                        &mut bindings,
+                        &mut origins,
+                    );
                 } else if matches!(method.kind, MethodDefinitionKind::Get) {
-                    collect_getter_binding(method, &resolve, &mut bindings);
+                    collect_getter_binding(
+                        method,
+                        &resolve,
+                        &resolve_origin,
+                        &mut bindings,
+                        &mut origins,
+                    );
                 }
             }
             ClassElement::PropertyDefinition(prop) => {
+                let before = bindings.len();
                 collect_property_binding(prop, &resolve, &is_named_import_from, &mut bindings);
+                let origin = prop
+                    .type_annotation
+                    .as_deref()
+                    .and_then(|ty| resolve_origin(&ty.type_annotation))
+                    .or_else(|| match prop.value.as_ref() {
+                        Some(Expression::NewExpression(expr)) => match &expr.callee {
+                            Expression::Identifier(id) => Some(id.span),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                if let Some(origin) = origin {
+                    for (name, _) in &bindings[before..] {
+                        origins.insert(name.clone(), origin);
+                    }
+                }
             }
             _ => {}
         }
     }
-    bindings
+    (bindings, origins)
 }
 
 /// Positional super-class type arguments (the `<DerivedClient>` in
@@ -1253,7 +1451,11 @@ where
 /// the base's type parameters (issue #1910).
 #[must_use]
 pub fn extract_super_class_type_args(class: &Class<'_>) -> Vec<String> {
-    let Some(type_args) = class.super_type_arguments.as_deref() else {
+    let Some(type_args) = class
+        .heritage
+        .as_ref()
+        .and_then(|heritage| heritage.type_arguments.as_deref())
+    else {
         return Vec::new();
     };
     type_args
@@ -1339,7 +1541,12 @@ pub fn extract_class_generic_instance_bindings(class: &Class<'_>) -> Vec<(String
                     let Some(type_annotation) = method.value.return_type.as_deref() else {
                         continue;
                     };
-                    push_generic_binding(&name, type_annotation, &param_indices, &mut bindings);
+                    push_generic_binding(
+                        &name.text(),
+                        type_annotation,
+                        &param_indices,
+                        &mut bindings,
+                    );
                 }
             }
             ClassElement::PropertyDefinition(prop) => {
@@ -1352,7 +1559,7 @@ pub fn extract_class_generic_instance_bindings(class: &Class<'_>) -> Vec<(String
                 let Some(type_annotation) = prop.type_annotation.as_deref() else {
                     continue;
                 };
-                push_generic_binding(&name, type_annotation, &param_indices, &mut bindings);
+                push_generic_binding(&name.text(), type_annotation, &param_indices, &mut bindings);
             }
             _ => {}
         }
@@ -1392,7 +1599,9 @@ fn class_type_param_indices(class: &Class<'_>) -> FxHashMap<String, usize> {
 fn collect_constructor_param_bindings(
     method: &oxc_ast::ast::MethodDefinition<'_>,
     resolve: &impl Fn(String) -> Option<String>,
+    resolve_origin: &impl Fn(&TSType<'_>) -> Option<Span>,
     bindings: &mut Vec<(String, String)>,
+    origins: &mut FxHashMap<String, Span>,
 ) {
     for param in &method.value.params.items {
         let Some(accessibility) = param.accessibility else {
@@ -1413,6 +1622,9 @@ fn collect_constructor_param_bindings(
         let Some(resolved) = resolve(type_name) else {
             continue;
         };
+        if let Some(origin) = resolve_origin(&type_annotation.type_annotation) {
+            origins.insert(id.name.to_string(), origin);
+        }
         bindings.push((id.name.to_string(), resolved));
     }
 }
@@ -1421,7 +1633,9 @@ fn collect_constructor_param_bindings(
 fn collect_getter_binding(
     method: &oxc_ast::ast::MethodDefinition<'_>,
     resolve: &impl Fn(String) -> Option<String>,
+    resolve_origin: &impl Fn(&TSType<'_>) -> Option<Span>,
     bindings: &mut Vec<(String, String)>,
+    origins: &mut FxHashMap<String, Span>,
 ) {
     if matches!(method.accessibility, Some(TSAccessibility::Private)) {
         return;
@@ -1438,7 +1652,10 @@ fn collect_getter_binding(
     let Some(resolved) = resolve(type_name) else {
         return;
     };
-    bindings.push((name.to_string(), resolved));
+    if let Some(origin) = resolve_origin(&type_annotation.type_annotation) {
+        origins.insert(name.text().into_owned(), origin);
+    }
+    bindings.push((name.text().into_owned(), resolved));
 }
 
 /// Push an instance binding for a non-private property: typed annotation first,
@@ -1461,7 +1678,7 @@ fn collect_property_binding<F>(
         && let Some(type_name) = extract_type_annotation_name(type_annotation)
     {
         if let Some(resolved) = resolve(type_name) {
-            bindings.push((name.to_string(), resolved));
+            bindings.push((name.text().into_owned(), resolved));
         }
         return;
     }
@@ -1469,13 +1686,13 @@ fn collect_property_binding<F>(
         && let Expression::Identifier(callee) = &new_expr.callee
         && !is_builtin_constructor(callee.name.as_str())
     {
-        bindings.push((name.to_string(), callee.name.to_string()));
+        bindings.push((name.text().into_owned(), callee.name.to_string()));
         return;
     }
     if let Some(Expression::CallExpression(call)) = &prop.value
         && let Some(type_name) = extract_angular_inject_target(call, is_named_import_from)
     {
-        bindings.push((name.to_string(), type_name));
+        bindings.push((name.text().into_owned(), type_name));
     }
 }
 
@@ -1518,6 +1735,15 @@ fn type_name_root(name: &TSTypeName<'_>) -> Option<String> {
 pub fn collect_class_type_param_constraints(
     class: &Class<'_>,
 ) -> FxHashMap<String, Option<String>> {
+    collect_class_type_param_constraint_origins(class)
+        .into_iter()
+        .map(|(name, target)| (name, target.map(|target| target.name)))
+        .collect()
+}
+
+pub(super) fn collect_class_type_param_constraint_origins(
+    class: &Class<'_>,
+) -> FxHashMap<String, Option<super::TypePropertyTarget>> {
     let mut map = FxHashMap::default();
     let Some(type_parameters) = class.type_parameters.as_deref() else {
         return map;
@@ -1527,12 +1753,36 @@ pub fn collect_class_type_param_constraints(
             .constraint
             .as_ref()
             .and_then(extract_type_reference_name);
-        map.insert(param.name.name.to_string(), constraint_name);
+        let target = constraint_name.map(|name| super::TypePropertyTarget {
+            name,
+            reference_span: param
+                .constraint
+                .as_ref()
+                .and_then(extract_type_reference_origin),
+            owner_span: None,
+        });
+        map.insert(param.name.name.to_string(), target);
     }
     map
 }
 
 #[must_use]
+pub(super) fn extract_type_reference_origin(ty: &TSType<'_>) -> Option<Span> {
+    match ty {
+        TSType::TSTypeReference(reference) => match &reference.type_name {
+            TSTypeName::IdentifierReference(reference) => Some(reference.span),
+            _ => None,
+        },
+        TSType::TSParenthesizedType(parenthesized) => {
+            extract_type_reference_origin(&parenthesized.type_annotation)
+        }
+        TSType::TSUnionType(union) if extract_nullable_union_name(union).is_some() => {
+            union.types.iter().find_map(extract_type_reference_origin)
+        }
+        _ => None,
+    }
+}
+
 pub fn extract_type_reference_name(ty: &TSType<'_>) -> Option<String> {
     match ty {
         TSType::TSTypeReference(type_ref) => extract_type_name(&type_ref.type_name),
@@ -1575,34 +1825,13 @@ fn decorator_path(expr: &Expression<'_>) -> String {
     }
 }
 
-fn extract_static_expression_name(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::Identifier(ident) => Some(ident.name.to_string()),
-        Expression::StaticMemberExpression(member) => Some(format!(
-            "{}.{}",
-            extract_static_expression_name(&member.object)?,
-            member.property.name
-        )),
-        _ => None,
-    }
-}
-
-fn extract_type_name(name: &TSTypeName<'_>) -> Option<String> {
-    match name {
-        TSTypeName::IdentifierReference(ident) => Some(ident.name.to_string()),
-        TSTypeName::QualifiedName(name) => Some(format!(
-            "{}.{}",
-            extract_type_name(&name.left)?,
-            name.right.name
-        )),
-        TSTypeName::ThisExpression(_) => None,
-    }
-}
-
 pub(super) fn is_meta_url_arg(arg: &Argument<'_>) -> bool {
     if let Argument::StaticMemberExpression(member) = arg
         && member.property.name == "url"
-        && matches!(member.object, Expression::MetaProperty(_))
+        && matches!(
+            member.object,
+            Expression::ImportMeta(_) | Expression::NewTarget(_)
+        )
     {
         return true;
     }
@@ -1621,17 +1850,41 @@ pub(super) fn ts_import_type_qualifier_root<'a>(
     }
 }
 
+/// Escape the glob metacharacters of a literal path part.
+///
+/// The resolver reads a dynamic import pattern as a glob. A literal part, such
+/// as the `./[id]/` prefix of a template literal, must match only itself. Each
+/// metacharacter becomes a one-character class, for example `[` becomes
+/// `[[]`. A class works on every platform, but a backslash escape does not
+/// work on Windows. The escape of `(` stops the resolver from reading a text
+/// such as `@(a)` as an extglob group.
+pub(super) fn escape_glob_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '(') {
+            escaped.push('[');
+            escaped.push(character);
+            escaped.push(']');
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+/// The glob prefix and suffix of a `'./dir/' + name + '.js'` concatenation.
+/// Both parts are glob-escaped literal text.
 pub(super) fn extract_concat_parts(
     expr: &BinaryExpression<'_>,
 ) -> Option<(String, Option<String>)> {
-    let prefix = extract_leading_string(&expr.left)?;
-    let suffix = extract_trailing_string(&expr.right);
+    let prefix = escape_glob_literal(&extract_leading_string(&expr.left)?);
+    let suffix = extract_trailing_string(&expr.right).map(|suffix| escape_glob_literal(&suffix));
     Some((prefix, suffix))
 }
 
 fn extract_leading_string(expr: &Expression<'_>) -> Option<String> {
     match expr {
-        Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+        Expression::StringLiteral(lit) => Some(lit.value.text().into_owned()),
         Expression::BinaryExpression(bin)
             if bin.operator == oxc_ast::ast::BinaryOperator::Addition =>
         {
@@ -1644,7 +1897,7 @@ fn extract_leading_string(expr: &Expression<'_>) -> Option<String> {
 fn extract_trailing_string(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::StringLiteral(lit) => {
-            let s = lit.value.to_string();
+            let s = lit.value.text().into_owned();
             if s.is_empty() { None } else { Some(s) }
         }
         _ => None,
@@ -1689,46 +1942,60 @@ pub(super) fn regex_pattern_to_suffix(pattern: &str) -> Option<String> {
 }
 
 pub(super) fn try_extract_factory_new_class(arguments: &[Argument<'_>]) -> Option<String> {
+    factory_new_class_target(arguments).map(|(name, _)| name)
+}
+
+pub(super) fn try_extract_factory_new_class_origin(
+    arguments: &[Argument<'_>],
+) -> Option<(String, Span)> {
+    let (name, origin) = factory_new_class_target(arguments)?;
+    Some((name, origin?))
+}
+
+fn factory_new_class_target(arguments: &[Argument<'_>]) -> Option<(String, Option<Span>)> {
     for arg in arguments {
+        let executes = match arg {
+            Argument::ArrowFunctionExpression(arrow) => !arrow.r#async,
+            Argument::FunctionExpression(function) => !function.r#async && !function.generator,
+            _ => false,
+        };
         let class_name = match arg {
-            Argument::ArrowFunctionExpression(arrow) => {
-                if arrow.expression {
-                    extract_new_class_from_statement(arrow.body.statements.first()?)
-                } else {
-                    extract_new_class_from_return_body(&arrow.body.statements)
+            Argument::ArrowFunctionExpression(arrow) => match &arrow.body {
+                ArrowFunctionBody::FunctionBody(body) => {
+                    extract_new_class_from_return_body(&body.statements)
                 }
-            }
+                body => extract_new_class_from_expression(body.as_expression()?),
+            },
             Argument::FunctionExpression(func) => {
                 extract_new_class_from_return_body(&func.body.as_ref()?.statements)
             }
             _ => None,
         };
-        if let Some(name) = class_name
+        if let Some((name, origin)) = class_name
             && !is_builtin_constructor(&name)
         {
-            return Some(name);
+            return Some((name, executes.then_some(origin)));
         }
     }
     None
 }
 
-fn extract_new_class_from_statement(stmt: &Statement<'_>) -> Option<String> {
-    if let Statement::ExpressionStatement(expr_stmt) = stmt
-        && let Expression::NewExpression(new_expr) = &expr_stmt.expression
+fn extract_new_class_from_expression(expr: &Expression<'_>) -> Option<(String, Span)> {
+    if let Expression::NewExpression(new_expr) = expr
         && let Expression::Identifier(callee) = &new_expr.callee
     {
-        return Some(callee.name.to_string());
+        return Some((callee.name.to_string(), callee.span));
     }
     None
 }
 
-fn extract_new_class_from_return_body(stmts: &[Statement<'_>]) -> Option<String> {
+fn extract_new_class_from_return_body(stmts: &[Statement<'_>]) -> Option<(String, Span)> {
     for stmt in stmts.iter().rev() {
         if let Statement::ReturnStatement(ret) = stmt
             && let Some(Expression::NewExpression(new_expr)) = &ret.argument
             && let Expression::Identifier(callee) = &new_expr.callee
         {
-            return Some(callee.name.to_string());
+            return Some((callee.name.to_string(), callee.span));
         }
     }
     None

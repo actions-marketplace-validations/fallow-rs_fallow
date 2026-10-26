@@ -15,7 +15,7 @@ use fallow_cli::report::{
 use fallow_output::{
     CiIssue, CiProvider, ExplainOutput, InspectEvidence, InspectEvidenceScope,
     InspectEvidenceSection, InspectFileIdentity, InspectIdentity, InspectOutput,
-    InspectTargetDescriptor, PrCommentRenderInput, RootEnvelopeMode, render_pr_comment,
+    InspectTargetDescriptor, PrCommentRenderInput, render_pr_comment,
     serialize_explain_json_output, serialize_inspect_json_output,
 };
 use serde_json::json;
@@ -35,7 +35,10 @@ fn create_ci_issues() -> Vec<CiIssue> {
             severity: if index % 5 == 0 { "major" } else { "minor" }.to_string(),
             path: format!("src/module-{}.ts", index % 40),
             line: u64::try_from(index + 1).unwrap(),
+            end_line: None,
+            other_locations: Vec::new(),
             fingerprint: format!("fp-{index:04}"),
+            legacy_fingerprint: None,
         })
         .collect()
 }
@@ -56,7 +59,7 @@ fn create_explain_output() -> ExplainOutput {
         rationale: "Unused exports increase maintenance cost.".to_string(),
         example: "export const unused = true;".to_string(),
         how_to_fix: "Remove the export or reference it from an entry point.".to_string(),
-        docs: "https://docs.fallow.tools/rules/unused-export".to_string(),
+        docs: "https://fallow.tools/docs/explanations/dead-code/#unused-exports".to_string(),
     }
 }
 
@@ -130,6 +133,7 @@ fn component_output_pr_comment_render(c: &mut Criterion) {
                     marker_id: "bench".to_string(),
                     max_comments: 50,
                     category_for_rule: &category_for_rule,
+                    trailing_section: None,
                 })
             },
             BatchSize::LargeInput,
@@ -141,10 +145,7 @@ fn component_output_explain_json_serialize(c: &mut Criterion) {
     c.bench_function("component_output_explain_json_serialize", |bencher| {
         bencher.iter_batched(
             create_explain_output,
-            |output| {
-                serialize_explain_json_output(output, RootEnvelopeMode::Tagged, Some("bench-run"))
-                    .unwrap()
-            },
+            |output| serialize_explain_json_output(output, Some("bench-run")).unwrap(),
             BatchSize::SmallInput,
         );
     });
@@ -154,10 +155,7 @@ fn component_output_inspect_json_serialize(c: &mut Criterion) {
     c.bench_function("component_output_inspect_json_serialize", |bencher| {
         bencher.iter_batched(
             create_inspect_output,
-            |output| {
-                serialize_inspect_json_output(output, RootEnvelopeMode::Tagged, Some("bench-run"))
-                    .unwrap()
-            },
+            |output| serialize_inspect_json_output(output, Some("bench-run")).unwrap(),
             BatchSize::SmallInput,
         );
     });

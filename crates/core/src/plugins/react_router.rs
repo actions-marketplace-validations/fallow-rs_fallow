@@ -8,11 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use oxc_allocator::Allocator;
+use fallow_extract::JsText;
 use oxc_ast::ast::{
     CallExpression, ExportDefaultDeclarationKind, Expression, ObjectExpression, Program, Statement,
 };
-use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 use super::{Plugin, PluginResult, config_parser};
@@ -42,6 +41,11 @@ const TOOLING_DEPENDENCIES: &[&str] = &[
     "@react-router/serve",
     "@react-router/node",
 ];
+
+/// Packages that the framework's built-in server entry imports. React Router
+/// uses this built-in entry when the app directory has no `entry.server` file.
+const DEFAULT_ENTRY_SERVER_DEPENDENCIES: &[&str] = &["isbot"];
+const ENTRY_SERVER_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx"];
 
 const BUNDLE_BOUNDARY_DIRS: &[&str] = &[".client", ".server"];
 const GENERATED_TYPE_IMPORT_PREFIXES: &[&str] = &["./+types/"];
@@ -93,6 +97,7 @@ define_plugin! {
         if is_react_router_project_config(config_path) {
             let app_dir = extract_app_directory(source, config_path, root);
             add_app_dir_patterns(&mut result, &app_dir);
+            add_default_entry_server_dependencies(&mut result, root, &app_dir);
             if !matches!(app_dir.as_str(), "app" | "src") {
                 collect_route_config_from_disk(&mut result, root, &app_dir);
             }
@@ -103,6 +108,7 @@ define_plugin! {
             return result;
         };
         add_app_dir_patterns(&mut result, &app_dir);
+        add_default_entry_server_dependencies(&mut result, root, &app_dir);
         collect_route_config_from_source(&mut result, source, config_path, root);
         result
     },
@@ -158,6 +164,24 @@ fn add_app_dir_patterns(result: &mut PluginResult, app_dir: &str) {
     result.push_used_export_rule(route_config_pattern, ROUTE_CONFIG_EXPORTS.iter().copied());
 }
 
+/// Credits the imports of the built-in server entry when the app has no
+/// authored `entry.server` file. An authored file is an entry point, so its
+/// own imports decide which packages are used.
+fn add_default_entry_server_dependencies(result: &mut PluginResult, root: &Path, app_dir: &str) {
+    let app_path = root.join(app_dir);
+    let has_authored_entry = ENTRY_SERVER_EXTENSIONS
+        .iter()
+        .any(|ext| app_path.join(format!("entry.server.{ext}")).is_file());
+    if has_authored_entry {
+        return;
+    }
+    result.referenced_dependencies.extend(
+        DEFAULT_ENTRY_SERVER_DEPENDENCIES
+            .iter()
+            .map(|dep| (*dep).to_string()),
+    );
+}
+
 fn route_dir_pattern(app_dir: &str) -> String {
     format!("{app_dir}/routes/**/*.{{ts,tsx,js,jsx}}")
 }
@@ -196,14 +220,14 @@ fn collect_route_config_from_source(
     root: &Path,
 ) {
     let source_type = SourceType::from_path(route_config_path).unwrap_or_default();
-    let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, source, source_type).parse();
-    let Some(expr) = find_default_export_expression(&parsed.program) else {
-        return;
-    };
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        let Some(expr) = find_default_export_expression(&parsed.program) else {
+            return;
+        };
 
-    let base_dir = route_config_path.parent().unwrap_or(root);
-    collect_route_entries(expr, &parsed.program, base_dir, root, result);
+        let base_dir = route_config_path.parent().unwrap_or(root);
+        collect_route_entries(expr, &parsed.program, base_dir, root, result);
+    });
 }
 
 fn find_default_export_expression<'a>(program: &'a Program<'a>) -> Option<&'a Expression<'a>> {
@@ -391,7 +415,7 @@ fn nth_argument_string(call: &CallExpression<'_>, index: usize) -> Option<String
 
 fn expression_string(expr: &Expression<'_>) -> Option<String> {
     match strip_wrappers(expr) {
-        Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+        Expression::StringLiteral(lit) => Some(lit.value.text().into_owned()),
         Expression::TemplateLiteral(tpl) if tpl.expressions.is_empty() => {
             tpl.quasis.first().map(|quasi| quasi.value.raw.to_string())
         }
@@ -550,5 +574,46 @@ mod tests {
         );
 
         assert!(has_entry_pattern(&result, "web/marketing/home.tsx"));
+    }
+
+    #[test]
+    fn resolve_config_credits_default_entry_server_dependencies() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("app")).unwrap();
+
+        let plugin = ReactRouterPlugin;
+        let result = plugin.resolve_config(
+            temp.path().join("app/routes.ts").as_path(),
+            "export default [];",
+            temp.path(),
+        );
+
+        assert!(
+            result
+                .referenced_dependencies
+                .iter()
+                .any(|dep| dep == "isbot")
+        );
+    }
+
+    #[test]
+    fn resolve_config_skips_default_entry_server_dependencies_for_authored_entry() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("web")).unwrap();
+        fs::write(temp.path().join("web/entry.server.tsx"), "").unwrap();
+
+        let plugin = ReactRouterPlugin;
+        let result = plugin.resolve_config(
+            temp.path().join("react-router.config.ts").as_path(),
+            r#"export default { appDirectory: "web" };"#,
+            temp.path(),
+        );
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .iter()
+                .any(|dep| dep == "isbot")
+        );
     }
 }

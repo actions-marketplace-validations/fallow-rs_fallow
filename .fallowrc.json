@@ -4,10 +4,27 @@
     "tests/fixtures/**",
     "tests/conformance/fixtures/**",
     "editors/vscode/test/integration/fixtures/**",
-    "apps/review-electron/test/fixtures/**",
     "benchmarks/knip6/**",
     "reference/knip/**",
-    "fuzz/corpus/**"
+    "fuzz/corpus/**",
+    "crates/cli/viz-assets/**",
+    "crates/api/src/mutation/companion/**",
+    "tools/mutation-runner/test/fixtures/**",
+    "assets/demo-project/**",
+    "tests/benchmark-corpus/**",
+    "tests/coverage-producer-corpus/**",
+    "tests/semantic-clone-corpus/**"
+  ],
+  "ignoreDependencies": [
+    "@fallow-cli/fallow-node-*",
+    "vitest4",
+    "zod"
+  ],
+  "ignoreExports": [
+    {
+      "file": "tools/mutation-runner/src/adapters/{bun-test,node-test,vitest}.mjs",
+      "exports": ["createAdapter"]
+    }
   ],
   "ignoreUnresolvedImports": [
     "./generated/lsp-initialization-options.js",
@@ -15,6 +32,7 @@
   ],
   "health": {
     "ignore": [
+      "crates/napi/index.js",
       "npm/fallow/scripts/**",
       "scripts/check-contract-surfaces.mjs",
       "scripts/public-smoke-conformance.mjs",

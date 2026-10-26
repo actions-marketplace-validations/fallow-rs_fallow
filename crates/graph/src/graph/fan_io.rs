@@ -16,7 +16,9 @@
 //! No `FxHashMap` iteration order reaches output: every collection is sorted
 //! before serialization in the path-resolved view.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use super::relativize;
 
 use fallow_types::discover::FileId;
 use rustc_hash::FxHashSet;
@@ -229,13 +231,6 @@ impl ModuleGraph {
     }
 }
 
-/// Strip `root` and forward-slash-normalize a module path (mirrors
-/// `impact_closure::relativize` / `partition_order::relativize`).
-fn relativize(path: &Path, root: &Path) -> String {
-    let rel: PathBuf = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-    rel.to_string_lossy().replace('\\', "/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +274,8 @@ mod tests {
             members: vec![],
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }
     }
 

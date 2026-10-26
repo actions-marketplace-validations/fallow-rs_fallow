@@ -2,15 +2,26 @@
     clippy::wildcard_imports,
     reason = "package-resolution helpers use many AST node shapes"
 )]
+use std::borrow::Cow;
+
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, walk};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::DynamicImportInfo;
+use crate::js_text::JsText;
+use fallow_types::extract::ImportLoadKind;
 
 use super::super::ModuleInfoExtractor;
 use super::{
     StaticPackageLoopBindings, for_of_binding_name, object_values_or_entries_argument_name,
 };
 
+/// The name of the CommonJS `require` function.
+const REQUIRE: &str = "require";
+
+/// Whether `expr` is `require.resolve`, by syntax only. The caller checks
+/// that no local binding shadows `require`.
 fn is_require_resolve_callee(expr: &Expression<'_>) -> bool {
     let Expression::StaticMemberExpression(member) = expr else {
         return false;
@@ -18,14 +29,164 @@ fn is_require_resolve_callee(expr: &Expression<'_>) -> bool {
     let Expression::Identifier(object) = &member.object else {
         return false;
     };
-    object.name == "require" && member.property.name == "resolve"
+    object.name == REQUIRE && member.property.name == "resolve"
 }
 
+/// Whether `declarator` is `require = createRequire(import.meta.url)` or
+/// `require = createRequire(__filename)`, also through a member such as
+/// `module.createRequire`.
+///
+/// This `require` resolves from the file itself, the same as the module
+/// `require`, so a nested scope that declares it does not shadow the module
+/// `require`. Another base, such as `createRequire(join(dir, 'x.json'))`,
+/// resolves from another directory and stays a shadow.
+fn is_module_create_require_binding(declarator: &VariableDeclarator<'_>) -> bool {
+    let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+        return false;
+    };
+    let Some(Expression::CallExpression(call)) = &declarator.init else {
+        return false;
+    };
+    let callee_is_create_require = match &call.callee {
+        Expression::Identifier(callee) => callee.name == "createRequire",
+        Expression::StaticMemberExpression(member) => member.property.name == "createRequire",
+        _ => false,
+    };
+    let [argument] = call.arguments.as_slice() else {
+        return false;
+    };
+    let base_is_this_file = match argument {
+        Argument::StaticMemberExpression(member) => {
+            matches!(member.object, Expression::ImportMeta(_)) && member.property.name == "url"
+        }
+        Argument::Identifier(base) => base.name == "__filename",
+        _ => false,
+    };
+    id.name == REQUIRE && callee_is_create_require && base_is_this_file
+}
+
+/// The declarators of `var` that a nested scope records as bindings. The
+/// `require` bindings that `is_module_create_require_binding` accepts are not
+/// in this list.
+pub(super) fn nested_scope_declarators<'b, 'a>(
+    var: &'b VariableDeclaration<'a>,
+) -> impl Iterator<Item = &'b VariableDeclarator<'a>> {
+    var.declarations
+        .iter()
+        .filter(|declarator| !is_module_create_require_binding(declarator))
+}
+
+/// Whether `expr` is `import.meta.resolve`. Code cannot rebind `import.meta`,
+/// so no shadow check applies.
+fn is_import_meta_resolve_callee(expr: &Expression<'_>) -> bool {
+    let Expression::StaticMemberExpression(member) = expr else {
+        return false;
+    };
+    matches!(member.object, Expression::ImportMeta(_)) && member.property.name == "resolve"
+}
+
+/// The value of a string literal or of a template literal without expressions.
+fn static_string_argument<'a>(argument: &'a Argument<'_>) -> Option<Cow<'a, str>> {
+    match argument {
+        Argument::StringLiteral(lit) => Some(lit.value.text()),
+        Argument::TemplateLiteral(tpl) if tpl.expressions.is_empty() => tpl
+            .quasis
+            .first()
+            .and_then(|quasi| quasi.value.cooked)
+            .map(JsText::text),
+        _ => None,
+    }
+}
+
+/// Whether the program has top-level import or export syntax, the rule that
+/// TypeScript uses to treat a file as a module and not as a script.
+/// `export as namespace` alone does not make a module file.
+pub(super) fn program_has_module_syntax(program: &Program<'_>) -> bool {
+    program.body.iter().any(|statement| match statement {
+        Statement::TSNamespaceExportDeclaration(_) => false,
+        Statement::TSImportEqualsDeclaration(decl) => matches!(
+            decl.module_reference,
+            TSModuleReference::ExternalModuleReference(_)
+        ),
+        _ => statement.is_module_declaration(),
+    })
+}
+
+/// Whether TypeScript reads the program as adding to the global scope: a
+/// script file (no top-level import or export, see
+/// [`program_has_module_syntax`]), or a module file with a top-level
+/// `declare global` block or string-named `declare module` block (an ambient
+/// module declaration or a module augmentation).
+pub(super) fn program_has_global_declarations(program: &Program<'_>, is_module_file: bool) -> bool {
+    !is_module_file
+        || program.body.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::TSGlobalDeclaration(_) | Statement::TSExternalModuleDeclaration(_)
+            )
+        })
+}
+
+/// The `path` values of every `/// <reference path="..." />` directive in the
+/// program, in source order. `types`, `lib` and `no-default-lib` directives
+/// name packages or compiler settings, not files, and are skipped.
+pub(super) fn triple_slash_reference_paths(program: &Program<'_>) -> Vec<String> {
+    program
+        .comments
+        .iter()
+        .filter(|comment| comment.is_line())
+        .filter_map(|comment| {
+            reference_directive_path(comment.content_span().source_text(program.source_text))
+        })
+        .collect()
+}
+
+/// Parse the content of a line comment (the text after `//`) as a
+/// `/ <reference path="..." />` directive and return its `path` value.
+fn reference_directive_path(content: &str) -> Option<String> {
+    let rest = content.strip_prefix('/')?.trim_start();
+    let attributes = rest.strip_prefix("<reference")?;
+    if !attributes.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut search = attributes;
+    while let Some(index) = search.find("path") {
+        let preceded_by_space = search[..index]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+        let after = &search[index + "path".len()..];
+        if preceded_by_space && let Some(value) = after.trim_start().strip_prefix('=') {
+            let value = value.trim_start();
+            let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let value = &value[quote.len_utf8()..];
+            let end = value.find(quote)?;
+            let path = value[..end].trim();
+            return (!path.is_empty()).then(|| path.to_string());
+        }
+        search = after;
+    }
+    None
+}
+
+/// The package that a resolution specifier names: everything before the
+/// first `/`, or before the second `/` for a scoped package. A subpath, such
+/// as `pkg/lib/tsc`, resolves inside the package, so it names `pkg` too.
 fn package_from_resolution_specifier(specifier: &str) -> Option<String> {
     if !is_package_resolution_specifier(specifier) {
         return None;
     }
-    let package_name = package_name_from_specifier(specifier)?;
+    package_name_from_specifier(specifier)
+}
+
+/// The package of a specifier that names the package root: a bare package
+/// name or `<pkg>/package.json`.
+///
+/// A path alias, such as `@/lib/x` or `src/lib/x` with a `baseUrl`, can look
+/// like a package subpath. A resolve call does not go through the resolver,
+/// so only a root specifier is sure enough to be an unlisted-dependency site.
+fn package_root_from_resolution_specifier(specifier: &str) -> Option<String> {
+    let package_name = package_from_resolution_specifier(specifier)?;
     let suffix = specifier
         .strip_prefix(package_name.as_str())
         .unwrap_or_default();
@@ -69,6 +230,34 @@ fn package_name_from_specifier(specifier: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Every string value that `expr` can have, when each value is a string
+/// literal: a literal, or a `?:`, `||` or `??` expression whose branches are
+/// such values, as in `const c = native ? 'pkg' : '@scope/pkg-wasm'`.
+///
+/// The test of a `?:` expression does not matter. A branch with any other
+/// value makes the result unknown, so the function gives `None`.
+fn string_literal_alternatives(expr: &Expression<'_>) -> Option<Vec<String>> {
+    match expr.without_parentheses() {
+        Expression::StringLiteral(lit) => Some(vec![lit.value.text().into_owned()]),
+        Expression::ConditionalExpression(cond) => {
+            let mut values = string_literal_alternatives(&cond.consequent)?;
+            values.extend(string_literal_alternatives(&cond.alternate)?);
+            Some(values)
+        }
+        Expression::LogicalExpression(logical)
+            if matches!(
+                logical.operator,
+                LogicalOperator::Or | LogicalOperator::Coalesce
+            ) =>
+        {
+            let mut values = string_literal_alternatives(&logical.left)?;
+            values.extend(string_literal_alternatives(&logical.right)?);
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
 fn package_values_from_raw_values(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -98,9 +287,9 @@ fn collect_static_object_string_property_values(
         match &prop.value {
             Expression::StringLiteral(lit) => {
                 values
-                    .entry(key_name.to_string())
+                    .entry(key_name.text().into_owned())
                     .or_default()
-                    .push(lit.value.to_string());
+                    .push(lit.value.text().into_owned());
             }
             Expression::ObjectExpression(child) => {
                 collect_static_object_string_property_values(child, values);
@@ -110,19 +299,65 @@ fn collect_static_object_string_property_values(
     }
 }
 
+/// The path segment that leads to the installed binaries of a package manager.
+const NODE_MODULES_BIN: &str = "node_modules/.bin/";
+
+/// The binary names in each `node_modules/.bin/<name>` path segment of `text`.
+///
+/// The segment must start the text or follow a character that cannot be part
+/// of a directory name, such as `/`, a space or a quote. The name ends at the
+/// first character that a binary name does not use, such as `/`, a space or a
+/// quote. A segment without a name gives nothing.
+fn bin_names_in_text(text: &str) -> impl Iterator<Item = &str> {
+    text.match_indices(NODE_MODULES_BIN)
+        .filter(|(start, _)| {
+            text[..*start]
+                .chars()
+                .next_back()
+                .is_none_or(|prev| !is_bin_name_char(prev))
+        })
+        .filter_map(|(start, _)| {
+            let rest = &text[start + NODE_MODULES_BIN.len()..];
+            let end = rest
+                .find(|ch: char| !is_bin_name_char(ch))
+                .unwrap_or(rest.len());
+            let name = &rest[..end];
+            (!name.is_empty()).then_some(name)
+        })
+}
+
+fn is_bin_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '@')
+}
+
 impl ModuleInfoExtractor {
+    /// Whether `callee` is `require.resolve` on the `require` of the module.
+    ///
+    /// A parameter or a declaration named `require` in a nested scope, such
+    /// as `function f(require) { require.resolve('./x') }`, is some other
+    /// function, so its calls reference nothing. A module-level
+    /// `const require = createRequire(...)` stays the module `require`: it
+    /// resolves relative to the same file. In a nested scope, only the
+    /// bindings that `is_module_create_require_binding` accepts stay the
+    /// module `require`; the scope does not record them as a shadow.
+    fn is_module_require_resolve(&self, callee: &Expression<'_>) -> bool {
+        is_require_resolve_callee(callee) && !self.nested_scope_shadows(REQUIRE)
+    }
+
     pub(super) fn record_static_package_values(&mut self, name: &str, init: &Expression<'_>) {
+        if let Some(values) = string_literal_alternatives(init) {
+            self.static_string_bindings.insert(name.to_string(), values);
+            return;
+        }
         match init {
-            Expression::StringLiteral(lit) => {
-                self.static_string_bindings
-                    .insert(name.to_string(), lit.value.to_string());
-            }
             Expression::ArrayExpression(array) => {
                 let values: Vec<String> = array
                     .elements
                     .iter()
                     .filter_map(|element| match element {
-                        ArrayExpressionElement::StringLiteral(lit) => Some(lit.value.to_string()),
+                        ArrayExpressionElement::StringLiteral(lit) => {
+                            Some(lit.value.text().into_owned())
+                        }
                         _ => None,
                     })
                     .collect();
@@ -142,11 +377,13 @@ impl ModuleInfoExtractor {
     }
 
     pub(super) fn try_record_package_path_reference(&mut self, call: &CallExpression<'_>) {
-        if is_require_resolve_callee(&call.callee)
+        if (self.is_module_require_resolve(&call.callee)
+            || is_import_meta_resolve_callee(&call.callee))
             && let Some(arg) = call.arguments.first()
         {
             let references = self.package_references_from_argument(arg);
             self.push_package_path_references(references);
+            self.try_record_package_resolve_site(call);
         }
 
         if let Expression::Identifier(callee) = &call.callee
@@ -161,6 +398,101 @@ impl ModuleInfoExtractor {
         }
     }
 
+    /// Record the site of a direct `require.resolve('pkg')` call.
+    ///
+    /// The argument is a string literal or a template literal without
+    /// expressions, so the call names the package at a known location. The
+    /// specifier must name the package root, see
+    /// [`package_root_from_resolution_specifier`]. A call
+    /// with a second argument (the `paths` option) resolves from other
+    /// directories and gets no site. Names from resolver functions, loop
+    /// bindings and static tables also get no site: they only credit the
+    /// dependency.
+    fn try_record_package_resolve_site(&mut self, call: &CallExpression<'_>) {
+        if call.arguments.len() != 1 {
+            return;
+        }
+        let Some(package_name) = call
+            .arguments
+            .first()
+            .and_then(static_string_argument)
+            .and_then(|specifier| package_root_from_resolution_specifier(&specifier))
+        else {
+            return;
+        };
+        self.package_resolve_sites.push((package_name, call.span));
+    }
+
+    /// Record `require.resolve('./file')` as a reference to a project file.
+    ///
+    /// The call returns a path, and code hands that path to a consumer that
+    /// static analysis cannot follow, such as a webpack module replacement or
+    /// a worker. That consumer uses the whole module, so the edge credits every
+    /// export. The call does not load the module, so the edge is a path
+    /// reference and never closes a cycle.
+    ///
+    /// The argument is a string literal or a template literal without
+    /// expressions. A call with a second argument (the `paths` option)
+    /// resolves from other directories, so it is not recorded. The reference
+    /// is speculative: a target that is not on disk, such as build output or a
+    /// native addon, is dropped and does not become an unresolved import.
+    pub(super) fn try_record_relative_require_resolve(&mut self, call: &CallExpression<'_>) {
+        if !self.is_module_require_resolve(&call.callee) || call.arguments.len() != 1 {
+            return;
+        }
+        let Some(source) = call.arguments.first().and_then(static_string_argument) else {
+            return;
+        };
+        if !(source.starts_with("./") || source.starts_with("../")) {
+            return;
+        }
+        self.dynamic_imports.push(DynamicImportInfo {
+            source: source.to_string(),
+            span: call.span,
+            destructured_names: Vec::new(),
+            local_name: Some(String::new()),
+            is_speculative: true,
+            value_escapes: false,
+        });
+        self.mark_import_load_kind(call.span, ImportLoadKind::PathReference);
+    }
+
+    /// Record the package that a module augmentation names.
+    ///
+    /// TypeScript treats `declare module 'pkg' { ... }` as an augmentation
+    /// only in a module file, and there `pkg` must resolve. So the declaration
+    /// is a type-only use of the package. In a script file the same syntax
+    /// declares an ambient module, which uses nothing. A wildcard pattern such
+    /// as `'*.svg'` and a relative path name no package.
+    pub(super) fn record_module_augmentation(&mut self, decl: &TSExternalModuleDeclaration<'_>) {
+        if !self.is_module_file || self.ambient_module_depth > 0 || decl.body.is_none() {
+            return;
+        }
+        let specifier = &*decl.id.value.text();
+        if specifier.contains('*') || !is_package_resolution_specifier(specifier) {
+            return;
+        }
+        if let Some(package_name) = package_name_from_specifier(specifier)
+            && !self.type_package_references.contains(&package_name)
+        {
+            self.type_package_references.push(package_name);
+        }
+    }
+
+    /// Record the binary name of each `node_modules/.bin/<name>` path in the
+    /// text of a string literal or a template quasi.
+    ///
+    /// Code hands such a path to a consumer that static analysis cannot
+    /// follow, such as a child process. The analysis maps the name to the
+    /// package that declares the binary and credits that package.
+    pub(super) fn record_bin_path_references(&mut self, text: &str) {
+        for name in bin_names_in_text(text) {
+            if !self.bin_path_references.iter().any(|known| known == name) {
+                self.bin_path_references.push(name.to_string());
+            }
+        }
+    }
+
     fn push_package_path_references(&mut self, references: Vec<String>) {
         for package_name in references {
             if !self.package_path_references.contains(&package_name) {
@@ -171,7 +503,7 @@ impl ModuleInfoExtractor {
 
     fn package_references_from_argument(&self, arg: &Argument<'_>) -> Vec<String> {
         match arg {
-            Argument::StringLiteral(lit) => package_from_resolution_specifier(lit.value.as_str())
+            Argument::StringLiteral(lit) => package_from_resolution_specifier(&lit.value.text())
                 .into_iter()
                 .collect(),
             Argument::TemplateLiteral(tpl) => self.package_references_from_template(tpl),
@@ -187,7 +519,7 @@ impl ModuleInfoExtractor {
 
     fn package_references_from_expression(&self, expr: &Expression<'_>) -> Vec<String> {
         match expr {
-            Expression::StringLiteral(lit) => package_from_resolution_specifier(lit.value.as_str())
+            Expression::StringLiteral(lit) => package_from_resolution_specifier(&lit.value.text())
                 .into_iter()
                 .collect(),
             Expression::TemplateLiteral(tpl) => self.package_references_from_template(tpl),
@@ -195,7 +527,8 @@ impl ModuleInfoExtractor {
             Expression::StaticMemberExpression(member) => {
                 self.package_values_for_static_member(member)
             }
-            _ => Vec::new(),
+            _ => string_literal_alternatives(expr)
+                .map_or_else(Vec::new, |values| package_values_from_raw_values(&values)),
         }
     }
 
@@ -235,11 +568,7 @@ impl ModuleInfoExtractor {
 
         self.static_string_bindings
             .get(name)
-            .map_or_else(Vec::new, |value| {
-                package_from_resolution_specifier(value)
-                    .into_iter()
-                    .collect()
-            })
+            .map_or_else(Vec::new, |values| package_values_from_raw_values(values))
     }
 
     fn package_values_for_static_member(&self, member: &StaticMemberExpression<'_>) -> Vec<String> {
@@ -300,10 +629,14 @@ pub(super) fn package_resolution_arg_index(
         })
         .collect();
     let param_set: FxHashSet<String> = param_names.iter().cloned().collect();
+    if params_bind_require(params) {
+        return None;
+    }
     let mut collector = PackageResolutionParamCollector {
         params: &param_set,
         known_helpers,
         matched: FxHashSet::default(),
+        require_shadow_depth: 0,
     };
     collector.visit_function_body(body);
 
@@ -312,15 +645,45 @@ pub(super) fn package_resolution_arg_index(
         .position(|name| collector.matched.contains(name))
 }
 
+/// Whether a parameter list binds the name `require`, also through a
+/// destructuring pattern.
+fn params_bind_require(params: &FormalParameters<'_>) -> bool {
+    params.items.iter().any(|param| {
+        param
+            .pattern
+            .get_binding_identifiers()
+            .iter()
+            .any(|id| id.name == REQUIRE)
+    })
+}
+
 struct PackageResolutionParamCollector<'p> {
     params: &'p FxHashSet<String>,
     known_helpers: &'p FxHashMap<String, usize>,
     matched: FxHashSet<String>,
+    /// How many enclosing nested functions bind a `require` parameter. Inside
+    /// such a function, `require.resolve` is not the module `require`.
+    require_shadow_depth: usize,
 }
 
 impl<'a> Visit<'a> for PackageResolutionParamCollector<'_> {
+    fn visit_function(&mut self, func: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        let shadows = params_bind_require(&func.params);
+        self.require_shadow_depth += usize::from(shadows);
+        walk::walk_function(self, func, flags);
+        self.require_shadow_depth -= usize::from(shadows);
+    }
+
+    fn visit_arrow_function_expression(&mut self, expr: &ArrowFunctionExpression<'a>) {
+        let shadows = params_bind_require(&expr.params);
+        self.require_shadow_depth += usize::from(shadows);
+        walk::walk_arrow_function_expression(self, expr);
+        self.require_shadow_depth -= usize::from(shadows);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if is_require_resolve_callee(&call.callee)
+        if self.require_shadow_depth == 0
+            && is_require_resolve_callee(&call.callee)
             && let Some(arg) = call.arguments.first()
             && let Some(param) = package_resolution_param_from_argument(arg, self.params)
         {
@@ -374,9 +737,10 @@ fn call_joins_node_modules_with_param(
     call: &CallExpression<'_>,
     params: &FxHashSet<String>,
 ) -> bool {
-    let has_node_modules = call.arguments.iter().any(
-        |arg| matches!(arg, Argument::StringLiteral(lit) if lit.value.as_str() == "node_modules"),
-    );
+    let has_node_modules = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, Argument::StringLiteral(lit) if lit.value == "node_modules"));
     has_node_modules
         && call
             .arguments

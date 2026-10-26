@@ -1,11 +1,20 @@
 //! Source parsing contracts owned by the engine boundary.
 
+use std::sync::atomic::AtomicBool;
+
 use fallow_types::discover::DiscoveredFile;
 #[cfg(test)]
 pub use fallow_types::extract::{ExportName, MemberKind, VisibilityTag};
 pub use fallow_types::extract::{ModuleInfo, ParseResult, SourceReadFailure};
 
 type CacheStore = fallow_extract::cache::CacheStore;
+
+/// Parse the `fallow-ignore-next-line` and `fallow-ignore-file` comments of
+/// raw source text, without a parse. Unknown tokens are dropped.
+#[must_use]
+pub fn suppressions_from_text(source: &str) -> Vec<fallow_types::suppress::Suppression> {
+    fallow_extract::suppress::parse_suppressions_from_source(source).suppressions
+}
 
 /// On-demand, transient function extraction for local similar-code inference.
 pub mod similar_code {
@@ -52,8 +61,13 @@ pub mod inventory {
         pub end_line: u32,
         /// 1-indexed UTF-16 column of the function node end.
         pub end_column: u32,
-        /// Content digest of the function's full-span source slice.
-        pub source_hash: String,
+        /// Content digest of the function's full-span source slice. `None`
+        /// for a function with too many nested functions below it.
+        pub source_hash: Option<String>,
+        /// Whether the name came from the callee of the call this function is
+        /// passed to (`arr.map(cb)` -> `map`) rather than from a declaration,
+        /// a binding, or a property key.
+        pub is_callback: bool,
     }
 
     impl From<fallow_extract::inventory::InventoryEntry> for InventoryEntry {
@@ -65,6 +79,7 @@ pub mod inventory {
                 end_line: entry.end_line,
                 end_column: entry.end_column,
                 source_hash: entry.source_hash,
+                is_callback: entry.is_callback,
             }
         }
     }
@@ -118,11 +133,24 @@ pub mod inventory {
 /// Keeping parsing behind the engine boundary lets sessions and future
 /// incremental runners choose cache policy without exposing the extract crate
 /// as the public orchestration layer.
+///
+/// `cancellation`, when set mid-parse, turns every remaining file into a no-op
+/// and truncates the returned modules; see
+/// [`fallow_extract::parse_all_files_cancellable`]. `flag_patterns` are the
+/// user flag patterns of the config the cache is keyed on.
 #[must_use]
 pub(crate) fn parse_all_files(
     files: &[DiscoveredFile],
     cache: Option<&CacheStore>,
     need_complexity: bool,
+    cancellation: Option<&AtomicBool>,
+    flag_patterns: &fallow_types::extract::FlagPatterns,
 ) -> ParseResult {
-    fallow_extract::parse_all_files(files, cache, need_complexity)
+    fallow_extract::parse_all_files_cancellable(
+        files,
+        cache,
+        need_complexity,
+        cancellation,
+        flag_patterns,
+    )
 }

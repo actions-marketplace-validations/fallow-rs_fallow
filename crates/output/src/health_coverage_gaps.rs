@@ -6,7 +6,7 @@ use fallow_types::output_health::{
 use fallow_types::serde_path;
 
 /// Runtime code that no test dependency path reaches.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedFile {
     /// Absolute file path.
@@ -17,7 +17,7 @@ pub struct UntestedFile {
 }
 
 /// Runtime export that no test-reachable module references.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedExport {
     /// Absolute file path.
@@ -37,7 +37,7 @@ pub struct UntestedExport {
 /// so descriptions match `strip_root_prefix`'s post-pass output on the inner
 /// `path` field. Schemars derives the merged shape natively; this retires
 /// the `augment_finding_definition` graft for `UntestedFile`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedFileFinding {
     /// The underlying coverage-gap entry.
@@ -76,7 +76,7 @@ impl UntestedFileFinding {
 /// Wire-shape envelope for an [`UntestedExport`] finding. Same pattern as
 /// [`UntestedFileFinding`]: flattens the bare finding and carries a typed
 /// `actions` array computed at construction time.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UntestedExportFinding {
     /// The underlying coverage-gap entry.
@@ -91,17 +91,26 @@ impl UntestedExportFinding {
     /// Build the wrapper from a raw [`UntestedExport`] and the project root.
     #[must_use]
     pub fn with_actions(export: UntestedExport, root: &Path) -> Self {
+        Self::with_reach_actions(export, root, false)
+    }
+
+    /// Build the wrapper and say in the primary note when only tests that
+    /// mock the module reference the export.
+    #[must_use]
+    pub fn with_reach_actions(export: UntestedExport, root: &Path, mocked_only: bool) -> Self {
         let display_path = relative_display(&export.path, root);
         let export_name = export.export_name.clone();
+        let note = if mocked_only {
+            "This export is runtime-reachable, but only tests that mock this module reference it"
+        } else {
+            "This export is runtime-reachable but no test-reachable module references it"
+        };
         let actions = vec![
             UntestedExportAction {
                 kind: UntestedExportActionType::AddTestImport,
                 auto_fixable: false,
                 description: format!("Import and test `{export_name}` from `{display_path}`"),
-                note: Some(
-                    "This export is runtime-reachable but no test-reachable module references it"
-                        .to_string(),
-                ),
+                note: Some(note.to_string()),
                 comment: None,
             },
             UntestedExportAction {
@@ -124,7 +133,7 @@ fn relative_display(path: &Path, root: &Path) -> String {
 }
 
 /// Aggregate coverage-gap counters for the current analysis scope.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CoverageGapSummary {
     /// Runtime-reachable files in scope.
@@ -141,7 +150,7 @@ pub struct CoverageGapSummary {
 
 /// Static test coverage gaps derived from the module graph. Shows runtime files
 /// and exports with no test dependency path.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CoverageGaps {
     /// Summary metrics for the current analysis scope.
@@ -184,6 +193,30 @@ mod tests {
 
         assert_eq!(finding.actions.len(), 2);
         assert!(finding.actions[0].description.contains("src/api.ts"));
+    }
+
+    #[test]
+    fn mocked_only_export_note_names_the_mock() {
+        let export = || UntestedExport {
+            path: PathBuf::from("/repo/src/queue.ts"),
+            export_name: "enqueue".to_string(),
+            line: 1,
+            col: 0,
+        };
+        let root = Path::new("/repo");
+        let mocked = UntestedExportFinding::with_reach_actions(export(), root, true);
+        let plain = UntestedExportFinding::with_actions(export(), root);
+
+        assert_eq!(
+            mocked.actions[0].note.as_deref(),
+            Some(
+                "This export is runtime-reachable, but only tests that mock this module reference it"
+            )
+        );
+        assert_eq!(
+            plain.actions[0].note.as_deref(),
+            Some("This export is runtime-reachable but no test-reachable module references it")
+        );
     }
 
     #[test]

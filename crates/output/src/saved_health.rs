@@ -50,6 +50,14 @@ struct SavedHealthFinding {
     coverage_pct: Option<f64>,
     #[serde(default)]
     introduced: Option<bool>,
+    /// Audit class and grown metrics, so a `report --from` re-render keeps
+    /// the SARIF properties and CodeClimate text of the direct run.
+    #[serde(default)]
+    attribution: Option<crate::AuditFindingAttribution>,
+    #[serde(default)]
+    worsened_metrics: Vec<crate::WorsenedMetric>,
+    #[serde(default)]
+    gate_exemption: Option<crate::AuditGateExemption>,
     /// Carried through so a `report --from` re-render describes the finding
     /// against the ceiling it was measured with. Absent in envelopes written by
     /// an older fallow, which then fall back to the summary (issue #2163).
@@ -57,6 +65,13 @@ struct SavedHealthFinding {
     effective_thresholds: Option<crate::HealthEffectiveThresholds>,
     #[serde(default)]
     threshold_source: Option<crate::ThresholdSource>,
+    /// Absent in envelopes from an older fallow. An unknown value reads as
+    /// absent, so the renderers keep the band-based level.
+    #[serde(
+        default,
+        deserialize_with = "fallow_types::output_dead_code::deserialize_effective_severity"
+    )]
+    effective_severity: Option<fallow_types::output_dead_code::EffectiveSeverity>,
 }
 
 #[derive(Default, Deserialize)]
@@ -88,7 +103,7 @@ fn default_max_crap() -> f64 {
 }
 
 const fn default_max_unit_size() -> u32 {
-    crate::DEFAULT_MAX_UNIT_SIZE
+    crate::health_scores::DEFAULT_MAX_UNIT_SIZE
 }
 
 #[derive(Deserialize)]
@@ -228,13 +243,14 @@ impl From<SavedHealthReport> for HealthReport {
 
 impl From<SavedHealthFinding> for HealthFinding {
     fn from(saved: SavedHealthFinding) -> Self {
-        Self::new(
+        let mut finding = Self::new(
             ComplexityViolation {
                 path: saved.path,
                 name: saved.name,
                 line: saved.line,
                 col: saved.col,
                 cyclomatic: saved.cyclomatic,
+                standard_cyclomatic: None,
                 cognitive: saved.cognitive,
                 line_count: saved.line_count,
                 param_count: saved.param_count,
@@ -244,7 +260,9 @@ impl From<SavedHealthFinding> for HealthFinding {
                 react_hook_profile: None,
                 exceeded: saved.exceeded,
                 severity: saved.severity,
+                effective_severity: saved.effective_severity,
                 crap: saved.crap,
+                mutation: None,
                 coverage_pct: saved.coverage_pct,
                 coverage_tier: None,
                 coverage_source: None,
@@ -256,7 +274,11 @@ impl From<SavedHealthFinding> for HealthFinding {
             },
             Vec::new(),
             saved.introduced,
-        )
+        );
+        finding.attribution = saved.attribution;
+        finding.worsened_metrics = saved.worsened_metrics;
+        finding.gate_exemption = saved.gate_exemption;
+        finding
     }
 }
 
@@ -296,6 +318,7 @@ impl From<SavedRuntimeCoverageFinding> for RuntimeCoverageFinding {
             evidence: RuntimeCoverageEvidence {
                 static_status: String::new(),
                 test_coverage: String::new(),
+                test_only_reference: None,
                 v8_tracking: String::new(),
                 untracked_reason: None,
                 observation_days: 0,
@@ -472,6 +495,9 @@ mod tests {
 
         let thresholds = report.findings[0].resolved_thresholds(&report.summary);
         assert!((thresholds.max_crap - 30.0).abs() < f64::EPSILON);
-        assert_eq!(thresholds.max_unit_size, crate::DEFAULT_MAX_UNIT_SIZE);
+        assert_eq!(
+            thresholds.max_unit_size,
+            crate::health_scores::DEFAULT_MAX_UNIT_SIZE
+        );
     }
 }

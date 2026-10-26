@@ -2,8 +2,9 @@
 
 use std::time::Instant;
 
-use fallow_config::ResolvedConfig;
+use fallow_config::{ResolvedConfig, Severity};
 use fallow_output::{ComplexityViolation, FindingSeverity, RefactoringTarget};
+use fallow_types::output_dead_code::EffectiveSeverity;
 
 use crate::baseline::HealthBaselineData;
 
@@ -30,7 +31,10 @@ pub(super) struct HealthFindingsData {
     pub(super) sev_high: usize,
     pub(super) sev_moderate: usize,
     pub(super) loaded_baseline: Option<HealthBaselineData>,
-    pub(super) baseline_staleness: Option<fallow_output::HealthBaselineStaleness>,
+    pub(super) baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    /// The findings before `--top`, kept only when `--group-by` is active and
+    /// `--top` removed findings, so each group applies `--top` to its own list.
+    pub(super) group_findings: Option<Vec<ComplexityViolation>>,
 }
 
 struct CollectedHealthFindings {
@@ -88,12 +92,13 @@ pub(super) fn prepare_health_findings(
         sev_moderate,
         loaded_baseline,
         baseline_staleness,
+        group_findings,
     } = finalize_health_findings(
         input.opts,
         input.config,
         &mut collected.findings,
         input.diff_index,
-        is_change_scoped(&input),
+        baseline_scope_reasons(&input),
         &mut threshold_state_tracker,
     )?;
     threshold_state_tracker.record_no_match_entries(
@@ -118,6 +123,7 @@ pub(super) fn prepare_health_findings(
         sev_moderate,
         loaded_baseline,
         baseline_staleness,
+        group_findings,
     })
 }
 
@@ -305,10 +311,30 @@ fn should_emit_no_match_threshold_overrides(
         && diff_index.is_none()
 }
 
-/// True when this run analyzes a subset of the project, so a loaded full-repo
-/// baseline would look stale for reasons that have nothing to do with rot.
-fn is_change_scoped(input: &HealthFindingsInput<'_>) -> bool {
-    input.diff_index.is_some() || input.changed_files.is_some() || input.ws_roots.is_some()
+/// Which channels narrowed this run below the whole project, so a loaded
+/// full-repo baseline would look stale for reasons that have nothing to do
+/// with rot.
+///
+/// Production mode counts: it drops test, story and dev files before analysis,
+/// so their baseline entries match nothing on a project nobody touched. The
+/// resolved config carries the effective flag whether it came from the CLI or
+/// from the project config, which is the same reading `dead-code` takes in
+/// `baseline_scope_reasons` and `dupes` in
+/// `duplication_comparison_scope_reasons`.
+///
+/// Coarser than the dead-code side by construction. This runs after the flags
+/// were resolved, so a changed-file set is reported as `changed-files` and
+/// workspace roots as `workspace` whether they came from `--workspace` or
+/// `--changed-workspaces`. `change_scoped` is derived from the returned set, so
+/// the two cannot disagree.
+fn baseline_scope_reasons(input: &HealthFindingsInput<'_>) -> fallow_output::BaselineScopeReasons {
+    use fallow_output::ScopeReason;
+
+    fallow_output::BaselineScopeReasons::empty()
+        .insert_if(input.diff_index.is_some(), ScopeReason::Diff)
+        .insert_if(input.changed_files.is_some(), ScopeReason::ChangedFiles)
+        .insert_if(input.ws_roots.is_some(), ScopeReason::Workspace)
+        .insert_if(input.config.production, ScopeReason::Production)
 }
 
 struct HealthFindingFinalizeResult {
@@ -317,7 +343,8 @@ struct HealthFindingFinalizeResult {
     sev_high: usize,
     sev_moderate: usize,
     loaded_baseline: Option<HealthBaselineData>,
-    baseline_staleness: Option<fallow_output::HealthBaselineStaleness>,
+    baseline_staleness: Option<fallow_output::BaselineStaleness>,
+    group_findings: Option<Vec<ComplexityViolation>>,
 }
 
 fn finalize_health_findings(
@@ -325,23 +352,28 @@ fn finalize_health_findings(
     config: &ResolvedConfig,
     findings: &mut Vec<ComplexityViolation>,
     diff_index: Option<&fallow_output::DiffIndex>,
-    change_scoped: bool,
+    scope_reasons: fallow_output::BaselineScopeReasons,
     threshold_state_tracker: &mut ThresholdOverrideStateTracker,
 ) -> Result<HealthFindingFinalizeResult, HealthError> {
     // Runs before every downstream narrowing. The override rows were recorded
-    // over the whole collection pass, while `--diff-file`/`--diff-stdin`,
-    // `--baseline` and `--top` all narrow the findings list for DISPLAY, so
-    // annotating after any of them leaves an `insufficient` row with an empty
-    // `outstanding`: the one contradiction a CI gate cannot detect.
+    // over the whole collection pass, while the `complexity-*` rules,
+    // `--diff-file`/`--diff-stdin`, `--baseline` and `--top` all narrow the
+    // findings list, so annotating after any of them leaves an `insufficient`
+    // row with an empty `outstanding`: the one contradiction a CI gate cannot
+    // detect. A rule set to `off` hides a finding but does not make the
+    // override high enough, so the row keeps the dimension.
     annotate_outstanding_dimensions(threshold_state_tracker, findings);
+    // The rules drop the findings whose kinds are all `off` before the counts,
+    // the baseline and `--top`.
+    apply_complexity_rules(findings, config, opts.gates.fail_on_issues);
     if let Some(diff_index) = diff_index {
         filter_complexity_findings_by_diff(findings, diff_index, &config.root);
     }
     sort_findings(findings, opts.sort);
     let total_above_threshold = findings.len();
     let (sev_critical, sev_high, sev_moderate) = count_finding_severities(findings);
-    let (loaded_baseline, baseline_staleness) =
-        apply_health_baseline_and_top(opts, config, findings, change_scoped)?;
+    let (loaded_baseline, baseline_staleness, group_findings) =
+        apply_health_baseline_and_top(opts, config, findings, scope_reasons)?;
     Ok(HealthFindingFinalizeResult {
         total_above_threshold,
         sev_critical,
@@ -349,7 +381,45 @@ fn finalize_health_findings(
         sev_moderate,
         loaded_baseline,
         baseline_staleness,
+        group_findings,
     })
+}
+
+/// Apply the `complexity-*` rules to the findings.
+///
+/// The thresholds decide if a finding exists. The rules decide if it blocks.
+/// The most severe rule of the kinds in `exceeded` gives the gate severity,
+/// with `overrides[].rules` resolved for the path of the finding. A finding
+/// whose contributing kinds are all `off` is dropped. `fail_on_issues`
+/// raises a `warn` finding to `error`, as `--fail-on-issues` does for
+/// dead-code findings.
+fn apply_complexity_rules(
+    findings: &mut Vec<ComplexityViolation>,
+    config: &ResolvedConfig,
+    fail_on_issues: bool,
+) {
+    findings.retain_mut(|finding| {
+        let exceeded = finding.exceeded;
+        let severity_of = |rules: &fallow_config::RulesConfig| {
+            rules.complexity_severity(
+                exceeded.includes_cyclomatic(),
+                exceeded.includes_cognitive(),
+                exceeded.includes_crap(),
+            )
+        };
+        let severity = if config.overrides.is_empty() {
+            severity_of(&config.rules)
+        } else {
+            severity_of(&config.resolve_rules_for_path(&finding.path))
+        };
+        finding.effective_severity = match severity {
+            Severity::Error => Some(EffectiveSeverity::Error),
+            Severity::Warn if fail_on_issues => Some(EffectiveSeverity::Error),
+            Severity::Warn => Some(EffectiveSeverity::Warn),
+            Severity::Off => None,
+        };
+        severity != Severity::Off
+    });
 }
 
 fn count_finding_severities(findings: &[ComplexityViolation]) -> (usize, usize, usize) {
@@ -366,14 +436,15 @@ fn count_finding_severities(findings: &[ComplexityViolation]) -> (usize, usize, 
 
 type LoadedBaselineParts = (
     Option<HealthBaselineData>,
-    Option<fallow_output::HealthBaselineStaleness>,
+    Option<fallow_output::BaselineStaleness>,
+    Option<Vec<ComplexityViolation>>,
 );
 
 fn apply_health_baseline_and_top(
     opts: &HealthOptions<'_>,
     config: &ResolvedConfig,
     findings: &mut Vec<ComplexityViolation>,
-    change_scoped: bool,
+    scope_reasons: fallow_output::BaselineScopeReasons,
 ) -> Result<LoadedBaselineParts, HealthError> {
     let (loaded_baseline, baseline_staleness) = if let Some(load_path) = opts.baseline {
         let loaded = load_health_baseline(
@@ -382,16 +453,17 @@ fn apply_health_baseline_and_top(
             &config.root,
             opts.quiet,
             opts.baseline_mode,
-            change_scoped,
+            scope_reasons,
         )?;
         (Some(loaded.data), Some(loaded.staleness))
     } else {
         (None, None)
     };
+    let group_findings = super::grouping::untruncated_for_groups(opts, findings);
     if let Some(top) = opts.top {
         findings.truncate(top);
     }
-    Ok((loaded_baseline, baseline_staleness))
+    Ok((loaded_baseline, baseline_staleness, group_findings))
 }
 
 pub(super) fn save_health_baseline_if_requested(

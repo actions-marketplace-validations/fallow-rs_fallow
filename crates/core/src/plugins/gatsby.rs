@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use fallow_extract::JsText;
+
 use super::config_parser;
 use super::{Plugin, PluginResult};
 
@@ -18,6 +20,14 @@ const ENTRY_PATTERNS: &[&str] = &[
 
 const CONFIG_PATTERNS: &[&str] = &[
     "gatsby-config.{ts,js,mjs}",
+    "gatsby-node.{ts,js,mjs}",
+    "gatsby-browser.{ts,tsx,js,jsx}",
+    "gatsby-ssr.{ts,tsx,js,jsx}",
+];
+
+/// Gatsby reads named API exports (`createPages`, `wrapPageElement`, ...) from
+/// these files, not a default export, so their default export gets no credit.
+const NAMED_API_CONFIG_PATTERNS: &[&str] = &[
     "gatsby-node.{ts,js,mjs}",
     "gatsby-browser.{ts,tsx,js,jsx}",
     "gatsby-ssr.{ts,tsx,js,jsx}",
@@ -40,6 +50,7 @@ define_plugin! {
     enablers: ENABLERS,
     entry_patterns: ENTRY_PATTERNS,
     config_patterns: CONFIG_PATTERNS,
+    config_default_export_opt_out: NAMED_API_CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
     used_exports: [
@@ -80,56 +91,54 @@ define_plugin! {
 ///
 /// Handles: `plugins: [{ resolve: "gatsby-plugin-x", options: {} }]`
 fn extract_gatsby_plugin_resolves(source: &str, path: &Path, result: &mut PluginResult) {
-    use oxc_allocator::Allocator;
     use oxc_ast::ast::{Expression, ObjectPropertyKind, PropertyKey};
-    use oxc_parser::Parser;
+
     use oxc_span::SourceType;
 
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, source, source_type).parse();
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        let Some(obj) = config_parser::find_config_object(&parsed.program) else {
+            return;
+        };
 
-    let Some(obj) = config_parser::find_config_object_pub(&parsed.program) else {
-        return;
-    };
-
-    let Some(plugins_prop) = obj.properties.iter().find_map(|prop| {
-        if let ObjectPropertyKind::ObjectProperty(p) = prop {
-            let is_match = match &p.key {
-                PropertyKey::StaticIdentifier(id) => id.name == "plugins",
-                PropertyKey::StringLiteral(s) => s.value == "plugins",
-                _ => false,
-            };
-            if is_match {
-                return Some(p);
+        let Some(plugins_prop) = obj.properties.iter().find_map(|prop| {
+            if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                let is_match = match &p.key {
+                    PropertyKey::StaticIdentifier(id) => id.name == "plugins",
+                    PropertyKey::StringLiteral(s) => s.value == "plugins",
+                    _ => false,
+                };
+                if is_match {
+                    return Some(p);
+                }
             }
-        }
-        None
-    }) else {
-        return;
-    };
+            None
+        }) else {
+            return;
+        };
 
-    let Expression::ArrayExpression(arr) = &plugins_prop.value else {
-        return;
-    };
+        let Expression::ArrayExpression(arr) = &plugins_prop.value else {
+            return;
+        };
 
-    for el in &arr.elements {
-        if let Some(Expression::ObjectExpression(plugin_obj)) = el.as_expression() {
-            for prop in &plugin_obj.properties {
-                if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                    let is_resolve = match &p.key {
-                        PropertyKey::StaticIdentifier(id) => id.name == "resolve",
-                        PropertyKey::StringLiteral(s) => s.value == "resolve",
-                        _ => false,
-                    };
-                    if is_resolve && let Expression::StringLiteral(s) = &p.value {
-                        let dep = crate::resolve::extract_package_name(&s.value);
-                        result.referenced_dependencies.push(dep);
+        for el in &arr.elements {
+            if let Some(Expression::ObjectExpression(plugin_obj)) = el.as_expression() {
+                for prop in &plugin_obj.properties {
+                    if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                        let is_resolve = match &p.key {
+                            PropertyKey::StaticIdentifier(id) => id.name == "resolve",
+                            PropertyKey::StringLiteral(s) => s.value == "resolve",
+                            _ => false,
+                        };
+                        if is_resolve && let Expression::StringLiteral(s) = &p.value {
+                            let dep = crate::resolve::extract_package_name(&s.value.text());
+                            result.referenced_dependencies.push(dep);
+                        }
                     }
                 }
             }
         }
-    }
+    });
 }
 
 #[cfg(test)]

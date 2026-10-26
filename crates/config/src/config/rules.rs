@@ -4,15 +4,18 @@ use serde::{Deserialize, Serialize};
 
 /// Severity level for rules.
 ///
-/// Controls whether an issue type causes CI failure (`error`), is reported
-/// without failing (`warn`), or is suppressed entirely (`off`).
+/// Controls whether an issue type sets a non-zero exit code (`error`), is
+/// reported without an effect on the exit code (`warn`), or is suppressed
+/// entirely (`off`). `--fail-on-issues` promotes `warn` to `error`. The
+/// dead-code count gate of the GitHub Action counts `warn` findings unless its
+/// `fail-on-issues` input is `false`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
-    /// Report and fail CI (non-zero exit code).
+    /// Report and set a non-zero exit code.
     #[default]
     Error,
-    /// Report but don't fail CI.
+    /// Report without an effect on the exit code.
     Warn,
     /// Don't detect or report.
     Off,
@@ -91,6 +94,11 @@ pub struct RulesConfig {
     /// without re-recording this flag.
     #[serde(skip)]
     pub private_type_leaks_configured: bool,
+    /// An export marked `@deprecated` that still has at least one reachable
+    /// reference. Opt-in; defaults to `off`. A per-path override resolves on
+    /// the file that declares the export, not on the consumer.
+    #[serde(default = "Severity::default_off", alias = "deprecated-export-in-use")]
+    pub deprecated_exports_in_use: Severity,
     /// A declared `dependencies` entry never observed used. Defaults to
     /// `error`.
     #[serde(default, alias = "unused-dependency")]
@@ -118,79 +126,118 @@ pub struct RulesConfig {
     /// project-wide. Defaults to `warn`, not `error` like the closed-set
     /// class/enum member rules: a store has an OPEN declaration surface
     /// (plugins, `$onAction`, dynamic dispatch) so analyzer confidence is
-    /// genuinely lower; warn encodes that without failing CI. Promotable to
+    /// genuinely lower. A `warn` finding does not change the CLI exit code
+    /// unless `--fail-on-issues` is set. The dead-code count gate of the GitHub
+    /// Action counts it unless `fail-on-issues` is `false`. Promotable to
     /// `error` once validated on a codebase.
     #[serde(default = "Severity::default_warn", alias = "unused-store-member")]
     pub unused_store_members: Severity,
     /// Vue `inject(KEY)` / Svelte `getContext(KEY)` whose symbol KEY is
     /// `provide`/`setContext`'d nowhere in the project (the
-    /// injected-never-provided dead-half). Defaults to `warn`, not `error`:
-    /// a DI key has an open provide surface (plugins, app-level provide) so
-    /// analyzer confidence is lower; warn encodes that without failing CI.
+    /// injected-never-provided dead-half). Defaults to `warn`, not `error`: a
+    /// DI key has an open provide surface (plugins, app-level provide) so
+    /// analyzer confidence is lower. A `warn` finding does not change the CLI
+    /// exit code unless `--fail-on-issues` is set. The dead-code count gate of
+    /// the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unprovided-inject")]
     pub unprovided_injects: Severity,
     /// Vue/Svelte single-file component reachable in the module graph but
     /// rendered nowhere in the project (the imported-but-never-rendered
     /// dead-half). Defaults to `warn`, not `error`: a component can be rendered
     /// reflectively (dynamic `<component :is>`), so analyzer confidence is
-    /// lower; warn encodes that without failing CI.
+    /// lower. A `warn` finding does not change the CLI exit code unless
+    /// `--fail-on-issues` is set. The dead-code count gate of the GitHub Action
+    /// counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unrendered-component")]
     pub unrendered_components: Severity,
     /// Vue `<script setup>` `defineProps`, Svelte 5 `$props()`, or React
     /// declared prop referenced nowhere inside its own component. The
-    /// single-component dead-input direction. Defaults to `warn`, not `error`: a
-    /// prop can be part of a deliberately-stable public component API, so
-    /// analyzer confidence is lower; warn encodes that without failing CI.
+    /// single-component dead-input direction. Defaults to `warn`, not `error`:
+    /// a prop can be part of a deliberately-stable public component API, so
+    /// analyzer confidence is lower. A `warn` finding does not change the CLI
+    /// exit code unless `--fail-on-issues` is set. The dead-code count gate of
+    /// the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-component-prop")]
     pub unused_component_props: Severity,
+    /// Used optional inputs absent from inspected callers. Requires manual review; off by default.
+    #[serde(default = "Severity::default_off", alias = "absent-component-prop")]
+    pub absent_component_props: Severity,
     /// Vue `<script setup>` `defineEmits` declared event emitted nowhere inside
-    /// its own single-file component (no `emit('<name>')` call). The single-file
-    /// dead-input direction. Defaults to `warn`, not `error`: an emit can be part
-    /// of a deliberately-stable public component API, so analyzer confidence is
-    /// lower; warn encodes that without failing CI.
+    /// its own single-file component (no `emit('<name>')` call). The
+    /// single-file dead-input direction. Defaults to `warn`, not `error`: an
+    /// emit can be part of a deliberately-stable public component API, so
+    /// analyzer confidence is lower. A `warn` finding does not change the CLI
+    /// exit code unless `--fail-on-issues` is set. The dead-code count gate of
+    /// the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-component-emit")]
     pub unused_component_emits: Severity,
     /// Angular `@Input()` / signal `input()` / `model()` declared input read
-    /// nowhere inside its own component (neither the inline/external template nor
-    /// the class body). The single-file dead-input direction, the Angular
+    /// nowhere inside its own component (neither the inline/external template
+    /// nor the class body). The single-file dead-input direction, the Angular
     /// analogue of `unused-component-prop`. Defaults to `warn`, not `error`: an
     /// input can be part of a deliberately-stable public component API, so
-    /// analyzer confidence is lower; warn encodes that without failing CI.
+    /// analyzer confidence is lower. A `warn` finding does not change the CLI
+    /// exit code unless `--fail-on-issues` is set. The dead-code count gate of
+    /// the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-component-input")]
     pub unused_component_inputs: Severity,
     /// Angular `@Output()` / signal `output()` declared output emitted nowhere
     /// inside its own component (no `this.<output>.emit(...)`). The single-file
     /// dead-output direction, the Angular analogue of `unused-component-emit`.
     /// Defaults to `warn`, not `error`: an output can be part of a
-    /// deliberately-stable public component API, so analyzer confidence is lower;
-    /// warn encodes that without failing CI.
+    /// deliberately-stable public component API, so analyzer confidence is
+    /// lower. A `warn` finding does not change the CLI exit code unless
+    /// `--fail-on-issues` is set. The dead-code count gate of the GitHub Action
+    /// counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-component-output")]
     pub unused_component_outputs: Severity,
-    /// Svelte component dispatching a custom event via `createEventDispatcher()`
-    /// whose event name is listened to nowhere in the analyzed project. The
-    /// cross-file dead-output direction (no eslint-plugin-svelte / svelte-check
-    /// rule covers the listener side). Defaults to `warn`, not `error`: a
-    /// dispatched event can be part of a deliberately-stable public component
-    /// API, or a listener may be added later, so analyzer confidence is lower;
-    /// warn encodes that without failing CI.
+    /// Svelte component dispatching a custom event via
+    /// `createEventDispatcher()` whose event name is listened to nowhere in the
+    /// analyzed project. The cross-file dead-output direction (no
+    /// eslint-plugin-svelte / svelte-check rule covers the listener side).
+    /// Defaults to `warn`, not `error`: a dispatched event can be part of a
+    /// deliberately-stable public component API, or a listener may be added
+    /// later, so analyzer confidence is lower. A `warn` finding does not change
+    /// the CLI exit code unless `--fail-on-issues` is set. The dead-code count
+    /// gate of the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-svelte-event")]
     pub unused_svelte_events: Severity,
+    /// Effect layer composed only into other layers that nothing uses. Gated
+    /// on the project declaring `effect`. Defaults to `warn`: code outside the
+    /// analyzed project can still compose the layer.
+    #[serde(default = "Severity::default_warn", alias = "unused-effect-layer")]
+    pub unused_effect_layers: Severity,
+    /// Effect tagged error class that only type positions or `catchTag`
+    /// handlers reference. Gated on the project declaring `effect`. Defaults
+    /// to `warn`: consumers outside the project can construct the error.
+    #[serde(default = "Severity::default_warn", alias = "unused-tagged-error")]
+    pub unused_tagged_errors: Severity,
+    /// `catchTag` handler for a project tag that no code produces, when no
+    /// `unused-tagged-errors` finding covers it. Gated on the project
+    /// declaring `effect`. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "unproduced-catch-tag")]
+    pub unproduced_catch_tags: Severity,
     /// Next.js Server Action (an export of a `"use server"` file) referenced by
     /// no code in the project: no import-and-call, no `action={fn}` binding, no
-    /// `<form action={fn}>`. Cross-graph dead-export direction, reclassified out
-    /// of `unused-export` for `"use server"` files. Defaults to `warn`, not
+    /// `<form action={fn}>`. Cross-graph dead-export direction, reclassified
+    /// out of `unused-export` for `"use server"` files. Defaults to `warn`, not
     /// `error`: the rule is new and false-negative-preferring, and reflective
-    /// action-dispatch shapes can hide a real consumer; warn encodes that
-    /// without failing CI until corpus-validated.
+    /// action-dispatch shapes can hide a real consumer. The rule stays at
+    /// `warn` until corpus validation. A `warn` finding does not change the CLI
+    /// exit code unless `--fail-on-issues` is set. The dead-code count gate of
+    /// the GitHub Action counts it unless `fail-on-issues` is `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-server-action")]
     pub unused_server_actions: Severity,
     /// SvelteKit `+page.{ts,server.ts,js,server.js}` `load()` return-object key
     /// read by no consumer: not off the sibling `+page.svelte`'s `data.<key>`,
     /// nor project-wide via `page.data.<key>` / `$page.data.<key>`. Cross-file
-    /// dead-input direction. Defaults to `warn`, not `error`: the rule is new and
-    /// false-negative-preferring (a whole-object `data` pass abstains), and a
-    /// load fetch can have side effects so deletion is a human call; warn encodes
-    /// that without failing CI until corpus-validated.
+    /// dead-input direction. Defaults to `warn`, not `error`: the rule is new
+    /// and false-negative-preferring (a whole-object `data` pass abstains), and
+    /// a load fetch can have side effects so deletion is a human call. The rule
+    /// stays at `warn` until corpus validation. A `warn` finding does not
+    /// change the CLI exit code unless `--fail-on-issues` is set. The dead-code
+    /// count gate of the GitHub Action counts it unless `fail-on-issues` is
+    /// `false`.
     #[serde(default = "Severity::default_warn", alias = "unused-load-data-key")]
     pub unused_load_data_keys: Severity,
     /// React/Preact prop forwarded unchanged through `>= N` intermediate
@@ -198,6 +245,9 @@ pub struct RulesConfig {
     /// A graph-derived health signal. Defaults to `off` (opt-in), like
     /// `private-type-leak` / `security-*`: the located per-chain records and the
     /// small capped health penalty are dormant until the user enables the rule.
+    /// `error` enforces the finding in CI; `warn` stays advisory even under
+    /// strict flags. Overrides resolve for the source hop and can enable the
+    /// rule while the base rule is off.
     #[serde(default = "Severity::default_off", alias = "prop-drilling")]
     pub prop_drilling: Severity,
     /// A React/Preact component whose entire body is `return <Child {...props}/>`
@@ -240,6 +290,28 @@ pub struct RulesConfig {
     /// to `warn` (verdict-neutral). Set to `error` to gate, or `off` to silence.
     #[serde(default = "Severity::default_warn", alias = "css-broken-reference")]
     pub css_broken_reference: Severity,
+    /// A function above the cyclomatic ceiling (`health.maxCyclomatic` or a
+    /// `thresholdOverrides` entry). The threshold decides if the finding
+    /// exists; this rule decides if it fails the run. Defaults to `error`.
+    /// `warn` reports the finding without a failure, and `off` hides it. A
+    /// finding above several ceilings takes the most severe of their rules.
+    /// The rule applies before the `health --min-severity` band gate.
+    /// After you set a kind to `off`, save the health baseline again: its
+    /// entries for the hidden findings no longer match.
+    #[serde(default)]
+    pub complexity_cyclomatic: Severity,
+    /// A function above the cognitive ceiling (`health.maxCognitive` or a
+    /// `thresholdOverrides` entry). The threshold decides if the finding
+    /// exists; this rule decides if it fails the run. Defaults to `error`.
+    #[serde(default)]
+    pub complexity_cognitive: Severity,
+    /// A function above the CRAP ceiling (`health.maxCrap` or a
+    /// `thresholdOverrides` entry). The threshold decides if the finding
+    /// exists; this rule decides if it fails the run. Defaults to `error`.
+    /// `off` hides the findings only. `health.maxCrap: 0` also turns off the
+    /// threshold-relative file-score signals.
+    #[serde(default)]
+    pub complexity_crap: Severity,
     /// An import specifier that resolves to no file or package. Defaults to
     /// `error`.
     #[serde(default, alias = "unresolved-import")]
@@ -280,6 +352,10 @@ pub struct RulesConfig {
         alias = "reexport-cycles"
     )]
     pub re_export_cycle: Severity,
+    /// A dependency cycle between workspace packages, built from resolved
+    /// cross-package imports. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "package-cycles")]
+    pub package_cycle: Severity,
     /// An import crossing a forbidden architecture-boundary edge declared in
     /// the `boundaries` config. Defaults to `error`.
     #[serde(default, alias = "boundary-violations")]
@@ -384,6 +460,29 @@ pub struct RulesConfig {
     /// "error-runtime" severity tier, shared with `route-collision`).
     #[serde(default, alias = "dynamic-segment-name-conflicts")]
     pub dynamic_segment_name_conflict: Severity,
+    /// An audit diff that weakens tests: a new skip or focus marker, removed
+    /// test cases, fewer assertions, or a lowered coverage threshold.
+    /// `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn")]
+    pub weakened_tests: Severity,
+    /// An audit diff that adds a lint, type-check, coverage or Fallow
+    /// suppression comment. `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "added-suppressions")]
+    pub added_suppression: Severity,
+    /// An audit diff that adds a test-environment branch to a non-test source
+    /// file. `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "test-only-branches")]
+    pub test_only_branch: Severity,
+    /// An audit diff that edits one copy of a base clone group so that it no
+    /// longer matches its siblings, while no sibling changed. `fallow audit`
+    /// only. Opt-in; defaults to `off`, because copies often differ on
+    /// purpose.
+    #[serde(default = "Severity::default_off", alias = "diverged-clone-siblings")]
+    pub diverged_clone_sibling: Severity,
+    /// An audit diff that adds a dependency to a `package.json`. `fallow
+    /// audit` only. Opt-in; defaults to `off`.
+    #[serde(default = "Severity::default_off", alias = "added-dependencies")]
+    pub added_dependency: Severity,
 }
 
 impl Default for RulesConfig {
@@ -394,6 +493,7 @@ impl Default for RulesConfig {
             unused_types: Severity::Error,
             private_type_leaks: Severity::Off,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Off,
             unused_dependencies: Severity::Error,
             unused_dev_dependencies: Severity::Warn,
             unused_optional_dependencies: Severity::Warn,
@@ -403,10 +503,14 @@ impl Default for RulesConfig {
             unprovided_injects: Severity::Warn,
             unrendered_components: Severity::Warn,
             unused_component_props: Severity::Warn,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Warn,
             unused_component_inputs: Severity::Warn,
             unused_component_outputs: Severity::Warn,
             unused_svelte_events: Severity::Warn,
+            unused_effect_layers: Severity::Warn,
+            unused_tagged_errors: Severity::Warn,
+            unproduced_catch_tags: Severity::Warn,
             unused_server_actions: Severity::Warn,
             unused_load_data_keys: Severity::Warn,
             prop_drilling: Severity::Off,
@@ -417,6 +521,9 @@ impl Default for RulesConfig {
             css_selector_complexity: Severity::Warn,
             css_dead_surface: Severity::Warn,
             css_broken_reference: Severity::Warn,
+            complexity_cyclomatic: Severity::Error,
+            complexity_cognitive: Severity::Error,
+            complexity_crap: Severity::Error,
             unresolved_imports: Severity::Error,
             unlisted_dependencies: Severity::Error,
             duplicate_exports: Severity::Error,
@@ -425,6 +532,7 @@ impl Default for RulesConfig {
             dev_dependencies_in_production: Severity::Warn,
             circular_dependencies: Severity::Error,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             boundary_violation: Severity::Error,
             coverage_gaps: Severity::Off,
             feature_flags: Severity::Off,
@@ -443,6 +551,11 @@ impl Default for RulesConfig {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Error,
             dynamic_segment_name_conflict: Severity::Error,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Off,
+            added_dependency: Severity::Off,
         }
     }
 }
@@ -476,6 +589,7 @@ impl RulesConfig {
             IssueKind::UnusedExport => self.unused_exports,
             IssueKind::UnusedType => self.unused_types,
             IssueKind::PrivateTypeLeak => self.private_type_leaks,
+            IssueKind::DeprecatedExportInUse => self.deprecated_exports_in_use,
             IssueKind::UnusedDependency => self.unused_dependencies,
             IssueKind::UnusedDevDependency => self.unused_dev_dependencies,
             IssueKind::UnusedEnumMember => self.unused_enum_members,
@@ -487,6 +601,7 @@ impl RulesConfig {
             IssueKind::DuplicateExport => self.duplicate_exports,
             IssueKind::CircularDependency => self.circular_dependencies,
             IssueKind::ReExportCycle => self.re_export_cycle,
+            IssueKind::PackageCycle => self.package_cycle,
             IssueKind::TypeOnlyDependency => self.type_only_dependencies,
             IssueKind::TestOnlyDependency => self.test_only_dependencies,
             IssueKind::DevDependencyInProduction => self.dev_dependencies_in_production,
@@ -509,10 +624,14 @@ impl RulesConfig {
             IssueKind::DynamicSegmentNameConflict => self.dynamic_segment_name_conflict,
             IssueKind::UnrenderedComponent => self.unrendered_components,
             IssueKind::UnusedComponentProp => self.unused_component_props,
+            IssueKind::AbsentComponentProp => self.absent_component_props,
             IssueKind::UnusedComponentEmit => self.unused_component_emits,
             IssueKind::UnusedComponentInput => self.unused_component_inputs,
             IssueKind::UnusedComponentOutput => self.unused_component_outputs,
             IssueKind::UnusedSvelteEvent => self.unused_svelte_events,
+            IssueKind::UnusedEffectLayer => self.unused_effect_layers,
+            IssueKind::UnusedTaggedError => self.unused_tagged_errors,
+            IssueKind::UnproducedCatchTag => self.unproduced_catch_tags,
             IssueKind::UnusedServerAction => self.unused_server_actions,
             IssueKind::UnusedLoadDataKey => self.unused_load_data_keys,
             IssueKind::PropDrilling => self.prop_drilling,
@@ -523,8 +642,36 @@ impl RulesConfig {
             IssueKind::CssSelectorComplexity => self.css_selector_complexity,
             IssueKind::CssDeadSurface => self.css_dead_surface,
             IssueKind::CssBrokenReference => self.css_broken_reference,
+            IssueKind::WeakenedTests => self.weakened_tests,
+            IssueKind::AddedSuppression => self.added_suppression,
+            IssueKind::TestOnlyBranch => self.test_only_branch,
+            IssueKind::DivergedCloneSibling => self.diverged_clone_sibling,
+            IssueKind::AddedDependency => self.added_dependency,
             IssueKind::Complexity | IssueKind::CodeDuplication => Severity::Error,
         }
+    }
+
+    /// The gate severity of a complexity finding from the kinds that exceeded
+    /// their threshold.
+    ///
+    /// The most severe rule of the contributing kinds wins. The result is
+    /// `Off` only when every contributing kind is `off`, and the finding is
+    /// then dropped. A kind that did not contribute has no effect.
+    #[must_use]
+    pub fn complexity_severity(&self, cyclomatic: bool, cognitive: bool, crap: bool) -> Severity {
+        [
+            (cyclomatic, self.complexity_cyclomatic),
+            (cognitive, self.complexity_cognitive),
+            (crap, self.complexity_crap),
+        ]
+        .into_iter()
+        .filter_map(|(contributed, severity)| contributed.then_some(severity))
+        .max_by_key(|severity| match severity {
+            Severity::Error => 2,
+            Severity::Warn => 1,
+            Severity::Off => 0,
+        })
+        .unwrap_or(Severity::Off)
     }
 
     /// Apply a partial rules config on top. Only `Some` fields override.
@@ -537,6 +684,7 @@ impl RulesConfig {
                 unused_exports,
                 unused_types,
                 private_type_leaks,
+                deprecated_exports_in_use,
                 unused_dependencies,
                 unused_dev_dependencies,
                 unused_optional_dependencies,
@@ -552,10 +700,14 @@ impl RulesConfig {
                 unprovided_injects,
                 unrendered_components,
                 unused_component_props,
+                absent_component_props,
                 unused_component_emits,
                 unused_component_inputs,
                 unused_component_outputs,
                 unused_svelte_events,
+                unused_effect_layers,
+                unused_tagged_errors,
+                unproduced_catch_tags,
                 unused_server_actions,
                 unused_load_data_keys,
                 prop_drilling,
@@ -566,6 +718,9 @@ impl RulesConfig {
                 css_selector_complexity,
                 css_dead_surface,
                 css_broken_reference,
+                complexity_cyclomatic,
+                complexity_cognitive,
+                complexity_crap,
             ]
         );
         apply_partial_rules!(
@@ -580,6 +735,7 @@ impl RulesConfig {
                 dev_dependencies_in_production,
                 circular_dependencies,
                 re_export_cycle,
+                package_cycle,
                 boundary_violation,
             ]
         );
@@ -610,6 +766,11 @@ impl RulesConfig {
                 misplaced_directive,
                 route_collision,
                 dynamic_segment_name_conflict,
+                weakened_tests,
+                added_suppression,
+                test_only_branch,
+                diverged_clone_sibling,
+                added_dependency,
             ]
         );
     }
@@ -670,6 +831,13 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub private_type_leaks: Option<Severity>,
+    /// Optional override for [`RulesConfig::deprecated_exports_in_use`].
+    #[serde(
+        default,
+        alias = "deprecated-export-in-use",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deprecated_exports_in_use: Option<Severity>,
     /// Optional override for [`RulesConfig::unused_dependencies`].
     #[serde(
         default,
@@ -733,6 +901,13 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub unused_component_props: Option<Severity>,
+    /// Optional override for absent optional component inputs.
+    #[serde(
+        default,
+        alias = "absent-component-prop",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub absent_component_props: Option<Severity>,
     /// Optional override for [`RulesConfig::unused_component_emits`].
     #[serde(
         default,
@@ -761,6 +936,27 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub unused_svelte_events: Option<Severity>,
+    /// Optional override for [`RulesConfig::unused_effect_layers`].
+    #[serde(
+        default,
+        alias = "unused-effect-layer",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unused_effect_layers: Option<Severity>,
+    /// Optional override for [`RulesConfig::unused_tagged_errors`].
+    #[serde(
+        default,
+        alias = "unused-tagged-error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unused_tagged_errors: Option<Severity>,
+    /// Optional override for [`RulesConfig::unproduced_catch_tags`].
+    #[serde(
+        default,
+        alias = "unproduced-catch-tag",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unproduced_catch_tags: Option<Severity>,
     /// Optional override for [`RulesConfig::unused_server_actions`].
     #[serde(
         default,
@@ -831,6 +1027,15 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub css_broken_reference: Option<Severity>,
+    /// Optional override for [`RulesConfig::complexity_cyclomatic`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_cyclomatic: Option<Severity>,
+    /// Optional override for [`RulesConfig::complexity_cognitive`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_cognitive: Option<Severity>,
+    /// Optional override for [`RulesConfig::complexity_crap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complexity_crap: Option<Severity>,
     /// Optional override for [`RulesConfig::unresolved_imports`].
     #[serde(
         default,
@@ -889,6 +1094,13 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub re_export_cycle: Option<Severity>,
+    /// Optional override for [`RulesConfig::package_cycle`].
+    #[serde(
+        default,
+        alias = "package-cycles",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub package_cycle: Option<Severity>,
     /// Optional override for [`RulesConfig::boundary_violation`].
     #[serde(
         default,
@@ -1007,6 +1219,37 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub dynamic_segment_name_conflict: Option<Severity>,
+    /// Optional override for [`RulesConfig::weakened_tests`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weakened_tests: Option<Severity>,
+    /// Optional override for [`RulesConfig::added_suppression`].
+    #[serde(
+        default,
+        alias = "added-suppressions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub added_suppression: Option<Severity>,
+    /// Optional override for [`RulesConfig::test_only_branch`].
+    #[serde(
+        default,
+        alias = "test-only-branches",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub test_only_branch: Option<Severity>,
+    /// Optional override for [`RulesConfig::diverged_clone_sibling`].
+    #[serde(
+        default,
+        alias = "diverged-clone-siblings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub diverged_clone_sibling: Option<Severity>,
+    /// Optional override for [`RulesConfig::added_dependency`].
+    #[serde(
+        default,
+        alias = "added-dependencies",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub added_dependency: Option<Severity>,
 }
 
 /// Every rule name accepted by `RulesConfig` deserialization, in kebab-case.
@@ -1017,13 +1260,18 @@ pub struct PartialRulesConfig {
 /// emit a `tracing::warn!` suggestion at config load time.
 ///
 /// Keep in sync with the `#[serde]` attributes on `RulesConfig` and
-/// `PartialRulesConfig`; the `known_rule_names_count_matches_struct` test
-/// fails when the lists drift.
+/// `PartialRulesConfig`. Nothing enforces that: the only guard here pins the
+/// list's length to a literal, so adding a rule to the struct and forgetting
+/// this list leaves every test green while the new name warns as an unknown
+/// key in user configs. A real pin needs the provenance of each entry, because
+/// the list also covers rule names that no `RulesConfig` field produces, so a
+/// field-count comparison would not even be correct.
 pub const KNOWN_RULE_NAMES: &[&str] = &[
     "unused-files",
     "unused-exports",
     "unused-types",
     "private-type-leaks",
+    "deprecated-exports-in-use",
     "unused-dependencies",
     "unused-dev-dependencies",
     "unused-optional-dependencies",
@@ -1033,10 +1281,14 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "unprovided-injects",
     "unrendered-components",
     "unused-component-props",
+    "absent-component-props",
     "unused-component-emits",
     "unused-component-inputs",
     "unused-component-outputs",
     "unused-svelte-events",
+    "unused-effect-layers",
+    "unused-tagged-errors",
+    "unproduced-catch-tags",
     "unused-server-actions",
     "unused-load-data-keys",
     "prop-drilling",
@@ -1047,6 +1299,9 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "css-selector-complexity",
     "css-dead-surface",
     "css-broken-reference",
+    "complexity-cyclomatic",
+    "complexity-cognitive",
+    "complexity-crap",
     "unresolved-imports",
     "unlisted-dependencies",
     "duplicate-exports",
@@ -1055,6 +1310,7 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "dev-dependencies-in-production",
     "circular-dependencies",
     "re-export-cycle",
+    "package-cycle",
     "boundary-violation",
     "coverage-gaps",
     "feature-flags",
@@ -1079,6 +1335,7 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "unused-export",
     "unused-type",
     "private-type-leak",
+    "deprecated-export-in-use",
     "unused-dependency",
     "unused-dev-dependency",
     "unused-optional-dependency",
@@ -1088,10 +1345,14 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "unprovided-inject",
     "unrendered-component",
     "unused-component-prop",
+    "absent-component-prop",
     "unused-component-emit",
     "unused-component-input",
     "unused-component-output",
     "unused-svelte-event",
+    "unused-effect-layer",
+    "unused-tagged-error",
+    "unproduced-catch-tag",
     "unused-server-action",
     "unused-load-data-key",
     "unresolved-import",
@@ -1104,6 +1365,7 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "re-export-cycles",
     "reexport-cycle",
     "reexport-cycles",
+    "package-cycles",
     "boundary-violations",
     "coverage-gap",
     "feature-flag",
@@ -1118,19 +1380,26 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "misplaced-directives",
     "route-collisions",
     "dynamic-segment-name-conflicts",
+    "weakened-tests",
+    "added-suppression",
+    "added-suppressions",
+    "test-only-branch",
+    "test-only-branches",
+    "diverged-clone-sibling",
+    "diverged-clone-siblings",
+    "added-dependency",
+    "added-dependencies",
 ];
 
 /// Find the closest known rule name to `input` when it is plausibly a typo.
 ///
 /// Thin wrapper over [`crate::levenshtein::closest_match`] that scopes the
-/// candidate set to [`KNOWN_RULE_NAMES`] and returns a `'static` reference so
-/// the suggestion can be embedded in tracing warnings without allocation.
+/// candidate set to [`KNOWN_RULE_NAMES`]. The `'static` lifetime comes from that
+/// slice, so the suggestion can be embedded in tracing warnings without
+/// allocation. `closest_match` lowercases `input` itself.
 #[must_use]
 pub fn closest_known_rule_name(input: &str) -> Option<&'static str> {
-    let input_lower = input.to_ascii_lowercase();
-    let candidates = KNOWN_RULE_NAMES.iter().copied();
-    let suggestion = crate::levenshtein::closest_match(&input_lower, candidates)?;
-    KNOWN_RULE_NAMES.iter().copied().find(|&c| c == suggestion)
+    crate::levenshtein::closest_match(input, KNOWN_RULE_NAMES.iter().copied())
 }
 
 /// An unknown key found inside a `rules` (or `overrides[].rules`) object.
@@ -1174,6 +1443,50 @@ pub fn find_unknown_rule_keys(value: &serde_json::Value, context: &str) -> Vec<U
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn severity_for_kind_maps_configured_fields_and_default() {
+        let rules = RulesConfig {
+            unused_exports: Severity::Warn,
+            unused_types: Severity::Off,
+            unresolved_imports: Severity::Warn,
+            boundary_violation: Severity::Off,
+            ..RulesConfig::default()
+        };
+
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::UnusedExport),
+            Severity::Warn
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::UnusedType),
+            Severity::Off
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::UnresolvedImport),
+            Severity::Warn
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::BoundaryViolation),
+            Severity::Off
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::UnusedFile),
+            Severity::Error
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::PrivateTypeLeak),
+            Severity::Off
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::Complexity),
+            Severity::Error
+        );
+        assert_eq!(
+            rules.severity_for_kind(IssueKind::CodeDuplication),
+            Severity::Error
+        );
+    }
 
     #[test]
     fn rules_default_severities() {
@@ -1265,6 +1578,25 @@ mod tests {
     fn rules_re_export_cycle_default_is_warn() {
         let rules = RulesConfig::default();
         assert_eq!(rules.re_export_cycle, Severity::Warn);
+    }
+
+    #[test]
+    fn rules_package_cycle_default_is_warn() {
+        let rules = RulesConfig::default();
+        assert_eq!(rules.package_cycle, Severity::Warn);
+    }
+
+    #[test]
+    fn package_cycle_aliases_round_trip_to_the_same_field() {
+        for alias in ["package-cycle", "package-cycles"] {
+            let json = format!(r#"{{"{alias}": "error"}}"#);
+            let partial: PartialRulesConfig = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("'{alias}' should deserialize: {e}"));
+            assert_eq!(partial.package_cycle, Some(Severity::Error), "{alias}");
+            let rules: RulesConfig = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("'{alias}' should deserialize: {e}"));
+            assert_eq!(rules.package_cycle, Severity::Error, "{alias}");
+        }
     }
 
     #[test]
@@ -1426,6 +1758,45 @@ mod tests {
     }
 
     #[test]
+    fn complexity_rules_default_to_error_and_deserialize() {
+        let rules = RulesConfig::default();
+        assert_eq!(rules.complexity_cyclomatic, Severity::Error);
+        assert_eq!(rules.complexity_cognitive, Severity::Error);
+        assert_eq!(rules.complexity_crap, Severity::Error);
+
+        let partial: PartialRulesConfig =
+            serde_json::from_str(r#"{ "complexity-crap": "warn", "complexity-cognitive": "off" }"#)
+                .unwrap();
+        assert_eq!(partial.complexity_crap, Some(Severity::Warn));
+        assert_eq!(partial.complexity_cognitive, Some(Severity::Off));
+        assert_eq!(partial.complexity_cyclomatic, None);
+    }
+
+    #[test]
+    fn complexity_severity_takes_the_most_severe_contributing_rule() {
+        let rules = RulesConfig {
+            complexity_cyclomatic: Severity::Warn,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Error,
+            ..RulesConfig::default()
+        };
+        assert_eq!(
+            rules.complexity_severity(true, false, true),
+            Severity::Error
+        );
+        assert_eq!(rules.complexity_severity(true, true, false), Severity::Warn);
+        assert_eq!(rules.complexity_severity(false, true, false), Severity::Off);
+        assert_eq!(
+            rules.complexity_severity(true, false, false),
+            Severity::Warn
+        );
+        assert_eq!(
+            rules.complexity_severity(false, false, false),
+            Severity::Off
+        );
+    }
+
+    #[test]
     fn severity_display() {
         assert_eq!(Severity::Error.to_string(), "error");
         assert_eq!(Severity::Warn.to_string(), "warn");
@@ -1463,10 +1834,14 @@ mod tests {
             unprovided_injects: Some(Severity::Off),
             unrendered_components: Some(Severity::Off),
             unused_component_props: Some(Severity::Off),
+            absent_component_props: Some(Severity::Off),
             unused_component_emits: Some(Severity::Off),
             unused_component_inputs: Some(Severity::Off),
             unused_component_outputs: Some(Severity::Off),
             unused_svelte_events: Some(Severity::Off),
+            unused_effect_layers: Some(Severity::Off),
+            unused_tagged_errors: Some(Severity::Off),
+            unproduced_catch_tags: Some(Severity::Off),
             unused_server_actions: Some(Severity::Off),
             unused_load_data_keys: Some(Severity::Off),
             prop_drilling: Some(Severity::Off),
@@ -1477,6 +1852,9 @@ mod tests {
             css_selector_complexity: Some(Severity::Off),
             css_dead_surface: Some(Severity::Off),
             css_broken_reference: Some(Severity::Off),
+            complexity_cyclomatic: Some(Severity::Off),
+            complexity_cognitive: Some(Severity::Off),
+            complexity_crap: Some(Severity::Off),
             unresolved_imports: Some(Severity::Off),
             unlisted_dependencies: Some(Severity::Off),
             duplicate_exports: Some(Severity::Off),
@@ -1485,6 +1863,7 @@ mod tests {
             dev_dependencies_in_production: Some(Severity::Off),
             circular_dependencies: Some(Severity::Off),
             re_export_cycle: Some(Severity::Off),
+            package_cycle: Some(Severity::Off),
             boundary_violation: Some(Severity::Off),
             coverage_gaps: Some(Severity::Off),
             feature_flags: Some(Severity::Off),
@@ -1503,6 +1882,12 @@ mod tests {
             misplaced_directive: Some(Severity::Off),
             route_collision: Some(Severity::Off),
             dynamic_segment_name_conflict: Some(Severity::Off),
+            deprecated_exports_in_use: Some(Severity::Off),
+            weakened_tests: Some(Severity::Off),
+            added_suppression: Some(Severity::Off),
+            test_only_branch: Some(Severity::Off),
+            diverged_clone_sibling: Some(Severity::Off),
+            added_dependency: Some(Severity::Off),
         };
         rules.apply_partial(&partial);
         assert_eq!(rules.unused_files, Severity::Off);
@@ -1531,9 +1916,29 @@ mod tests {
     }
 
     #[test]
-    fn rules_config_defaults_include_optional_deps() {
+    fn diff_risk_rules_default_and_parse_from_kebab_keys() {
         let rules = RulesConfig::default();
-        assert_eq!(rules.unused_optional_dependencies, Severity::Warn);
+        assert_eq!(rules.weakened_tests, Severity::Warn);
+        assert_eq!(rules.added_suppression, Severity::Warn);
+        assert_eq!(rules.test_only_branch, Severity::Warn);
+        assert_eq!(rules.diverged_clone_sibling, Severity::Off);
+        assert_eq!(rules.added_dependency, Severity::Off);
+
+        let json = r#"{"weakened-tests": "error", "added-dependency": "warn"}"#;
+        let partial: PartialRulesConfig = serde_json::from_str(json).expect("partial rules");
+        let mut merged = RulesConfig::default();
+        merged.apply_partial(&partial);
+        assert_eq!(merged.weakened_tests, Severity::Error);
+        assert_eq!(merged.added_dependency, Severity::Warn);
+        assert_eq!(merged.added_suppression, Severity::Warn);
+        assert_eq!(
+            merged.severity_for_kind(IssueKind::WeakenedTests),
+            Severity::Error
+        );
+        assert_eq!(
+            merged.severity_for_kind(IssueKind::AddedDependency),
+            Severity::Warn
+        );
     }
 
     #[test]
@@ -1569,9 +1974,41 @@ mod tests {
         );
     }
 
+    /// Pins the list's length only. This does NOT compare against
+    /// `RulesConfig`, so it cannot catch a rule added to the struct and
+    /// missing here. It exists to make an accidental deletion loud, nothing
+    /// more. See the note on [`KNOWN_RULE_NAMES`].
     #[test]
-    fn known_rule_names_count_matches_struct() {
-        assert_eq!(KNOWN_RULE_NAMES.len(), 98);
+    fn known_rule_names_list_length_is_pinned() {
+        assert_eq!(KNOWN_RULE_NAMES.len(), 122);
+    }
+
+    /// The reverse of `known_rule_names_covers_every_struct_field`. That one
+    /// proves every real rule is listed; this one proves every listed name is
+    /// real. A stale entry is not inert: `closest_known_rule_name` suggests
+    /// from this list, so a removed or renamed rule left behind here gets
+    /// offered to a user as the fix for their typo.
+    #[test]
+    fn known_rule_names_holds_no_unreachable_entry() {
+        let serialized =
+            serde_json::to_value(RulesConfig::default()).expect("RulesConfig serializes");
+        let canonical = serialized
+            .as_object()
+            .expect("RulesConfig serializes to an object");
+        let source = include_str!("rules.rs");
+
+        let unreachable: Vec<&&str> = KNOWN_RULE_NAMES
+            .iter()
+            .filter(|name| !canonical.contains_key(**name))
+            .filter(|name| !source.contains(&format!("alias = \"{name}\"")))
+            .collect();
+
+        assert!(
+            unreachable.is_empty(),
+            "KNOWN_RULE_NAMES entries that are neither a serialized rule nor a declared \
+             serde alias: {unreachable:?}. closest_known_rule_name suggests from this list, \
+             so each one can be offered to a user as a rule that does not exist."
+        );
     }
 
     #[test]
@@ -1612,8 +2049,8 @@ mod tests {
 
         assert_eq!(
             aliases_found.len(),
-            106,
-            "expected 106 source-level alias attrs (53 per struct); got {}: {:?}",
+            126,
+            "expected 126 source-level alias attrs (63 per struct); got {}: {:?}",
             aliases_found.len(),
             aliases_found
         );

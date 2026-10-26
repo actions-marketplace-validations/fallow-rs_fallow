@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use oxc_span::Span;
 
+pub use crate::complexity_contribution::{
+    ComplexityContribution, ComplexityContributionKind, ComplexityMetric,
+};
 use crate::discover::FileId;
 use crate::suppress::{Suppression, UnknownSuppressionKind};
 
@@ -31,6 +34,18 @@ pub struct ModuleInfo {
     pub require_calls: Vec<RequireCallInfo>,
     /// Package names statically referenced through package path resolution.
     pub package_path_references: Box<[String]>,
+    /// Package names that a module augmentation (`declare module 'pkg'` in a
+    /// module file) names. They credit the package as a type-only use.
+    pub type_package_references: Box<[String]>,
+    /// Binary names found in `node_modules/.bin/<name>` paths in string
+    /// literals and template quasis. The analysis maps each name to the
+    /// package that declares the binary.
+    pub bin_path_references: Box<[String]>,
+    /// Package names from direct `require.resolve('pkg')` calls, each with the
+    /// byte offset of its call. A name from a resolver function, a loop
+    /// binding or a static table has no site, because it is a heuristic
+    /// credit. The unlisted-dependency check reports a site like an import.
+    pub package_resolve_sites: Box<[(String, u32)]>,
     /// Static member access expressions (e.g., `Status.Active`).
     pub member_accesses: Arc<[MemberAccess]>,
     /// Typed semantic facts produced by extraction for cross-layer analysis.
@@ -46,6 +61,16 @@ pub struct ModuleInfo {
     pub has_angular_component_template_url: bool,
     /// xxh3 hash of the file content for incremental caching.
     pub content_hash: u64,
+    /// Number of parser diagnostics the parse of this file produced. Non-zero
+    /// means imports, exports and references after the first error may be
+    /// missing (`source-parse-degraded`, which never withholds a finding).
+    /// Zero for non-JS extraction paths, which do not run the oxc parser.
+    pub parse_error_count: u32,
+    /// `true` when the parser abandoned the file instead of recovering. The
+    /// extracted module is then a fragment of the real one at best.
+    pub parse_panicked: bool,
+    /// `true` when the file nests too deep to parse, so it was not parsed.
+    pub parse_nesting_too_deep: bool,
     /// Inline suppression directives parsed from comments.
     pub suppressions: Vec<Suppression>,
     /// Suppression tokens that did not parse to any known `IssueKind`.
@@ -70,6 +95,10 @@ pub struct ModuleInfo {
     pub complexity: Vec<FunctionComplexity>,
     /// Feature flag use sites.
     pub flag_uses: Vec<FlagUse>,
+    /// Flag-key registries this module exports, and flag reads that name a
+    /// member of an imported registry. `None` for the common module with
+    /// neither.
+    pub flag_registry_facts: Option<Box<FlagRegistryFacts>>,
     /// Heritage metadata for exported classes that declare `implements`.
     pub class_heritage: Vec<ClassHeritageInfo>,
     /// Exported free-function factories that provably return one class instance
@@ -152,8 +181,8 @@ pub struct ModuleInfo {
     /// time. Used for direct sink calls such as
     /// `el.innerHTML = DOMPurify.sanitize(input)`.
     pub sanitized_sink_args: Vec<SanitizedSinkArg>,
-    /// Known defensive control call sites found in this module. Consumed only by
-    /// the `fallow security --surface` agent JSON path.
+    /// Control patterns observed in this module. Surface context only: their
+    /// presence does not establish input identity, execution order, or protection.
     pub security_control_sites: Vec<SecurityControlSite>,
     /// Statically flattenable callee paths invoked in this module, deduped per
     /// unique path (first occurrence wins). Consumed by the
@@ -161,6 +190,12 @@ pub struct ModuleInfo {
     /// extraction is config-blind; the per-module cost is bounded by the
     /// unique-callee count.
     pub callee_uses: Vec<CalleeUse>,
+    /// Per-call references to actual runtime ESM import bindings.
+    pub imported_call_sites: Arc<[ImportedCallSite]>,
+    /// Value references to runtime ESM import bindings that are not admitted
+    /// call sites, plus admitted calls that initialize a top-level declarator.
+    /// Sorted by `span_start`. Read by `fallow trace --dependency`.
+    pub import_binding_references: Arc<[ImportBindingReference]>,
     /// `"use client"` / `"use server"` directive strings written as expression
     /// statements in `program.body` (misplaced, NOT in the leading
     /// prologue), so the RSC bundler silently ignores them. One entry per
@@ -186,6 +221,31 @@ pub struct ModuleInfo {
     /// inject findings project-wide when any reachable module sets this flag.
     /// Mirrors the spread-return whole-object abstain used for Pinia stores.
     pub has_dynamic_provide: bool,
+    /// `true` when the prologue holds `"use server"` and every value export
+    /// is an async function (a Server Action). A `"use client"` import of
+    /// such a module becomes an action reference, so the security
+    /// `client-server-leak` BFS stops at the module. `false` for every other
+    /// module, including a `"use server"` file with a non-action value
+    /// export. Captured only by JS/TS extraction.
+    pub is_server_action_module: bool,
+    /// `true` when TypeScript reads this file as adding to the global scope:
+    /// a script file (no top-level import or export), or a module file with a
+    /// top-level `declare global` block or string-named `declare module`
+    /// block. Read only for declaration files (`.d.ts`, `.d.mts`, `.d.cts`):
+    /// a declaration file without global declarations is seeded as an entry
+    /// point only when something points to it. Captured only by JS/TS
+    /// extraction; `false` for every other module.
+    pub has_global_declarations: bool,
+    /// Raw `path` values of `/// <reference path="..." />` directives in this
+    /// file, in source order. A declaration file named by one stays an entry
+    /// point. Captured only by JS/TS extraction.
+    pub triple_slash_reference_paths: Box<[String]>,
+    /// `true` when the file has a JSX element or fragment and no
+    /// `@jsxImportSource` or `@jsxRuntime classic` pragma. A bundler or test
+    /// config can then select the automatic JSX runtime for the file, so the
+    /// resolver adds the runtime edge from a plugin rule. Captured only by
+    /// JS/TS extraction; `false` for every other module.
+    pub jsx_runtime_from_config: bool,
     /// Local names of import bindings that ARE referenced somewhere in this file
     /// (script value/type position OR template/markup). The complement of
     /// `unused_import_bindings` among `imports`. Derived by
@@ -201,6 +261,11 @@ pub struct ModuleInfo {
     /// referenced nowhere in its own SFC. Each entry carries `used_in_script` /
     /// `used_in_template`.
     pub component_props: Vec<ComponentProp>,
+    /// Cached framework-neutral component input contracts and inspected callers.
+    pub component_contracts: Option<Box<ComponentContractFacts>>,
+    /// Effect layer, tagged error and `catchTag` facts. Set only for a module
+    /// that imports `effect` or an `@effect/*` package.
+    pub effect_facts: Option<Box<EffectFacts>>,
     /// `true` when the template spreads the whole props/attrs object
     /// (`v-bind="$attrs"` / `v-bind="$props"` / `v-bind="props"`) or the props
     /// return is destructured with a rest element. Either form can consume a prop
@@ -371,12 +436,18 @@ impl ModuleInfo {
             dynamic_import_patterns: Vec::new(),
             require_calls: Vec::new(),
             package_path_references: Box::default(),
+            type_package_references: Box::default(),
+            bin_path_references: Box::default(),
+            package_resolve_sites: Box::default(),
             member_accesses: Arc::default(),
             semantic_facts: Arc::default(),
             whole_object_uses: Arc::default(),
             has_cjs_exports: false,
             has_angular_component_template_url: false,
             content_hash: 0,
+            parse_error_count: 0,
+            parse_panicked: false,
+            parse_nesting_too_deep: false,
             suppressions: Vec::new(),
             unknown_suppression_kinds: Vec::new(),
             unused_import_bindings: Vec::new(),
@@ -385,6 +456,7 @@ impl ModuleInfo {
             line_offsets: Vec::new(),
             complexity: Vec::new(),
             flag_uses: Vec::new(),
+            flag_registry_facts: None,
             class_heritage: Vec::new(),
             exported_factory_returns: Arc::default(),
             exported_factory_return_object_shapes: Arc::default(),
@@ -405,12 +477,20 @@ impl ModuleInfo {
             sanitized_sink_args: Vec::new(),
             security_control_sites: Vec::new(),
             callee_uses: Vec::new(),
+            imported_call_sites: Arc::default(),
+            import_binding_references: Arc::default(),
             misplaced_directives: Vec::new(),
             inline_server_action_exports: Vec::new(),
             di_key_sites: Vec::new(),
             has_dynamic_provide: false,
+            is_server_action_module: false,
+            has_global_declarations: false,
+            triple_slash_reference_paths: Box::default(),
+            jsx_runtime_from_config: false,
             referenced_import_bindings: Vec::new(),
             component_props: Vec::new(),
+            component_contracts: None,
+            effect_facts: None,
             has_props_attrs_fallthrough: false,
             has_define_expose: false,
             has_define_model: false,
@@ -482,7 +562,10 @@ impl ModuleInfo {
         Self::release_vec(&mut self.dynamic_imports);
         Self::release_vec(&mut self.require_calls);
         Self::release_boxed_slice(&mut self.package_path_references);
+        Self::release_boxed_slice(&mut self.type_package_references);
+        Self::release_boxed_slice(&mut self.bin_path_references);
         Self::release_arc_slice(&mut self.whole_object_uses);
+        Self::release_arc_slice(&mut self.import_binding_references);
         Self::release_vec(&mut self.unused_import_bindings);
         Self::release_vec(&mut self.type_referenced_import_bindings);
         Self::release_vec(&mut self.value_referenced_import_bindings);
@@ -505,7 +588,7 @@ impl ModuleInfo {
     }
 }
 
-/// Defensive control family detected on a source to sink path.
+/// Family of a control pattern observed in a file on an import trace.
 #[derive(
     Debug,
     Clone,
@@ -532,7 +615,7 @@ pub enum SecurityControlKind {
     Authorization,
 }
 
-/// A known defensive control call site.
+/// An observed control call or guard pattern, without proof that it protects a sink.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bitcode::Encode, bitcode::Decode)]
 pub struct SecurityControlSite {
     /// Control family.
@@ -1003,16 +1086,202 @@ pub fn is_synthetic_template_unit(name: &str) -> bool {
     name == "<template>" || name.starts_with("<snippet:")
 }
 
+/// Placeholder name of a function expression that has no name from its
+/// declaration, its binding, a key, or its call context.
+pub const ANONYMOUS_FUNCTION_NAME: &str = "<anonymous>";
+
+/// Placeholder name of an arrow function that has no name from its binding, a
+/// key, or its call context.
+pub const ANONYMOUS_ARROW_NAME: &str = "<arrow>";
+
+/// True when `name` is the placeholder of a function without a name. Two
+/// functions that share a placeholder are not the same function.
+#[must_use]
+pub fn is_anonymous_function_name(name: &str) -> bool {
+    name == ANONYMOUS_FUNCTION_NAME || name == ANONYMOUS_ARROW_NAME
+}
+
+/// Emitted name of the synthetic module-scope complexity unit.
+pub const MODULE_UNIT_NAME: &str = "<module>";
+
+/// True when `name` identifies the synthetic per-file module-scope unit.
+///
+/// Extraction pushes one root frame per program so decision points outside
+/// every function (an environment guard, a top-level `??` / `||` default, an
+/// `?.` access on a config object) are counted instead of silently dropped.
+/// The unit is emitted only when it actually branches, and it is
+/// aggregate-only: it feeds vital signs, file scores, and branching
+/// conservation, and never becomes a user-facing finding. "Extract a helper"
+/// is not advice that applies to module scope, so the unit reports the
+/// quantity without asking anyone to act on it.
+///
+/// Deliberately NOT part of [`is_synthetic_template_unit`]. That predicate
+/// carries template-family CRAP, suppression, and display semantics, and
+/// [`FileBranching::from_units`] filters on it: folding `<module>` in would
+/// exclude module-scope branching from the branching totals, which is the
+/// blind spot this unit exists to close.
+#[must_use]
+pub fn is_synthetic_module_unit(name: &str) -> bool {
+    name == MODULE_UNIT_NAME
+}
+
+/// Branching totals for one file: the quantity that survives extraction, and
+/// the number of units now holding it.
+///
+/// A per-function cyclomatic ceiling constrains a partition, not a quantity.
+/// `McCabe` gives a function `1 + one increment per decision point`, so across
+/// a set of units the summed cyclomatic score is `functions + branch_points`.
+/// Moving an `if` from one function into a new one removes an increment from
+/// the first and adds it to the second: `branch_points` is unchanged and
+/// `functions` rises. Reporting the two terms separately is what distinguishes
+/// branching that left from branching that only moved.
+///
+/// Module scope is accounted for. Extraction pushes a root frame per program
+/// and emits it as a synthetic `<module>` unit whenever it branches, so a
+/// branch hoisted out of a function to the top level of the module keeps its
+/// increment in `branch_points` and adds one to `functions`, exactly as moving
+/// it into a new function would. A fall in `branch_points` is therefore a
+/// statement about the file's measured decision points, not about a partition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FileBranching {
+    /// Summed weight of `Cyclomatic` contributions. The conserved quantity.
+    pub branch_points: u32,
+    /// Number of accounted units. The tax a split adds.
+    pub functions: u32,
+    /// Highest single-unit cyclomatic score. Reported, never a verdict input:
+    /// a split lowers it by construction.
+    pub peak_cyclomatic: u16,
+    /// Summed weight of `Cognitive` contributions, excluding `PropCount` and
+    /// `HookDensity`. Both are cognitive-only with no cyclomatic counterpart,
+    /// and `PropCount` records the excess over a floor, so it is superlinear in
+    /// a split: one 14-prop component contributes `+10` while the same props
+    /// across two 7-prop components contribute `+3` and `+3`. Including them
+    /// would move this number with both `branch_points` and nesting flat.
+    /// This therefore does NOT equal the sum of `FunctionComplexity::cognitive`.
+    pub cognitive: u32,
+    /// Summed `nesting` over the same cognitive contributions. Extraction
+    /// rebases nesting to zero on every new frame, so a cognitive improvement
+    /// that shows up here and not in `branch_points` came from repartitioning,
+    /// not from removing branching.
+    pub cognitive_nesting_weight: u32,
+    /// Whether one of the counted units is the module body. Its branching is
+    /// real and belongs in `branch_points`, but it is not a function anyone
+    /// split into, so a consumer judging whether a file was split must not
+    /// count it towards the function tax.
+    pub has_module_unit: bool,
+    /// Whether the file carried a synthetic template unit that these counts
+    /// exclude. When it did, the numbers describe the file's script only, so a
+    /// consumer must not present them as describing the whole file. The
+    /// synthetic `<module>` unit is NOT a template unit and does not set this
+    /// flag: it is counted like any other unit, because module-scope branching
+    /// is part of the script the numbers describe.
+    pub has_synthetic_units: bool,
+}
+
+impl FileBranching {
+    /// Aggregate one file's units.
+    ///
+    /// Synthetic template units are excluded: they are suppressed entirely when
+    /// trivial, which would silently move any denominator that counted them.
+    /// Suppression is deliberately not consulted, so a
+    /// `fallow-ignore-next-line complexity` comment cannot remove a unit's
+    /// branches from the total.
+    ///
+    /// The synthetic `<module>` unit IS counted. It carries the file's
+    /// module-scope decision points, and leaving it out would restore the blind
+    /// spot that let a branch disappear from the total by being hoisted out of
+    /// every function.
+    #[must_use]
+    pub fn from_units(units: &[FunctionComplexity]) -> Self {
+        let mut totals = Self {
+            has_module_unit: units
+                .iter()
+                .any(|unit| is_synthetic_module_unit(&unit.name)),
+            has_synthetic_units: units
+                .iter()
+                .any(|unit| is_synthetic_template_unit(&unit.name)),
+            ..Self::default()
+        };
+        for unit in units
+            .iter()
+            .filter(|unit| !is_synthetic_template_unit(&unit.name))
+        {
+            totals.functions += 1;
+            totals.peak_cyclomatic = totals.peak_cyclomatic.max(unit.cyclomatic);
+            for contribution in &unit.contributions {
+                match contribution.metric {
+                    ComplexityMetric::Cyclomatic => {
+                        totals.branch_points += u32::from(contribution.weight);
+                    }
+                    ComplexityMetric::Cognitive => {
+                        if matches!(
+                            contribution.kind,
+                            ComplexityContributionKind::PropCount
+                                | ComplexityContributionKind::HookDensity
+                        ) {
+                            continue;
+                        }
+                        totals.cognitive += u32::from(contribution.weight);
+                        totals.cognitive_nesting_weight += u32::from(contribution.nesting);
+                    }
+                }
+            }
+        }
+        totals
+    }
+
+    /// Summed cyclomatic score implied by the identity `functions + branch_points`.
+    ///
+    /// Equals the direct sum of `FunctionComplexity::cyclomatic` over the same
+    /// units unless a unit saturated `u16`, which is the one way the identity
+    /// can break.
+    #[must_use]
+    pub const fn implied_cyclomatic(&self) -> u32 {
+        self.functions + self.branch_points
+    }
+}
+
+/// The kind of function that has no name of its own, which selects its
+/// placeholder name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+pub enum AnonymousFunctionKind {
+    /// A function expression: `<anonymous>`.
+    Function,
+    /// An arrow function: `<arrow>`.
+    Arrow,
+}
+
+impl AnonymousFunctionKind {
+    /// The placeholder name of this kind.
+    #[must_use]
+    pub const fn placeholder(self) -> &'static str {
+        match self {
+            Self::Function => ANONYMOUS_FUNCTION_NAME,
+            Self::Arrow => ANONYMOUS_ARROW_NAME,
+        }
+    }
+}
+
 /// Complexity metrics for a single function/method/arrow.
 #[derive(Debug, Clone, serde::Serialize, bitcode::Encode, bitcode::Decode)]
 pub struct FunctionComplexity {
-    /// Function name (or `"<anonymous>"` for unnamed functions/arrows).
+    /// Function name, or a placeholder (`"<anonymous>"`, `"<arrow>"`) for a
+    /// function that has no name.
     pub name: String,
     /// Whether this function is an ECMAScript `#`-private class member.
     ///
     /// Kept separately from `name` because a public string-named method may
     /// legally begin with `#` and remains eligible for runtime coverage.
     pub is_private_member: bool,
+    /// `Some` when `name` comes from the call or the function that holds this
+    /// function, not from its own declaration, binding, or key. Examples:
+    /// `Command.make("setup")` for a callback argument, the `Effect.fn` span
+    /// name, or the name of the function that returns `Effect.gen(...)`. The
+    /// value is the kind of placeholder that the function had before.
+    ///
+    /// Coverage producers and runtime identities record such a function
+    /// without a name, so they use [`Self::identity_name`].
+    pub context_named: Option<AnonymousFunctionKind>,
     /// 1-based line number where the function starts.
     pub line: u32,
     /// 0-based byte column where the function starts.
@@ -1051,6 +1320,18 @@ pub struct FunctionComplexity {
     pub contributions: Vec<ComplexityContribution>,
 }
 
+impl FunctionComplexity {
+    /// The name that coverage producers and runtime identities use: the
+    /// placeholder for a function with a context name, else `name`.
+    #[must_use]
+    pub fn identity_name(&self) -> &str {
+        match self.context_named {
+            Some(kind) => kind.placeholder(),
+            None => &self.name,
+        }
+    }
+}
+
 /// Structural CSS metrics for a single style rule, computed from the parsed CSS
 /// syntax tree. A rule is recorded only when it crosses a structural floor (an
 /// id selector, a complex selector, a `!important` declaration, or deep
@@ -1058,7 +1339,7 @@ pub struct FunctionComplexity {
 ///
 /// Not persisted in the extraction cache: `fallow health` computes these
 /// on demand from the CSS source, so there is no `bitcode` derive.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CssRuleMetric {
     /// 1-based line of the rule's first selector.
@@ -1127,7 +1408,7 @@ pub struct CssCustomPropertyDefinition {
 /// Stylesheet-level structural CSS analytics, computed from the parsed CSS
 /// syntax tree. Feeds `fallow health` penalty weights and located findings,
 /// never a standalone CSS score.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CssAnalytics {
     /// Total declarations across every style rule (normal plus `!important`).
@@ -1210,110 +1491,6 @@ pub struct CssAnalytics {
     pub declaration_blocks: Vec<CssDeclarationBlock>,
 }
 
-/// Which complexity metric a [`ComplexityContribution`] adds to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "kebab-case")]
-pub enum ComplexityMetric {
-    /// `McCabe` cyclomatic complexity (independent execution paths).
-    Cyclomatic,
-    /// `SonarSource` cognitive complexity (structural + nesting penalty).
-    Cognitive,
-}
-
-/// The syntactic construct that produced a single complexity increment.
-///
-/// Mirrors `SonarSource` cognitive-complexity vocabulary where it overlaps.
-/// `Case` means a `case` label carrying a test; a bare `default` adds nothing
-/// to cyclomatic complexity and so produces no contribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum ComplexityContributionKind {
-    /// An `if` condition.
-    If,
-    /// A bare `else` branch (cognitive only).
-    Else,
-    /// An `else if` continuation (both metrics: cyclomatic +1, cognitive flat
-    /// +1 with no nesting penalty).
-    ElseIf,
-    /// A `?:` conditional (ternary) expression.
-    Ternary,
-    /// A logical `&&` operator.
-    LogicalAnd,
-    /// A logical `||` operator.
-    LogicalOr,
-    /// A `??` nullish-coalescing operator.
-    NullishCoalescing,
-    /// A logical assignment operator (`&&=`, `||=`, `??=`); cyclomatic only.
-    LogicalAssignment,
-    /// An optional-chaining link (`?.`); cyclomatic only.
-    OptionalChain,
-    /// A `for` loop.
-    For,
-    /// A `for...in` loop.
-    ForIn,
-    /// A `for...of` loop.
-    ForOf,
-    /// A `while` loop.
-    While,
-    /// A `do...while` loop.
-    DoWhile,
-    /// A `switch` statement (cognitive only; each `case` adds cyclomatic).
-    Switch,
-    /// A `case` label carrying a test (cyclomatic only).
-    Case,
-    /// A `catch` clause.
-    Catch,
-    /// A labeled `break` (cognitive only).
-    LabeledBreak,
-    /// A labeled `continue` (cognitive only).
-    LabeledContinue,
-    /// Legacy JSX-depth contribution kind kept for schema compatibility. Current
-    /// extraction records JSX nesting as descriptive `react_jsx_max_depth`
-    /// context and does not emit this kind for layout depth.
-    JsxDepth,
-    /// React hook density (cognitive only). One contribution per hook call in a
-    /// component body (`useState` / `useEffect` / `useMemo` / `useCallback` /
-    /// custom `use*`); a hook-heavy component accrues cognitive load the same way
-    /// branching does.
-    HookDensity,
-    /// React prop count past the comfortable floor (cognitive only). A component
-    /// destructuring many props is doing many things; the props beyond the floor
-    /// fold into cognitive so a wide-interface component surfaces as a hotspot.
-    PropCount,
-    /// A Svelte `{#await}` block.
-    Await,
-    /// A Svelte `{:then}` continuation.
-    Then,
-}
-
-/// A single complexity increment, located at its source line/column.
-///
-/// `weight` is the amount this construct added to `metric`; for nested
-/// cognitive increments `weight == 1 + nesting`. Consumers that render inline
-/// (the VS Code editor breakdown) group contributions by `line` and sum the
-/// weights, deferring the per-kind list to a hover.
-#[derive(Debug, Clone, serde::Serialize, bitcode::Encode, bitcode::Decode)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct ComplexityContribution {
-    /// 1-based line number where the construct begins.
-    pub line: u32,
-    /// 0-based byte column where the construct begins.
-    pub col: u32,
-    /// Which metric this increment contributes to.
-    pub metric: ComplexityMetric,
-    /// The syntactic construct responsible for the increment.
-    pub kind: ComplexityContributionKind,
-    /// The amount added to `metric` at this site (`1 + nesting` for nested
-    /// cognitive increments, otherwise `1`).
-    pub weight: u16,
-    /// The nesting depth at the increment site (`0` when not nested). Lets a
-    /// consumer explain a cognitive `+3` as "+1 base, +2 nesting".
-    pub nesting: u16,
-}
-
 /// The kind of feature flag pattern detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
 pub enum FlagUseKind {
@@ -1342,9 +1519,207 @@ pub struct FlagUse {
     pub guard_span_end: Option<u32>,
     /// SDK/provider name.
     pub sdk_name: Option<String>,
+    /// Facts about the site, for the retirement report and the confidence
+    /// mapping.
+    pub facts: FlagSiteFacts,
 }
 
 const _: () = assert!(std::mem::size_of::<FlagUse>() <= 96);
+
+/// Facts about a flag site that the flag retirement report and the
+/// confidence mapping read.
+///
+/// The branch facts describe the `if`, ternary or JSX `&&` that the site
+/// guards. A site without a guard has no branch facts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FlagSiteFacts(u8);
+
+impl FlagSiteFacts {
+    const IDENTICAL_BRANCHES: u8 = 1;
+    const EMPTY_BRANCH: u8 = 1 << 1;
+    const DEFINITION: u8 = 1 << 2;
+    const UNCONFIRMED_SDK: u8 = 1 << 3;
+
+    /// Both branches of the guard are the same code, ignoring whitespace
+    /// and comments.
+    #[must_use]
+    pub const fn identical_branches(self) -> bool {
+        self.0 & Self::IDENTICAL_BRANCHES != 0
+    }
+
+    /// No branch of the guard holds code, so the flag does nothing. An
+    /// empty branch is `{}`, `;`, `null`, `undefined`, `void 0`, `<></>`, or
+    /// `false` next to JSX. A missing `else` is an empty branch. Code in one
+    /// branch, for the on case or for the off case, clears this fact.
+    #[must_use]
+    pub const fn empty_branch(self) -> bool {
+        self.0 & Self::EMPTY_BRANCH != 0
+    }
+
+    /// The site defines the flag, as in `export const x = flag({ key })`,
+    /// and does not read it.
+    #[must_use]
+    pub const fn definition(self) -> bool {
+        self.0 & Self::DEFINITION != 0
+    }
+
+    /// The site calls a generic SDK name, such as `isEnabled` or
+    /// `getValue`, and its file imports no flag SDK or flag module. Other
+    /// libraries use the same names, so the site is less certain.
+    #[must_use]
+    pub const fn unconfirmed_sdk(self) -> bool {
+        self.0 & Self::UNCONFIRMED_SDK != 0
+    }
+
+    /// These facts with `unconfirmed_sdk` set to `value`.
+    #[must_use]
+    pub const fn with_unconfirmed_sdk(self, value: bool) -> Self {
+        Self::set(self, Self::UNCONFIRMED_SDK, value)
+    }
+
+    /// These facts with `definition` set to `value`.
+    #[must_use]
+    pub const fn with_definition(self, value: bool) -> Self {
+        Self::set(self, Self::DEFINITION, value)
+    }
+
+    /// These facts with `identical_branches` set to `value`.
+    #[must_use]
+    pub const fn with_identical_branches(self, value: bool) -> Self {
+        Self::set(self, Self::IDENTICAL_BRANCHES, value)
+    }
+
+    /// These facts with `empty_branch` set to `value`.
+    #[must_use]
+    pub const fn with_empty_branch(self, value: bool) -> Self {
+        Self::set(self, Self::EMPTY_BRANCH, value)
+    }
+
+    const fn set(self, bit: u8, value: bool) -> Self {
+        if value {
+            Self(self.0 | bit)
+        } else {
+            Self(self.0 & !bit)
+        }
+    }
+}
+
+/// User flag patterns from the `flags` config section that detection
+/// applies during the parse. The default holds the built-in patterns only.
+///
+/// The parse cache keys on these patterns, so every parse that writes the
+/// cache must use the patterns of the resolved config.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlagPatterns {
+    /// Extra SDK calls: function name, zero-based name argument, provider label.
+    pub sdk_patterns: Vec<(String, usize, String)>,
+    /// Extra environment variable prefixes.
+    pub env_prefixes: Vec<String>,
+    /// Whether an access on a config object with a flag-like name is a flag.
+    pub config_object_heuristics: bool,
+}
+
+impl FlagPatterns {
+    /// Whether no user pattern is present.
+    #[must_use]
+    pub fn is_builtin_only(&self) -> bool {
+        self.sdk_patterns.is_empty()
+            && self.env_prefixes.is_empty()
+            && !self.config_object_heuristics
+    }
+}
+
+/// A flag-key registry that a module exports: a module-level `as const`
+/// object or a TypeScript enum whose members hold string flag keys.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FlagKeyRegistry {
+    /// Name the module exports the registry under.
+    pub export_name: String,
+    /// Member name and flag key of each string member, in declaration order.
+    pub members: Vec<(String, String)>,
+}
+
+/// A flag read whose key is a member of an imported registry, as in
+/// `useFlag(FLAGS.X)` where `FLAGS` is imported.
+///
+/// Extraction sees one file only, so project analysis resolves the key
+/// through the import of `registry`.
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
+pub struct FlagRegistryRead {
+    /// Local name of the imported registry binding.
+    pub registry: String,
+    /// Registry member that holds the flag key.
+    pub member: String,
+    /// The read site. `flag_name` stays empty until analysis resolves the key.
+    pub flag_use: FlagUse,
+}
+
+/// A module-level `const` with a flag-style name and a literal value, such
+/// as `const FEATURE_NEW_UI = true`, that a guard in the same module tests.
+///
+/// The flag retirement report reads these. They are not in the per-site
+/// flag findings.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FlagConstant {
+    /// Binding name.
+    pub name: String,
+    /// The literal value as source code: `true`, `0` or `'on'`.
+    pub value: String,
+    /// 1-based line of the binding.
+    pub line: u32,
+    /// 0-based byte column of the binding.
+    pub col: u32,
+    /// Guard tests that read the binding, in source order.
+    pub reads: Vec<FlagConstantRead>,
+}
+
+/// A guard test that reads a [`FlagConstant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FlagConstantRead {
+    /// 1-based line.
+    pub line: u32,
+    /// 0-based byte column.
+    pub col: u32,
+    /// Facts about the guard.
+    pub facts: FlagSiteFacts,
+}
+
+/// A flag definition bound to a `const`, as in
+/// `export const showBanner = flag({ key: 'show-banner' })`.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct FlagDefinition {
+    /// The binding that holds the definition.
+    pub binding: String,
+    /// 1-based line of the definition call, as on its [`FlagUse`].
+    pub line: u32,
+    /// 0-based byte column of the definition call, as on its [`FlagUse`].
+    pub col: u32,
+}
+
+/// Registry facts, and other flag facts outside the per-site findings, that
+/// a module gives to feature flag analysis.
+#[derive(Debug, Clone, Default, bitcode::Encode, bitcode::Decode)]
+pub struct FlagRegistryFacts {
+    /// Registries this module exports.
+    pub registries: Vec<FlagKeyRegistry>,
+    /// Flag reads that name a member of an imported registry.
+    pub reads: Vec<FlagRegistryRead>,
+    /// Literal `const` flags that a guard in the module tests.
+    pub constants: Vec<FlagConstant>,
+    /// Flag definitions bound to a `const`.
+    pub definitions: Vec<FlagDefinition>,
+}
+
+impl FlagRegistryFacts {
+    /// Whether the module contributes no fact.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.registries.is_empty()
+            && self.reads.is_empty()
+            && self.constants.is_empty()
+            && self.definitions.is_empty()
+    }
+}
 
 /// The runtime mechanism used to load a module.
 #[derive(
@@ -1367,13 +1742,114 @@ pub enum ModuleLoadMechanism {
     CommonJsRequire = 1,
 }
 
+/// When the target of an import edge loads, relative to the importing module.
+///
+/// The startup weight report follows only `Static` edges to find the code that
+/// loads before the entry module runs. The other kinds load later, or outside
+/// the importing thread, except `PathReference` and `AssetReference`. These
+/// two edges keep their target in use but do not run it: see
+/// [`Self::loads_target`]. Only an asset reference also stops reachability:
+/// see [`Self::runs_target_code`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ImportLoadKind {
+    /// The target loads before the importer runs: `import`, `export ... from`,
+    /// `require()`, `require.context` and `import.meta.glob(..., { eager: true })`.
+    #[default]
+    Static = 0,
+    /// The target loads on demand through `import('./literal')`.
+    Dynamic = 1,
+    /// The target is one match of an on-demand pattern: a template `import()`
+    /// or a lazy `import.meta.glob`.
+    DynamicPattern = 2,
+    /// The target runs on another thread or in another process: a
+    /// `new URL(..., import.meta.url)` reference (for example a worker URL),
+    /// a webpack worker loader request (`worker-loader!./work.js`),
+    /// `child_process.fork`, a pino transport or a `module.register` hook.
+    OutOfThread = 3,
+    /// The importer gets only the path of the target and does not load it:
+    /// `require.resolve('./file')` or ``require.resolve(`./file`)``. The edge
+    /// keeps the target in use. The consumer of the path can run the target
+    /// later, so the imports of the target stay reachable.
+    PathReference = 4,
+    /// The importer reads the target as text, bytes or a URL through a
+    /// webpack asset loader, such as `raw-loader!./file.js`. The bundle never
+    /// runs the target as code, so the imports of the target are not
+    /// reachable through this edge. The graph sets this kind; extraction
+    /// never records it.
+    AssetReference = 5,
+}
+
+impl ImportLoadKind {
+    /// Whether the target loads before the importing module runs.
+    #[must_use]
+    pub const fn is_eager(self) -> bool {
+        matches!(self, Self::Static)
+    }
+
+    /// Whether the target loads on demand on the importing thread.
+    #[must_use]
+    pub const fn is_deferred(self) -> bool {
+        matches!(self, Self::Dynamic | Self::DynamicPattern)
+    }
+
+    /// Whether the edge runs its target. A path reference and an asset
+    /// reference keep the target in use but do not run it, so the edge does
+    /// not close a cycle, is not in the entry load closure, does not cross an
+    /// architecture boundary and does not carry server code into a client
+    /// bundle.
+    #[must_use]
+    pub const fn loads_target(self) -> bool {
+        !matches!(self, Self::PathReference | Self::AssetReference)
+    }
+
+    /// Whether the target can run as code at all, through this edge or
+    /// through the consumer of a path reference. Only an asset reference never
+    /// runs its target, so reachability does not continue through it.
+    #[must_use]
+    pub const fn runs_target_code(self) -> bool {
+        !matches!(self, Self::AssetReference)
+    }
+
+    /// Whether an import with this load kind puts a runtime value of the
+    /// target on the startup path: the target loads before the importer runs
+    /// and the import is not type-only.
+    #[must_use]
+    pub const fn is_eager_value(self, is_type_only: bool) -> bool {
+        self.is_eager() && !is_type_only
+    }
+}
+
 /// A dynamic import with a partially resolved pattern.
 #[derive(Debug, Clone)]
 pub struct DynamicImportPattern {
-    /// Static prefix of the import path (e.g., "./locales/"). May contain glob characters.
+    /// Glob prefix of the import path (e.g., "./locales/"). An
+    /// `import.meta.glob` pattern is the full glob. For a template literal, a
+    /// string concatenation, or `require.context`, each glob metacharacter of
+    /// the literal text is escaped as a one-character class, such as `[[]`.
     pub prefix: String,
-    /// Static suffix of the import path (e.g., ".json"), if any.
+    /// Glob suffix of the import path (e.g., ".json"), if any.
     pub suffix: Option<String>,
+    /// Globs of the files that the pattern does not load. Vite reads a
+    /// negative `import.meta.glob` array entry, such as `'!./a/skip.js'`, as
+    /// an exclude for every positive entry of the same call.
+    pub excludes: Vec<String>,
     /// Source span in the original file.
     pub span: Span,
     /// Runtime mechanism used to load modules matching this pattern.
@@ -1435,6 +1911,14 @@ pub struct ExportInfo {
     /// Human-authored reason on `@expected-unused -- <reason>`, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_unused_reason: Option<String>,
+    /// Whether the leading JSDoc carries a `@deprecated` tag. Orthogonal to
+    /// `visibility`: `@public @deprecated` is a normal combination.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deprecated: bool,
+    /// Plain-text `@deprecated` message, capped at
+    /// `DEPRECATED_REASON_MAX_CHARS` characters. `None` for a bare tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated_reason: Option<Box<str>>,
     /// Source span of the export declaration.
     #[serde(serialize_with = "serialize_span")]
     pub span: Span,
@@ -1509,6 +1993,10 @@ pub struct FactoryReturnExport {
     pub export_name: String,
     /// The returned class's local name within the factory module.
     pub class_local_name: String,
+    /// The factory returns a promise of the class (an `async` function, or a
+    /// `Promise<Class>` return type). Only an awaited call result is the class.
+    #[serde(default)]
+    pub is_async: bool,
 }
 
 /// One resolved property of an object-literal factory return: a dotted property
@@ -1608,6 +2096,11 @@ pub struct PublicSignatureTypeReference {
     /// Reference span.
     #[serde(serialize_with = "serialize_span")]
     pub span: Span,
+    /// True when the reference comes from a `satisfies` clause. The clause
+    /// checks the value but does not change the exported type, so the type is
+    /// in use but is not a private type leak.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub from_satisfies: bool,
 }
 
 /// A member of an enum, class, or namespace.
@@ -1651,6 +2144,13 @@ pub struct MemberInfo {
     /// `.build()`. See issue #387.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_self_returning: bool,
+    /// Root identifier of the class `extends` expression, set only when the
+    /// member has the `override` modifier: `Container` in
+    /// `extends Container<Env>`, `Schema` in `extends Schema.TaggedError<E>()(...)`.
+    /// The analysis credits the member when this root names code outside the
+    /// project, because that code calls the overridden member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_base: Option<String>,
 }
 
 /// The kind of member.
@@ -1804,6 +2304,172 @@ pub enum SemanticFact {
     /// A default import binding was handed on as a whole object.
     /// Appended because bitcode encodes enum variants by ordinal.
     DefaultImportWholeObjectUse(DefaultImportWholeObjectUseFact),
+    /// A property of an exported object contains a local class instance.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    ExportedObjectInstanceProperty(ExportedObjectInstancePropertyFact),
+    /// A proven class member read selected through a namespace import.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    QualifiedClassMemberAccess(QualifiedClassMemberAccessFact),
+    /// A Module Federation runtime call (`registerRemotes`, `loadRemote`,
+    /// `init` or `createInstance`) imported from a Federation runtime package.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    FederationRuntimeRemote(FederationRuntimeRemoteFact),
+    /// A dynamic import or an import pattern whose load kind differs from the
+    /// default of its list: `Dynamic` for `dynamic_imports` and
+    /// `DynamicPattern` for `dynamic_import_patterns`.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    ImportLoadKindOverride(ImportLoadKindOverrideFact),
+    /// A source-owned class-producing property of an exported object factory.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    FactoryReturnObjectPropertySource(Box<FactoryReturnObjectPropertySourceFact>),
+    /// Property read whose bound factory receiver passed source-time lexical and value checks.
+    ProvenFactoryReturnObjectPropertyAccess(FactoryReturnObjectPropertyAccessFact),
+    /// Caller-owned callback origins for a source-proven returned property.
+    CallbackFactoryPropertyAccess(Box<CallbackFactoryPropertyAccessFact>),
+    /// A Playwright fixture definition from `<base>.extend<T>()` where `base`
+    /// is imported. Analysis applies it only when `base` resolves to a
+    /// Playwright test. Appended because bitcode encodes enum variants by ordinal.
+    PlaywrightConditionalFixtureDefinition(Box<PlaywrightConditionalFixtureDefinitionFact>),
+    /// A local name that the extractor proved holds a Playwright test.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    PlaywrightTestBinding(PlaywrightTestBindingFact),
+    /// A top-level statement or declaration emits runtime code beyond module
+    /// imports and exports, which have their own extraction records.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    TopLevelRuntimeStatement,
+}
+
+/// Deferred class provenance owned by the module declaring an object factory.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum FactoryPropertySource {
+    /// A property path through a named type in the factory's module.
+    TypedProperty {
+        /// Named receiver type in the producer module.
+        type_name: String,
+        /// Remaining path through the receiver type.
+        property_path: String,
+    },
+    /// A synchronous function call in the factory's module.
+    FunctionReturn {
+        /// Function binding in the producer module.
+        callee_name: String,
+    },
+    /// A proven instance-returning static class method.
+    StaticFactoryReturn {
+        /// Class binding in the producer module.
+        callee_object: String,
+        /// Statically named instance-returning method.
+        callee_method: String,
+    },
+    /// A class proven in the object factory's own module.
+    LocalClass {
+        /// Local class binding resolved relative to the factory module.
+        class_local_name: String,
+    },
+    /// Return of the callback at this ordinal in the proven helper declaration.
+    CallbackParameterReturn {
+        /// Zero-based formal parameter ordinal.
+        parameter_index: u32,
+    },
+}
+
+/// Callback-origin member use, joined with the callee module's property source.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CallbackFactoryPropertyAccessFact {
+    /// Callee import binding in the caller module.
+    pub callee_name: String,
+    /// Static export selected from a namespace import, if present.
+    pub callee_member: Option<String>,
+    /// Requested path in the wrapper's returned value.
+    pub property_path: String,
+    /// Requested member on the callback result.
+    pub member: String,
+    /// A property write permits only the canonical Vue getter contract.
+    pub vue_only: bool,
+    /// Ordinary assigned value, ignored by a canonical Vue setter contract.
+    pub assigned_class: Option<String>,
+    /// Callback ordinal and class origin interpreted in the caller module.
+    pub arguments: Vec<CallbackFactoryArgument>,
+}
+
+/// Proven callback result owned by a factory consumer's module.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CallbackFactoryArgument {
+    /// Zero-based actual argument ordinal.
+    pub parameter_index: u32,
+    /// Class binding resolved in the consumer module.
+    pub class_local_name: String,
+    /// This argument is an options object with a proven `get` callback.
+    pub getter: bool,
+    /// No mutable capture makes a lazy invocation select another class.
+    pub lazy_safe: bool,
+}
+
+/// An exported object factory's deferred property receiver.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FactoryReturnObjectPropertySourceFact {
+    /// Public factory export name.
+    pub factory_export_name: String,
+    /// Path within the returned object, separate from any source property path.
+    pub property_path: String,
+    /// Names interpreted relative to this fact's owning module.
+    pub source: FactoryPropertySource,
+}
+
+/// The load kind of the dynamic imports or patterns that start at `span_start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportLoadKindOverrideFact {
+    /// Byte offset of the call or `new` expression that records the edge.
+    pub span_start: u32,
+    /// The load kind of every edge that the expression records.
+    pub kind: ImportLoadKind,
+}
+
+/// The Module Federation runtime function that a call names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum FederationRuntimeCall {
+    /// `registerRemotes([{ name, entry }])`.
+    RegisterRemotes,
+    /// `loadRemote('remote/module')`.
+    LoadRemote,
+    /// `init({ remotes: [{ name, entry }] })`.
+    /// Appended because bitcode encodes enum variants by ordinal.
+    Init,
+    /// `createInstance({ remotes: [{ name, entry }] })`.
+    CreateInstance,
+}
+
+impl FederationRuntimeCall {
+    /// The function name as the source writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RegisterRemotes => "registerRemotes",
+            Self::LoadRemote => "loadRemote",
+            Self::Init => "init",
+            Self::CreateInstance => "createInstance",
+        }
+    }
+}
+
+/// One remote that a Module Federation runtime call names.
+///
+/// `remote` is the remote alias when the argument is a static literal, and
+/// `None` when the call receives a value that static analysis cannot read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct FederationRuntimeRemoteFact {
+    /// The runtime function the call names.
+    pub call: FederationRuntimeCall,
+    /// The remote alias the call names, or `None` for a non-literal argument.
+    pub remote: Option<String>,
 }
 
 /// Iterate Angular template member names from typed semantic facts.
@@ -1936,6 +2602,20 @@ impl<'a> SemanticFactView<'a> {
             .collect()
     }
 
+    /// Iterate exported object properties that contain class instances.
+    pub fn exported_object_instance_properties(
+        self,
+    ) -> impl Iterator<Item = &'a ExportedObjectInstancePropertyFact> + 'a {
+        exported_object_instance_property_facts(self.semantic_facts)
+    }
+
+    /// Iterate proven namespace-qualified class member accesses.
+    pub fn qualified_class_member_accesses(
+        self,
+    ) -> impl Iterator<Item = &'a QualifiedClassMemberAccessFact> + 'a {
+        qualified_class_member_access_facts(self.semantic_facts)
+    }
+
     /// Collect static factory call member facts.
     pub fn factory_call_member_accesses(self) -> Vec<FactoryCallMemberAccessFact> {
         factory_call_member_access_facts(self.semantic_facts)
@@ -1964,6 +2644,36 @@ impl<'a> SemanticFactView<'a> {
         factory_return_object_property_access_facts(self.semantic_facts)
             .cloned()
             .collect()
+    }
+
+    /// Iterate deferred object-factory property sources without copying their names.
+    pub fn factory_return_object_property_sources(
+        self,
+    ) -> impl Iterator<Item = &'a FactoryReturnObjectPropertySourceFact> + 'a {
+        self.semantic_facts.iter().filter_map(|fact| match fact {
+            SemanticFact::FactoryReturnObjectPropertySource(source) => Some(source.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// Property accesses with source-owned receiver admission.
+    pub fn proven_factory_return_object_property_accesses(
+        self,
+    ) -> impl Iterator<Item = &'a FactoryReturnObjectPropertyAccessFact> + 'a {
+        self.semantic_facts.iter().filter_map(|fact| match fact {
+            SemanticFact::ProvenFactoryReturnObjectPropertyAccess(access) => Some(access),
+            _ => None,
+        })
+    }
+
+    /// Iterate caller-owned callback property projections.
+    pub fn callback_factory_property_accesses(
+        self,
+    ) -> impl Iterator<Item = &'a CallbackFactoryPropertyAccessFact> + 'a {
+        self.semantic_facts.iter().filter_map(|fact| match fact {
+            SemanticFact::CallbackFactoryPropertyAccess(access) => Some(access.as_ref()),
+            _ => None,
+        })
     }
 
     /// Collect typed-property-hop member facts.
@@ -2034,6 +2744,32 @@ impl<'a> SemanticFactView<'a> {
             .collect()
     }
 
+    /// Collect conditional Playwright fixture-definition facts.
+    pub fn playwright_conditional_fixture_definitions(
+        self,
+    ) -> Vec<PlaywrightConditionalFixtureDefinitionFact> {
+        self.semantic_facts
+            .iter()
+            .filter_map(|fact| match fact {
+                SemanticFact::PlaywrightConditionalFixtureDefinition(access) => {
+                    Some(access.as_ref().clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collect the names of proven Playwright test bindings.
+    pub fn playwright_test_bindings(self) -> Vec<PlaywrightTestBindingFact> {
+        self.semantic_facts
+            .iter()
+            .filter_map(|fact| match fact {
+                SemanticFact::PlaywrightTestBinding(binding) => Some(binding.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Collect Playwright fixture-type facts.
     pub fn playwright_fixture_types(self) -> Vec<PlaywrightFixtureTypeFact> {
         playwright_fixture_type_facts(self.semantic_facts)
@@ -2053,6 +2789,30 @@ fn instance_export_binding_facts(
 ) -> impl Iterator<Item = &InstanceExportBindingFact> {
     semantic_facts.iter().filter_map(|fact| {
         if let SemanticFact::InstanceExportBinding(access) = fact {
+            Some(access)
+        } else {
+            None
+        }
+    })
+}
+
+fn exported_object_instance_property_facts(
+    semantic_facts: &[SemanticFact],
+) -> impl Iterator<Item = &ExportedObjectInstancePropertyFact> {
+    semantic_facts.iter().filter_map(|fact| {
+        if let SemanticFact::ExportedObjectInstanceProperty(property) = fact {
+            Some(property)
+        } else {
+            None
+        }
+    })
+}
+
+fn qualified_class_member_access_facts(
+    semantic_facts: &[SemanticFact],
+) -> impl Iterator<Item = &QualifiedClassMemberAccessFact> {
+    semantic_facts.iter().filter_map(|fact| {
+        if let SemanticFact::QualifiedClassMemberAccess(access) = fact {
             Some(access)
         } else {
             None
@@ -2336,6 +3096,8 @@ pub struct FactoryFnMemberAccessFact {
     pub callee_name: String,
     /// Member accessed on the returned instance-like object.
     pub member: String,
+    /// The local holds the awaited call result (`const x = await factory()`).
+    pub awaited: bool,
 }
 
 /// A factory-returned value consumed opaquely, so every member of the class it
@@ -2441,7 +3203,8 @@ pub struct ComputedEnumKeyUseFact {
     pub key_member: String,
 }
 
-/// A member access on a fluent chain rooted at a static factory call.
+/// A fluent chain rooted at a static factory call, one fact per chain. A step is
+/// used when the root method is a factory and each earlier step returns `this`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FluentChainMemberAccessFact {
@@ -2449,22 +3212,21 @@ pub struct FluentChainMemberAccessFact {
     pub root_object: String,
     /// Static factory method that starts the fluent chain.
     pub root_method: String,
-    /// Intermediate fluent methods between the root method and final member.
-    pub chain: Vec<String>,
-    /// Member accessed at this chain step.
-    pub member: String,
+    /// The methods called after the root method, each once, in first-call order.
+    pub steps: Vec<String>,
 }
 
-/// A member access on a fluent chain rooted at a `new` expression.
+/// A fluent chain rooted at a `new` expression, one fact per chain. A step is
+/// used when the first method and each earlier step return `this`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FluentChainNewMemberAccessFact {
     /// Local imported class constructed by the `new` expression.
     pub class_name: String,
-    /// Intermediate fluent methods between construction and final member.
-    pub chain: Vec<String>,
-    /// Member accessed at this chain step.
-    pub member: String,
+    /// The method called on the new instance.
+    pub first_method: String,
+    /// The methods called after the first method, each once, in first-call order.
+    pub steps: Vec<String>,
 }
 
 /// A member access on a Playwright fixture object inside a test callback.
@@ -2489,6 +3251,31 @@ pub struct PlaywrightFixtureDefinitionFact {
     pub fixture_name: String,
     /// Local type symbol used as the fixture target.
     pub type_name: String,
+}
+
+/// A Playwright fixture definition from `<base>.extend<T>()` where `base` is
+/// an imported name. The extractor cannot prove that `base` holds a Playwright
+/// test, so analysis applies the definition only when `base` resolves to one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PlaywrightConditionalFixtureDefinitionFact {
+    /// Local test function or wrapper receiving the fixture definition.
+    pub test_name: String,
+    /// Imported local name that `.extend<T>()` is called on.
+    pub base_name: String,
+    /// Fixture name or dotted fixture path declared by the fixture type.
+    pub fixture_name: String,
+    /// Local type symbol used as the fixture target.
+    pub type_name: String,
+}
+
+/// A local name that holds a Playwright test: the result of an `.extend()` on
+/// the `@playwright/test` `test` import or of a `mergeTests(...)` call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PlaywrightTestBindingFact {
+    /// Local name of the Playwright test.
+    pub test_name: String,
 }
 
 /// A Playwright fixture wrapper alias declared by `mergeTests` or `.extend`.
@@ -2521,6 +3308,30 @@ pub struct InstanceExportBindingFact {
     pub export_name: String,
     /// Local class or interface symbol used as the instance target.
     pub target_name: String,
+}
+
+/// A property of an exported object whose value is an instance of a local class.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExportedObjectInstancePropertyFact {
+    /// Public export name of the containing object.
+    pub export_name: String,
+    /// Dotted path from the exported object to the instance property.
+    pub property_path: String,
+    /// Local class symbol instantiated at that property.
+    pub class_local_name: String,
+}
+
+/// A proven class member read through a namespace-qualified constructor or local subclass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, bitcode::Encode, bitcode::Decode)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct QualifiedClassMemberAccessFact {
+    /// Local namespace-import binding.
+    pub namespace_local: String,
+    /// Class export selected from that namespace.
+    pub class_export_name: String,
+    /// Member accessed through the proven class or instance binding.
+    pub member: String,
 }
 
 /// Opaque marker for a dynamic custom-element render site.
@@ -2615,6 +3426,71 @@ pub struct CalleeUse {
     pub callee_path: String,
     /// Start byte offset of the first call site using this path.
     pub span_start: u32,
+}
+
+/// A direct call whose root identifier resolves to a runtime ESM import.
+///
+/// Every occurrence is retained. Computed or optional callees and arbitrary
+/// value aliases are excluded; origin resolution through re-exports is deferred
+/// to analysis.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ImportedCallSite {
+    /// The local root import binding used by the callee.
+    pub local_name: String,
+    /// Dot-separated static member suffix, empty for a bare imported call.
+    pub member_path: String,
+    /// Static first string argument, or `None` for any other argument shape.
+    pub first_argument: Option<String>,
+    /// Start byte offset of this call site.
+    pub span_start: u32,
+}
+
+/// A value reference to a runtime ESM import binding that is not an admitted
+/// call site, or that initializes a top-level declarator.
+///
+/// The admission rules are the same as for [`ImportedCallSite`]: the binding
+/// has one import declaration, it is not type-only, and the reference reads a
+/// value. `fallow trace --dependency` reads these facts to count each use of
+/// an imported name that it cannot resolve to a call, and to find project
+/// wrappers such as `export const useX = useSelector.withTypes()`.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ImportBindingReference {
+    /// Index into `ModuleInfo.imports` of the root binding.
+    pub import_index: u32,
+    /// Static member suffix after the root, empty for a bare reference.
+    pub member_path: Box<str>,
+    /// How the code uses the reference.
+    pub kind: ImportBindingReferenceKind,
+    /// Start byte of the root identifier, or of the call for
+    /// [`ImportBindingReferenceKind::InitializerCall`].
+    pub span_start: u32,
+    /// Name of the top-level declarator that this reference initializes.
+    pub declared_name: Option<Box<str>>,
+    /// The exported top-level declarator that the reference reads, when the
+    /// reference names that declarator and not the import binding. The
+    /// declarator is initialized by a reference to the import binding at
+    /// `import_index`, so the reference is a use of the binding through a
+    /// project wrapper in its own module. `None` for a direct reference.
+    pub through: Option<Box<str>>,
+}
+
+/// How the code uses an [`ImportBindingReference`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub enum ImportBindingReferenceKind {
+    /// An admitted call that is the whole initializer of a top-level
+    /// declarator: `const x = useSelector.withTypes<T>()`.
+    InitializerCall,
+    /// The reference is the whole initializer of a declarator:
+    /// `const x = useDispatch`.
+    ValueAlias,
+    /// The reference names a JSX opening element: `<Provider>`.
+    JsxElement,
+    /// Any other value use that is not an admitted call, for example an
+    /// argument, an array element or an optional call.
+    Other,
+    /// A direct call of a wrapper declarator in its own module. Only a
+    /// reference with `through` set has this kind.
+    Call,
 }
 
 /// A `"use client"` / `"use server"` directive string written as an expression
@@ -3070,7 +3946,7 @@ pub enum ImportedName {
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ExportInfo>() == 136);
+const _: () = assert!(std::mem::size_of::<ExportInfo>() == 152);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<ImportInfo>() == 96);
 #[cfg(target_pointer_width = "64")]
@@ -3080,11 +3956,13 @@ const _: () = assert!(std::mem::size_of::<ImportedName>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<MemberAccess>() == 48);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<SemanticFact>() == 96);
+const _: () = assert!(std::mem::size_of::<SemanticFact>() == 80);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<SinkSite>() == 216);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 1336);
+const _: () = assert!(std::mem::size_of::<ModuleInfo>() == 1472);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ImportBindingReference>() == 64);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<TypeMemberTypeEntry>() == 72);
 
@@ -3129,6 +4007,12 @@ pub struct DynamicImportInfo {
     pub local_name: Option<String>,
     /// True when this dynamic import was synthesised by fallow rather than appearing in user source.
     pub is_speculative: bool,
+    /// True when the value of an `import()` without a binding escapes, for
+    /// example as a return value, a call argument, or an array element.
+    /// The consumer can then read any export, so the edge credits the whole
+    /// module namespace. False for a discarded `import()` statement, which
+    /// only loads the module.
+    pub value_escapes: bool,
 }
 
 /// A `require()` call.
@@ -3163,12 +4047,22 @@ pub struct ParseResult {
     pub modules: Vec<ModuleInfo>,
     /// Files discovered with stable IDs but unreadable by the parser.
     pub read_failures: Vec<SourceReadFailure>,
+    /// Files that parsed with diagnostics, so their extracted module may be
+    /// incomplete. Reported, never used to withhold findings.
+    pub parse_degradations: Vec<SourceParseDegradation>,
     /// Number of files whose parse results were loaded from cache (unchanged).
     pub cache_hits: usize,
     /// Number of files that required a full parse (new or changed).
     pub cache_misses: usize,
     /// Summed wall-clock time of the actual AST parses across all rayon workers.
     pub parse_cpu_ms: f64,
+    /// Files whose bytes were read from disk: every parse, plus every cache
+    /// hit that had to compare the content hash.
+    pub files_read: u64,
+    /// Bytes of source read from disk across all files.
+    pub source_bytes_read: u64,
+    /// Source bytes that the CSS comment mask read across all parsed files.
+    pub css_masked_bytes: u64,
 }
 
 /// A discovered source that could not be read as UTF-8 text.
@@ -3182,1733 +4076,261 @@ pub struct SourceReadFailure {
     pub error: String,
 }
 
+/// A discovered source that was read but did not parse cleanly.
+///
+/// The module it produced is still analyzed: dropping it would turn one broken
+/// file into project-wide silence. The point of carrying the degradation is
+/// that the imports the file failed to parse credited nothing, so its targets
+/// can be reported as unused with full confidence unless a consumer is told the
+/// parse was partial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceParseDegradation {
+    /// Stable discovery identity of the degraded source.
+    pub file_id: FileId,
+    /// Absolute discovered source path.
+    pub path: PathBuf,
+    /// Number of parser diagnostics reported for the file.
+    pub error_count: u32,
+    /// `true` when the parser abandoned the file instead of recovering.
+    pub panicked: bool,
+    /// The nesting cap when the file nests too deep to parse.
+    pub nesting_limit: Option<u32>,
+}
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn span() -> Span {
-        Span::new(0, 1)
-    }
-
-    macro_rules! assert_released {
-        ($values:expr) => {{
-            assert!($values.is_empty());
-        }};
-    }
-
-    #[test]
-    fn public_env_var_includes_public_ci_metadata() {
-        for name in ["TAG_REF", "GITHUB_SHA", "CI_COMMIT_BRANCH", "APP_MODE"] {
-            assert!(is_public_env_var(name), "{name} should be public metadata");
-        }
-    }
-
-    #[test]
-    fn public_env_var_keeps_secret_shaped_names_source_backed() {
-        for name in ["GITHUB_TOKEN", "REFRESH_TOKEN", "API_KEY", "SECRET_SHA"] {
-            assert!(
-                !is_public_env_var(name),
-                "{name} should remain secret-shaped"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_access_helpers_keep_source_accesses() {
-        let member_accesses = vec![
-            MemberAccess {
-                object: "this".to_string(),
-                member: "render".to_string(),
-            },
-            MemberAccess {
-                object: "service".to_string(),
-                member: "run".to_string(),
-            },
-        ];
-        let ordinary = SemanticFactView::new(&[], &member_accesses)
-            .ordinary_member_accesses()
-            .map(|access| (access.object.as_str(), access.member.as_str()))
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordinary, vec![("this", "render"), ("service", "run")]);
-
-        let whole_object_uses = vec!["model".to_string(), "service".to_string()];
-
-        assert_eq!(
-            ordinary_whole_object_uses(&whole_object_uses).collect::<Vec<_>>(),
-            vec!["model", "service"]
-        );
-    }
-
-    #[test]
-    fn angular_template_member_names_use_typed_facts() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::AngularTemplateMemberAccess(AngularTemplateMemberAccessFact {
-                member: "typed".to_string(),
-            }),
-        );
-
-        let names: Vec<&str> = angular_template_member_names(&module).collect();
-
-        assert_eq!(names, vec!["typed"]);
-        assert!(has_angular_template_members(&module));
-    }
-
-    #[test]
-    fn angular_this_spread_uses_typed_fact() {
-        let mut typed = minimal_module_info();
-        push_semantic_fact(
-            &mut typed,
-            SemanticFact::AngularThisSpread(AngularThisSpreadFact),
-        );
-
-        assert!(has_angular_this_spread(&typed));
-        assert!(!has_angular_this_spread(&minimal_module_info()));
-    }
-
-    #[test]
-    fn semantic_fact_view_iterates_typed_facts() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "make".to_string(),
-                member: "run".to_string(),
-            }),
-        );
-
-        let facts = SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
-            .facts()
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            facts[0],
-            &SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "make".to_string(),
-                member: "run".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn typed_fact_helpers_collect_each_family() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::InstanceExportBinding(InstanceExportBindingFact {
-                export_name: "exported".to_string(),
-                target_name: "target".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "create".to_string(),
-                member: "run".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::FluentChainMemberAccess(FluentChainMemberAccessFact {
-                root_object: "Builder".to_string(),
-                root_method: "start".to_string(),
-                chain: vec!["next".to_string()],
-                member: "value".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::FluentChainNewMemberAccess(FluentChainNewMemberAccessFact {
-                class_name: "Builder".to_string(),
-                chain: vec!["next".to_string(), "finish".to_string()],
-                member: "done".to_string(),
-            }),
-        );
-
-        assert_eq!(
-            SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
-                .instance_export_bindings(),
-            vec![InstanceExportBindingFact {
-                export_name: "exported".to_string(),
-                target_name: "target".to_string(),
-            }]
-        );
-        assert_eq!(
-            SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
-                .factory_call_member_accesses(),
-            vec![FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "create".to_string(),
-                member: "run".to_string(),
-            }]
-        );
-        assert_eq!(
-            SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
-                .fluent_chain_member_accesses(),
-            vec![FluentChainMemberAccessFact {
-                root_object: "Builder".to_string(),
-                root_method: "start".to_string(),
-                chain: vec!["next".to_string()],
-                member: "value".to_string(),
-            }]
-        );
-        assert_eq!(
-            SemanticFactView::new(&module.semantic_facts, &module.member_accesses)
-                .fluent_chain_new_member_accesses(),
-            vec![FluentChainNewMemberAccessFact {
-                class_name: "Builder".to_string(),
-                chain: vec!["next".to_string(), "finish".to_string()],
-                member: "done".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn semantic_fact_view_exposes_typed_first_contract() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::FactoryCallMemberAccess(FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "create".to_string(),
-                member: "run".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::PlaywrightFixtureUse(PlaywrightFixtureUseFact {
-                test_name: "test".to_string(),
-                fixture_name: "page".to_string(),
-                member: "goto".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::InstanceExportBinding(InstanceExportBindingFact {
-                export_name: "exported".to_string(),
-                target_name: "target".to_string(),
-            }),
-        );
-
-        let view = SemanticFactView::new(&module.semantic_facts, &module.member_accesses);
-
-        assert_eq!(
-            view.factory_call_member_accesses(),
-            vec![FactoryCallMemberAccessFact {
-                callee_object: "Svc".to_string(),
-                callee_method: "create".to_string(),
-                member: "run".to_string(),
-            }]
-        );
-        assert_eq!(
-            view.playwright_fixture_uses(),
-            vec![PlaywrightFixtureUseFact {
-                test_name: "test".to_string(),
-                fixture_name: "page".to_string(),
-                member: "goto".to_string(),
-            }]
-        );
-        assert_eq!(
-            view.instance_export_bindings(),
-            vec![InstanceExportBindingFact {
-                export_name: "exported".to_string(),
-                target_name: "target".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn playwright_fixture_fact_helpers_select_each_fact_family() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::PlaywrightFixtureUse(PlaywrightFixtureUseFact {
-                test_name: "test".to_string(),
-                fixture_name: "page".to_string(),
-                member: "goto".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::PlaywrightFixtureDefinition(PlaywrightFixtureDefinitionFact {
-                test_name: "test".to_string(),
-                fixture_name: "adminPage".to_string(),
-                type_name: "AdminPage".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::PlaywrightFixtureAlias(PlaywrightFixtureAliasFact {
-                test_name: "mergedTest".to_string(),
-                base_name: "test".to_string(),
-            }),
-        );
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::PlaywrightFixtureType(PlaywrightFixtureTypeFact {
-                alias_name: "Pages".to_string(),
-                fixture_name: "adminPage".to_string(),
-                type_name: "AdminPage".to_string(),
-            }),
-        );
-
-        assert_eq!(
-            playwright_fixture_use_facts(&module.semantic_facts)
-                .map(|fact| fact.member.as_str())
-                .collect::<Vec<_>>(),
-            vec!["goto"]
-        );
-        assert_eq!(
-            playwright_fixture_definition_facts(&module.semantic_facts)
-                .map(|fact| fact.type_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["AdminPage"]
-        );
-        assert_eq!(
-            playwright_fixture_alias_facts(&module.semantic_facts)
-                .map(|fact| fact.base_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["test"]
-        );
-        assert_eq!(
-            playwright_fixture_type_facts(&module.semantic_facts)
-                .map(|fact| fact.fixture_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["adminPage"]
-        );
-    }
-
-    #[test]
-    fn line_offsets_empty_string() {
-        assert_eq!(compute_line_offsets(""), vec![0]);
-    }
-
-    #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exhaustive field-by-field construction + release assertions for every ModuleInfo field"
-    )]
-    fn release_resolution_payload_drops_copied_vectors_only() {
-        let mut module = ModuleInfo {
-            file_id: FileId(7),
-            exports: vec![ExportInfo {
-                name: ExportName::Named("kept".to_string()),
-                local_name: None,
-                is_type_only: false,
-                is_side_effect_used: false,
-                visibility: VisibilityTag::None,
-                expected_unused_reason: None,
-                span: span(),
-                members: Vec::new(),
-                super_class: None,
-            }]
-            .into(),
-            imports: vec![ImportInfo {
-                source: "node:child_process".to_string(),
-                imported_name: ImportedName::Default,
-                local_name: "childProcess".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: span(),
-                source_span: span(),
-            }],
-            re_exports: vec![ReExportInfo {
-                source: "./kept".to_string(),
-                imported_name: "kept".to_string(),
-                exported_name: "kept".to_string(),
-                is_type_only: false,
-                span: span(),
-                statement_span: span(),
-                source_span: span(),
-            }],
-            dynamic_imports: vec![DynamicImportInfo {
-                source: "./dynamic".to_string(),
-                span: span(),
-                destructured_names: vec!["value".to_string()],
-                local_name: None,
-                is_speculative: false,
-            }],
-            dynamic_import_patterns: vec![DynamicImportPattern {
-                prefix: "./pages/".to_string(),
-                suffix: Some(".tsx".to_string()),
-                span: span(),
-                mechanism: ModuleLoadMechanism::EsModule,
-            }],
-            require_calls: vec![RequireCallInfo {
-                source: "./required".to_string(),
-                span: span(),
-                source_span: span(),
-                destructured_names: Vec::new(),
-                local_name: Some("required".to_string()),
-                is_type_only: false,
-            }],
-            package_path_references: vec!["react".to_string()].into(),
-            member_accesses: vec![MemberAccess {
-                object: "Status".to_string(),
-                member: "Active".to_string(),
-            }]
-            .into(),
-            semantic_facts: std::sync::Arc::default(),
-            whole_object_uses: vec!["Status".to_string()].into(),
-            has_cjs_exports: true,
-            has_angular_component_template_url: true,
-            content_hash: 42,
-            suppressions: Vec::new(),
-            unknown_suppression_kinds: Vec::new(),
-            unused_import_bindings: vec!["unused".to_string()],
-            type_referenced_import_bindings: vec!["TypeOnly".to_string()],
-            value_referenced_import_bindings: vec!["Value".to_string()],
-            line_offsets: vec![0, 8],
-            complexity: vec![FunctionComplexity {
-                name: "work".to_string(),
-                is_private_member: false,
-                line: 1,
-                col: 0,
-                cyclomatic: 2,
-                cognitive: 3,
-                line_count: 4,
-                param_count: 1,
-                react_hook_count: 0,
-                react_jsx_max_depth: 0,
-                react_prop_count: 0,
-                source_hash: Some("hash".to_string()),
-                contributions: Vec::new(),
-            }],
-            flag_uses: vec![FlagUse {
-                flag_name: "FEATURE_X".to_string(),
-                kind: FlagUseKind::EnvVar,
-                line: 1,
-                col: 0,
-                guard_span_start: None,
-                guard_span_end: None,
-                sdk_name: None,
-            }],
-            class_heritage: vec![ClassHeritageInfo {
-                export_name: "Child".to_string(),
-                super_class: Some("Parent".to_string()),
-                implements: vec!["Contract".to_string()],
-                type_parameters: Vec::new(),
-                instance_bindings: Vec::new(),
-                super_class_type_args: Vec::new(),
-                generic_instance_bindings: Vec::new(),
-            }],
-            exported_factory_returns: std::sync::Arc::from([FactoryReturnExport {
-                export_name: "useApi".to_string(),
-                class_local_name: "RESTApi".to_string(),
-            }]),
-            exported_factory_return_object_shapes: std::sync::Arc::from([
-                FactoryReturnObjectShapeExport {
-                    export_name: "createUi".to_string(),
-                    properties: Box::from([FactoryReturnObjectProperty {
-                        property_path: "orders".to_string(),
-                        class_local_name: "OrdersPage".to_string(),
-                    }]),
-                },
-            ]),
-            type_member_types: std::sync::Arc::from([TypeMemberTypeEntry {
-                type_name: "Opts".to_string(),
-                property: "c".to_string(),
-                property_type: "OptDep".to_string(),
-            }]),
-            injection_tokens: vec![("TOKEN".to_string(), "Contract".to_string())],
-            local_type_declarations: vec![LocalTypeDeclaration {
-                name: "Contract".to_string(),
-                span: span(),
-            }],
-            public_signature_type_references: vec![PublicSignatureTypeReference {
-                export_name: "kept".to_string(),
-                type_name: "Contract".to_string(),
-                span: span(),
-            }],
-            namespace_object_aliases: vec![NamespaceObjectAlias {
-                via_export_name: "api".to_string(),
-                suffix: "read".to_string(),
-                namespace_local: "ns".to_string(),
-            }],
-            iconify_prefixes: vec!["hero".to_string()],
-            iconify_icon_names: vec!["hero-home".to_string()],
-            auto_import_candidates: vec!["useState".to_string()],
-            directives: vec!["use client".to_string()],
-            client_only_dynamic_import_spans: Vec::new(),
-            security_sinks: Vec::new(),
-            security_sinks_skipped: 1,
-            security_unresolved_callee_sites: Vec::new(),
-            tainted_bindings: Vec::new(),
-            sanitized_sink_args: Vec::new(),
-            security_control_sites: Vec::new(),
-            callee_uses: Vec::new(),
-            misplaced_directives: Vec::new(),
-            inline_server_action_exports: Vec::new(),
-            di_key_sites: Vec::new(),
-            has_dynamic_provide: false,
-            referenced_import_bindings: Vec::new(),
-            component_props: Vec::new(),
-            has_props_attrs_fallthrough: false,
-            has_define_expose: false,
-            has_define_model: false,
-            has_unharvestable_props: false,
-            component_emits: Vec::new(),
-            angular_inputs: Vec::new(),
-            angular_outputs: Vec::new(),
-            angular_component_selectors: Vec::new(),
-            registered_custom_elements: Vec::new(),
-            used_custom_element_tags: Vec::new(),
-            angular_used_selectors: Vec::new(),
-            angular_entry_component_refs: Vec::new(),
-            has_dynamic_component_render: false,
-            has_unharvestable_emits: false,
-            has_dynamic_emit: false,
-            has_emit_whole_object_use: false,
-            load_return_keys: Vec::new(),
-            has_unharvestable_load: false,
-            has_load_data_whole_use: false,
-            has_page_data_store_whole_use: false,
-            has_route_loader_data_whole_use: false,
-            component_functions: Vec::new(),
-            react_props: Vec::new(),
-            hook_uses: Vec::new(),
-            render_edges: Vec::new(),
-            svelte_dispatched_events: Vec::new(),
-            svelte_listened_events: Vec::new(),
-            has_dynamic_dispatch: false,
-        };
-
-        module.release_resolution_payload();
-
-        assert_eq!(module.file_id, FileId(7));
-        assert_eq!(module.content_hash, 42);
-        assert_eq!(module.line_offsets, vec![0, 8]);
-        assert_eq!(module.imports.len(), 1);
-        assert_eq!(module.exports.len(), 1);
-        assert_eq!(module.re_exports.len(), 1);
-        assert_eq!(module.dynamic_import_patterns.len(), 1);
-        assert_eq!(module.member_accesses.len(), 1);
-        assert_eq!(module.complexity.len(), 1);
-        assert_eq!(module.flag_uses.len(), 1);
-        assert_eq!(module.class_heritage.len(), 1);
-        assert_eq!(module.exported_factory_returns.len(), 1);
-        assert_eq!(module.injection_tokens.len(), 1);
-        assert_eq!(module.local_type_declarations.len(), 1);
-        assert_eq!(module.public_signature_type_references.len(), 1);
-        assert_eq!(module.iconify_prefixes.len(), 1);
-        assert_eq!(module.iconify_icon_names.len(), 1);
-        assert_eq!(module.directives.len(), 1);
-        assert_eq!(module.security_sinks_skipped, 1);
-        assert_released!(module.dynamic_imports);
-        assert_released!(module.require_calls);
-        assert_released!(module.package_path_references);
-        assert_released!(module.whole_object_uses);
-        assert_released!(module.unused_import_bindings);
-        assert_released!(module.type_referenced_import_bindings);
-        assert_released!(module.value_referenced_import_bindings);
-        assert_released!(module.namespace_object_aliases);
-        assert_released!(module.auto_import_candidates);
-        assert_eq!(
-            module.referenced_import_bindings,
-            vec!["childProcess".to_string()]
-        );
-    }
-
-    #[test]
-    fn sink_shape_bitcode_roundtrip() {
-        for shape in [
-            SinkShape::Call,
-            SinkShape::MemberCall,
-            SinkShape::MemberAssign,
-            SinkShape::TaggedTemplate,
-            SinkShape::JsxAttr,
-            SinkShape::NewExpression,
-            SinkShape::SecretLiteral,
-        ] {
-            let encoded = bitcode::encode(&shape);
-            let decoded: SinkShape = bitcode::decode(&encoded).expect("decode sink shape");
-            assert_eq!(shape, decoded);
-        }
-    }
-
-    #[test]
-    fn sink_arg_kind_bitcode_roundtrip() {
-        for kind in [
-            SinkArgKind::TemplateWithSubst,
-            SinkArgKind::Concat,
-            SinkArgKind::Object,
-            SinkArgKind::Call,
-            SinkArgKind::Literal,
-            SinkArgKind::NoArg,
-            SinkArgKind::Other,
-        ] {
-            let encoded = bitcode::encode(&kind);
-            let decoded: SinkArgKind = bitcode::decode(&encoded).expect("decode sink arg kind");
-            assert_eq!(kind, decoded);
-        }
-    }
-
-    #[test]
-    fn security_url_shape_bitcode_roundtrip() {
-        for shape in [
-            SecurityUrlShape::FixedOriginDynamicPath,
-            SecurityUrlShape::DynamicOrigin,
-        ] {
-            let encoded = bitcode::encode(&shape);
-            let decoded: SecurityUrlShape =
-                bitcode::decode(&encoded).expect("decode security url shape");
-            assert_eq!(shape, decoded);
-        }
-    }
-
-    #[test]
-    fn sink_site_bitcode_roundtrip() {
-        let site = SinkSite {
-            sink_shape: SinkShape::MemberAssign,
-            callee_path: "el.innerHTML".to_string(),
-            arg_index: 0,
-            arg_is_non_literal: true,
-            arg_kind: SinkArgKind::Other,
-            arg_literal: Some(SinkLiteralValue::Integer(511)),
-            regex_pattern: None,
-            object_properties: vec![SinkObjectProperty {
-                key: "origin".to_string(),
-                value: SinkLiteralValue::String("*".to_string()),
-            }],
-            object_property_keys: vec!["origin".to_string()],
-            object_property_keys_complete: true,
-            arg_idents: vec!["userInput".to_string()],
-            arg_source_paths: vec!["req.body.email".to_string(), "req.body".to_string()],
-            span_start: 10,
-            span_end: 20,
-            url_arg_literal: Some("https://api.example.com".to_string()),
-            url_shape: Some(SecurityUrlShape::FixedOriginDynamicPath),
-        };
-        let encoded = bitcode::encode(&site);
-        let decoded: SinkSite = bitcode::decode(&encoded).expect("decode sink site");
-        assert_eq!(decoded.sink_shape, site.sink_shape);
-        assert_eq!(decoded.callee_path, site.callee_path);
-        assert_eq!(decoded.arg_index, site.arg_index);
-        assert_eq!(decoded.arg_is_non_literal, site.arg_is_non_literal);
-        assert_eq!(decoded.arg_kind, site.arg_kind);
-        assert_eq!(decoded.arg_literal, site.arg_literal);
-        assert_eq!(decoded.object_properties, site.object_properties);
-        assert_eq!(decoded.object_property_keys, site.object_property_keys);
-        assert_eq!(
-            decoded.object_property_keys_complete,
-            site.object_property_keys_complete
-        );
-        assert_eq!(decoded.arg_idents, site.arg_idents);
-        assert_eq!(decoded.arg_source_paths, site.arg_source_paths);
-        assert_eq!(decoded.url_shape, site.url_shape);
-        assert_eq!(decoded.span(), site.span());
-    }
-
-    #[test]
-    fn line_offsets_single_line_no_newline() {
-        assert_eq!(compute_line_offsets("hello"), vec![0]);
-    }
-
-    #[test]
-    fn line_offsets_single_line_with_newline() {
-        assert_eq!(compute_line_offsets("hello\n"), vec![0, 6]);
-    }
-
-    #[test]
-    fn line_offsets_multiple_lines() {
-        assert_eq!(compute_line_offsets("abc\ndef\nghi"), vec![0, 4, 8]);
-    }
-
-    #[test]
-    fn line_offsets_trailing_newline() {
-        assert_eq!(compute_line_offsets("abc\ndef\n"), vec![0, 4, 8]);
-    }
-
-    #[test]
-    fn line_offsets_consecutive_newlines() {
-        assert_eq!(compute_line_offsets("\n\n\n"), vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn line_offsets_multibyte_utf8() {
-        assert_eq!(compute_line_offsets("á\n"), vec![0, 3]);
-    }
-
-    #[test]
-    fn line_col_offset_zero() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 0);
-        assert_eq!((line, col), (1, 0));
-    }
-
-    #[test]
-    fn line_col_middle_of_first_line() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 2);
-        assert_eq!((line, col), (1, 2));
-    }
-
-    #[test]
-    fn line_col_start_of_second_line() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 4);
-        assert_eq!((line, col), (2, 0));
-    }
-
-    #[test]
-    fn line_col_middle_of_second_line() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 5);
-        assert_eq!((line, col), (2, 1));
-    }
-
-    #[test]
-    fn line_col_start_of_third_line() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 8);
-        assert_eq!((line, col), (3, 0));
-    }
-
-    #[test]
-    fn line_col_end_of_file() {
-        let offsets = compute_line_offsets("abc\ndef\nghi");
-        let (line, col) = byte_offset_to_line_col(&offsets, 10);
-        assert_eq!((line, col), (3, 2));
-    }
-
-    #[test]
-    fn line_col_single_line() {
-        let offsets = compute_line_offsets("hello");
-        let (line, col) = byte_offset_to_line_col(&offsets, 3);
-        assert_eq!((line, col), (1, 3));
-    }
-
-    #[test]
-    fn line_col_at_newline_byte() {
-        let offsets = compute_line_offsets("abc\ndef");
-        let (line, col) = byte_offset_to_line_col(&offsets, 3);
-        assert_eq!((line, col), (1, 3));
-    }
-
-    #[test]
-    fn export_name_matches_str_named() {
-        let name = ExportName::Named("foo".to_string());
-        assert!(name.matches_str("foo"));
-        assert!(!name.matches_str("bar"));
-        assert!(!name.matches_str("default"));
-    }
-
-    #[test]
-    fn export_name_matches_str_default() {
-        let name = ExportName::Default;
-        assert!(name.matches_str("default"));
-        assert!(!name.matches_str("foo"));
-    }
-
-    #[test]
-    fn export_name_display_named() {
-        let name = ExportName::Named("myExport".to_string());
-        assert_eq!(name.to_string(), "myExport");
-    }
-
-    #[test]
-    fn export_name_display_default() {
-        let name = ExportName::Default;
-        assert_eq!(name.to_string(), "default");
-    }
-
-    #[test]
-    fn export_name_equality_named() {
-        let a = ExportName::Named("foo".to_string());
-        let b = ExportName::Named("foo".to_string());
-        let c = ExportName::Named("bar".to_string());
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn export_name_equality_default() {
-        let a = ExportName::Default;
-        let b = ExportName::Default;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn export_name_named_not_equal_to_default() {
-        let named = ExportName::Named("default".to_string());
-        let default = ExportName::Default;
-        assert_ne!(named, default);
-    }
-
-    #[test]
-    fn export_name_hash_consistency() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
-        ExportName::Named("foo".to_string()).hash(&mut h1);
-        ExportName::Named("foo".to_string()).hash(&mut h2);
-        assert_eq!(h1.finish(), h2.finish());
-    }
-
-    #[test]
-    fn export_name_matches_str_empty_string() {
-        let name = ExportName::Named(String::new());
-        assert!(name.matches_str(""));
-        assert!(!name.matches_str("foo"));
-    }
-
-    #[test]
-    fn export_name_default_does_not_match_empty() {
-        let name = ExportName::Default;
-        assert!(!name.matches_str(""));
-    }
-
-    #[test]
-    fn imported_name_equality() {
-        assert_eq!(
-            ImportedName::Named("foo".to_string()),
-            ImportedName::Named("foo".to_string())
-        );
-        assert_ne!(
-            ImportedName::Named("foo".to_string()),
-            ImportedName::Named("bar".to_string())
-        );
-        assert_eq!(ImportedName::Default, ImportedName::Default);
-        assert_eq!(ImportedName::Namespace, ImportedName::Namespace);
-        assert_eq!(ImportedName::SideEffect, ImportedName::SideEffect);
-        assert_ne!(ImportedName::Default, ImportedName::Namespace);
-        assert_ne!(
-            ImportedName::Named("default".to_string()),
-            ImportedName::Default
-        );
-    }
-
-    #[test]
-    fn member_kind_equality() {
-        assert_eq!(MemberKind::EnumMember, MemberKind::EnumMember);
-        assert_eq!(MemberKind::ClassMethod, MemberKind::ClassMethod);
-        assert_eq!(MemberKind::ClassProperty, MemberKind::ClassProperty);
-        assert_eq!(MemberKind::NamespaceMember, MemberKind::NamespaceMember);
-        assert_ne!(MemberKind::EnumMember, MemberKind::ClassMethod);
-        assert_ne!(MemberKind::ClassMethod, MemberKind::ClassProperty);
-        assert_ne!(MemberKind::NamespaceMember, MemberKind::EnumMember);
-    }
-
-    #[test]
-    fn member_kind_bitcode_roundtrip() {
-        let kinds = [
-            MemberKind::EnumMember,
-            MemberKind::ClassMethod,
-            MemberKind::ClassProperty,
-            MemberKind::NamespaceMember,
-        ];
-        for kind in &kinds {
-            let bytes = bitcode::encode(kind);
-            let decoded: MemberKind = bitcode::decode(&bytes).unwrap();
-            assert_eq!(&decoded, kind);
-        }
-    }
-
-    #[test]
-    fn member_access_bitcode_roundtrip() {
-        let access = MemberAccess {
-            object: "Status".to_string(),
-            member: "Active".to_string(),
-        };
-        let bytes = bitcode::encode(&access);
-        let decoded: MemberAccess = bitcode::decode(&bytes).unwrap();
-        assert_eq!(decoded.object, "Status");
-        assert_eq!(decoded.member, "Active");
-    }
-
-    #[test]
-    fn line_offsets_crlf_only_counts_lf() {
-        let offsets = compute_line_offsets("ab\r\ncd");
-        assert_eq!(offsets, vec![0, 4]);
-    }
-
-    #[test]
-    fn line_col_empty_file_offset_zero() {
-        let offsets = compute_line_offsets("");
-        let (line, col) = byte_offset_to_line_col(&offsets, 0);
-        assert_eq!((line, col), (1, 0));
-    }
-
-    // --- VisibilityTag ---
-
-    #[test]
-    fn visibility_tag_default_is_none_variant() {
-        assert_eq!(VisibilityTag::default(), VisibilityTag::None);
-    }
-
-    #[test]
-    fn visibility_tag_is_none_only_for_none_variant() {
-        assert!(VisibilityTag::None.is_none());
-        assert!(!VisibilityTag::Public.is_none());
-        assert!(!VisibilityTag::Internal.is_none());
-        assert!(!VisibilityTag::Beta.is_none());
-        assert!(!VisibilityTag::Alpha.is_none());
-        assert!(!VisibilityTag::ExpectedUnused.is_none());
-    }
-
-    #[test]
-    fn visibility_tag_suppresses_unused_for_api_tags() {
-        assert!(VisibilityTag::Public.suppresses_unused());
-        assert!(VisibilityTag::Internal.suppresses_unused());
-        assert!(VisibilityTag::Beta.suppresses_unused());
-        assert!(VisibilityTag::Alpha.suppresses_unused());
-    }
-
-    #[test]
-    fn visibility_tag_does_not_suppress_none_or_expected_unused() {
-        assert!(!VisibilityTag::None.suppresses_unused());
-        assert!(!VisibilityTag::ExpectedUnused.suppresses_unused());
-    }
-
-    // --- is_public_env_path ---
-
-    #[test]
-    fn is_public_env_path_process_env_public_prefix() {
-        assert!(is_public_env_path("process.env.NEXT_PUBLIC_API_URL"));
-        assert!(is_public_env_path("process.env.VITE_APP_KEY"));
-        assert!(is_public_env_path("process.env.REACT_APP_TITLE"));
-        assert!(is_public_env_path("process.env.NODE_ENV"));
-    }
-
-    #[test]
-    fn is_public_env_path_import_meta_env_public_prefix() {
-        assert!(is_public_env_path("import.meta.env.VITE_BASE_URL"));
-        assert!(is_public_env_path("import.meta.env.PUBLIC_API"));
-    }
-
-    #[test]
-    fn is_public_env_path_secret_env_vars_are_not_public() {
-        assert!(!is_public_env_path("process.env.SECRET_KEY"));
-        assert!(!is_public_env_path("process.env.DATABASE_PASSWORD"));
-        assert!(!is_public_env_path("import.meta.env.API_TOKEN"));
-    }
-
-    #[test]
-    fn is_public_env_path_non_env_paths_are_not_public() {
-        assert!(!is_public_env_path("req.query.id"));
-        assert!(!is_public_env_path("process.argv"));
-        assert!(!is_public_env_path("window.location.href"));
-    }
-
-    // --- is_public_env_var edge cases ---
-
-    #[test]
-    fn is_public_env_var_exact_matches() {
-        assert!(is_public_env_var("NODE_ENV"));
-    }
-
-    #[test]
-    fn is_public_env_var_all_known_prefixes() {
-        assert!(is_public_env_var("NUXT_PUBLIC_API_URL"));
-        assert!(is_public_env_var("PUBLIC_API_KEY"));
-        assert!(is_public_env_var("GATSBY_APP_ID"));
-        assert!(is_public_env_var("EXPO_PUBLIC_SENTRY_DSN"));
-        assert!(is_public_env_var("STORYBOOK_ENV"));
-    }
-
-    #[test]
-    fn is_public_env_var_secret_token_beats_metadata_token() {
-        // "SECRET_SHA": has SECRET (wins) and SHA (metadata); should NOT be public
-        assert!(!is_public_env_var("SECRET_SHA"));
-        // "REF_TOKEN": has TOKEN (secret) and REF (metadata); should NOT be public
-        assert!(!is_public_env_var("REF_TOKEN"));
-    }
-
-    #[test]
-    fn is_public_env_var_plain_unknown_names_are_not_public() {
-        assert!(!is_public_env_var("MY_SERVICE_URL"));
-        assert!(!is_public_env_var("FEATURE_FLAG"));
-        assert!(!is_public_env_var("DATABASE_URL"));
-    }
-
-    // --- SinkSite::span ---
-
-    #[test]
-    fn sink_site_span_reconstructs_from_offsets() {
-        let site = SinkSite {
-            sink_shape: SinkShape::Call,
-            callee_path: "eval".to_string(),
-            arg_index: 0,
-            arg_is_non_literal: true,
-            arg_kind: SinkArgKind::Other,
-            arg_literal: None,
-            regex_pattern: None,
-            object_properties: Vec::new(),
-            object_property_keys: Vec::new(),
-            object_property_keys_complete: false,
-            arg_idents: Vec::new(),
-            arg_source_paths: Vec::new(),
-            span_start: 5,
-            span_end: 15,
-            url_arg_literal: None,
-            url_shape: None,
-        };
-        let s = site.span();
-        assert_eq!(s.start, 5);
-        assert_eq!(s.end, 15);
-    }
-
-    // --- SecurityControlKind ---
-
-    #[test]
-    fn security_control_kind_equality_and_ordering() {
-        assert_eq!(
-            SecurityControlKind::Sanitization,
-            SecurityControlKind::Sanitization
-        );
-        assert_eq!(
-            SecurityControlKind::Validation,
-            SecurityControlKind::Validation
-        );
-        assert_ne!(
-            SecurityControlKind::Sanitization,
-            SecurityControlKind::Validation
-        );
-        assert!(SecurityControlKind::Sanitization < SecurityControlKind::Validation);
-        assert!(SecurityControlKind::Authentication < SecurityControlKind::Authorization);
-    }
-
-    // --- SanitizerScope ---
-
-    #[test]
-    fn sanitizer_scope_equality_and_ordering() {
-        assert_eq!(SanitizerScope::Html, SanitizerScope::Html);
-        assert_eq!(SanitizerScope::Url, SanitizerScope::Url);
-        assert_eq!(SanitizerScope::Path, SanitizerScope::Path);
-        assert_eq!(SanitizerScope::SqlIdentifier, SanitizerScope::SqlIdentifier);
-        assert_ne!(SanitizerScope::Html, SanitizerScope::Url);
-        assert!(SanitizerScope::Html < SanitizerScope::Url);
-    }
-
-    // --- SkippedSecurityCalleeReason ---
-
-    #[test]
-    fn skipped_security_callee_reason_equality() {
-        assert_eq!(
-            SkippedSecurityCalleeReason::ComputedMember,
-            SkippedSecurityCalleeReason::ComputedMember
-        );
-        assert_ne!(
-            SkippedSecurityCalleeReason::ComputedMember,
-            SkippedSecurityCalleeReason::DynamicDispatch
-        );
-        assert_ne!(
-            SkippedSecurityCalleeReason::DynamicDispatch,
-            SkippedSecurityCalleeReason::UnsupportedAssignmentObject
-        );
-    }
-
-    // --- SkippedSecurityCalleeExpressionKind ---
-
-    #[test]
-    fn skipped_security_callee_expression_kind_equality() {
-        use SkippedSecurityCalleeExpressionKind as K;
-        assert_eq!(K::StaticMemberExpression, K::StaticMemberExpression);
-        assert_eq!(K::ComputedMemberExpression, K::ComputedMemberExpression);
-        assert_eq!(K::Identifier, K::Identifier);
-        assert_eq!(K::Other, K::Other);
-        assert_ne!(K::StaticMemberExpression, K::ComputedMemberExpression);
-        assert_ne!(K::Identifier, K::Other);
-    }
-
-    // --- SinkLiteralValue ---
-
-    #[test]
-    fn sink_literal_value_equality() {
-        assert_eq!(
-            SinkLiteralValue::String("x".to_string()),
-            SinkLiteralValue::String("x".to_string())
-        );
-        assert_ne!(
-            SinkLiteralValue::String("x".to_string()),
-            SinkLiteralValue::String("y".to_string())
-        );
-        assert_eq!(SinkLiteralValue::Integer(42), SinkLiteralValue::Integer(42));
-        assert_ne!(SinkLiteralValue::Integer(1), SinkLiteralValue::Integer(2));
-        assert_eq!(
-            SinkLiteralValue::Boolean(true),
-            SinkLiteralValue::Boolean(true)
-        );
-        assert_ne!(
-            SinkLiteralValue::Boolean(true),
-            SinkLiteralValue::Boolean(false)
-        );
-        assert_eq!(SinkLiteralValue::Null, SinkLiteralValue::Null);
-        assert_ne!(SinkLiteralValue::Null, SinkLiteralValue::Boolean(false));
-    }
-
-    // --- SecurityUrlShape ---
-
-    #[test]
-    fn security_url_shape_equality() {
-        assert_eq!(
-            SecurityUrlShape::FixedOriginDynamicPath,
-            SecurityUrlShape::FixedOriginDynamicPath
-        );
-        assert_eq!(
-            SecurityUrlShape::DynamicOrigin,
-            SecurityUrlShape::DynamicOrigin
-        );
-        assert_ne!(
-            SecurityUrlShape::FixedOriginDynamicPath,
-            SecurityUrlShape::DynamicOrigin
-        );
-    }
-
-    // --- FlagUseKind ---
-
-    #[test]
-    fn flag_use_kind_equality() {
-        assert_eq!(FlagUseKind::EnvVar, FlagUseKind::EnvVar);
-        assert_eq!(FlagUseKind::SdkCall, FlagUseKind::SdkCall);
-        assert_eq!(FlagUseKind::ConfigObject, FlagUseKind::ConfigObject);
-        assert_ne!(FlagUseKind::EnvVar, FlagUseKind::SdkCall);
-        assert_ne!(FlagUseKind::SdkCall, FlagUseKind::ConfigObject);
-    }
-
-    // --- ComplexityMetric ---
-
-    #[test]
-    fn complexity_metric_equality() {
-        assert_eq!(ComplexityMetric::Cyclomatic, ComplexityMetric::Cyclomatic);
-        assert_eq!(ComplexityMetric::Cognitive, ComplexityMetric::Cognitive);
-        assert_ne!(ComplexityMetric::Cyclomatic, ComplexityMetric::Cognitive);
-    }
-
-    // --- ComplexityContributionKind ---
-
-    #[test]
-    fn complexity_contribution_kind_equality_spot_check() {
-        use ComplexityContributionKind as K;
-        assert_eq!(K::If, K::If);
-        assert_eq!(K::Else, K::Else);
-        assert_eq!(K::ElseIf, K::ElseIf);
-        assert_eq!(K::Ternary, K::Ternary);
-        assert_eq!(K::LogicalAnd, K::LogicalAnd);
-        assert_eq!(K::LogicalOr, K::LogicalOr);
-        assert_eq!(K::NullishCoalescing, K::NullishCoalescing);
-        assert_eq!(K::LogicalAssignment, K::LogicalAssignment);
-        assert_eq!(K::OptionalChain, K::OptionalChain);
-        assert_eq!(K::For, K::For);
-        assert_eq!(K::ForIn, K::ForIn);
-        assert_eq!(K::ForOf, K::ForOf);
-        assert_eq!(K::While, K::While);
-        assert_eq!(K::DoWhile, K::DoWhile);
-        assert_eq!(K::Switch, K::Switch);
-        assert_eq!(K::Case, K::Case);
-        assert_eq!(K::Catch, K::Catch);
-        assert_eq!(K::LabeledBreak, K::LabeledBreak);
-        assert_eq!(K::LabeledContinue, K::LabeledContinue);
-        assert_eq!(K::JsxDepth, K::JsxDepth);
-        assert_eq!(K::HookDensity, K::HookDensity);
-        assert_eq!(K::PropCount, K::PropCount);
-        assert_eq!(K::Await, K::Await);
-        assert_eq!(K::Then, K::Then);
-        assert_ne!(K::If, K::Else);
-        assert_ne!(K::For, K::While);
-        assert_ne!(K::Switch, K::Case);
-    }
-
-    // --- MisplacedDirectiveSite ---
-
-    #[test]
-    fn misplaced_directive_site_equality() {
-        let client = MisplacedDirectiveSite {
-            is_server: false,
-            span_start: 10,
-        };
-        let server = MisplacedDirectiveSite {
-            is_server: true,
-            span_start: 10,
-        };
-        let client2 = MisplacedDirectiveSite {
-            is_server: false,
-            span_start: 10,
-        };
-        assert_eq!(client, client2);
-        assert_ne!(client, server);
-    }
-
-    #[test]
-    fn misplaced_directive_site_is_server_flag() {
-        let site = MisplacedDirectiveSite {
-            is_server: true,
-            span_start: 42,
-        };
-        assert!(site.is_server);
-        assert_eq!(site.span_start, 42);
-
-        let client_site = MisplacedDirectiveSite {
-            is_server: false,
-            span_start: 0,
-        };
-        assert!(!client_site.is_server);
-    }
-
-    // --- DiRole / DiFramework ---
-
-    #[test]
-    fn di_role_equality() {
-        assert_eq!(DiRole::Provide, DiRole::Provide);
-        assert_eq!(DiRole::Inject, DiRole::Inject);
-        assert_ne!(DiRole::Provide, DiRole::Inject);
-    }
-
-    #[test]
-    fn di_framework_equality() {
-        assert_eq!(DiFramework::Vue, DiFramework::Vue);
-        assert_eq!(DiFramework::Svelte, DiFramework::Svelte);
-        assert_eq!(DiFramework::Angular, DiFramework::Angular);
-        assert_ne!(DiFramework::Vue, DiFramework::Svelte);
-        assert_ne!(DiFramework::Svelte, DiFramework::Angular);
-    }
-
-    // --- ComponentEmit ---
-
-    #[test]
-    fn component_emit_equality() {
-        let a = ComponentEmit {
-            name: "close".to_string(),
-            span_start: 10,
-            used: true,
-        };
-        let b = ComponentEmit {
-            name: "close".to_string(),
-            span_start: 10,
-            used: true,
-        };
-        let different_used = ComponentEmit {
-            name: "close".to_string(),
-            span_start: 10,
-            used: false,
-        };
-        let different_name = ComponentEmit {
-            name: "open".to_string(),
-            span_start: 10,
-            used: true,
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, different_used);
-        assert_ne!(a, different_name);
-    }
-
-    // --- DispatchedEvent ---
-
-    #[test]
-    fn dispatched_event_equality() {
-        let a = DispatchedEvent {
-            name: "myEvent".to_string(),
-            span_start: 20,
-        };
-        let b = DispatchedEvent {
-            name: "myEvent".to_string(),
-            span_start: 20,
-        };
-        let c = DispatchedEvent {
-            name: "otherEvent".to_string(),
-            span_start: 20,
-        };
-        let d = DispatchedEvent {
-            name: "myEvent".to_string(),
-            span_start: 99,
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(a, d);
-    }
-
-    // --- AngularInputMember / AngularOutputMember ---
-
-    #[test]
-    fn angular_input_member_equality() {
-        let a = AngularInputMember {
-            name: "title".to_string(),
-            span_start: 5,
-        };
-        let b = AngularInputMember {
-            name: "title".to_string(),
-            span_start: 5,
-        };
-        let c = AngularInputMember {
-            name: "label".to_string(),
-            span_start: 5,
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn angular_output_member_equality() {
-        let a = AngularOutputMember {
-            name: "clicked".to_string(),
-            span_start: 8,
-        };
-        let b = AngularOutputMember {
-            name: "clicked".to_string(),
-            span_start: 8,
-        };
-        let c = AngularOutputMember {
-            name: "hovered".to_string(),
-            span_start: 8,
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    // --- AngularComponentSelector ---
-
-    #[test]
-    fn angular_component_selector_fields() {
-        let s = AngularComponentSelector {
-            selectors: vec!["app-foo".to_string(), "[appFoo]".to_string()],
-            span_start: 100,
-            class_name: "FooComponent".to_string(),
-        };
-        assert_eq!(s.selectors.len(), 2);
-        assert_eq!(s.selectors[0], "app-foo");
-        assert_eq!(s.selectors[1], "[appFoo]");
-        assert_eq!(s.class_name, "FooComponent");
-    }
-
-    #[test]
-    fn angular_component_selector_equality() {
-        let a = AngularComponentSelector {
-            selectors: vec!["app-bar".to_string()],
-            span_start: 0,
-            class_name: "BarComponent".to_string(),
-        };
-        let b = AngularComponentSelector {
-            selectors: vec!["app-bar".to_string()],
-            span_start: 0,
-            class_name: "BarComponent".to_string(),
-        };
-        let c = AngularComponentSelector {
-            selectors: vec!["app-baz".to_string()],
-            span_start: 0,
-            class_name: "BazComponent".to_string(),
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    // --- LoadReturnKey ---
-
-    #[test]
-    fn load_return_key_equality() {
-        let a = LoadReturnKey {
-            name: "user".to_string(),
-            span_start: 50,
-            span_end: 54,
-        };
-        let b = LoadReturnKey {
-            name: "user".to_string(),
-            span_start: 50,
-            span_end: 54,
-        };
-        let c = LoadReturnKey {
-            name: "posts".to_string(),
-            span_start: 50,
-            span_end: 55,
-        };
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn load_return_key_span_fields() {
-        let key = LoadReturnKey {
-            name: "data".to_string(),
-            span_start: 10,
-            span_end: 14,
-        };
-        assert_eq!(key.span_start, 10);
-        assert_eq!(key.span_end, 14);
-        assert_eq!(key.name, "data");
-    }
-
-    // --- ComponentFunctionKind ---
-
-    #[test]
-    fn component_function_kind_equality() {
-        assert_eq!(ComponentFunctionKind::FnDecl, ComponentFunctionKind::FnDecl);
-        assert_eq!(ComponentFunctionKind::Arrow, ComponentFunctionKind::Arrow);
-        assert_eq!(
-            ComponentFunctionKind::ForwardRefWrapper,
-            ComponentFunctionKind::ForwardRefWrapper
-        );
-        assert_eq!(
-            ComponentFunctionKind::MemoWrapper,
-            ComponentFunctionKind::MemoWrapper
-        );
-        assert_ne!(ComponentFunctionKind::FnDecl, ComponentFunctionKind::Arrow);
-        assert_ne!(
-            ComponentFunctionKind::ForwardRefWrapper,
-            ComponentFunctionKind::MemoWrapper
-        );
-    }
-
-    // --- HookUseKind ---
-
-    #[test]
-    fn hook_use_kind_equality() {
-        assert_eq!(HookUseKind::UseState, HookUseKind::UseState);
-        assert_eq!(HookUseKind::UseEffect, HookUseKind::UseEffect);
-        assert_eq!(HookUseKind::UseMemo, HookUseKind::UseMemo);
-        assert_eq!(HookUseKind::UseCallback, HookUseKind::UseCallback);
-        assert_eq!(HookUseKind::Custom, HookUseKind::Custom);
-        assert_ne!(HookUseKind::UseState, HookUseKind::UseEffect);
-        assert_ne!(HookUseKind::UseMemo, HookUseKind::Custom);
-    }
-
-    // --- HookUse ---
-
-    #[test]
-    fn hook_use_fields() {
-        let h = HookUse {
-            kind: HookUseKind::UseEffect,
-            dep_array_arity: Some(2),
-            span_start: 30,
-            component: "Widget".to_string(),
-        };
-        assert_eq!(h.kind, HookUseKind::UseEffect);
-        assert_eq!(h.dep_array_arity, Some(2));
-        assert_eq!(h.span_start, 30);
-        assert_eq!(h.component, "Widget");
-    }
-
-    #[test]
-    fn hook_use_no_dep_array() {
-        let h = HookUse {
-            kind: HookUseKind::UseCallback,
-            dep_array_arity: None,
-            span_start: 0,
-            component: String::new(),
-        };
-        assert!(h.dep_array_arity.is_none());
-    }
-
-    // --- MemberKind::StoreMember (missed in existing bitcode test) ---
-
-    #[test]
-    fn member_kind_store_member_bitcode_roundtrip() {
-        let kind = MemberKind::StoreMember;
-        let bytes = bitcode::encode(&kind);
-        let decoded: MemberKind = bitcode::decode(&bytes).unwrap();
-        assert_eq!(decoded, kind);
-    }
-
-    // --- RenderEdge / ForwardAttr ---
-
-    #[test]
-    fn render_edge_fields() {
-        let edge = RenderEdge {
-            parent_component: "Parent".to_string(),
-            child_component_name: "Child".to_string(),
-            attr_names: vec!["title".to_string(), "onClick".to_string()],
-            has_spread: false,
-            forward_attrs: vec![ForwardAttr {
-                attr: "title".to_string(),
-                root: "props".to_string(),
-            }],
-            has_complex_forward: false,
-        };
-        assert_eq!(edge.parent_component, "Parent");
-        assert_eq!(edge.child_component_name, "Child");
-        assert_eq!(edge.attr_names.len(), 2);
-        assert!(!edge.has_spread);
-        assert_eq!(edge.forward_attrs.len(), 1);
-        assert_eq!(edge.forward_attrs[0].attr, "title");
-        assert_eq!(edge.forward_attrs[0].root, "props");
-        assert!(!edge.has_complex_forward);
-    }
-
-    #[test]
-    fn render_edge_with_spread() {
-        let edge = RenderEdge {
-            parent_component: "Wrapper".to_string(),
-            child_component_name: "Inner".to_string(),
-            attr_names: Vec::new(),
-            has_spread: true,
-            forward_attrs: Vec::new(),
-            has_complex_forward: true,
-        };
-        assert!(edge.has_spread);
-        assert!(edge.has_complex_forward);
-    }
-
-    // --- ComponentFunction ---
-
-    #[test]
-    fn component_function_fields() {
-        let cf = ComponentFunction {
-            name: "MyButton".to_string(),
-            span_start: 0,
-            kind: ComponentFunctionKind::Arrow,
-            is_exported: true,
-            has_unharvestable_props: false,
-            uses_clone_element: false,
-            renders_provider: false,
-            has_children_as_function: false,
-            is_pure_passthrough: false,
-        };
-        assert_eq!(cf.name, "MyButton");
-        assert_eq!(cf.kind, ComponentFunctionKind::Arrow);
-        assert!(cf.is_exported);
-        assert!(!cf.has_unharvestable_props);
-        assert!(!cf.is_pure_passthrough);
-    }
-
-    #[test]
-    fn component_function_passthrough_flag() {
-        let cf = ComponentFunction {
-            name: "Passthrough".to_string(),
-            span_start: 5,
-            kind: ComponentFunctionKind::FnDecl,
-            is_exported: false,
-            has_unharvestable_props: false,
-            uses_clone_element: false,
-            renders_provider: false,
-            has_children_as_function: false,
-            is_pure_passthrough: true,
-        };
-        assert!(cf.is_pure_passthrough);
-        assert!(!cf.is_exported);
-    }
-
-    // --- DiKeySite ---
-
-    #[test]
-    fn di_key_site_fields() {
-        let site = DiKeySite {
-            key_local: "MY_KEY".to_string(),
-            role: DiRole::Provide,
-            framework: DiFramework::Vue,
-            span_start: 77,
-        };
-        assert_eq!(site.key_local, "MY_KEY");
-        assert_eq!(site.role, DiRole::Provide);
-        assert_eq!(site.framework, DiFramework::Vue);
-        assert_eq!(site.span_start, 77);
-    }
-
-    #[test]
-    fn di_key_site_inject_svelte() {
-        let site = DiKeySite {
-            key_local: "ctx_key".to_string(),
-            role: DiRole::Inject,
-            framework: DiFramework::Svelte,
-            span_start: 0,
-        };
-        assert_eq!(site.role, DiRole::Inject);
-        assert_eq!(site.framework, DiFramework::Svelte);
-    }
-
-    // --- release_resolution_payload: page data store whole-use derivation ---
-
-    #[test]
-    fn release_payload_derives_page_data_store_whole_use_from_page_data() {
-        let mut m = minimal_module_info();
-        m.whole_object_uses = vec!["page.data".to_string()].into();
-        m.release_resolution_payload();
-        assert!(m.has_page_data_store_whole_use);
-    }
-
-    #[test]
-    fn release_payload_derives_page_data_store_whole_use_from_dollar_page_data() {
-        let mut m = minimal_module_info();
-        m.whole_object_uses = vec!["$page.data".to_string()].into();
-        m.release_resolution_payload();
-        assert!(m.has_page_data_store_whole_use);
-    }
-
-    #[test]
-    fn release_payload_does_not_set_page_data_store_whole_use_for_other_names() {
-        let mut m = minimal_module_info();
-        m.whole_object_uses = vec!["data".to_string(), "page".to_string()].into();
-        m.release_resolution_payload();
-        assert!(!m.has_page_data_store_whole_use);
-    }
-
-    #[test]
-    fn release_payload_derives_route_loader_data_whole_use() {
-        let mut m = minimal_module_info();
-        m.whole_object_uses = vec!["$fallow.routeLoaderData".to_string()].into();
-        m.release_resolution_payload();
-        assert!(m.has_route_loader_data_whole_use);
-    }
-
-    // --- release_resolution_payload: referenced_import_bindings derivation ---
-
-    #[test]
-    fn release_payload_referenced_bindings_excludes_empty_local_names() {
-        let mut m = minimal_module_info();
-        m.imports = vec![
-            ImportInfo {
-                source: "./styles.css".to_string(),
-                imported_name: ImportedName::SideEffect,
-                local_name: String::new(), // empty = side-effect import
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: true,
-                span: span(),
-                source_span: span(),
-            },
-            ImportInfo {
-                source: "react".to_string(),
-                imported_name: ImportedName::Default,
-                local_name: "React".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: span(),
-                source_span: span(),
-            },
-        ];
-        m.unused_import_bindings = vec!["React".to_string()];
-        m.release_resolution_payload();
-        // "React" was unused, empty local is filtered; result should be empty
-        assert!(m.referenced_import_bindings.is_empty());
-    }
-
-    #[test]
-    fn release_payload_referenced_bindings_sorted_and_deduped() {
-        let mut m = minimal_module_info();
-        // Two imports with the same local name (unusual but possible via re-exports)
-        m.imports = vec![
-            ImportInfo {
-                source: "a".to_string(),
-                imported_name: ImportedName::Named("foo".to_string()),
-                local_name: "foo".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: span(),
-                source_span: span(),
-            },
-            ImportInfo {
-                source: "b".to_string(),
-                imported_name: ImportedName::Named("bar".to_string()),
-                local_name: "bar".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: span(),
-                source_span: span(),
-            },
-            ImportInfo {
-                source: "c".to_string(),
-                imported_name: ImportedName::Named("foo".to_string()),
-                local_name: "foo".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: span(),
-                source_span: span(),
-            },
-        ];
-        m.unused_import_bindings = Vec::new();
-        m.release_resolution_payload();
-        // sorted: ["bar", "foo"] with "foo" deduped
-        assert_eq!(
-            m.referenced_import_bindings,
-            vec!["bar".to_string(), "foo".to_string()]
-        );
-    }
-
-    // --- CalleeUse ---
-
-    #[test]
-    fn callee_use_fields() {
-        let cu = CalleeUse {
-            callee_path: "child_process.exec".to_string(),
-            span_start: 100,
-        };
-        assert_eq!(cu.callee_path, "child_process.exec");
-        assert_eq!(cu.span_start, 100);
-    }
-
-    // --- Helper to build a minimal ModuleInfo for targeted tests ---
-
-    fn minimal_module_info() -> ModuleInfo {
-        ModuleInfo::empty(FileId(0))
-    }
-
-    fn push_semantic_fact(module: &mut ModuleInfo, fact: SemanticFact) {
-        let mut facts = std::mem::take(&mut module.semantic_facts).to_vec();
-        facts.push(fact);
-        module.semantic_facts = facts.into();
-    }
-
-    #[test]
-    fn dynamic_custom_element_render_helper_prefers_typed_fact() {
-        let mut module = minimal_module_info();
-        push_semantic_fact(
-            &mut module,
-            SemanticFact::DynamicCustomElementRender(DynamicCustomElementRenderFact),
-        );
-
-        assert!(has_dynamic_custom_element_render(&module));
-    }
-
-    #[test]
-    fn function_complexity_bitcode_roundtrip() {
-        let fc = FunctionComplexity {
-            name: "processData".to_string(),
-            is_private_member: true,
-            line: 42,
-            col: 4,
-            cyclomatic: 15,
-            cognitive: 25,
-            line_count: 80,
-            param_count: 3,
-            react_hook_count: 0,
-            react_jsx_max_depth: 0,
-            react_prop_count: 0,
-            source_hash: Some("0123456789abcdef".to_string()),
-            contributions: vec![
-                ComplexityContribution {
-                    line: 43,
-                    col: 8,
-                    metric: ComplexityMetric::Cyclomatic,
-                    kind: ComplexityContributionKind::If,
-                    weight: 1,
-                    nesting: 0,
-                },
-                ComplexityContribution {
-                    line: 45,
-                    col: 12,
-                    metric: ComplexityMetric::Cognitive,
-                    kind: ComplexityContributionKind::ElseIf,
-                    weight: 3,
-                    nesting: 2,
-                },
-            ],
-        };
-        let bytes = bitcode::encode(&fc);
-        let decoded: FunctionComplexity = bitcode::decode(&bytes).unwrap();
-        assert_eq!(decoded.name, "processData");
-        assert!(decoded.is_private_member);
-        assert_eq!(decoded.line, 42);
-        assert_eq!(decoded.col, 4);
-        assert_eq!(decoded.cyclomatic, 15);
-        assert_eq!(decoded.cognitive, 25);
-        assert_eq!(decoded.line_count, 80);
-        assert_eq!(decoded.source_hash.as_deref(), Some("0123456789abcdef"));
-        assert_eq!(decoded.contributions.len(), 2);
-        assert_eq!(
-            decoded.contributions[1].kind,
-            ComplexityContributionKind::ElseIf
-        );
-        assert_eq!(decoded.contributions[1].weight, 3);
-        assert_eq!(decoded.contributions[1].nesting, 2);
-        assert_eq!(decoded.contributions[1].metric, ComplexityMetric::Cognitive);
-    }
+#[path = "extract_tests.rs"]
+mod tests;
+
+/// Framework owning a statically extracted component contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub enum ComponentFramework {
+    /// React JSX.
+    React,
+    /// Preact JSX.
+    Preact,
+    /// Solid JSX.
+    Solid,
+    /// Qwik JSX.
+    Qwik,
+    /// Vue and Nuxt single-file components.
+    Vue,
+    /// Svelte components.
+    Svelte,
+    /// Astro components.
+    Astro,
+    /// Angular components and directives.
+    Angular,
+    /// Lit custom elements.
+    Lit,
+    /// Ember and Glimmer components.
+    Ember,
+}
+
+/// Stable component binding identity, independent of transient parser symbols.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, bitcode::Encode, bitcode::Decode)]
+pub enum ComponentReference {
+    /// A same-module declaration, including resolved immutable local aliases.
+    Local {
+        /// Declaration binding name.
+        name: String,
+        /// Start byte of the declaration binding.
+        span_start: u32,
+    },
+    /// An import binding. Analysis resolves its effective export via the graph.
+    Import {
+        /// Local name of the actual import binding, never a shadowing identifier.
+        local: String,
+        /// Start byte of the import binding declaration.
+        span_start: u32,
+    },
+    /// A direct member of a proven namespace import.
+    NamespaceMember {
+        /// Local namespace import binding name.
+        local: String,
+        /// Namespace import binding byte anchor.
+        span_start: u32,
+        /// Effective value export requested by the member access.
+        member: String,
+    },
+    /// A statically registered Angular selector or custom-element tag.
+    Selector(String),
+    /// Dynamic or unsupported component identity.
+    Unknown,
+}
+
+/// A declared public input, kept distinct from legacy unused-prop facts.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentPropDeclaration {
+    /// Component declaration name. Empty denotes the sole SFC default export.
+    pub component: String,
+    /// Stable declaration binding byte anchor.
+    pub component_span: u32,
+    /// Public input name.
+    pub name: String,
+    /// Local binding name used by destructured template reads.
+    pub local: String,
+    /// Additional public attribute names supplying the same input.
+    pub aliases: Vec<String>,
+    /// Declaration byte anchor in the original source.
+    pub span_start: u32,
+    /// Whether the declaration explicitly permits omission.
+    pub optional: bool,
+    /// Whether omission has a syntactically declared default value.
+    pub has_default: bool,
+    /// Whether the input is consumed within the component.
+    pub is_used: bool,
+    /// Producer framework.
+    pub framework: ComponentFramework,
+    /// Unsupported declarations, forwarding, or open consumers prohibit absence claims.
+    pub incomplete: bool,
+}
+
+/// One inspected render invocation and its supplied input names.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentInvocation {
+    /// Binding or selector used by the invocation.
+    pub target: ComponentReference,
+    /// Original source byte anchor of the opening tag or call.
+    pub span_start: u32,
+    /// Supplied names, independent of values and including proven spread keys.
+    pub supplied: Vec<String>,
+    /// Case-sensitive Lit JavaScript property bindings, distinct from HTML attributes.
+    pub supplied_properties: Vec<String>,
+    /// A spread or dynamic attribute may supply additional names.
+    pub unknown_props: bool,
+    /// Framework syntax of this caller.
+    pub framework: ComponentFramework,
+}
+
+/// Persisted syntactic Effect evidence for one module.
+///
+/// The layer keys, their `dependencies` and `layer_root_keys` use one
+/// format: a plain binding name (`FooLive`) or a class static member
+/// (`FooService.layer`). Import aliases resolve to the imported name, and a
+/// namespace member (`Ns.FooLive`) resolves to the member name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct EffectFacts {
+    /// Module-scope classes that extend a tagged error constructor.
+    pub tagged_errors: Vec<EffectTaggedError>,
+    /// `catchTag("X")` arguments and `catchTags({ X })` keys.
+    pub caught_tags: Vec<EffectCaughtTag>,
+    /// Tags written as an object literal `_tag: "X"` property.
+    pub literal_tags: Vec<String>,
+    /// Layer definitions: module-scope consts and class static properties.
+    pub layers: Vec<EffectLayer>,
+    /// Keys that a value reference outside every layer definition reads.
+    pub layer_root_keys: Vec<String>,
+}
+
+/// A module-scope class that extends a tagged error constructor.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct EffectTaggedError {
+    /// Class binding name.
+    pub name: String,
+    /// The `_tag` string literal.
+    pub tag: String,
+    /// Byte offset of the class name.
+    pub span_start: u32,
+    /// The class is exported from its module.
+    pub exported: bool,
+    /// The module reads the class as a value outside its own declaration.
+    pub local_value_reference: bool,
+    /// The module reads the class in a type position outside its own declaration.
+    pub local_type_reference: bool,
+}
+
+/// One tag that a `catchTag` or `catchTags` handler names.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct EffectCaughtTag {
+    /// The handled tag.
+    pub tag: String,
+    /// Byte offset of the tag string or object key.
+    pub span_start: u32,
+}
+
+/// A layer definition and the layer keys its initializer reads.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct EffectLayer {
+    /// `FooLive` or `FooService.layer`.
+    pub key: String,
+    /// Byte offset of the binding name or static property key.
+    pub span_start: u32,
+    /// The const, or the class of a static property, is exported.
+    pub exported: bool,
+    /// Keys that value references inside the initializer read.
+    pub dependencies: Vec<String>,
+}
+
+/// Persisted syntactic evidence for conservative component-input analysis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentContractFacts {
+    /// Immutable root script aliases resolved to their semantic targets.
+    pub aliases: Vec<ComponentAliasBinding>,
+    /// Exact Angular templateUrl source owned by each component binding.
+    pub external_templates: Vec<ComponentExternalTemplate>,
+    /// Original component bodies that own embedded Glimmer templates.
+    pub template_owners: Vec<ComponentTemplateOwner>,
+    /// Effective local export bindings retained after graph payload release.
+    pub exports: Vec<ComponentExportBinding>,
+    /// Immutable local object shapes retained for template spread resolution.
+    pub spread_bindings: Vec<ComponentSpreadBinding>,
+    /// Known declaration contracts.
+    pub declarations: Vec<ComponentPropDeclaration>,
+    /// Inspected render sites, including module-level invocations.
+    pub invocations: Vec<ComponentInvocation>,
+    /// Component bindings used opaquely outside inspected renders.
+    pub escapes: Vec<ComponentReference>,
+    /// Frameworks with a dynamic consumer whose affected target is unknowable.
+    pub incomplete_frameworks: Vec<ComponentFramework>,
+}
+
+/// An immutable, unescaped local object with statically known own keys.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentSpreadBinding {
+    /// Root script binding name, resolved before template scopes are applied.
+    pub local: String,
+    /// Script binding declaration anchor.
+    pub span_start: u32,
+    /// Complete own property names.
+    pub keys: Vec<String>,
+}
+
+/// An export name resolved to its syntactic component or import binding.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentExportBinding {
+    /// Public export name, including `default`.
+    pub export_name: String,
+    /// Original export declaration byte anchor.
+    pub export_span: u32,
+    /// Proven local binding, canonicalizing immutable aliases.
+    pub target: ComponentReference,
+}
+
+/// A semantic component declaration body containing an embedded template.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentTemplateOwner {
+    /// Owning component binding anchor.
+    pub component_span: u32,
+    /// Original class body start.
+    pub start: u32,
+    /// Original class body end.
+    pub end: u32,
+}
+
+/// A statically declared external template owned by one component.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentExternalTemplate {
+    /// Owning component binding anchor.
+    pub component_span: u32,
+    /// Literal templateUrl source, resolved through the graph import edge.
+    pub source: String,
+}
+
+/// An immutable root binding that aliases a component or import.
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode)]
+pub struct ComponentAliasBinding {
+    /// Root script binding spelling used by template expressions.
+    pub local: String,
+    /// Canonical semantic binding target, including its source anchor.
+    pub target: ComponentReference,
 }

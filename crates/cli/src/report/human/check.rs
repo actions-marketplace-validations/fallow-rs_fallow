@@ -1,10 +1,10 @@
 use crate::report::sink::outln;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use colored::Colorize;
 use fallow_config::{RulesConfig, Severity};
+use fallow_engine::test_paths::is_test_path;
 use fallow_types::output_dead_code::*;
 use fallow_types::results::{
     AnalysisResults, DuplicateExport, TestOnlyDependency, TypeOnlyDependency, UnusedDependency,
@@ -17,10 +17,12 @@ use super::{
     print_explain_tip_if_tty, push_section_footer_rollup, push_section_footer_with_count,
     push_section_footer_with_fixability,
 };
+use crate::report::ArchitectureLayout;
 use crate::report::grouping::OwnershipResolver;
 use crate::report::shared::NAMESPACE_BARREL_HINT;
 use crate::report::{
-    Level, elide_common_prefix, plural, relative_path, severity_to_level, split_dir_filename,
+    Level, elide_common_prefix, format_display_path, plural, relative_path, severity_to_level,
+    split_dir_filename,
 };
 
 /// Minimum number of duplicate-export findings before the human section is
@@ -109,44 +111,32 @@ const SCOPING_HINT_THRESHOLD: usize = 500;
 /// exceeds the threshold, so medium-sized projects with dispersed issues still see the hint.
 fn truncation_hint(remaining: usize, total_issues: usize) -> String {
     if remaining > SCOPING_HINT_THRESHOLD || total_issues > SCOPING_HINT_THRESHOLD {
-        format!(
-            "... and {remaining} more \u{2014} try --workspace <name> or --changed-since main to scope"
-        )
+        format!("... and {remaining} more; try --workspace <name> or --changed-since main to scope")
     } else {
         format!("... and {remaining} more (--format json for full list)")
     }
 }
 
-/// Check if a path contains a test directory segment.
-fn is_test_path(path: &Path) -> bool {
-    path.components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        matches!(
-            s.as_ref(),
-            "test"
-                | "tests"
-                | "__tests__"
-                | "__test__"
-                | "spec"
-                | "specs"
-                | "__mocks__"
-                | "__fixtures__"
-                | "fixtures"
-        )
-    })
-}
-
 /// Insert a dimmed test/src breakdown line when the majority of items are in test paths.
 ///
 /// The annotation is inserted before the last blank line of the current section
-/// so it appears just before the section gap.
-fn insert_test_src_split<T>(lines: &mut Vec<String>, items: &[T], get_path: impl Fn(&T) -> &Path) {
+/// so it appears just before the section gap. Paths are classified relative to
+/// `root`, so a directory above the project root never makes a file a test.
+fn insert_test_src_split<T>(
+    lines: &mut Vec<String>,
+    items: &[T],
+    root: &Path,
+    get_path: impl Fn(&T) -> &Path,
+) {
     if items.len() < 5 {
         return;
     }
     let test_count = items
         .iter()
-        .filter(|item| is_test_path(get_path(item)))
+        .filter(|item| {
+            let path = get_path(item);
+            is_test_path(root, path.strip_prefix(root).unwrap_or(path))
+        })
         .count();
     let src_count = items.len() - test_count;
     if test_count == 0 || src_count == 0 {
@@ -158,7 +148,7 @@ fn insert_test_src_split<T>(lines: &mut Vec<String>, items: &[T], get_path: impl
     }
     let annotation = format!(
         "  {}",
-        format!("{src_count} in src, {test_count} in test directories").dimmed()
+        format!("{src_count} in src, {test_count} in test files").dimmed()
     );
     if lines.last().is_some_and(String::is_empty) {
         let pos = lines.len() - 1;
@@ -177,6 +167,39 @@ pub(in crate::report) struct PrintHumanInput<'a> {
     pub top: Option<usize>,
     pub show_explain_tip: bool,
     pub explain: bool,
+    /// Whether a gate of this run fails it. Picks the mark of the final
+    /// status line.
+    pub run_fails: bool,
+    /// Files an armed `parse-error` gate failed on; see [`clean_status_line`].
+    pub failed_parse_files: usize,
+    /// Where the architecture findings render.
+    pub architecture_layout: ArchitectureLayout,
+}
+
+/// The final status line of a run with no finding.
+///
+/// When an armed `parse-error` gate failed, the run exits 1, so the line says
+/// that instead of "No issues found". The gate lines that follow name the
+/// files.
+fn clean_status_line(elapsed: Duration, failed_parse_files: usize) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if failed_parse_files == 0 {
+        return format!("\u{2713} No issues found ({seconds:.2}s)")
+            .green()
+            .bold()
+            .to_string();
+    }
+    let noun = if failed_parse_files == 1 {
+        "file did"
+    } else {
+        "files did"
+    };
+    format!(
+        "\u{2717} 0 issues, parse-error gate failed: {failed_parse_files} {noun} not parse ({seconds:.2}s)"
+    )
+    .red()
+    .bold()
+    .to_string()
 }
 
 pub(in crate::report) fn print_human(input: &PrintHumanInput<'_>) {
@@ -188,13 +211,15 @@ pub(in crate::report) fn print_human(input: &PrintHumanInput<'_>) {
     let total = input.results.total_issues();
     print_explain_tip_if_tty(input.show_explain_tip && total > 0, input.quiet);
 
-    for line in build_human_lines_with_explain(
-        input.results,
-        input.root,
-        input.rules,
-        input.top,
-        input.explain,
-    ) {
+    let lines = build_layout_lines(&LayoutLinesInput {
+        results: input.results,
+        root: input.root,
+        rules: input.rules,
+        top: input.top,
+        explain: input.explain,
+        layout: input.architecture_layout,
+    });
+    for line in lines {
         outln!("{line}");
     }
 
@@ -207,12 +232,7 @@ fn print_human_footer(input: &PrintHumanInput<'_>, total: usize) {
     if total == 0 {
         eprintln!(
             "{}",
-            format!(
-                "\u{2713} No issues found ({:.2}s)",
-                input.elapsed.as_secs_f64()
-            )
-            .green()
-            .bold()
+            clean_status_line(input.elapsed, input.failed_parse_files)
         );
         return;
     }
@@ -238,11 +258,33 @@ fn print_human_footer(input: &PrintHumanInput<'_>, total: usize) {
     let summary = build_summary_footer(input.results, suppressed_exports, suppressed_types);
     eprintln!(
         "{}",
-        format!("\u{2717} {summary} ({:.2}s)", input.elapsed.as_secs_f64())
-            .red()
-            .bold()
+        super::findings_status_line(
+            &format!("{summary} ({:.2}s)", input.elapsed.as_secs_f64()),
+            input.run_fails,
+        )
     );
     print_suppression_footer(input.results);
+    if let Some(line) = cascade_footer(input.results) {
+        eprintln!("  {}", line.dimmed());
+    }
+}
+
+/// The footer line for the findings that the cascade filter hid, or `None`
+/// when it hid nothing.
+fn cascade_footer(results: &AnalysisResults) -> Option<String> {
+    let hidden = results.cascade_hidden;
+    if hidden == 0 {
+        return None;
+    }
+    let (verb, pronoun) = if hidden == 1 {
+        ("is", "it")
+    } else {
+        ("are", "them")
+    };
+    Some(format!(
+        "{hidden} finding{} in unused files {verb} hidden \u{00b7} --show-cascade shows {pronoun}",
+        plural(hidden)
+    ))
 }
 
 fn print_suppression_footer(results: &AnalysisResults) {
@@ -284,6 +326,85 @@ fn build_human_lines_with_explain(
     top: Option<usize>,
     explain: bool,
 ) -> Vec<String> {
+    with_explain(
+        build_dead_code_lines(results, root, rules, top, true),
+        explain,
+    )
+}
+
+struct LayoutLinesInput<'a> {
+    results: &'a AnalysisResults,
+    root: &'a Path,
+    rules: &'a RulesConfig,
+    top: Option<usize>,
+    explain: bool,
+    layout: ArchitectureLayout,
+}
+
+/// Build the human lines for an [`ArchitectureLayout`]. `Embedded` returns the
+/// classic dead-code report. `Split` and `Only` move the architecture findings
+/// to one "Architecture" category: after the dead-code categories for bare
+/// `fallow`, first for `fallow architecture`.
+fn build_layout_lines(input: &LayoutLinesInput<'_>) -> Vec<String> {
+    let LayoutLinesInput {
+        results,
+        root,
+        rules,
+        top,
+        explain,
+        layout,
+    } = *input;
+    if layout == ArchitectureLayout::Embedded {
+        return build_human_lines_with_explain(results, root, rules, top, explain);
+    }
+    let dead_code = with_explain(
+        build_dead_code_lines(results, root, rules, top, false),
+        explain,
+    );
+    let architecture = with_explain(build_architecture_lines(results, root, rules), explain);
+    let (first, second) = if layout == ArchitectureLayout::Only {
+        (architecture, dead_code)
+    } else {
+        (dead_code, architecture)
+    };
+    first.into_iter().chain(second).collect()
+}
+
+fn with_explain(lines: Vec<String>, explain: bool) -> Vec<String> {
+    if explain {
+        inject_explain_blocks(lines)
+    } else {
+        lines
+    }
+}
+
+/// The "Architecture" category: import cycles, boundary violations and
+/// rule-pack policy violations. Empty when the results hold none.
+fn build_architecture_lines(
+    results: &AnalysisResults,
+    root: &Path,
+    rules: &RulesConfig,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !crate::report::has_architecture_findings(results) {
+        return lines;
+    }
+    push_category_header(&mut lines, "Architecture");
+    let total_issues = results.total_issues();
+    push_architecture_sections(&mut lines, results, root, rules, total_issues);
+    build_policy_violations_section(&mut lines, &results.policy_violations, root, total_issues);
+    lines
+}
+
+/// The dead-code report lines. With `include_architecture` false, the
+/// "Structure" and "Policy" categories leave out the architecture findings.
+fn build_dead_code_lines(
+    results: &AnalysisResults,
+    root: &Path,
+    rules: &RulesConfig,
+    top: Option<usize>,
+    include_architecture: bool,
+) -> Vec<String> {
     let max_items = top.unwrap_or(MAX_FLAT_ITEMS);
     let max_grouped_files = top.unwrap_or(MAX_GROUPED_FILES);
     let total_issues = results.total_issues();
@@ -307,15 +428,34 @@ fn build_human_lines_with_explain(
         max_grouped_files,
         total_issues,
     });
-    build_structure_section(&mut lines, results, root, rules, total_issues);
-    build_policy_section(&mut lines, results, root, rules, total_issues);
-    build_maintenance_section(&mut lines, results, root, rules, total_issues);
+    let sections = SectionInput {
+        results,
+        root,
+        rules,
+        total_issues,
+        include_architecture,
+    };
+    build_structure_section(&mut lines, &sections);
+    build_policy_section(&mut lines, &sections);
+    build_maintenance_section(
+        &mut lines,
+        results,
+        root,
+        rules,
+        total_issues,
+        max_grouped_files,
+    );
+    lines
+}
 
-    if explain {
-        inject_explain_blocks(lines)
-    } else {
-        lines
-    }
+/// Shared input of the "Structure" and "Policy" category builders.
+struct SectionInput<'a> {
+    results: &'a AnalysisResults,
+    root: &'a Path,
+    rules: &'a RulesConfig,
+    total_issues: usize,
+    /// Render the architecture findings inside these categories.
+    include_architecture: bool,
 }
 
 fn inject_explain_blocks(lines: Vec<String>) -> Vec<String> {
@@ -339,6 +479,10 @@ fn check_explain_for_header(line: &str) -> Option<&'static crate::explain::RuleD
         ("Unused exports", "fallow/unused-export"),
         ("Unused type exports", "fallow/unused-type"),
         ("Private type leaks", "fallow/private-type-leak"),
+        (
+            "Deprecated exports in use",
+            "fallow/deprecated-export-in-use",
+        ),
         ("Unused dependencies", "fallow/unused-dependency"),
         ("Unused devDependencies", "fallow/unused-dev-dependency"),
         (
@@ -362,6 +506,7 @@ fn check_explain_for_header(line: &str) -> Option<&'static crate::explain::RuleD
         ("Duplicate exports", "fallow/duplicate-export"),
         ("Circular dependencies", "fallow/circular-dependency"),
         ("Re-Export Cycles", "fallow/re-export-cycle"),
+        ("Package cycles", "fallow/package-cycle"),
         ("Boundary violations", "fallow/boundary-violation"),
         ("Stale suppressions", "fallow/stale-suppression"),
         ("Unused catalog entries", "fallow/unused-catalog-entry"),
@@ -428,17 +573,62 @@ fn push_suppressed_count_note(lines: &mut Vec<String>, suppressed: usize) {
     );
 }
 
-fn format_unused_export(e: &UnusedExport) -> String {
+/// The compact dimmed parenthetical a finding line carries when a degraded
+/// parse could have distorted its verdict, matching how `(re-export)` and the
+/// other per-finding annotations render. Empty when there is no caveat, so a
+/// project that parses cleanly renders byte-identically.
+fn dimmed_caveat_suffix(caveats: &[ReachabilityCaveat]) -> String {
+    caveat_suffix(caveats)
+        .map(|suffix| suffix.dimmed().to_string())
+        .unwrap_or_default()
+}
+
+fn format_unused_export(e: &UnusedExport, caveats: &[ReachabilityCaveat]) -> String {
     let tag = if e.is_re_export {
         " (re-export)".dimmed().to_string()
     } else {
         String::new()
     };
+    let deprecated = if e.deprecated {
+        " (marked @deprecated)".dimmed().to_string()
+    } else {
+        String::new()
+    };
     format!(
-        "{} {}{}",
+        "{} {}{}{}{}",
         format!(":{}", e.line).dimmed(),
         e.export_name.bold(),
-        tag
+        tag,
+        deprecated,
+        dimmed_caveat_suffix(caveats),
+    )
+}
+
+fn format_deprecated_export_in_use(
+    entry: &fallow_types::output_dead_code::DeprecatedExportInUseFinding,
+) -> String {
+    let e = &entry.export;
+    let noun = if e.consumer_count == 1 {
+        "consumer"
+    } else {
+        "consumers"
+    };
+    let scope = if e.public_api {
+        " (public API)".dimmed().to_string()
+    } else {
+        String::new()
+    };
+    let reason = e
+        .deprecated_reason
+        .as_deref()
+        .map_or_else(String::new, |reason| {
+            format!(": {reason}").dimmed().to_string()
+        });
+    format!(
+        "{} {} still used by {} {noun}{scope}{reason}",
+        format!(":{}", e.line).dimmed(),
+        e.export_name.bold(),
+        e.consumer_count,
     )
 }
 
@@ -454,40 +644,238 @@ fn format_private_type_leak(
     )
 }
 
-fn format_unused_member(m: &UnusedMember) -> String {
+fn format_unused_member(m: &UnusedMember, caveats: &[ReachabilityCaveat]) -> String {
     format!(
-        "{} {}",
+        "{} {}{}",
         format!(":{}", m.line).dimmed(),
-        format!("{}.{}", m.parent_name, m.member_name).bold()
+        format!("{}.{}", m.parent_name, m.member_name).bold(),
+        dimmed_caveat_suffix(caveats),
     )
 }
 
+/// Width a dependency line renders within, including the two-space indent that
+/// `push_human_pkg_dep_section` prepends.
+const DEP_LINE_WIDTH: usize = 80;
+
+/// Fixed cost of `  {name} ({label})`: the indent, the separating space, and
+/// the parentheses. What is left after the package name is the label budget.
+const DEP_LINE_DECORATION: usize = 5;
+
+/// Manifest path of the workspace root. It says nothing beyond "the root", so
+/// the label drops it and keeps only the cross-workspace clause.
+const ROOT_MANIFEST: &str = "package.json";
+
+/// Clause introducing the workspaces that import the package.
+const IMPORTED_IN: &str = "imported in ";
+
+/// Clause introducing the workspaces that declare the package and import it.
+const DECLARED_AND_IMPORTED_IN: &str = "declared and imported in ";
+
+/// The relation between a dependency finding and the workspaces its label
+/// lists.
+#[derive(Clone, Copy)]
+enum WorkspaceClause {
+    /// The workspaces import the package, but the declaring manifest does not.
+    ImportedIn,
+    /// The workspaces declare the package and import it, so the root
+    /// declaration of the finding stays unused.
+    DeclaredAndImportedIn,
+}
+
+impl WorkspaceClause {
+    const fn intro(self) -> &'static str {
+        match self {
+            Self::ImportedIn => IMPORTED_IN,
+            Self::DeclaredAndImportedIn => DECLARED_AND_IMPORTED_IN,
+        }
+    }
+
+    /// Whether the label names a root manifest. The clause names other
+    /// manifests that declare the same package, so the label must say which
+    /// declaration the finding is about.
+    const fn names_root_manifest(self) -> bool {
+        matches!(self, Self::DeclaredAndImportedIn)
+    }
+}
+
+/// Marker for a path shortened from the left.
+const PATH_ELLIPSIS: &str = ".../";
+
+/// Narrowest label worth rendering, the width of a manifest path elided to its
+/// file name. Below it the parenthetical carries nothing, so the package
+/// renders bare.
+const MIN_LABEL_WIDTH: usize = 16;
+
+/// Narrowest workspace clause worth rendering: one elided path plus a
+/// `+N more`.
+const MIN_WORKSPACE_LIST_WIDTH: usize = 18;
+
+/// Shorten a path from the left so a deep manifest or workspace path cannot
+/// push a dependency line past `DEP_LINE_WIDTH`. A path is identified by its
+/// innermost segments, so the head goes first; whole segments are kept wherever
+/// they fit, because a half-eaten directory name reads as a different
+/// directory. Callers keep the budget wider than the marker.
+fn elide_path(path: &str, budget: usize) -> String {
+    if path.chars().count() <= budget {
+        return path.to_string();
+    }
+    let tail_budget = budget.saturating_sub(PATH_ELLIPSIS.chars().count());
+    let tail = path
+        .match_indices('/')
+        .map(|(offset, _)| &path[offset + 1..])
+        .find(|tail| tail.chars().count() <= tail_budget)
+        .map_or_else(
+            // One segment wider than the budget: its tail is where a generated
+            // or numbered name differs.
+            || {
+                let skip = path.chars().count().saturating_sub(tail_budget);
+                path.chars().skip(skip).collect()
+            },
+            str::to_string,
+        );
+    format!("{PATH_ELLIPSIS}{tail}")
+}
+
+/// Whether an elided manifest path still names the directory that declares the
+/// dependency, instead of collapsing onto the `package.json` tail every
+/// manifest shares.
+fn names_owning_directory(manifest: &str) -> bool {
+    manifest
+        .strip_prefix(PATH_ELLIPSIS)
+        .unwrap_or(manifest)
+        .contains('/')
+}
+
+/// Join the importing workspaces under `budget`, collapsing the tail into
+/// `+N more`.
+///
+/// The collapse promises no route. `used_in_workspaces` is uncapped in JSON, so
+/// a `--format json for full list` pointer would hold, but it costs more width
+/// than the whole clause has, and the package name is already on the line for a
+/// reader to query with. This is how the review brief caps an inline list.
+fn summarize_workspaces(workspaces: &[String], budget: usize) -> String {
+    let mut shown = 0usize;
+    let mut width = 0usize;
+    for workspace in workspaces {
+        let separator = usize::from(shown > 0) * ", ".len();
+        let omitted = workspaces.len() - shown - 1;
+        // Keep room for the suffix the omitted workspaces will need.
+        let suffix = if omitted == 0 {
+            0
+        } else {
+            format!(" +{omitted} more").chars().count()
+        };
+        let next = width + separator + workspace.chars().count();
+        if shown > 0 && next + suffix > budget {
+            break;
+        }
+        width = next;
+        shown += 1;
+    }
+    // The first workspace always renders, elided if it alone overruns.
+    let shown = shown.max(1).min(workspaces.len());
+    let joined = workspaces[..shown].join(", ");
+    let omitted = workspaces.len() - shown;
+    if omitted == 0 {
+        return elide_path(&joined, budget);
+    }
+    let suffix = format!(" +{omitted} more");
+    let head = elide_path(&joined, budget.saturating_sub(suffix.chars().count()));
+    format!("{head}{suffix}")
+}
+
+/// Build the parenthetical for a dependency line: where the package is declared
+/// and which workspaces import it, both bounded so the label holds within
+/// `budget`. `None` means there is nothing to say (a root manifest with no
+/// cross-workspace consumers) and the caller renders the name alone.
+///
+/// The manifest path outranks the workspace clause. Once seating a clause has
+/// eroded the path down to `.../package.json`, the label no longer names a
+/// package, and a reader cannot edit a manifest they cannot identify, so the
+/// path takes the whole label and the clause goes.
+///
+/// Split out from the printer so the wording and the width are testable.
+fn dep_label(
+    pkg_label: &str,
+    clause: WorkspaceClause,
+    workspaces: &[String],
+    budget: usize,
+) -> Option<String> {
+    // A package name wide enough to leave no usable budget renders bare. The
+    // name is never shortened: it is the identity a reader looks up and passes
+    // to `fallow fix`, and a truncated one is unusable.
+    if budget < MIN_LABEL_WIDTH {
+        return None;
+    }
+    if workspaces.is_empty() {
+        return (pkg_label != ROOT_MANIFEST).then(|| elide_path(pkg_label, budget));
+    }
+    let manifest =
+        (pkg_label != ROOT_MANIFEST || clause.names_root_manifest()).then_some(pkg_label);
+    let intro = clause.intro();
+    let separator = if manifest.is_some() { "; " } else { "" };
+    let clause_width = separator.chars().count() + intro.chars().count();
+    let head = match manifest {
+        Some(ROOT_MANIFEST) => ROOT_MANIFEST.to_string(),
+        Some(path) => {
+            let head = elide_path(
+                path,
+                budget.saturating_sub(clause_width + MIN_WORKSPACE_LIST_WIDTH),
+            );
+            if !names_owning_directory(&head) {
+                return Some(elide_path(path, budget));
+            }
+            head
+        }
+        None => String::new(),
+    };
+    let Some(list_budget) = budget
+        .checked_sub(head.chars().count() + clause_width)
+        .filter(|width| *width >= MIN_WORKSPACE_LIST_WIDTH)
+    else {
+        // The root manifest names nothing without its clause.
+        return (!head.is_empty() && head != ROOT_MANIFEST).then_some(head);
+    };
+    let list = summarize_workspaces(workspaces, list_budget);
+    Some(format!("{head}{separator}{intro}{list}"))
+}
+
+/// Render `name` plus its bounded label. `reserved` is the width of the text
+/// the caller appends to the line, for example a caveat parenthetical, so the
+/// label leaves room for it inside `DEP_LINE_WIDTH`.
 fn format_dep_with_pkg(
     name: &str,
     pkg_path: &Path,
-    used_in_workspaces: &[PathBuf],
+    (clause, context_workspaces): (WorkspaceClause, &[PathBuf]),
     root: &Path,
+    reserved: usize,
 ) -> String {
-    let pkg_label = relative_path(pkg_path, root).display().to_string();
-    let workspace_context = if used_in_workspaces.is_empty() {
-        String::new()
+    // Normalized separators: the label's elision snaps to path segments, and a
+    // Windows-shaped path would otherwise present as one unbreakable segment.
+    let pkg_label = format_display_path(pkg_path, root);
+    let workspaces: Vec<String> = context_workspaces
+        .iter()
+        .map(|path| format_display_path(path, root))
+        .collect();
+    let budget =
+        DEP_LINE_WIDTH.saturating_sub(name.chars().count() + DEP_LINE_DECORATION + reserved);
+    match dep_label(&pkg_label, clause, &workspaces, budget) {
+        Some(label) => format!("{} ({})", name.bold(), label.dimmed()),
+        None => name.bold().to_string(),
+    }
+}
+
+/// The label context of an unused dependency. A workspace finding lists the
+/// other workspaces that import the package. A root finding lists the
+/// workspaces whose own declaration their imports use.
+fn unused_dependency_context(dep: &UnusedDependency) -> (WorkspaceClause, &[PathBuf]) {
+    if dep.used_in_workspaces.is_empty() && !dep.declared_and_imported_in.is_empty() {
+        (
+            WorkspaceClause::DeclaredAndImportedIn,
+            &dep.declared_and_imported_in,
+        )
     } else {
-        let workspaces = used_in_workspaces
-            .iter()
-            .map(|path| relative_path(path, root).display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("; imported in {workspaces}")
-    };
-    if pkg_label == "package.json" && workspace_context.is_empty() {
-        format!("{}", name.bold())
-    } else {
-        let label = if pkg_label == "package.json" {
-            workspace_context.trim_start_matches("; ").to_string()
-        } else {
-            format!("{pkg_label}{workspace_context}")
-        };
-        format!("{} ({})", name.bold(), label.dimmed())
+        (WorkspaceClause::ImportedIn, &dep.used_in_workspaces)
     }
 }
 
@@ -497,7 +885,14 @@ fn format_dep_with_pkg(
 trait NamedPkgDep {
     fn pkg_name(&self) -> &str;
     fn pkg_path(&self) -> &Path;
-    fn used_in_workspaces(&self) -> &[PathBuf] {
+    /// The workspaces the label lists and their relation to the finding.
+    fn workspace_context(&self) -> (WorkspaceClause, &[PathBuf]) {
+        (WorkspaceClause::ImportedIn, &[])
+    }
+    /// Degraded-parse caveats on the verdict behind this finding. Only the
+    /// three unused-dependency arrays carry them; every other dep finding
+    /// answers the question from a manifest rather than from the import graph.
+    fn caveats(&self) -> &[ReachabilityCaveat] {
         &[]
     }
 }
@@ -509,8 +904,8 @@ impl NamedPkgDep for UnusedDependency {
     fn pkg_path(&self) -> &Path {
         &self.path
     }
-    fn used_in_workspaces(&self) -> &[PathBuf] {
-        &self.used_in_workspaces
+    fn workspace_context(&self) -> (WorkspaceClause, &[PathBuf]) {
+        unused_dependency_context(self)
     }
 }
 
@@ -539,8 +934,11 @@ impl NamedPkgDep for UnusedDependencyFinding {
     fn pkg_path(&self) -> &Path {
         &self.dep.path
     }
-    fn used_in_workspaces(&self) -> &[PathBuf] {
-        &self.dep.used_in_workspaces
+    fn workspace_context(&self) -> (WorkspaceClause, &[PathBuf]) {
+        unused_dependency_context(&self.dep)
+    }
+    fn caveats(&self) -> &[ReachabilityCaveat] {
+        &self.reachability_caveats
     }
 }
 
@@ -551,8 +949,11 @@ impl NamedPkgDep for UnusedDevDependencyFinding {
     fn pkg_path(&self) -> &Path {
         &self.dep.path
     }
-    fn used_in_workspaces(&self) -> &[PathBuf] {
-        &self.dep.used_in_workspaces
+    fn workspace_context(&self) -> (WorkspaceClause, &[PathBuf]) {
+        unused_dependency_context(&self.dep)
+    }
+    fn caveats(&self) -> &[ReachabilityCaveat] {
+        &self.reachability_caveats
     }
 }
 
@@ -563,8 +964,11 @@ impl NamedPkgDep for UnusedOptionalDependencyFinding {
     fn pkg_path(&self) -> &Path {
         &self.dep.path
     }
-    fn used_in_workspaces(&self) -> &[PathBuf] {
-        &self.dep.used_in_workspaces
+    fn workspace_context(&self) -> (WorkspaceClause, &[PathBuf]) {
+        unused_dependency_context(&self.dep)
+    }
+    fn caveats(&self) -> &[ReachabilityCaveat] {
+        &self.reachability_caveats
     }
 }
 
@@ -616,14 +1020,17 @@ fn push_human_pkg_dep_section<T: NamedPkgDep>(input: &mut HumanPkgDepSectionInpu
             total_issues: input.total_issues,
         },
         |dep| {
+            let caveat_width = caveat_suffix(dep.caveats()).map_or(0, |text| text.chars().count());
             vec![format!(
-                "  {}",
+                "  {}{}",
                 format_dep_with_pkg(
                     dep.pkg_name(),
                     dep.pkg_path(),
-                    dep.used_in_workspaces(),
-                    input.root
-                )
+                    dep.workspace_context(),
+                    input.root,
+                    caveat_width,
+                ),
+                dimmed_caveat_suffix(dep.caveats()),
             )]
         },
     );
@@ -714,14 +1121,18 @@ fn push_unused_files_section(input: &mut UnusedCodeSectionInput<'_>) {
                 total_issues: input.total_issues,
             },
             |file| {
-                let path_str = relative_path(&file.file.path, input.root)
-                    .display()
-                    .to_string();
-                vec![format!("  {}", format_path(&path_str))]
+                let path_str = format_display_path(&file.file.path, input.root);
+                vec![format!(
+                    "  {}{}",
+                    format_path(&path_str),
+                    dimmed_caveat_suffix(&file.reachability_caveats),
+                )]
             },
         );
     }
-    insert_test_src_split(input.lines, &input.results.unused_files, |f| &f.file.path);
+    insert_test_src_split(input.lines, &input.results.unused_files, input.root, |f| {
+        &f.file.path
+    });
 }
 
 /// Renders the unused-export, unused-type, and private-type-leak grouped sections.
@@ -745,12 +1156,16 @@ fn push_unused_export_sections(
             root: input.root,
             max_files: input.max_grouped_files,
             get_path: |e| e.export.path.as_path(),
-            format_detail: &|e: &UnusedExportFinding| format_unused_export(&e.export),
+            format_detail: &|e: &UnusedExportFinding| {
+                format_unused_export(&e.export, &e.reachability_caveats)
+            },
         },
         has_fixable_export,
     );
     push_suppressed_count_note(input.lines, suppressed_exports);
-    insert_test_src_split(input.lines, filtered_exports, |e| &e.export.path);
+    insert_test_src_split(input.lines, filtered_exports, input.root, |e| {
+        &e.export.path
+    });
 
     let has_fixable_type = filtered_types
         .iter()
@@ -765,7 +1180,9 @@ fn push_unused_export_sections(
             root: input.root,
             max_files: input.max_grouped_files,
             get_path: |e| e.export.path.as_path(),
-            format_detail: &|e: &UnusedTypeFinding| format_unused_export(&e.export),
+            format_detail: &|e: &UnusedTypeFinding| {
+                format_unused_export(&e.export, &e.reachability_caveats)
+            },
         },
         has_fixable_type,
     );
@@ -804,7 +1221,9 @@ fn build_unused_member_sections(
             root,
             max_files: max_grouped_files,
             get_path: |m| m.member.path.as_path(),
-            format_detail: &|m: &UnusedEnumMemberFinding| format_unused_member(&m.member),
+            format_detail: &|m: &UnusedEnumMemberFinding| {
+                format_unused_member(&m.member, &m.reachability_caveats)
+            },
         },
         has_fixable_enum_member,
     );
@@ -823,7 +1242,9 @@ fn build_unused_member_sections(
             root,
             max_files: max_grouped_files,
             get_path: |m| m.member.path.as_path(),
-            format_detail: &|m: &UnusedClassMemberFinding| format_unused_member(&m.member),
+            format_detail: &|m: &UnusedClassMemberFinding| {
+                format_unused_member(&m.member, &m.reachability_caveats)
+            },
         },
         has_fixable_class_member,
     );
@@ -836,7 +1257,9 @@ fn build_unused_member_sections(
         root,
         max_files: max_grouped_files,
         get_path: |m| m.member.path.as_path(),
-        format_detail: &|m: &UnusedStoreMemberFinding| format_unused_member(&m.member),
+        format_detail: &|m: &UnusedStoreMemberFinding| {
+            format_unused_member(&m.member, &m.reachability_caveats)
+        },
     });
 }
 
@@ -1115,10 +1538,7 @@ fn push_unused_catalog_entries_section(
                 catalog = entry.catalog_name.dimmed(),
                 loc = format!(
                     "{}:{}",
-                    path_display
-                        .strip_prefix(ctx.root)
-                        .unwrap_or(&path_display)
-                        .display(),
+                    format_display_path(&path_display, ctx.root),
                     entry.line
                 )
                 .dimmed(),
@@ -1128,7 +1548,7 @@ fn push_unused_catalog_entries_section(
                 let consumers = entry
                     .hardcoded_consumers
                     .iter()
-                    .map(|p| p.strip_prefix(ctx.root).unwrap_or(p).display().to_string())
+                    .map(|p| format_display_path(p, ctx.root))
                     .collect::<Vec<_>>()
                     .join(", ");
                 row = format!("    {}: {consumers}", "hardcoded in".dimmed());
@@ -1165,10 +1585,7 @@ fn push_empty_catalog_groups_section(
                 catalog = group.catalog_name.bold(),
                 loc = format!(
                     "{}:{}",
-                    path_display
-                        .strip_prefix(ctx.root)
-                        .unwrap_or(&path_display)
-                        .display(),
+                    format_display_path(&path_display, ctx.root),
                     group.line
                 )
                 .dimmed(),
@@ -1224,10 +1641,7 @@ fn format_unresolved_catalog_reference(
         catalog = catalog_label.dimmed(),
         loc = format!(
             "{}:{}",
-            path_display
-                .strip_prefix(root)
-                .unwrap_or(&path_display)
-                .display(),
+            format_display_path(&path_display, root),
             finding.line
         )
         .dimmed(),
@@ -1295,10 +1709,7 @@ fn push_unused_dependency_overrides_section(input: UnusedDependencyOverridesInpu
                 source = finding.source.as_label().dimmed(),
                 loc = format!(
                     "{}:{}",
-                    path_display
-                        .strip_prefix(input.root)
-                        .unwrap_or(&path_display)
-                        .display(),
+                    format_display_path(&path_display, input.root),
                     finding.line
                 )
                 .dimmed(),
@@ -1351,10 +1762,7 @@ fn push_misconfigured_dependency_overrides_section(
                 source = finding.source.as_label().dimmed(),
                 loc = format!(
                     "{}:{}",
-                    path_display
-                        .strip_prefix(root)
-                        .unwrap_or(&path_display)
-                        .display(),
+                    format_display_path(&path_display, root),
                     finding.line
                 )
                 .dimmed(),
@@ -1364,20 +1772,22 @@ fn push_misconfigured_dependency_overrides_section(
     );
 }
 
-fn build_structure_section(
-    lines: &mut Vec<String>,
-    results: &AnalysisResults,
-    root: &Path,
-    rules: &RulesConfig,
-    total_issues: usize,
-) {
-    let has_structure = !results.duplicate_exports.is_empty()
-        || !results.circular_dependencies.is_empty()
-        || !results.re_export_cycles.is_empty()
-        || !results.boundary_violations.is_empty()
-        || !results.boundary_coverage_violations.is_empty()
-        || !results.boundary_call_violations.is_empty();
-    if !has_structure {
+fn build_structure_section(lines: &mut Vec<String>, input: &SectionInput<'_>) {
+    let SectionInput {
+        results,
+        root,
+        rules,
+        total_issues,
+        include_architecture,
+    } = *input;
+    let has_architecture = include_architecture
+        && (!results.circular_dependencies.is_empty()
+            || !results.re_export_cycles.is_empty()
+            || !results.package_cycles.is_empty()
+            || !results.boundary_violations.is_empty()
+            || !results.boundary_coverage_violations.is_empty()
+            || !results.boundary_call_violations.is_empty());
+    if results.duplicate_exports.is_empty() && !has_architecture {
         return;
     }
     push_category_header(lines, "Structure");
@@ -1389,6 +1799,20 @@ fn build_structure_section(
         root,
         total_issues,
     );
+    if include_architecture {
+        push_architecture_sections(lines, results, root, rules, total_issues);
+    }
+}
+
+/// The cycle and boundary sub-sections, in the order the "Structure" category
+/// has always printed them.
+fn push_architecture_sections(
+    lines: &mut Vec<String>,
+    results: &AnalysisResults,
+    root: &Path,
+    rules: &RulesConfig,
+    total_issues: usize,
+) {
     build_circular_deps_section(
         lines,
         &results.circular_dependencies,
@@ -1400,6 +1824,13 @@ fn build_structure_section(
         lines,
         &results.re_export_cycles,
         severity_to_level(rules.re_export_cycle),
+        root,
+        total_issues,
+    );
+    build_package_cycles_section(
+        lines,
+        &results.package_cycles,
+        severity_to_level(rules.package_cycle),
         root,
         total_issues,
     );
@@ -1440,7 +1871,11 @@ fn push_react_component_health_sections(
         lines,
         items: &results.prop_drilling_chains,
         title: "Prop drilling",
-        level: severity_to_level(rules.prop_drilling),
+        level: if results.enforced_prop_drilling_count() > 0 {
+            crate::report::Level::Error
+        } else {
+            crate::report::Level::Warn
+        },
         root,
         max_files: MAX_FLAT_ITEMS,
         get_path: prop_drilling_anchor,
@@ -1474,24 +1909,29 @@ fn push_react_component_health_sections(
 
 /// Build the Policy category (rule-pack findings). Separate from Structure
 /// because policy is user-authored project rules, not architecture analysis.
-fn build_policy_section(
-    lines: &mut Vec<String>,
-    results: &AnalysisResults,
-    root: &Path,
-    rules: &RulesConfig,
-    total_issues: usize,
-) {
-    if results.policy_violations.is_empty()
+fn build_policy_section(lines: &mut Vec<String>, input: &SectionInput<'_>) {
+    let SectionInput {
+        results,
+        root,
+        rules,
+        total_issues,
+        include_architecture,
+    } = *input;
+    if (!include_architecture || results.policy_violations.is_empty())
         && results.invalid_client_exports.is_empty()
         && results.mixed_client_server_barrels.is_empty()
         && results.misplaced_directives.is_empty()
         && results.unprovided_injects.is_empty()
         && results.unrendered_components.is_empty()
         && results.unused_component_props.is_empty()
+        && results.absent_component_props.is_empty()
         && results.unused_component_emits.is_empty()
         && results.unused_component_inputs.is_empty()
         && results.unused_component_outputs.is_empty()
         && results.unused_svelte_events.is_empty()
+        && results.unused_effect_layers.is_empty()
+        && results.unused_tagged_errors.is_empty()
+        && results.unproduced_catch_tags.is_empty()
         && results.unused_server_actions.is_empty()
         && results.unused_load_data_keys.is_empty()
         && results.route_collisions.is_empty()
@@ -1503,7 +1943,9 @@ fn build_policy_section(
         return;
     }
     push_category_header(lines, "Policy");
-    build_policy_violations_section(lines, &results.policy_violations, root, total_issues);
+    if include_architecture {
+        build_policy_violations_section(lines, &results.policy_violations, root, total_issues);
+    }
     build_framework_policy_section(lines, results, root, rules);
     build_component_policy_section(lines, results, root, rules);
     build_route_policy_section(lines, results, root, rules);
@@ -1622,6 +2064,45 @@ fn push_component_io_sections(
 ) {
     build_human_grouped_section(GroupedSectionInput {
         lines,
+        items: &results.absent_component_props,
+        title: "Absent optional component props",
+        level: if results
+            .absent_component_props
+            .iter()
+            .any(|finding| finding.effective_severity == Some(EffectiveSeverity::Error))
+        {
+            crate::report::Level::Error
+        } else {
+            crate::report::Level::Warn
+        },
+        root,
+        max_files: MAX_FLAT_ITEMS,
+        get_path: |finding: &AbsentComponentPropFinding| finding.prop.path.as_path(),
+        format_detail: &|finding: &AbsentComponentPropFinding| {
+            let prop = &finding.prop;
+            let callers = prop
+                .inspected_call_sites
+                .iter()
+                .map(|site| format!("{}:{}", format_display_path(&site.path, root), site.line))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                ":{} {}.{} (default: {})\n    {}\n    Inspected callers: {}",
+                prop.line,
+                prop.component_name,
+                prop.prop_name,
+                if prop.has_default {
+                    "present"
+                } else {
+                    "absent"
+                },
+                prop.explanation,
+                callers
+            )
+        },
+    });
+    build_human_grouped_section(GroupedSectionInput {
+        lines,
         items: &results.unused_component_props,
         title: "Unused component props",
         level: severity_to_level(rules.unused_component_props),
@@ -1694,6 +2175,45 @@ fn push_framework_key_sections(
             e.event.path.as_path()
         },
         format_detail: &format_unused_svelte_event,
+    });
+
+    build_human_grouped_section(GroupedSectionInput {
+        lines,
+        items: &results.unused_effect_layers,
+        title: "Unused Effect layers",
+        level: severity_to_level(rules.unused_effect_layers),
+        root,
+        max_files: MAX_FLAT_ITEMS,
+        get_path: |e: &fallow_types::output_dead_code::UnusedEffectLayerFinding| {
+            e.layer.path.as_path()
+        },
+        format_detail: &format_unused_effect_layer,
+    });
+
+    build_human_grouped_section(GroupedSectionInput {
+        lines,
+        items: &results.unused_tagged_errors,
+        title: "Unused tagged errors",
+        level: severity_to_level(rules.unused_tagged_errors),
+        root,
+        max_files: MAX_FLAT_ITEMS,
+        get_path: |e: &fallow_types::output_dead_code::UnusedTaggedErrorFinding| {
+            e.error.path.as_path()
+        },
+        format_detail: &format_unused_tagged_error,
+    });
+
+    build_human_grouped_section(GroupedSectionInput {
+        lines,
+        items: &results.unproduced_catch_tags,
+        title: "Unproduced catch tags",
+        level: severity_to_level(rules.unproduced_catch_tags),
+        root,
+        max_files: MAX_FLAT_ITEMS,
+        get_path: |e: &fallow_types::output_dead_code::UnproducedCatchTagFinding| {
+            e.catch_tag.path.as_path()
+        },
+        format_detail: &format_unproduced_catch_tag,
     });
 
     build_human_grouped_section(GroupedSectionInput {
@@ -1955,6 +2475,43 @@ fn format_unused_component_output(
     )
 }
 
+fn format_unused_effect_layer(
+    entry: &fallow_types::output_dead_code::UnusedEffectLayerFinding,
+) -> String {
+    let layer = &entry.layer;
+    format!(
+        "{} {} {} {}",
+        format!(":{}", layer.line).dimmed(),
+        layer.name.bold(),
+        "is composed only into layers that nothing uses:".dimmed(),
+        layer.dead_consumers.join(", ").dimmed(),
+    )
+}
+
+fn format_unused_tagged_error(
+    entry: &fallow_types::output_dead_code::UnusedTaggedErrorFinding,
+) -> String {
+    let error = &entry.error;
+    format!(
+        "{} {} {}",
+        format!(":{}", error.line).dimmed(),
+        error.name.bold(),
+        "is never constructed or failed with (remove it or fail with it)".dimmed(),
+    )
+}
+
+fn format_unproduced_catch_tag(
+    entry: &fallow_types::output_dead_code::UnproducedCatchTagFinding,
+) -> String {
+    let catch_tag = &entry.catch_tag;
+    format!(
+        "{} {} {}",
+        format!(":{}", catch_tag.line).dimmed(),
+        catch_tag.tag.bold(),
+        "is caught, but no code in this project produces it".dimmed(),
+    )
+}
+
 fn format_unused_svelte_event(
     entry: &fallow_types::output_dead_code::UnusedSvelteEventFinding,
 ) -> String {
@@ -2035,26 +2592,17 @@ fn build_policy_violations_section(
     root: &Path,
     total_issues: usize,
 ) {
-    use fallow_types::results::PolicyViolationSeverity;
-
     if items.is_empty() {
         return;
     }
-    let level = if items
-        .iter()
-        .any(|f| f.violation.severity == PolicyViolationSeverity::Error)
-    {
-        Level::Error
-    } else {
-        Level::Warn
-    };
+    let level = policy_violations_level(items);
     let title = "Policy violations";
     lines.push(build_section_header(title, items.len(), level));
 
     let shown = items.len().min(MAX_FLAT_ITEMS);
     for entry in &items[..shown] {
         let v = &entry.violation;
-        let path = relative_path(&v.path, root).display().to_string();
+        let path = format_display_path(&v.path, root);
         let detail = match &v.message {
             Some(message) => format!("banned by `{}/{}`: {message}", v.pack, v.rule_id),
             None => format!("banned by `{}/{}`", v.pack, v.rule_id),
@@ -2089,12 +2637,23 @@ fn build_maintenance_section(
     root: &Path,
     rules: &RulesConfig,
     total_issues: usize,
+    max_grouped_files: usize,
 ) {
-    if results.stale_suppressions.is_empty() {
+    if results.stale_suppressions.is_empty() && results.deprecated_exports_in_use.is_empty() {
         return;
     }
     push_category_header(lines, "Maintenance");
 
+    build_human_grouped_section(GroupedSectionInput {
+        lines,
+        items: &results.deprecated_exports_in_use,
+        title: "Deprecated exports in use",
+        level: severity_to_level(rules.deprecated_exports_in_use),
+        root,
+        max_files: max_grouped_files,
+        get_path: |e| e.export.path.as_path(),
+        format_detail: &format_deprecated_export_in_use,
+    });
     build_stale_suppressions_section(
         lines,
         &results.stale_suppressions,
@@ -2134,8 +2693,38 @@ fn build_dir_rollup_section(
         unused_file_display_entries(unused_files, root, &dir_counts, dominant.as_deref());
 
     render_dir_rollup_entries(lines, &display_entries, total_issues);
+    push_rollup_caveat_note(lines, unused_files);
     push_section_footer_rollup(lines, title, unused_files.len());
     lines.push(String::new());
+}
+
+/// The directory rollup collapses the per-file lines the flat section carries
+/// a caveat suffix on, so the caveat is stated once for the section instead.
+/// Silent when nothing degraded, keeping a clean project byte-identical.
+fn push_rollup_caveat_note(
+    lines: &mut Vec<String>,
+    unused_files: &[fallow_types::output_dead_code::UnusedFileFinding],
+) {
+    let caveated = unused_files
+        .iter()
+        .filter(|finding| !finding.reachability_caveats.is_empty())
+        .count();
+    if caveated == 0 {
+        return;
+    }
+    let mut present: Vec<ReachabilityCaveat> = unused_files
+        .iter()
+        .flat_map(|finding| finding.reachability_caveats.iter().copied())
+        .collect();
+    present.sort_unstable();
+    present.dedup();
+    let Some(labels) = caveat_labels(&present) else {
+        return;
+    };
+    lines.push(format!(
+        "  {}",
+        format!("({caveated} of these carry a caveat: {labels})").dimmed()
+    ));
 }
 
 fn unused_file_dir_counts(
@@ -2187,10 +2776,15 @@ fn unused_file_display_entries(
             .next()
             .map(|c| c.as_os_str().to_string_lossy().to_string());
         if first.as_deref() == Some(dom_dir) {
-            let sub_key = components.next().map_or_else(
-                || dom_dir.to_string(),
-                |c| format!("{}/{}", dom_dir, c.as_os_str().to_string_lossy()),
-            );
+            // The next component is a subdirectory only while something follows
+            // it. On `src/orphan.ts` it is the file itself, and labelling that
+            // as a directory printed `src/orphan.ts/`; the file belongs to the
+            // dominant directory.
+            let rest: Vec<_> = components.collect();
+            let sub_key = match rest.as_slice() {
+                [sub, _, ..] => format!("{}/{}", dom_dir, sub.as_os_str().to_string_lossy()),
+                _ => dom_dir.to_string(),
+            };
             if let Some(&idx) = sub_map.get(&sub_key) {
                 sub_counts[idx].1 += 1;
             } else {
@@ -2419,7 +3013,7 @@ fn collect_duplicate_export_pairs<'a>(
         let mut paths: Vec<String> = dup
             .locations
             .iter()
-            .map(|loc| relative_path(&loc.path, root).display().to_string())
+            .map(|loc| format_display_path(&loc.path, root))
             .collect();
         paths.sort();
         paths.dedup();
@@ -2528,7 +3122,7 @@ fn circular_dependency_hub_groups<'a>(
         let hub = cycle
             .files
             .first()
-            .map(|path| relative_path(path, root).display().to_string())
+            .map(|path| format_display_path(path, root))
             .unwrap_or_default();
         if let Some(&idx) = hub_map.get(&hub) {
             hub_groups[idx].1.push(cycle);
@@ -2559,7 +3153,7 @@ fn circular_dependency_cycle_line(
     let rel_paths: Vec<String> = cycle
         .files
         .iter()
-        .map(|path| relative_path(path, root).display().to_string())
+        .map(|path| format_display_path(path, root))
         .collect();
     let mut chain_parts: Vec<String> = rel_paths[1..]
         .iter()
@@ -2622,7 +3216,7 @@ fn build_re_export_cycles_section(
         let first_path = cycle
             .files
             .first()
-            .map(|p| relative_path(p, root).display().to_string())
+            .map(|p| format_display_path(p, root))
             .unwrap_or_default();
         lines.push(format!("  {}", format_path(&first_path)));
         let header_line = match cycle.kind {
@@ -2633,7 +3227,7 @@ fn build_re_export_cycles_section(
         };
         lines.push(format!("    {}", header_line.dimmed()));
         for path in &cycle.files {
-            let rel = relative_path(path, root).display().to_string();
+            let rel = format_display_path(path, root);
             lines.push(format!("      - {}", format_path(&rel)));
         }
         let fix_hint = match cycle.kind {
@@ -2661,6 +3255,68 @@ fn build_re_export_cycles_section(
     }
 }
 
+/// Build package cycles section. Each finding shows the package chain, then
+/// one example import per hop.
+fn build_package_cycles_section(
+    lines: &mut Vec<String>,
+    items: &[fallow_types::output_dead_code::PackageCycleFinding],
+    level: Level,
+    root: &Path,
+    total_issues: usize,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let title = "Package cycles";
+    lines.push(build_section_header(title, items.len(), level));
+
+    let arrow = format!(" {} ", "\u{2192}".dimmed());
+    let shown = items.len().min(MAX_FLAT_ITEMS);
+    for entry in &items[..shown] {
+        let cycle = &entry.cycle;
+        let mut chain: Vec<String> = cycle
+            .packages
+            .iter()
+            .map(|name| name.bold().to_string())
+            .collect();
+        if let Some(first) = chain.first().cloned() {
+            chain.push(first);
+        }
+        lines.push(format!("  {}", chain.join(&arrow)));
+        if cycle.group_truncated {
+            let note = format!(
+                "({})",
+                fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+            );
+            lines.push(format!("    {}", note.dimmed()));
+        }
+        for edge in &cycle.edges {
+            let type_tag = if edge.type_only {
+                format!(" {}", "(type-only)".dimmed())
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "    {}:{} {} {}{}",
+                format_display_path(&edge.path, root),
+                edge.line,
+                "\u{2192}".dimmed(),
+                format_display_path(&edge.target_path, root),
+                type_tag,
+            ));
+        }
+    }
+    if items.len() > MAX_FLAT_ITEMS {
+        let remaining = items.len() - MAX_FLAT_ITEMS;
+        lines.push(format!(
+            "  {}",
+            truncation_hint(remaining, total_issues).dimmed()
+        ));
+    }
+    push_section_footer_with_count(lines, title, items.len());
+    lines.push(String::new());
+}
+
 /// Build boundary violations section grouped by importing file.
 fn build_boundary_violations_section(
     lines: &mut Vec<String>,
@@ -2678,16 +3334,23 @@ fn build_boundary_violations_section(
     let shown = items.len().min(MAX_FLAT_ITEMS);
     for entry in &items[..shown] {
         let v = &entry.violation;
-        let from = relative_path(&v.from_path, root).display().to_string();
-        let to = relative_path(&v.to_path, root).display().to_string();
+        let from = format_display_path(&v.from_path, root);
+        let to = format_display_path(&v.to_path, root);
+        let via = v.via_path.as_ref().map_or_else(String::new, |via| {
+            format!(
+                " {}",
+                format!("via {}", format_display_path(via, root)).dimmed()
+            )
+        });
         lines.push(format!(
-            "  {}:{} {} {} {} {}",
+            "  {}:{} {} {} {} {}{}",
             from,
             v.line,
             "\u{2192}".dimmed(),
             to,
             format!("({}", v.from_zone).dimmed(),
             format!("\u{2192} {})", v.to_zone).dimmed(),
+            via,
         ));
     }
     if items.len() > MAX_FLAT_ITEMS {
@@ -2718,7 +3381,7 @@ fn build_boundary_coverage_violations_section(
     let shown = items.len().min(MAX_FLAT_ITEMS);
     for entry in &items[..shown] {
         let v = &entry.violation;
-        let path = relative_path(&v.path, root).display().to_string();
+        let path = format_display_path(&v.path, root);
         lines.push(format!(
             "  {}:{} {}",
             path,
@@ -2756,7 +3419,7 @@ fn build_boundary_call_violations_section(
     let shown = items.len().min(MAX_FLAT_ITEMS);
     for entry in &items[..shown] {
         let v = &entry.violation;
-        let path = relative_path(&v.path, root).display().to_string();
+        let path = format_display_path(&v.path, root);
         lines.push(format!(
             "  {}:{} {} {}",
             path,
@@ -2799,7 +3462,7 @@ fn build_stale_suppressions_section(
 
     let shown = items.len().min(MAX_FLAT_ITEMS);
     for s in &items[..shown] {
-        let path_str = relative_path(&s.path, root).display().to_string();
+        let path_str = format_display_path(&s.path, root);
         lines.push(format!(
             "  {}:{}:{} {} {}",
             path_str,
@@ -2834,6 +3497,9 @@ fn collect_matching_rules(
     collect_boundary_rules(&mut rules, results, root, resolver);
     collect_framework_rules(&mut rules, results, root, resolver);
     collect_suppression_rules(&mut rules, results, root, resolver);
+    collect_dependency_rules(&mut rules, results, root, resolver);
+    collect_workspace_config_rules(&mut rules, results, root, resolver);
+    collect_component_health_rules(&mut rules, results, root, resolver);
 
     let mut sorted: Vec<String> = rules.into_iter().collect();
     sorted.sort();
@@ -2869,6 +3535,9 @@ fn collect_dead_code_rules(
     }
     for e in &results.private_type_leaks {
         insert_matching_rule(rules, &e.leak.path, root, resolver);
+    }
+    for e in &results.deprecated_exports_in_use {
+        insert_matching_rule(rules, &e.export.path, root, resolver);
     }
     for m in &results.unused_enum_members {
         insert_matching_rule(rules, &m.member.path, root, resolver);
@@ -2941,6 +3610,9 @@ fn collect_framework_rules(
     for p in &results.unused_component_props {
         insert_matching_rule(rules, &p.prop.path, root, resolver);
     }
+    for p in &results.absent_component_props {
+        insert_matching_rule(rules, &p.prop.path, root, resolver);
+    }
     for e in &results.unused_component_emits {
         insert_matching_rule(rules, &e.emit.path, root, resolver);
     }
@@ -2952,6 +3624,15 @@ fn collect_framework_rules(
     }
     for e in &results.unused_svelte_events {
         insert_matching_rule(rules, &e.event.path, root, resolver);
+    }
+    for e in &results.unused_effect_layers {
+        insert_matching_rule(rules, &e.layer.path, root, resolver);
+    }
+    for e in &results.unused_tagged_errors {
+        insert_matching_rule(rules, &e.error.path, root, resolver);
+    }
+    for e in &results.unproduced_catch_tags {
+        insert_matching_rule(rules, &e.catch_tag.path, root, resolver);
     }
     for a in &results.unused_server_actions {
         insert_matching_rule(rules, &a.action.path, root, resolver);
@@ -2978,6 +3659,86 @@ fn collect_suppression_rules(
     }
 }
 
+/// Uses the same file anchors as the grouping builder, so the header names the
+/// rule that put each finding in its group.
+fn collect_dependency_rules(
+    rules: &mut FxHashSet<String>,
+    results: &AnalysisResults,
+    root: &Path,
+    resolver: &OwnershipResolver,
+) {
+    for d in &results.unused_dependencies {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.unused_dev_dependencies {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.unused_optional_dependencies {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.type_only_dependencies {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.test_only_dependencies {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.dev_dependencies_in_production {
+        insert_matching_rule(rules, &d.dep.path, root, resolver);
+    }
+    for d in &results.unlisted_dependencies {
+        if let Some(site) = d.dep.imported_from.first() {
+            insert_matching_rule(rules, &site.path, root, resolver);
+        }
+    }
+    for d in &results.duplicate_exports {
+        if let Some(location) = d.export.locations.first() {
+            insert_matching_rule(rules, &location.path, root, resolver);
+        }
+    }
+}
+
+fn collect_workspace_config_rules(
+    rules: &mut FxHashSet<String>,
+    results: &AnalysisResults,
+    root: &Path,
+    resolver: &OwnershipResolver,
+) {
+    for e in &results.unused_catalog_entries {
+        insert_matching_rule(rules, &e.entry.path, root, resolver);
+    }
+    for g in &results.empty_catalog_groups {
+        insert_matching_rule(rules, &g.group.path, root, resolver);
+    }
+    for r in &results.unresolved_catalog_references {
+        insert_matching_rule(rules, &r.reference.path, root, resolver);
+    }
+    for e in &results.unused_dependency_overrides {
+        insert_matching_rule(rules, &e.entry.path, root, resolver);
+    }
+    for e in &results.misconfigured_dependency_overrides {
+        insert_matching_rule(rules, &e.entry.path, root, resolver);
+    }
+}
+
+fn collect_component_health_rules(
+    rules: &mut FxHashSet<String>,
+    results: &AnalysisResults,
+    root: &Path,
+    resolver: &OwnershipResolver,
+) {
+    for c in &results.prop_drilling_chains {
+        if let Some(hop) = c.chain.hops.first() {
+            insert_matching_rule(rules, &hop.file, root, resolver);
+        }
+    }
+    for w in &results.thin_wrappers {
+        insert_matching_rule(rules, &w.wrapper.file, root, resolver);
+    }
+    for s in &results.duplicate_prop_shapes {
+        insert_matching_rule(rules, &s.shape.file, root, resolver);
+    }
+}
+
 /// Print analysis results grouped by owner or directory.
 ///
 /// Each group gets a colored header with its key and issue count, followed by
@@ -2991,6 +3752,22 @@ pub(in crate::report) struct PrintGroupedHumanInput<'a> {
     pub(in crate::report) quiet: bool,
     pub(in crate::report) resolver: Option<&'a OwnershipResolver>,
     pub(in crate::report) explain: bool,
+    /// Whether a gate of this run fails it. Picks the mark of the final
+    /// status line.
+    pub(in crate::report) run_fails: bool,
+    /// Files an armed `parse-error` gate failed on; see [`clean_status_line`].
+    pub(in crate::report) failed_parse_files: usize,
+    /// Where each group renders the architecture findings.
+    pub(in crate::report) architecture_layout: ArchitectureLayout,
+}
+
+/// Whether the results carry an advisory component health signal. These do not
+/// count toward `total_issues`, but the flat report shows them, so a group that
+/// holds only these signals must still render.
+fn has_component_health_signals(results: &AnalysisResults) -> bool {
+    results.prop_drilling_chains.len() > results.enforced_prop_drilling_count()
+        || !results.thin_wrappers.is_empty()
+        || !results.duplicate_prop_shapes.is_empty()
 }
 
 fn grouped_issue_counts(groups: &[crate::report::grouping::ResultGroup]) -> Vec<(&str, usize)> {
@@ -3030,10 +3807,11 @@ fn grouped_header_text(
 ) -> String {
     let issue_word = if total == 1 { "issue" } else { "issues" };
     let breakdown = build_summary_footer(&group.results, 0, 0);
+    let signals = fallow_api::health_signal_header_part(&group.results);
     let header_text = if breakdown.is_empty() {
-        format!("{} ({total} {issue_word})", group.key)
+        format!("{} ({total} {issue_word}{signals})", group.key)
     } else {
-        format!("{} ({total} {issue_word}: {breakdown})", group.key)
+        format!("{} ({total} {issue_word}: {breakdown}{signals})", group.key)
     };
 
     match resolver {
@@ -3055,6 +3833,7 @@ fn emit_grouped_body(
     rules: &RulesConfig,
     seen_footers: &mut FxHashSet<String>,
     explain: bool,
+    layout: ArchitectureLayout,
 ) {
     if let Some(ref owners) = group.owners
         && !owners.is_empty()
@@ -3062,9 +3841,9 @@ fn emit_grouped_body(
         outln!("  {} {}", "owners:".dimmed(), owners.join(" ").dimmed());
     }
 
-    let lines = build_human_lines_with_explain(&group.results, root, rules, None, explain);
+    let lines = grouped_lines(&group.results, root, rules, explain, layout);
     for line in &lines {
-        if line.contains("docs.fallow.tools") && !seen_footers.insert(line.clone()) {
+        if line.contains("fallow.tools/docs/") && !seen_footers.insert(line.clone()) {
             continue;
         }
         outln!("{line}");
@@ -3079,18 +3858,34 @@ fn emit_grouped_body(
     }
 }
 
+/// The lines of one `--group-by` group, in the same layout as the ungrouped
+/// report.
+fn grouped_lines(
+    results: &AnalysisResults,
+    root: &Path,
+    rules: &RulesConfig,
+    explain: bool,
+    layout: ArchitectureLayout,
+) -> Vec<String> {
+    build_layout_lines(&LayoutLinesInput {
+        results,
+        root,
+        rules,
+        top: None,
+        explain,
+        layout,
+    })
+}
+
 fn emit_grouped_final_status(
     groups: &[crate::report::grouping::ResultGroup],
     grand_total: usize,
     elapsed: Duration,
+    run_fails: bool,
+    failed_parse_files: usize,
 ) {
     if grand_total == 0 {
-        eprintln!(
-            "{}",
-            format!("\u{2713} No issues found ({:.2}s)", elapsed.as_secs_f64())
-                .green()
-                .bold()
-        );
+        eprintln!("{}", clean_status_line(elapsed, failed_parse_files));
     } else {
         let non_empty_groups = groups
             .iter()
@@ -3098,14 +3893,15 @@ fn emit_grouped_final_status(
             .count();
         eprintln!(
             "{}",
-            format!(
-                "\u{2717} {grand_total} issue{} across {non_empty_groups} group{} ({:.2}s)",
-                plural(grand_total),
-                plural(non_empty_groups),
-                elapsed.as_secs_f64()
+            super::findings_status_line(
+                &format!(
+                    "{grand_total} issue{} across {non_empty_groups} group{} ({:.2}s)",
+                    plural(grand_total),
+                    plural(non_empty_groups),
+                    elapsed.as_secs_f64()
+                ),
+                run_fails,
             )
-            .red()
-            .bold()
         );
     }
 }
@@ -3129,18 +3925,31 @@ pub(in crate::report) fn print_grouped_human(input: &PrintGroupedHumanInput<'_>)
 
     for group in groups {
         let total = group.results.total_issues();
-        if total == 0 {
+        if total == 0 && !has_component_health_signals(&group.results) {
             continue;
         }
         grand_total += total;
 
         let header_text = grouped_header_text(group, root, resolver, total);
         outln!("{}", header_text.cyan().bold());
-        emit_grouped_body(group, root, rules, &mut seen_footers, explain);
+        emit_grouped_body(
+            group,
+            root,
+            rules,
+            &mut seen_footers,
+            explain,
+            input.architecture_layout,
+        );
     }
 
     if !quiet {
-        emit_grouped_final_status(groups, grand_total, elapsed);
+        emit_grouped_final_status(
+            groups,
+            grand_total,
+            elapsed,
+            input.run_fails,
+            input.failed_parse_files,
+        );
     }
 }
 
@@ -3167,48 +3976,48 @@ fn emit_config_quality_signal(results: &AnalysisResults, root: &Path) {
         if pct > 80.0 {
             let is_source_dir =
                 matches!(dominant_dir.as_str(), "packages" | "src" | "lib" | "apps");
-            let advice = if is_source_dir {
-                format!(
-                    "Note: {pct:.0}% of unused files are under {dominant_dir}/ \
-                     \u{2014} run `fallow list --entry-points` to verify entry-point detection \
-                     \u{2014} https://docs.fallow.tools/explanations/dead-code#unused-files"
-                )
+            let summary = format!("Note: {pct:.0}% of unused files are under {dominant_dir}/.");
+            let advice: &[&str] = if is_source_dir {
+                &["Run `fallow list --entry-points` to verify entry-point detection."]
             } else {
-                format!(
-                    "Note: {pct:.0}% of unused files are under {dominant_dir}/ \
-                     \u{2014} consider adding it to ignorePatterns or using --production \
-                     (analyzes only production entry points) \
-                     \u{2014} https://docs.fallow.tools/explanations/dead-code#unused-files"
-                )
+                &[
+                    "Add it to ignorePatterns, or use --production to analyze only",
+                    "production entry points.",
+                ]
             };
-            eprintln!("  {}", advice.yellow());
+            eprintln!("  {}", summary.yellow());
+            for line in advice {
+                eprintln!("  {}", line.yellow());
+            }
+            eprintln!(
+                "  {}",
+                "https://fallow.tools/docs/explanations/dead-code/#unused-files".yellow()
+            );
         }
     }
 }
 
-/// Build a one-line summary footer showing counts per issue type.
-///
-/// `suppressed_exports` / `suppressed_types` are subtracted from the raw
-/// counts so the footer reflects the *visible* items when export suppression
-/// is active (exports from unused files are hidden).
 /// Pushes a pluralized `"<count> <label>"` part onto `parts` when `count > 0`.
+///
+/// The noun must be the last word of `label`: a trailing `s` or `ies` is read
+/// as the plural suffix. Use [`push_summary_part_forms`] for other labels.
 fn push_summary_part(parts: &mut Vec<String>, count: usize, label: &str) {
-    if count == 0 {
-        return;
-    }
-    let display_label = if count == 1 && label.ends_with("ies") {
-        format!("{}y", &label[..label.len() - 3])
-    } else if count == 1 && label.ends_with('s') {
-        label[..label.len() - 1].to_string()
+    if let Some(stem) = label.strip_suffix("ies") {
+        push_summary_part_forms(parts, count, &format!("{stem}y"), label);
+    } else if let Some(singular) = label.strip_suffix('s') {
+        push_summary_part_forms(parts, count, singular, label);
     } else {
-        label.to_string()
-    };
-    let mut s = String::new();
-    let _ = write!(s, "{count} {display_label}");
-    if count != 1 && !label.ends_with('s') {
-        s.push('s');
+        push_summary_part_forms(parts, count, label, &format!("{label}s"));
     }
-    parts.push(s);
+}
+
+/// Pushes `"<count> <singular|plural>"` onto `parts` when `count > 0`.
+fn push_summary_part_forms(parts: &mut Vec<String>, count: usize, singular: &str, plural: &str) {
+    match count {
+        0 => {}
+        1 => parts.push(format!("1 {singular}")),
+        _ => parts.push(format!("{count} {plural}")),
+    }
 }
 
 /// Counts distinct file pairs participating in duplicate-export findings.
@@ -3305,9 +4114,10 @@ fn push_summary_dependency_parts(parts: &mut Vec<String>, results: &AnalysisResu
 }
 
 fn push_summary_graph_parts(parts: &mut Vec<String>, results: &AnalysisResults) {
-    push_summary_part(
+    push_summary_part_forms(
         parts,
         results.dev_dependencies_in_production.len(),
+        "dev dependency in production",
         "dev dependencies in production",
     );
     push_summary_part(
@@ -3316,7 +4126,23 @@ fn push_summary_graph_parts(parts: &mut Vec<String>, results: &AnalysisResults) 
         "circular dependencies",
     );
     push_summary_part(parts, results.re_export_cycles.len(), "re-export cycles");
-    push_summary_part(parts, results.boundary_violations.len(), "violations");
+    push_summary_part(parts, results.package_cycles.len(), "package cycles");
+    push_summary_part(
+        parts,
+        results.boundary_violations.len(),
+        "boundary violations",
+    );
+    push_summary_part(
+        parts,
+        results.boundary_coverage_violations.len(),
+        "boundary coverage violations",
+    );
+    push_summary_part(
+        parts,
+        results.boundary_call_violations.len(),
+        "boundary call violations",
+    );
+    push_summary_part(parts, results.policy_violations.len(), "policy violations");
 }
 
 /// Appends the framework-specific summary parts.
@@ -3335,6 +4161,11 @@ fn push_summary_framework_parts(parts: &mut Vec<String>, results: &AnalysisResul
         parts,
         results.unused_component_props.len(),
         "unused component props",
+    );
+    push_summary_part(
+        parts,
+        results.absent_component_props.len(),
+        "optional prop review candidates",
     );
     push_summary_part(
         parts,
@@ -3358,6 +4189,21 @@ fn push_summary_framework_parts(parts: &mut Vec<String>, results: &AnalysisResul
     );
     push_summary_part(
         parts,
+        results.unused_effect_layers.len(),
+        "unused Effect layers",
+    );
+    push_summary_part(
+        parts,
+        results.unused_tagged_errors.len(),
+        "unused tagged errors",
+    );
+    push_summary_part(
+        parts,
+        results.unproduced_catch_tags.len(),
+        "unproduced catch tags",
+    );
+    push_summary_part(
+        parts,
         results.unused_server_actions.len(),
         "unused server actions",
     );
@@ -3373,6 +4219,11 @@ fn push_summary_framework_parts(parts: &mut Vec<String>, results: &AnalysisResul
     );
 }
 
+/// Build a one-line summary footer showing counts per issue type.
+///
+/// `suppressed_exports` / `suppressed_types` are subtracted from the raw
+/// counts so the footer reflects the *visible* items when export suppression
+/// is active (exports from unused files are hidden).
 fn build_summary_footer(
     results: &AnalysisResults,
     suppressed_exports: usize,
@@ -3384,41 +4235,162 @@ fn build_summary_footer(
     parts.join(" \u{00b7} ")
 }
 
+/// The layout of a `--summary` table.
+#[derive(Clone, Copy)]
+pub(in crate::report) struct SummaryStyle<'a> {
+    /// The bold heading above the rows, or `None` for no heading.
+    pub(in crate::report) heading: Option<&'a str>,
+    /// `Split` puts the architecture rows under their own label.
+    pub(in crate::report) layout: ArchitectureLayout,
+}
+
+/// The gate result that picks the final status line of a run.
+#[derive(Clone, Copy)]
+pub(in crate::report) struct RunStatus {
+    /// Whether a gate of this run fails it.
+    pub(in crate::report) run_fails: bool,
+    /// Files an armed `parse-error` gate failed on; see [`clean_status_line`].
+    pub(in crate::report) failed_parse_files: usize,
+}
+
 /// Print a concise summary showing only category counts, no individual items.
 pub(in crate::report) fn print_check_summary(
     results: &AnalysisResults,
     rules: &RulesConfig,
     elapsed: Duration,
     quiet: bool,
-    heading: bool,
+    style: SummaryStyle<'_>,
+    status: RunStatus,
 ) {
+    let SummaryStyle { heading, layout } = style;
+    let RunStatus {
+        run_fails,
+        failed_parse_files,
+    } = status;
     let total = results.total_issues();
     if total == 0 {
         if !quiet {
-            eprintln!(
-                "{}",
-                format!("\u{2713} No issues found ({:.2}s)", elapsed.as_secs_f64())
-                    .green()
-                    .bold()
-            );
+            eprintln!("{}", clean_status_line(elapsed, failed_parse_files));
         }
         return;
     }
 
-    if heading {
-        print_check_summary_heading();
+    if let Some(heading) = heading {
+        print_check_summary_heading(heading);
     }
 
-    print_check_summary_rows(&check_summary_categories(results, rules));
+    if layout == ArchitectureLayout::Split {
+        let (dead_code, architecture) = split_summary_categories(results, rules);
+        print_check_summary_rows(&dead_code);
+        let has_dead_code_rows = dead_code.iter().any(|(_, count, _)| *count > 0);
+        print_architecture_summary_rows(&architecture, has_dead_code_rows);
+    } else {
+        print_check_summary_rows(&check_summary_categories(results, rules));
+    }
     print_check_summary_total(total);
+    print_check_summary_caveat_note(results);
 
     if !quiet {
-        print_check_summary_failure(total, elapsed);
+        print_check_summary_status(total, elapsed, run_fails);
     }
 }
 
-fn print_check_summary_heading() {
-    outln!("{}", "Dead Code Summary".bold());
+/// Count the caveated findings across every array the analysis pass stamps,
+/// and collect which caveats occur, for the `--summary` footnote.
+///
+/// `--summary` prints category counts with no per-finding lines to hang a
+/// suffix on, so the run-level fact is stated once instead. Everything else is
+/// counted per finding, so this is too: "3 of these" is checkable against the
+/// full report, where "some" would not be.
+fn summary_caveat_rollup(results: &AnalysisResults) -> (usize, Vec<ReachabilityCaveat>) {
+    let per_finding: Vec<&[ReachabilityCaveat]> = results
+        .unused_files
+        .iter()
+        .map(|f| f.reachability_caveats.as_slice())
+        .chain(
+            results
+                .unused_exports
+                .iter()
+                .map(|e| e.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_types
+                .iter()
+                .map(|e| e.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_enum_members
+                .iter()
+                .map(|m| m.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_class_members
+                .iter()
+                .map(|m| m.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_store_members
+                .iter()
+                .map(|m| m.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_dependencies
+                .iter()
+                .map(|d| d.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_dev_dependencies
+                .iter()
+                .map(|d| d.reachability_caveats.as_slice()),
+        )
+        .chain(
+            results
+                .unused_optional_dependencies
+                .iter()
+                .map(|d| d.reachability_caveats.as_slice()),
+        )
+        .filter(|caveats| !caveats.is_empty())
+        .collect();
+    let mut present: Vec<ReachabilityCaveat> =
+        per_finding.iter().flat_map(|c| c.iter().copied()).collect();
+    present.sort_unstable();
+    present.dedup();
+    (per_finding.len(), present)
+}
+
+/// State the caveat once under the `--summary` totals.
+///
+/// A CI job that captures `--summary` stdout is a surface that reports a
+/// finding without ever printing the finding, so without this the caveat the
+/// full report carries is dropped on the floor. Silent when nothing degraded,
+/// which keeps a clean run's summary byte-identical.
+fn print_check_summary_caveat_note(results: &AnalysisResults) {
+    let Some(note) = check_summary_caveat_note(results) else {
+        return;
+    };
+    outln!();
+    outln!("  {}", note.dimmed());
+}
+
+/// The note's text, split out so it can be asserted without capturing the
+/// process-global report sink.
+fn check_summary_caveat_note(results: &AnalysisResults) -> Option<String> {
+    let (caveated, present) = summary_caveat_rollup(results);
+    if caveated == 0 {
+        return None;
+    }
+    let labels = caveat_labels(&present)?;
+    Some(format!("({caveated} of these carry a caveat: {labels})"))
+}
+
+fn print_check_summary_heading(heading: &str) {
+    outln!("{}", heading.bold());
     outln!();
 }
 
@@ -3465,6 +4437,11 @@ fn check_summary_unused_export_categories(
             "Private type leaks",
             results.private_type_leaks.len(),
             severity_to_level(rules.private_type_leaks),
+        ),
+        (
+            "Deprecated exports in use",
+            results.deprecated_exports_in_use.len(),
+            severity_to_level(rules.deprecated_exports_in_use),
         ),
         (
             "Unused dependencies",
@@ -3553,11 +4530,38 @@ fn check_summary_dependency_categories(
             severity_to_level(rules.re_export_cycle),
         ),
         (
+            "Package cycles",
+            results.package_cycles.len(),
+            severity_to_level(rules.package_cycle),
+        ),
+        (
             "Boundary violations",
             results.boundary_violations.len(),
             severity_to_level(rules.boundary_violation),
         ),
+        (
+            "Policy violations",
+            results.policy_violations.len(),
+            policy_violations_level(&results.policy_violations),
+        ),
     ]
+}
+
+/// The level of the rule-pack policy findings: error when any finding is an
+/// error, because a rule-level `severity` overrides the `policy-violation` rule.
+fn policy_violations_level(
+    items: &[fallow_types::output_dead_code::PolicyViolationFinding],
+) -> Level {
+    use fallow_types::results::PolicyViolationSeverity;
+
+    if items
+        .iter()
+        .any(|f| f.violation.severity == PolicyViolationSeverity::Error)
+    {
+        Level::Error
+    } else {
+        Level::Warn
+    }
 }
 
 fn check_summary_framework_categories(
@@ -3581,6 +4585,11 @@ fn check_summary_framework_categories(
             severity_to_level(rules.unused_component_props),
         ),
         (
+            "Absent optional component props",
+            results.absent_component_props.len(),
+            severity_to_level(rules.absent_component_props),
+        ),
+        (
             "Unused component emits",
             results.unused_component_emits.len(),
             severity_to_level(rules.unused_component_emits),
@@ -3599,6 +4608,21 @@ fn check_summary_framework_categories(
             "Unused Svelte events",
             results.unused_svelte_events.len(),
             severity_to_level(rules.unused_svelte_events),
+        ),
+        (
+            "Unused Effect layers",
+            results.unused_effect_layers.len(),
+            severity_to_level(rules.unused_effect_layers),
+        ),
+        (
+            "Unused tagged errors",
+            results.unused_tagged_errors.len(),
+            severity_to_level(rules.unused_tagged_errors),
+        ),
+        (
+            "Unproduced catch tags",
+            results.unproduced_catch_tags.len(),
+            severity_to_level(rules.unproduced_catch_tags),
         ),
         (
             "Unused server actions",
@@ -3626,6 +4650,43 @@ fn print_check_summary_rows(categories: &[(&str, usize, Level)]) {
     }
 }
 
+/// The rows of the architecture findings in a `--summary` table.
+const ARCHITECTURE_SUMMARY_ROWS: [&str; 5] = [
+    "Circular dependencies",
+    "Re-export cycles",
+    "Package cycles",
+    "Boundary violations",
+    "Policy violations",
+];
+
+/// One `--summary` row: the label, the count and the level of the count.
+type SummaryRow = (&'static str, usize, Level);
+
+/// Split the summary rows into the dead-code rows and the architecture rows,
+/// each in the order of [`check_summary_categories`].
+fn split_summary_categories(
+    results: &AnalysisResults,
+    rules: &RulesConfig,
+) -> (Vec<SummaryRow>, Vec<SummaryRow>) {
+    check_summary_categories(results, rules)
+        .into_iter()
+        .partition(|(name, _, _)| !ARCHITECTURE_SUMMARY_ROWS.contains(name))
+}
+
+/// Print the architecture rows under their own "Architecture" label, like the
+/// "Architecture" category of the bare `fallow` report. Prints nothing without
+/// a row. A blank line separates the label from dead-code rows above it.
+fn print_architecture_summary_rows(categories: &[(&str, usize, Level)], after_rows: bool) {
+    if categories.iter().all(|(_, count, _)| *count == 0) {
+        return;
+    }
+    if after_rows {
+        outln!();
+    }
+    outln!("  {}", "Architecture".bold());
+    print_check_summary_rows(categories);
+}
+
 fn colored_summary_count(count: usize, level: Level) -> String {
     let count_str = format!("{count:>6}");
     match level {
@@ -3641,12 +4702,17 @@ fn print_check_summary_total(total: usize) {
     outln!("  {}  {}", total_str.bold(), "Total".bold());
 }
 
-fn print_check_summary_failure(total: usize, elapsed: Duration) {
+fn print_check_summary_status(total: usize, elapsed: Duration, run_fails: bool) {
     eprintln!(
         "{}",
-        format!("\u{2717} {total} issues ({:.2}s)", elapsed.as_secs_f64())
-            .red()
-            .bold()
+        super::findings_status_line(
+            &format!(
+                "{total} issue{} ({:.2}s)",
+                plural(total),
+                elapsed.as_secs_f64()
+            ),
+            run_fails,
+        )
     );
 }
 
@@ -3662,6 +4728,24 @@ mod tests {
     /// Build sample results including optional deps (extends the shared helper).
     fn sample_results(root: &Path) -> AnalysisResults {
         crate::report::test_helpers::sample_results(root)
+    }
+
+    #[test]
+    fn cascade_footer_names_the_hidden_count_and_the_flag() {
+        let mut results = AnalysisResults::default();
+        assert_eq!(cascade_footer(&results), None);
+
+        results.cascade_hidden = 1;
+        assert_eq!(
+            cascade_footer(&results).as_deref(),
+            Some("1 finding in unused files is hidden \u{00b7} --show-cascade shows it")
+        );
+
+        results.cascade_hidden = 7;
+        assert_eq!(
+            cascade_footer(&results).as_deref(),
+            Some("7 findings in unused files are hidden \u{00b7} --show-cascade shows them")
+        );
     }
 
     #[test]
@@ -3694,6 +4778,7 @@ mod tests {
         insert_test_src_split(
             &mut small,
             &[src_a.clone(), test_a.clone()],
+            Path::new("/project"),
             PathBuf::as_path,
         );
         assert_eq!(small, vec!["section".to_string(), String::new()]);
@@ -3702,6 +4787,7 @@ mod tests {
         insert_test_src_split(
             &mut mostly_src,
             &[src_a.clone(), src_b.clone(), src_c, src_d, test_a.clone()],
+            Path::new("/project"),
             PathBuf::as_path,
         );
         assert_eq!(mostly_src, vec!["section".to_string(), String::new()]);
@@ -3716,6 +4802,7 @@ mod tests {
                 test_a.clone(),
                 test_b.clone(),
             ],
+            Path::new("/project"),
             PathBuf::as_path,
         );
         assert_eq!(all_tests, vec!["section".to_string(), String::new()]);
@@ -3724,9 +4811,67 @@ mod tests {
         insert_test_src_split(
             &mut mixed,
             &[src_a, src_b, test_a, test_b, fixture],
+            Path::new("/project"),
             PathBuf::as_path,
         );
-        assert!(plain(&mixed).contains("2 in src, 3 in test directories"));
+        assert!(plain(&mixed).contains("2 in src, 3 in test files"));
+    }
+
+    #[test]
+    fn insert_test_src_split_ignores_directories_above_the_root() {
+        let root = PathBuf::from("/home/ci/tests/app");
+        let items = [
+            root.join("src/a.ts"),
+            root.join("src/b.ts"),
+            root.join("src/c.ts"),
+            root.join("src/a.test.ts"),
+            root.join("tests/b.ts"),
+        ];
+
+        let mut lines = vec!["section".to_string()];
+        insert_test_src_split(&mut lines, &items, &root, PathBuf::as_path);
+
+        assert!(plain(&lines).contains("3 in src, 2 in test files"));
+    }
+
+    #[test]
+    fn collect_matching_rules_covers_dependency_and_component_health_findings() {
+        // `--group-by owner` puts these findings in an owner group, so the
+        // "matched by" header must name the rule that put them there.
+        let root = PathBuf::from("/project");
+        let resolver = OwnershipResolver::Owner(
+            crate::codeowners::CodeOwners::parse("/packages/app/ @app\n/packages/ui/ @ui\n")
+                .unwrap(),
+        );
+
+        let mut deps = AnalysisResults::default();
+        deps.unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash".to_string(),
+                location: fallow_types::results::DependencyLocation::Dependencies,
+                path: root.join("packages/app/package.json"),
+                line: 5,
+                used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
+            }));
+        assert_eq!(
+            collect_matching_rules(&deps, &root, &resolver),
+            vec!["/packages/app/".to_string()]
+        );
+
+        let mut health = AnalysisResults::default();
+        health
+            .thin_wrappers
+            .push(ThinWrapperFinding::with_actions(ThinWrapper {
+                file: root.join("packages/ui/Wrapper.tsx"),
+                line: 3,
+                component: "Wrapper".to_string(),
+                child_component: "Child".to_string(),
+            }));
+        assert_eq!(
+            collect_matching_rules(&health, &root, &resolver),
+            vec!["/packages/ui/".to_string()]
+        );
     }
 
     #[test]
@@ -3757,6 +4902,31 @@ mod tests {
         assert!(
             matched.iter().any(|r| r.contains("src")),
             "mixed-barrel path must route through the ownership resolver, got: {matched:?}"
+        );
+    }
+
+    #[test]
+    fn unused_file_lines_normalize_backslash_separators() {
+        // A Windows path reaches the renderer with native separators. The human
+        // report is read by people and matched by tooling, so it must show the
+        // same forward-slash form on every platform.
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src\\dead.ts"),
+            }));
+        let rules = RulesConfig::default();
+        let text = super::super::plain(&build_human_lines(&results, &root, &rules, None));
+
+        assert!(
+            text.contains("src/dead.ts"),
+            "unused-file lines must use forward slashes: {text}"
+        );
+        assert!(
+            !text.contains("src\\dead.ts"),
+            "unused-file lines must not leak native separators: {text}"
         );
     }
 
@@ -3820,6 +4990,34 @@ mod tests {
         assert!(text.contains("Structure"));
         assert!(text.contains("Boundary coverage (1)"));
         assert!(text.contains("src/middleware/error.ts:1"));
+    }
+
+    #[test]
+    fn boundary_violation_through_a_barrel_names_the_barrel() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .boundary_violations
+            .push(BoundaryViolationFinding::with_actions(BoundaryViolation {
+                from_path: root.join("src/ui/Button.ts"),
+                to_path: root.join("src/core/named.ts"),
+                from_zone: "ui".to_string(),
+                to_zone: "core".to_string(),
+                import_specifier: "src/core/named.ts".to_string(),
+                line: 1,
+                col: 9,
+                via_path: Some(root.join("src/shared/index.ts")),
+            }));
+
+        let lines = build_human_lines(&results, &root, &RulesConfig::default(), None);
+        let text = plain(&lines);
+
+        assert!(
+            text.contains(
+                "src/ui/Button.ts:1 \u{2192} src/core/named.ts (ui \u{2192} core) via src/shared/index.ts"
+            ),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -3920,7 +5118,373 @@ mod tests {
         let lines = build_human_lines(&results, &root, &rules, None);
         let text = plain(&lines);
 
-        assert!(text.contains("2 in src, 3 in test directories"));
+        assert!(text.contains("2 in src, 3 in test files"));
+    }
+
+    /// The `source-parse-degraded` diagnostic sits at the top of the JSON
+    /// envelope, and the human report never showed it next to the finding it
+    /// distorts. A person reading `src/helper.ts` under a `delete-file`
+    /// heading has to see that the verdict rests on an incomplete parse.
+    #[test]
+    fn a_caveated_finding_carries_a_compact_suffix_in_the_human_report() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/helper.ts"),
+        });
+        file.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_files.push(file);
+
+        let mut export = UnusedExportFinding::with_actions(UnusedExport {
+            path: root.join("src/lib.ts"),
+            export_name: "needed".to_string(),
+            is_type_only: false,
+            line: 1,
+            col: 13,
+            span_start: 13,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        });
+        export.reachability_caveats = vec![
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ];
+        results.unused_exports.push(export);
+
+        let mut dep = UnusedDependencyFinding::with_actions(UnusedDependency {
+            package_name: "lodash".to_string(),
+            location: fallow_types::results::DependencyLocation::Dependencies,
+            path: root.join("package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        });
+        dep.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_dependencies.push(dep);
+
+        // All three member arrays are stamped by the same reachability-free
+        // access walk, so all three lines have to hedge.
+        let member = |parent: &str, name: &str, kind| UnusedMember {
+            path: root.join("src/lib.ts"),
+            parent_name: parent.to_string(),
+            member_name: name.to_string(),
+            kind,
+            line: 7,
+            col: 2,
+        };
+        let mut enum_member =
+            UnusedEnumMemberFinding::with_actions(member("Mode", "Legacy", MemberKind::EnumMember));
+        enum_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_enum_members.push(enum_member);
+
+        let mut class_member = UnusedClassMemberFinding::with_actions(member(
+            "Widget",
+            "render",
+            MemberKind::ClassMethod,
+        ));
+        class_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_class_members.push(class_member);
+
+        let mut store_member = UnusedStoreMemberFinding::with_actions(member(
+            "useCart",
+            "subtotal",
+            MemberKind::StoreMember,
+        ));
+        store_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_store_members.push(store_member);
+
+        let rules = RulesConfig::default();
+        let text = plain(&build_human_lines(&results, &root, &rules, None));
+
+        assert!(
+            text.contains("src/helper.ts (caveat: incomplete import graph)"),
+            "the unused-file line must name the caveat: {text}"
+        );
+        assert!(
+            text.contains(":1 needed (caveat: incomplete file analysis, incomplete import graph)"),
+            "the unused-export line must name both caveats: {text}"
+        );
+        assert!(
+            text.contains("lodash (caveat: incomplete import graph)"),
+            "the dependency line must name the caveat: {text}"
+        );
+        for expected in [
+            "Mode.Legacy (caveat: incomplete import graph)",
+            "Widget.render (caveat: incomplete import graph)",
+            "useCart.subtotal (caveat: incomplete import graph)",
+        ] {
+            assert!(
+                text.contains(expected),
+                "every member line must name the caveat, missing {expected}: {text}"
+            );
+        }
+    }
+
+    /// `--summary` prints category counts with no per-finding lines, so a CI
+    /// job that captures only this output would otherwise lose the caveat the
+    /// full report carries. It is stated once under the totals instead.
+    #[test]
+    fn the_summary_view_states_the_caveat_under_the_totals() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/helper.ts"),
+        });
+        file.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_files.push(file);
+        let mut dep = UnusedDependencyFinding::with_actions(UnusedDependency {
+            package_name: "lodash".to_string(),
+            location: fallow_types::results::DependencyLocation::Dependencies,
+            path: root.join("package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        });
+        dep.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_dependencies.push(dep);
+
+        assert_eq!(
+            check_summary_caveat_note(&results).as_deref(),
+            Some("(2 of these carry a caveat: incomplete import graph)")
+        );
+    }
+
+    /// The rollup walks every stamped array, and two of them arrived through
+    /// separate merges. Counting a caveated type or enum member once per
+    /// chained iterator made the footnote over-report: on a fixture with one
+    /// caveated entry per array it claimed more than it printed. "N of these"
+    /// is only checkable against the full report while N is the number of
+    /// findings the report prints, so this pins one count per finding, with a
+    /// caveated entry in every array the rollup walks.
+    #[test]
+    fn the_summary_rollup_counts_each_caveated_finding_exactly_once() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        let caveat = vec![ReachabilityCaveat::IncompleteImportGraph];
+
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/helper.ts"),
+        });
+        file.reachability_caveats.clone_from(&caveat);
+        results.unused_files.push(file);
+
+        let export = |name: &str| UnusedExport {
+            path: root.join("src/lib.ts"),
+            export_name: name.to_string(),
+            is_type_only: false,
+            line: 1,
+            col: 13,
+            span_start: 13,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        };
+
+        let mut unused_export = UnusedExportFinding::with_actions(export("needed"));
+        unused_export.reachability_caveats.clone_from(&caveat);
+        results.unused_exports.push(unused_export);
+
+        let mut unused_type = UnusedTypeFinding::with_actions(export("Shape"));
+        unused_type.reachability_caveats.clone_from(&caveat);
+        results.unused_types.push(unused_type);
+
+        let mut member = UnusedEnumMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/enums.ts"),
+            parent_name: "Color".to_string(),
+            member_name: "Purple".to_string(),
+            kind: MemberKind::EnumMember,
+            line: 5,
+            col: 2,
+        });
+        member.reachability_caveats.clone_from(&caveat);
+        results.unused_enum_members.push(member);
+
+        let mut class_member = UnusedClassMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/widget.ts"),
+            parent_name: "Widget".to_string(),
+            member_name: "render".to_string(),
+            kind: MemberKind::ClassMethod,
+            line: 4,
+            col: 2,
+        });
+        class_member.reachability_caveats.clone_from(&caveat);
+        results.unused_class_members.push(class_member);
+
+        let mut store_member = UnusedStoreMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/cart.ts"),
+            parent_name: "useCart".to_string(),
+            member_name: "subtotal".to_string(),
+            kind: MemberKind::StoreMember,
+            line: 6,
+            col: 2,
+        });
+        store_member.reachability_caveats.clone_from(&caveat);
+        results.unused_store_members.push(store_member);
+
+        let dependency = |name: &str, location| UnusedDependency {
+            package_name: name.to_string(),
+            location,
+            path: root.join("package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        };
+
+        let mut prod = UnusedDependencyFinding::with_actions(dependency(
+            "lodash",
+            fallow_types::results::DependencyLocation::Dependencies,
+        ));
+        prod.reachability_caveats.clone_from(&caveat);
+        results.unused_dependencies.push(prod);
+
+        let mut dev = UnusedDevDependencyFinding::with_actions(dependency(
+            "chalk",
+            fallow_types::results::DependencyLocation::DevDependencies,
+        ));
+        dev.reachability_caveats.clone_from(&caveat);
+        results.unused_dev_dependencies.push(dev);
+
+        let mut optional = UnusedOptionalDependencyFinding::with_actions(dependency(
+            "fsevents",
+            fallow_types::results::DependencyLocation::OptionalDependencies,
+        ));
+        optional.reachability_caveats.clone_from(&caveat);
+        results.unused_optional_dependencies.push(optional);
+
+        assert_eq!(
+            check_summary_caveat_note(&results).as_deref(),
+            Some("(9 of these carry a caveat: incomplete import graph)")
+        );
+
+        // Every finding above carries exactly one caveat, which makes "one per
+        // finding" and "one per caveat token" indistinguishable. A real run
+        // produces both tokens on one finding whenever the finding's own file
+        // is the degraded one, so stamp that shape and hold the same total:
+        // the count is of findings, and a finding with two caveats is still
+        // one line in the report the reader checks it against.
+        results.unused_files[0].reachability_caveats = vec![
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ];
+        assert_eq!(
+            check_summary_caveat_note(&results).as_deref(),
+            Some("(9 of these carry a caveat: incomplete file analysis, incomplete import graph)"),
+            "a finding carrying both caveats must still be counted once"
+        );
+    }
+
+    /// Silent on a run that read every file it discovered, so the default
+    /// `--summary` output stays byte-identical.
+    #[test]
+    fn the_summary_view_stays_silent_without_a_caveat() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/helper.ts"),
+            }));
+
+        assert_eq!(check_summary_caveat_note(&results), None);
+    }
+
+    /// A project that parses cleanly must render exactly as before.
+    #[test]
+    fn an_uncaveated_finding_renders_without_a_suffix() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/helper.ts"),
+            }));
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash".to_string(),
+                location: fallow_types::results::DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 5,
+                used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
+            }));
+
+        let rules = RulesConfig::default();
+        let text = plain(&build_human_lines(&results, &root, &rules, None));
+
+        assert!(
+            !text.contains("caveat"),
+            "clean output must not change: {text}"
+        );
+    }
+
+    /// Above the rollup threshold the per-file lines collapse into directory
+    /// counts, so the caveat is stated once for the section instead of being
+    /// silently dropped.
+    #[test]
+    fn the_directory_rollup_states_the_caveat_once() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        for index in 0..=DIR_ROLLUP_THRESHOLD {
+            let mut file = UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join(format!("src/dead{index}.ts")),
+            });
+            if index % 2 == 0 {
+                file.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+            }
+            results.unused_files.push(file);
+        }
+        let expected = results
+            .unused_files
+            .iter()
+            .filter(|finding| !finding.reachability_caveats.is_empty())
+            .count();
+
+        let rules = RulesConfig::default();
+        let text = plain(&build_human_lines(&results, &root, &rules, None));
+
+        assert!(
+            text.contains(&format!(
+                "({expected} of these carry a caveat: incomplete import graph)"
+            )),
+            "the rollup must still surface the caveat: {text}"
+        );
+    }
+
+    /// The rollup labels a directory entry with a trailing slash. A file that
+    /// sits directly in the dominant directory has no subdirectory to group
+    /// under, and the split read its second path component regardless, so a
+    /// file name was labelled as though it were a directory: `src/orphan.ts/`.
+    /// It belongs to the dominant directory itself.
+    #[test]
+    fn the_dominant_directory_split_never_labels_a_file_as_a_directory() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        for index in 0..DIR_ROLLUP_THRESHOLD {
+            results
+                .unused_files
+                .push(UnusedFileFinding::with_actions(UnusedFile {
+                    path: root.join(format!("src/components/dead{index}.ts")),
+                }));
+        }
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/orphan.ts"),
+            }));
+
+        let rules = RulesConfig::default();
+        let text = plain(&build_human_lines(&results, &root, &rules, None));
+
+        assert!(
+            !text.contains("src/orphan.ts/"),
+            "a file must never be rendered as a directory: {text}"
+        );
+        assert!(
+            text.contains("src/  1 file"),
+            "the loose file counts under the directory it lives in: {text}"
+        );
     }
 
     #[test]
@@ -3937,6 +5501,8 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -3948,6 +5514,8 @@ mod tests {
                 col: 0,
                 span_start: 300,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -3973,6 +5541,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -3994,6 +5564,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4055,6 +5627,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4075,6 +5648,7 @@ mod tests {
                 path: root.join("packages/web/package.json"),
                 line: 8,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4095,6 +5669,7 @@ mod tests {
                 path: root.join("packages/shared/package.json"),
                 line: 8,
                 used_in_workspaces: vec![root.join("packages/consumer")],
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4115,6 +5690,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 8,
                 used_in_workspaces: vec![root.join("packages/consumer")],
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4122,6 +5698,245 @@ mod tests {
         assert!(text.contains("lodash-es"));
         assert!(text.contains("(imported in packages/consumer)"));
         assert!(!text.contains("(package.json; imported in packages/consumer)"));
+    }
+
+    #[test]
+    fn unused_root_dep_names_the_workspaces_that_declare_and_import_it() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash".to_string(),
+                location: DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 8,
+                used_in_workspaces: Vec::new(),
+                declared_and_imported_in: vec![root.join("packages/app")],
+            }));
+        let rules = RulesConfig::default();
+        let lines = build_human_lines(&results, &root, &rules, None);
+        let text = plain(&lines);
+        assert!(
+            text.contains("lodash (package.json; declared and imported in packages/app)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unused_dep_with_many_workspaces_holds_80_columns() {
+        let root = PathBuf::from("/project");
+        let manifest = root.join("packages/design-tokens/package.json");
+        let workspaces = vec![
+            root.join("packages/web-application"),
+            root.join("packages/mobile-application"),
+            root.join("packages/documentation-site"),
+        ];
+        let name = "@acme/tokens";
+        let natural: usize = name.chars().count()
+            + DEP_LINE_DECORATION
+            + relative_path(&manifest, &root)
+                .display()
+                .to_string()
+                .chars()
+                .count()
+            + IMPORTED_IN.chars().count()
+            + workspaces
+                .iter()
+                .map(|path| {
+                    relative_path(path, &root)
+                        .display()
+                        .to_string()
+                        .chars()
+                        .count()
+                        + 2
+                })
+                .sum::<usize>();
+        // Unelided, this line runs well past the ceiling it has to hold.
+        // The bound is a literal: written as DEP_LINE_WIDTH + 30 it would
+        // travel with the constant under test and guard nothing.
+        assert!(natural > 110, "{natural}");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: name.to_string(),
+                location: DependencyLocation::Dependencies,
+                path: manifest,
+                line: 8,
+                used_in_workspaces: workspaces,
+                declared_and_imported_in: Vec::new(),
+            }));
+        let rules = RulesConfig::default();
+        let lines = build_human_lines(&results, &root, &rules, None);
+        let text = plain(&lines);
+        let rendered = text
+            .lines()
+            .find(|line| line.contains(name))
+            .expect("dependency line rendered");
+        // Eighty columns is the contract with the terminal, not a restatement
+        // of DEP_LINE_WIDTH, so it is asserted as a literal. The fixture is
+        // sized to land on the ceiling exactly, which is what makes widening
+        // the constant fail here instead of passing while the output overruns.
+        assert_eq!(rendered.chars().count(), 80, "{rendered}");
+        // The declaring package survives the elision, and the workspaces the
+        // clause could not seat are disclosed rather than dropped.
+        assert!(rendered.contains("design-tokens/package.json"));
+        assert!(rendered.contains("imported in"));
+        assert!(rendered.contains("+2 more"));
+    }
+
+    #[test]
+    fn a_caveated_dep_line_keeps_its_caveat_inside_80_columns() {
+        let root = PathBuf::from("/project");
+        let name = "react-native-gzip";
+        let mut dep = UnusedDependencyFinding::with_actions(UnusedDependency {
+            package_name: name.to_string(),
+            location: DependencyLocation::Dependencies,
+            path: root.join("packages/mobile-application/package.json"),
+            line: 8,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        });
+        dep.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        let mut results = AnalysisResults::default();
+        results.unused_dependencies.push(dep);
+        let lines = build_human_lines(&results, &root, &RulesConfig::default(), None);
+        let text = plain(&lines);
+        let rendered = text
+            .lines()
+            .find(|line| line.contains(name))
+            .expect("dependency line rendered");
+        // The caveat is appended after the label, so the label budget has to
+        // leave room for it. Unreserved, this line renders at 95 columns.
+        assert!(
+            rendered.chars().count() <= 80,
+            "{} columns: {rendered}",
+            rendered.chars().count()
+        );
+        assert!(
+            rendered.ends_with("(caveat: incomplete import graph)"),
+            "the caveat is never cut: {rendered}"
+        );
+        assert!(
+            rendered.contains("package.json"),
+            "the manifest still renders: {rendered}"
+        );
+    }
+
+    #[test]
+    fn dep_label_caps_the_workspace_list_and_keeps_whole_paths() {
+        let label = dep_label(
+            "packages/tsc/package.json",
+            WorkspaceClause::ImportedIn,
+            &[
+                "packages/bench".to_string(),
+                "packages/treeshake".to_string(),
+            ],
+            DEP_LINE_WIDTH - "valibot".len() - DEP_LINE_DECORATION,
+        )
+        .expect("label rendered");
+        assert_eq!(
+            label,
+            "packages/tsc/package.json; imported in packages/bench +1 more"
+        );
+    }
+
+    #[test]
+    fn dep_label_elides_a_deep_manifest_on_segment_boundaries() {
+        let label = dep_label(
+            "packages/platform/internal/tooling/generators/package.json",
+            WorkspaceClause::ImportedIn,
+            &[],
+            40,
+        )
+        .expect("label rendered");
+        assert!(label.chars().count() <= 40, "{label}");
+        assert_eq!(label, ".../tooling/generators/package.json");
+    }
+
+    #[test]
+    fn dep_label_drops_the_clause_that_would_erode_the_manifest_path() {
+        let label = dep_label(
+            "packages/platform/design-system/package.json",
+            WorkspaceClause::ImportedIn,
+            &["packages/platform/web-application".to_string()],
+            DEP_LINE_WIDTH - "@internal/design-system-tokens".len() - DEP_LINE_DECORATION,
+        )
+        .expect("label rendered");
+        // Seating the clause would leave `.../package.json`, which names no
+        // package, so the path takes the label instead.
+        assert_eq!(label, "packages/platform/design-system/package.json");
+    }
+
+    #[test]
+    fn root_dep_label_without_room_for_the_declaring_workspaces_stays_bare() {
+        let workspaces = ["packages/app".to_string()];
+        // The root manifest alone says nothing, so it renders only with the
+        // clause that it introduces.
+        assert_eq!(
+            dep_label(
+                ROOT_MANIFEST,
+                WorkspaceClause::DeclaredAndImportedIn,
+                &workspaces,
+                31
+            ),
+            None
+        );
+        assert_eq!(
+            dep_label(
+                ROOT_MANIFEST,
+                WorkspaceClause::DeclaredAndImportedIn,
+                &workspaces,
+                60
+            )
+            .as_deref(),
+            Some("package.json; declared and imported in packages/app")
+        );
+    }
+
+    #[test]
+    fn dep_label_is_dropped_when_the_package_name_consumes_the_line() {
+        let manifest = "packages/platform/design-system/package.json";
+        let workspaces = ["packages/platform/web-application".to_string()];
+        // Sixteen columns is the width of a manifest elided to its file name,
+        // the narrowest label that still names something. Both budgets are
+        // literals: as MIN_LABEL_WIDTH +/- 1 they would follow the constant
+        // and leave the boundary it exists to express unpinned.
+        assert_eq!(
+            dep_label(manifest, WorkspaceClause::ImportedIn, &workspaces, 15),
+            None
+        );
+        assert_eq!(
+            dep_label(manifest, WorkspaceClause::ImportedIn, &workspaces, 16).as_deref(),
+            Some(".../package.json")
+        );
+    }
+
+    #[test]
+    fn summarize_workspaces_reserves_room_for_the_more_suffix() {
+        let workspaces: Vec<String> = ["a/bb", "c/ddddddddddd", "e/ff", "g/hh", "i/jj"]
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect();
+        let list = summarize_workspaces(&workspaces, 30);
+        // Seating a third path leaves no room for the `+N more` that the two
+        // it displaces still need, so the loop stops one earlier and every
+        // path it did seat renders whole. Drop the reservation and the joined
+        // list overruns, gets elided from the left, and silently loses entries
+        // the count is still promising are shown.
+        assert_eq!(list, "a/bb, c/ddddddddddd +3 more");
+        assert!(list.chars().count() <= 30, "{list}");
+    }
+
+    #[test]
+    fn summarize_workspaces_elides_a_single_overlong_path() {
+        let list = summarize_workspaces(
+            &["packages/platform/internal/generators".to_string()],
+            MIN_WORKSPACE_LIST_WIDTH,
+        );
+        assert!(list.chars().count() <= MIN_WORKSPACE_LIST_WIDTH, "{list}");
+        assert_eq!(list, ".../generators");
     }
 
     #[test]
@@ -4384,6 +6199,43 @@ mod tests {
     }
 
     #[test]
+    fn package_cycle_in_a_truncated_group_shows_a_note() {
+        let root = PathBuf::from("/project");
+        let hop = |from: &str, to: &str, file: &str| PackageCycleEdge {
+            from_package: from.to_string(),
+            to_package: to.to_string(),
+            path: root.join(file),
+            target_path: root.join(file),
+            line: 1,
+            col: 0,
+            type_only: false,
+        };
+        let cycle = |group_truncated: bool| {
+            PackageCycleFinding::with_actions(PackageCycle {
+                packages: vec!["a".to_string(), "b".to_string()],
+                package_roots: vec![root.join("packages/a"), root.join("packages/b")],
+                length: 2,
+                edges: vec![
+                    hop("a", "b", "packages/a/x.ts"),
+                    hop("b", "a", "packages/b/y.ts"),
+                ],
+                group_truncated,
+            })
+        };
+        let mut results = AnalysisResults::default();
+        results.package_cycles.push(cycle(true));
+        results.package_cycles.push(cycle(false));
+        let rules = RulesConfig::default();
+        let text = plain(&build_human_lines(&results, &root, &rules, None));
+        assert_eq!(
+            text.matches("(this package group has more cycles than listed)")
+                .count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
     fn empty_sections_are_omitted() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
@@ -4435,6 +6287,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -4446,6 +6300,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4459,17 +6315,19 @@ mod tests {
     fn grouped_items_from_same_file_share_one_file_header() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
-        for i in 0..3 {
+        for i in 0..3_u32 {
             results
                 .unused_exports
                 .push(UnusedExportFinding::with_actions(UnusedExport {
                     path: root.join("src/utils.ts"),
                     export_name: format!("fn{i}"),
                     is_type_only: false,
-                    line: (i + 1) as u32,
+                    line: i + 1,
                     col: 0,
                     span_start: 0,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }));
         }
         let rules = RulesConfig::default();
@@ -4554,6 +6412,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 1,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
@@ -4729,6 +6588,34 @@ mod tests {
         );
     }
 
+    fn push_dev_dependency_in_production(results: &mut AnalysisResults, package_name: &str) {
+        results.dev_dependencies_in_production.push(
+            fallow_types::output_dead_code::DevDependencyInProductionFinding::with_actions(
+                DevDependencyInProduction {
+                    package_name: package_name.to_string(),
+                    path: PathBuf::from("/project/package.json"),
+                    line: 5,
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn summary_footer_pluralizes_noun_before_trailing_qualifier() {
+        let mut results = AnalysisResults::default();
+        push_dev_dependency_in_production(&mut results, "vitest");
+        assert_eq!(
+            build_summary_footer(&results, 0, 0),
+            "1 dev dependency in production"
+        );
+
+        push_dev_dependency_in_production(&mut results, "tinyspy");
+        assert_eq!(
+            build_summary_footer(&results, 0, 0),
+            "2 dev dependencies in production"
+        );
+    }
+
     #[test]
     fn section_footer_contains_docs_link() {
         let root = PathBuf::from("/project");
@@ -4741,7 +6628,7 @@ mod tests {
         let rules = RulesConfig::default();
         let lines = build_human_lines(&results, &root, &rules, None);
         let text = plain(&lines);
-        assert!(text.contains("docs.fallow.tools/explanations/dead-code"));
+        assert!(text.contains("fallow.tools/docs/explanations/dead-code/"));
         assert!(text.contains("Files not reachable from any entry point"));
     }
 
@@ -4777,6 +6664,8 @@ mod tests {
                     col: 0,
                     span_start: 0,
                     is_re_export: false,
+                    deprecated: false,
+                    deprecated_reason: None,
                 }));
         }
         let rules = RulesConfig::default();
@@ -4816,6 +6705,177 @@ mod tests {
         assert!(
             text.contains("... and 3 more"),
             "Expected truncation hint, got:\n{text}"
+        );
+    }
+
+    fn architecture_sample(root: &Path) -> AnalysisResults {
+        let mut results = sample_results(root);
+        results
+            .policy_violations
+            .push(PolicyViolationFinding::with_actions(PolicyViolation {
+                path: root.join("src/app.ts"),
+                line: 7,
+                col: 2,
+                pack: "team-policy".to_string(),
+                rule_id: "no-moment".to_string(),
+                kind: fallow_types::results::PolicyRuleKind::BannedImport,
+                matched: "moment".to_string(),
+                severity: fallow_types::results::PolicyViolationSeverity::Warn,
+                message: None,
+            }));
+        results
+    }
+
+    fn layout_lines(
+        results: &AnalysisResults,
+        root: &Path,
+        layout: ArchitectureLayout,
+    ) -> Vec<String> {
+        build_layout_lines(&LayoutLinesInput {
+            results,
+            root,
+            rules: &RulesConfig::default(),
+            top: None,
+            explain: false,
+            layout,
+        })
+    }
+
+    #[test]
+    fn embedded_layout_is_the_classic_dead_code_report() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let lines = layout_lines(&results, &root, ArchitectureLayout::Embedded);
+        assert_eq!(
+            lines,
+            build_human_lines(&results, &root, &RulesConfig::default(), None)
+        );
+        let text = plain(&lines);
+        assert!(text.contains("Structure"));
+        assert!(!text.contains("\u{2500}\u{2500} Architecture"));
+        assert!(text.contains("Circular dependencies (1)"));
+        assert!(text.contains("Policy violations (1)"));
+    }
+
+    #[test]
+    fn split_layout_moves_architecture_findings_and_keeps_component_findings() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let text = plain(&layout_lines(&results, &root, ArchitectureLayout::Split));
+        let heading = text
+            .find("\u{2500}\u{2500} Architecture ")
+            .unwrap_or_else(|| panic!("architecture category: {text}"));
+        let (dead_code, architecture) = text.split_at(heading);
+
+        assert!(dead_code.contains("Duplicate exports"));
+        assert!(dead_code.contains("Unrendered components"));
+        assert!(!dead_code.contains("Circular dependencies"));
+        assert!(!dead_code.contains("Boundary violations"));
+        assert!(!dead_code.contains("Policy violations"));
+
+        assert!(architecture.contains("Circular dependencies (1)"));
+        assert!(architecture.contains("Boundary violations (1)"));
+        assert!(architecture.contains("Policy violations (1)"));
+        assert_eq!(
+            text.matches("\u{2500}\u{2500} Architecture").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn split_layout_equals_the_grouped_layout() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let rules = RulesConfig::default();
+        assert_eq!(
+            layout_lines(&results, &root, ArchitectureLayout::Split),
+            grouped_lines(&results, &root, &rules, false, ArchitectureLayout::Split)
+        );
+    }
+
+    #[test]
+    fn only_layout_prints_one_architecture_category() {
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+        let sample = architecture_sample(&root);
+        results.circular_dependencies = sample.circular_dependencies;
+        results.boundary_violations = sample.boundary_violations;
+        results.policy_violations = sample.policy_violations;
+
+        let text = plain(&layout_lines(&results, &root, ArchitectureLayout::Only));
+        assert!(text.starts_with("\u{2500}\u{2500} Architecture "), "{text}");
+        assert!(!text.contains("Structure"));
+        assert!(!text.contains("\u{2500}\u{2500} Policy"));
+        assert!(text.contains("Circular dependencies (1)"));
+        assert!(text.contains("Policy violations (1)"));
+    }
+
+    #[test]
+    fn split_layout_without_architecture_findings_has_no_architecture_lines() {
+        let root = PathBuf::from("/project");
+        let mut results = sample_results(&root);
+        results.circular_dependencies.clear();
+        results.boundary_violations.clear();
+        assert_eq!(
+            layout_lines(&results, &root, ArchitectureLayout::Split),
+            build_human_lines(&results, &root, &RulesConfig::default(), None)
+        );
+    }
+
+    #[test]
+    fn split_summary_moves_the_architecture_rows() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let (dead_code, architecture) = split_summary_categories(&results, &RulesConfig::default());
+        let names = |rows: &[(&str, usize, Level)]| -> Vec<String> {
+            rows.iter()
+                .map(|(name, _, _)| (*name).to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&architecture),
+            ARCHITECTURE_SUMMARY_ROWS.map(String::from)
+        );
+        assert!(names(&dead_code).contains(&"Duplicate exports".to_string()));
+        assert_eq!(
+            dead_code.len() + architecture.len(),
+            check_summary_categories(&results, &RulesConfig::default()).len()
+        );
+    }
+
+    #[test]
+    fn grouped_split_lines_use_one_architecture_category() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let rules = RulesConfig::default();
+        let text = plain(&grouped_lines(
+            &results,
+            &root,
+            &rules,
+            false,
+            ArchitectureLayout::Split,
+        ));
+        assert!(text.contains("\u{2500}\u{2500} Architecture "), "{text}");
+        assert_eq!(text.matches("Policy violations").count(), 1, "{text}");
+        let unused = text.find("Duplicate exports").expect("dead-code lines");
+        let architecture = text.find("\u{2500}\u{2500} Architecture ").expect("arch");
+        assert!(unused < architecture, "{text}");
+        assert_eq!(
+            grouped_lines(&results, &root, &rules, false, ArchitectureLayout::Embedded),
+            build_human_lines(&results, &root, &rules, None)
+        );
+    }
+
+    #[test]
+    fn summary_counts_policy_violations() {
+        let root = PathBuf::from("/project");
+        let results = architecture_sample(&root);
+        let categories = check_summary_categories(&results, &RulesConfig::default());
+        assert!(
+            categories
+                .iter()
+                .any(|(name, count, _)| *name == "Policy violations" && *count == 1)
         );
     }
 }

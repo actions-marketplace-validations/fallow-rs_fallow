@@ -1,10 +1,12 @@
 //! `--format github-annotations`: GitHub Actions workflow-command
 //! annotations (`::error` / `::warning` / `::notice` lines on stdout).
 //!
-//! The per-kind titles and message templates are ported from the bundled
-//! action's jq renderers (`action/jq/annotations-{check,dupes,health}.jq`);
-//! the security emitter is net-new (the jq layer has no security
-//! annotations). Messages are built with real newlines and escaped at the
+//! The per-kind titles and message templates were first ported from the
+//! bundled action's jq renderers (`action/jq/annotations-{check,dupes,
+//! health}.jq`); the security emitter is net-new (the jq layer has no security
+//! annotations). This renderer is now the source of truth for fallow 3.4.2 and
+//! later. The action keeps the jq files as frozen legacy renderers for older
+//! binaries, so new issue kinds go here and not into the jq files. Messages are built with real newlines and escaped at the
 //! render boundary per the strict contract in [`super::github`].
 //!
 //! The renderer is value-driven: it consumes the same JSON envelope that
@@ -14,6 +16,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use fallow_types::output_dead_code::caveat_labels_for_tokens;
 use serde_json::Value;
 
 use super::github::{
@@ -27,6 +30,9 @@ use crate::report::sink::outln;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnvelopeKind {
     DeadCode,
+    /// `fallow architecture`: the dead-code body with its own `kind` and
+    /// `schema_version`.
+    Architecture,
     Dupes,
     Health,
     Audit,
@@ -38,11 +44,37 @@ pub enum EnvelopeKind {
     Fix,
 }
 
+impl EnvelopeKind {
+    /// Whether the envelope has the dead-code body at its root:
+    /// `dead-code` or `architecture`.
+    pub const fn is_dead_code_family(self) -> bool {
+        matches!(self, Self::DeadCode | Self::Architecture)
+    }
+}
+
+impl From<fallow_output::CheckEnvelope> for EnvelopeKind {
+    fn from(envelope: fallow_output::CheckEnvelope) -> Self {
+        match envelope {
+            fallow_output::CheckEnvelope::DeadCode => Self::DeadCode,
+            fallow_output::CheckEnvelope::Architecture => Self::Architecture,
+        }
+    }
+}
+
 /// Render and print the annotation stream for one envelope, resolving the
 /// ambient path-rebase and package-manager options at this boundary.
 pub(crate) fn print_annotations(kind: EnvelopeKind, envelope: &Value, root: &Path) -> ExitCode {
     let options = resolve_render_options(root);
     let rendered = render_annotations(kind, envelope, &options);
+    // Before the findings, because the consumer caps this stream: the action
+    // pipes it through `head -n "$MAX"` (`action/scripts/annotate.sh`), so a
+    // verdict appended after the findings is the first thing a noisy run drops.
+    if let Some(line) = crate::report::gate_outcome_text::annotation_line(envelope) {
+        outln!("{line}");
+    }
+    if let Some(line) = crate::report::request_outcome_text::annotation_line(envelope) {
+        outln!("{line}");
+    }
     if !rendered.is_empty() {
         outln!("{rendered}");
     }
@@ -56,6 +88,10 @@ pub(crate) fn print_annotations(kind: EnvelopeKind, envelope: &Value, root: &Pat
 pub fn render_annotations(kind: EnvelopeKind, envelope: &Value, options: &RenderOptions) -> String {
     let mut annotations = collect_annotations(kind, envelope, options.pm);
     sort_annotations(&mut annotations);
+    if kind == EnvelopeKind::Audit && envelope["attribution"]["gate"] == "new-only" {
+        annotations
+            .sort_by_key(|annotation| (annotation.level, annotation.introduced != Some(true)));
+    }
     let mut lines: Vec<String> = Vec::with_capacity(annotations.len() + 1);
     for annotation in &mut annotations {
         annotation.path = options.rebase.apply(&annotation.path);
@@ -74,14 +110,18 @@ pub(crate) fn collect_annotations(
 ) -> Vec<Annotation> {
     let mut out = Vec::new();
     match kind {
-        EnvelopeKind::DeadCode => collect_check(envelope, pm, &mut out),
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => {
+            collect_check(envelope, pm, &mut out);
+        }
         EnvelopeKind::Dupes => collect_dupes(envelope, &mut out),
         EnvelopeKind::Health => collect_health(envelope, &mut out),
         EnvelopeKind::Security => collect_security(envelope, &mut out),
         EnvelopeKind::Audit => {
             collect_section(envelope, "dead_code", pm, &mut out, collect_check);
             collect_value_section(envelope, "complexity", &mut out, collect_health);
+            collect_value_section(envelope, "complexity", &mut out, collect_audit_styling);
             collect_value_section(envelope, "duplication", &mut out, collect_dupes);
+            collect_value_section(envelope, "diff_risk", &mut out, collect_diff_risk);
         }
         EnvelopeKind::Combined => {
             collect_section(envelope, "check", pm, &mut out, collect_check);
@@ -119,19 +159,26 @@ fn collect_value_section(
     }
 }
 
-/// Line/column anchor for one annotation.
+/// Location and source-finding provenance for one annotation.
 #[derive(Clone, Copy, Default)]
 struct Anchor {
     line: Option<u64>,
     col: Option<u64>,
+    introduced: Option<bool>,
 }
 
 impl Anchor {
+    fn with_introduced(mut self, finding: &Value) -> Self {
+        self.introduced = finding.get("introduced").and_then(Value::as_bool);
+        self
+    }
+
     /// Unconditional `line=` + 1-based `col=` (the common jq shape).
     fn line_col(item: &Value) -> Self {
         Self {
             line: Some(u(item, "line")),
             col: Some(one_based_col(u(item, "col"))),
+            ..Self::default().with_introduced(item)
         }
     }
 
@@ -140,6 +187,7 @@ impl Anchor {
         Self {
             line: Some(u(item, "line")),
             col: None,
+            ..Self::default().with_introduced(item)
         }
     }
 
@@ -148,7 +196,7 @@ impl Anchor {
         if u(item, "line") > 0 {
             Self::line_col(item)
         } else {
-            Self::default()
+            Self::default().with_introduced(item)
         }
     }
 
@@ -158,6 +206,7 @@ impl Anchor {
         Self {
             line: (line > 0).then_some(line),
             col: None,
+            ..Self::default().with_introduced(item)
         }
     }
 }
@@ -178,11 +227,27 @@ fn push(
         col: anchor.col,
         title,
         message,
+        introduced: anchor.introduced,
     });
 }
 
-/// Emit one warning per item of `env[key]`, with the anchor style chosen by
-/// `anchor` and the message built by `message`.
+/// The annotation level for a dead-code finding.
+///
+/// The level follows the `effective_severity` field of the finding: `error`
+/// gives `::error` and `warn` gives `::warning`. A finding without the field
+/// (a saved report from an older version) or with an unknown value keeps
+/// `fallback`, which is the level those versions used.
+fn gate_level(item: &Value, fallback: AnnotationLevel) -> AnnotationLevel {
+    match item.get("effective_severity").and_then(Value::as_str) {
+        Some("error") => AnnotationLevel::Error,
+        Some("warn") => AnnotationLevel::Warning,
+        _ => fallback,
+    }
+}
+
+/// Emit one annotation per item of `env[key]`, with the level from
+/// [`gate_level`], the anchor style chosen by `anchor` and the message built
+/// by `message`.
 fn push_each(
     out: &mut Vec<Annotation>,
     env: &Value,
@@ -194,7 +259,7 @@ fn push_each(
     for item in arr(env, key) {
         push(
             out,
-            AnnotationLevel::Warning,
+            gate_level(item, AnnotationLevel::Warning),
             s(item, "path"),
             anchor(item),
             title.to_owned(),
@@ -203,8 +268,8 @@ fn push_each(
     }
 }
 
-fn no_anchor(_item: &Value) -> Anchor {
-    Anchor::default()
+fn no_anchor(item: &Value) -> Anchor {
+    Anchor::default().with_introduced(item)
 }
 
 fn joined_strs(item: &Value, key: &str, separator: &str) -> String {
@@ -214,12 +279,36 @@ fn joined_strs(item: &Value, key: &str, separator: &str) -> String {
         .join(separator)
 }
 
+/// The qualifier appended to a dead-code annotation whose reachability
+/// verdict rests on a file this run never fully read. Empty when the finding
+/// carries no `reachability_caveats[]`, so a clean run's annotation stream is
+/// byte-identical to what it was before this hedge existed.
+///
+/// An annotation is the surface that suggests the mutation ("Run: npm
+/// uninstall x", "remove the export keyword"), so the qualifier has to travel
+/// with it: a suggestion that reads as confident while the evidence behind it
+/// is incomplete is the exact failure this mechanism exists to prevent.
+fn caveat_note(item: &Value) -> String {
+    caveat_labels_for_tokens(arr(item, "reachability_caveats").filter_map(Value::as_str)).map_or_else(
+        String::new,
+        |labels| {
+            format!(
+                "\n\nCaveat: {labels}. A file this run did not fully read can hide the reference that would credit this, so verify before removing."
+            )
+        },
+    )
+}
+
 fn workspace_context(item: &Value) -> String {
     let workspaces = joined_strs(item, "used_in_workspaces", ", ");
-    if workspaces.is_empty() {
+    if !workspaces.is_empty() {
+        return format!("\n\nImported in other workspaces: {workspaces}");
+    }
+    let declaring = joined_strs(item, "declared_and_imported_in", ", ");
+    if declaring.is_empty() {
         String::new()
     } else {
-        format!("\n\nImported in other workspaces: {workspaces}")
+        format!("\n\nDeclared and imported in other workspaces: {declaring}")
     }
 }
 
@@ -233,10 +322,11 @@ fn dependency_action(item: &Value, pm: PackageManager) -> String {
 
 fn unused_dependency_message(item: &Value, section: &str, pm: PackageManager) -> String {
     format!(
-        "Package '{}' is listed in {section} but never imported by this package.{}\n\n{}",
+        "Package '{}' is listed in {section} but never imported by this package.{}\n\n{}{}",
         s(item, "package_name"),
         workspace_context(item),
         dependency_action(item, pm),
+        caveat_note(item),
     )
 }
 
@@ -250,11 +340,42 @@ fn collect_check(env: &Value, pm: PackageManager, out: &mut Vec<Annotation>) {
     collect_check_components(env, out);
     collect_check_suppressions(env, out);
     collect_check_catalog(env, out);
+    collect_prop_drilling(env, out);
+}
+
+fn collect_prop_drilling(env: &Value, out: &mut Vec<Annotation>) {
+    for item in arr(env, "prop_drilling_chains") {
+        if s(item, "effective_severity") != "error" {
+            continue;
+        }
+        let Some(source) = arr(item, "hops").next() else {
+            continue;
+        };
+        push(
+            out,
+            AnnotationLevel::Error,
+            s(source, "file"),
+            Anchor {
+                line: Some(u(source, "line")),
+                col: None,
+                ..no_anchor(item)
+            },
+            "Prop drilling".to_owned(),
+            format!(
+                "Prop '{}' is forwarded unchanged through {} components. Review composition, colocation or context, or suppress the source prop declaration.",
+                s(item, "prop"),
+                u(item, "depth")
+            ),
+        );
+    }
 }
 
 fn collect_check_files_and_exports(env: &Value, out: &mut Vec<Annotation>) {
-    push_each(out, env, "unused_files", "Unused file", no_anchor, |_| {
-        "This file is not imported by any other module and unreachable from entry points.\nConsider removing it or importing it where needed.".to_owned()
+    push_each(out, env, "unused_files", "Unused file", no_anchor, |it| {
+        format!(
+            "This file is not imported by any other module and unreachable from entry points.\nConsider removing it or importing it where needed.{}",
+            caveat_note(it),
+        )
     });
     push_each(
         out,
@@ -264,7 +385,7 @@ fn collect_check_files_and_exports(env: &Value, out: &mut Vec<Annotation>) {
         Anchor::line_col,
         |it| {
             format!(
-                "{} {} '{}' is never imported by other modules.\n\nIf this export is part of a public API, consider adding it to the entry configuration.\nOtherwise, remove the export keyword or delete the declaration.",
+                "{} {} '{}' is never imported by other modules.\n\nIf this export is part of a public API, consider adding it to the entry configuration.\nOtherwise, remove the export keyword or delete the declaration.{}",
                 if b(it, "is_re_export") {
                     "Re-exported"
                 } else {
@@ -276,6 +397,7 @@ fn collect_check_files_and_exports(env: &Value, out: &mut Vec<Annotation>) {
                     "value"
                 },
                 s(it, "export_name"),
+                caveat_note(it),
             )
         },
     );
@@ -287,13 +409,14 @@ fn collect_check_files_and_exports(env: &Value, out: &mut Vec<Annotation>) {
         Anchor::line_col,
         |it| {
             format!(
-                "{} type '{}' is never imported by other modules.\n\nIf only used internally, remove the export keyword.",
+                "{} type '{}' is never imported by other modules.\n\nIf only used internally, remove the export keyword.{}",
                 if b(it, "is_re_export") {
                     "Re-exported"
                 } else {
                     "Exported"
                 },
                 s(it, "export_name"),
+                caveat_note(it),
             )
         },
     );
@@ -311,6 +434,29 @@ fn collect_check_files_and_exports(env: &Value, out: &mut Vec<Annotation>) {
             )
         },
     );
+    push_each(
+        out,
+        env,
+        "deprecated_exports_in_use",
+        "Deprecated export in use",
+        Anchor::line_col,
+        deprecated_export_message,
+    );
+}
+
+fn deprecated_export_message(item: &Value) -> String {
+    let count = u(item, "consumer_count");
+    let reason = item
+        .get("deprecated_reason")
+        .and_then(Value::as_str)
+        .map_or_else(String::new, |reason| {
+            format!("\n\nDeprecation message: {reason}")
+        });
+    format!(
+        "Deprecated export '{}' is still used by {count} consumer{}.{reason}\n\nMove the consumers to the replacement, then remove the export.",
+        s(item, "export_name"),
+        if count == 1 { "" } else { "s" },
+    )
 }
 
 fn collect_check_dependencies(env: &Value, pm: PackageManager, out: &mut Vec<Annotation>) {
@@ -343,9 +489,9 @@ fn collect_check_dependencies(env: &Value, pm: PackageManager, out: &mut Vec<Ann
         for site in arr(dependency, "imported_from") {
             push(
                 out,
-                AnnotationLevel::Warning,
+                gate_level(dependency, AnnotationLevel::Warning),
                 s(site, "path"),
-                Anchor::line_col(site),
+                Anchor::line_col(site).with_introduced(dependency),
                 "Unlisted dependency".to_owned(),
                 format!(
                     "Package '{package}' is imported here but not listed in package.json.\n\nRun: {}",
@@ -404,9 +550,10 @@ fn collect_check_members(env: &Value, out: &mut Vec<Annotation>) {
         Anchor::line_col,
         |it| {
             format!(
-                "Enum member '{}.{}' is never referenced in the codebase.\n\nConsider removing it to keep the enum minimal.",
+                "Enum member '{}.{}' is never referenced in the codebase.\n\nConsider removing it to keep the enum minimal.{}",
                 s(it, "parent_name"),
                 s(it, "member_name"),
+                caveat_note(it),
             )
         },
     );
@@ -418,9 +565,10 @@ fn collect_check_members(env: &Value, out: &mut Vec<Annotation>) {
         Anchor::line_col,
         |it| {
             format!(
-                "Class member '{}.{}' is never referenced.\n\nConsider removing it or marking it as private.",
+                "Class member '{}.{}' is never referenced.\n\nConsider removing it or marking it as private.{}",
                 s(it, "parent_name"),
                 s(it, "member_name"),
+                caveat_note(it),
             )
         },
     );
@@ -432,9 +580,10 @@ fn collect_check_members(env: &Value, out: &mut Vec<Annotation>) {
         Anchor::line_col,
         |it| {
             format!(
-                "Store member '{}.{}' is never accessed by any consumer.\n\nConsider removing the unused store state, getter, or action.",
+                "Store member '{}.{}' is never accessed by any consumer.\n\nConsider removing the unused store state, getter, or action.{}",
                 s(it, "parent_name"),
                 s(it, "member_name"),
+                caveat_note(it),
             )
         },
     );
@@ -471,9 +620,9 @@ fn collect_check_graph(env: &Value, out: &mut Vec<Annotation>) {
         for location in &locations {
             push(
                 out,
-                AnnotationLevel::Warning,
+                gate_level(duplicate, AnnotationLevel::Warning),
                 s(location, "path"),
-                Anchor::line_col(location),
+                Anchor::line_col(location).with_introduced(duplicate),
                 "Duplicate export".to_owned(),
                 format!(
                     "Export '{name}' is defined in {} modules:\n{listing}\n\nThis causes ambiguity for consumers. Keep one canonical location.",
@@ -487,7 +636,7 @@ fn collect_check_graph(env: &Value, out: &mut Vec<Annotation>) {
         let first = files.first().copied().unwrap_or_default();
         push(
             out,
-            AnnotationLevel::Warning,
+            gate_level(cycle, AnnotationLevel::Warning),
             first,
             Anchor::gated_line_col(cycle),
             "Circular dependency".to_owned(),
@@ -516,12 +665,59 @@ fn collect_check_graph(env: &Value, out: &mut Vec<Annotation>) {
         };
         push(
             out,
-            AnnotationLevel::Warning,
+            gate_level(cycle, AnnotationLevel::Warning),
             files.first().copied().unwrap_or_default(),
-            Anchor::default(),
+            no_anchor(cycle),
             "Re-export cycle".to_owned(),
             format!(
                 "{headline}\n\nChain propagation through the loop is a no-op, so imports through any member may silently come up empty.\n{remedy}",
+            ),
+        );
+    }
+    collect_check_package_cycles(env, out);
+}
+
+fn collect_check_package_cycles(env: &Value, out: &mut Vec<Annotation>) {
+    for cycle in arr(env, "package_cycles") {
+        let packages: Vec<&str> = arr(cycle, "packages").filter_map(Value::as_str).collect();
+        let Some(anchor) = arr(cycle, "edges").next() else {
+            continue;
+        };
+        let first = packages.first().copied().unwrap_or_default();
+        let hops = arr(cycle, "edges")
+            .map(|edge| {
+                let type_tag = if edge.get("type_only").and_then(Value::as_bool) == Some(true) {
+                    " (type-only)"
+                } else {
+                    ""
+                };
+                format!(
+                    "  \u{2022} {} \u{2192} {}: {}:{}{type_tag}",
+                    s(edge, "from_package"),
+                    s(edge, "to_package"),
+                    s(edge, "path"),
+                    num(edge, "line"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let note = if cycle.get("group_truncated").and_then(Value::as_bool) == Some(true) {
+            format!(
+                "\nNote: {}. Break this cycle and run again to see the rest.",
+                fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+            )
+        } else {
+            String::new()
+        };
+        push(
+            out,
+            gate_level(cycle, AnnotationLevel::Warning),
+            s(anchor, "path"),
+            Anchor::line_col(anchor).with_introduced(cycle),
+            "Package cycle".to_owned(),
+            format!(
+                "Workspace packages import each other in a loop:\n{} \u{2192} {first}\n{hops}\n\nPackages in a cycle cannot be built in dependency order.\nRemove the imports on one hop to break the cycle.{note}",
+                packages.join(" \u{2192} "),
             ),
         );
     }
@@ -531,7 +727,7 @@ fn collect_check_boundaries(env: &Value, out: &mut Vec<Annotation>) {
     for violation in arr(env, "boundary_violations") {
         push(
             out,
-            AnnotationLevel::Warning,
+            gate_level(violation, AnnotationLevel::Warning),
             s(violation, "from_path"),
             Anchor::gated_line_col(violation),
             "Boundary violation".to_owned(),
@@ -699,6 +895,21 @@ fn collect_check_components(env: &Value, out: &mut Vec<Annotation>) {
     push_each(
         out,
         env,
+        "absent_component_props",
+        "Absent optional component prop",
+        Anchor::line_col,
+        |it| {
+            format!(
+                "Optional prop '{}.{}' is absent from inspected callers. {}",
+                s(it, "component_name"),
+                s(it, "prop_name"),
+                s(it, "explanation")
+            )
+        },
+    );
+    push_each(
+        out,
+        env,
         "unused_component_props",
         "Unused component prop",
         Anchor::line_col,
@@ -767,6 +978,46 @@ fn collect_check_component_wiring(env: &Value, out: &mut Vec<Annotation>) {
                 "Event '{}' dispatched by component '{}' is listened to nowhere in the project.\n\nRemove the dispatched event, or listen for it. If it is part of a deliberately-stable public API, suppress this finding.",
                 s(it, "event_name"),
                 s(it, "component_name"),
+            )
+        },
+    );
+    push_each(
+        out,
+        env,
+        "unused_effect_layers",
+        "Unused Effect layer",
+        Anchor::line_col,
+        |it| {
+            format!(
+                "Layer '{}' is composed only into layers that nothing uses.\n\nRemove the unused consumer layers first, then this layer, or compose it into a layer that reaches a runtime.",
+                s(it, "name"),
+            )
+        },
+    );
+    push_each(
+        out,
+        env,
+        "unused_tagged_errors",
+        "Unused tagged error",
+        Anchor::line_col,
+        |it| {
+            format!(
+                "Tagged error '{}' (tag '{}') is never constructed or failed with in the project.\n\nFail with it where the condition occurs, or remove the class and its catchTag handlers.",
+                s(it, "name"),
+                s(it, "tag"),
+            )
+        },
+    );
+    push_each(
+        out,
+        env,
+        "unproduced_catch_tags",
+        "Unproduced catch tag",
+        Anchor::line_col,
+        |it| {
+            format!(
+                "No code in the project produces tag '{}', so this catchTag handler never runs.\n\nRemove the handler, or fail with the error where the condition occurs.",
+                s(it, "tag"),
             )
         },
     );
@@ -842,7 +1093,7 @@ fn collect_check_suppressions(env: &Value, out: &mut Vec<Annotation>) {
         let (title, message) = stale_suppression_message(item);
         push(
             out,
-            AnnotationLevel::Warning,
+            gate_level(item, AnnotationLevel::Warning),
             s(item, "path"),
             Anchor::line_col(item),
             title,
@@ -911,7 +1162,7 @@ fn collect_check_catalog(env: &Value, out: &mut Vec<Annotation>) {
     for item in arr(env, "unresolved_catalog_references") {
         push(
             out,
-            AnnotationLevel::Error,
+            gate_level(item, AnnotationLevel::Error),
             s(item, "path"),
             Anchor::line_only(item),
             "Unresolved catalog reference".to_owned(),
@@ -945,7 +1196,7 @@ fn collect_check_catalog(env: &Value, out: &mut Vec<Annotation>) {
             .unwrap_or("unparsable");
         push(
             out,
-            AnnotationLevel::Error,
+            gate_level(item, AnnotationLevel::Error),
             s(item, "path"),
             Anchor::line_only(item),
             "Misconfigured dependency override".to_owned(),
@@ -1000,6 +1251,7 @@ fn collect_dupes(env: &Value, out: &mut Vec<Annotation>) {
                     num(group, "token_count"),
                     instances.len(),
                 ),
+                introduced: group.get("introduced").and_then(Value::as_bool),
             });
         }
     }
@@ -1012,15 +1264,20 @@ fn threshold(env: &Value, key: &str, default: &str) -> String {
         .map_or_else(|| default.to_owned(), fmt_num)
 }
 
-/// Health complexity severity to workflow-command level: `critical` and
-/// `high` map to `::error` (consistent with SARIF's `error` for critical;
-/// panel decision), everything else to `::warning`.
-fn complexity_level(severity: &str) -> AnnotationLevel {
-    if matches!(severity, "critical" | "high") {
+/// Workflow-command level of a complexity finding.
+///
+/// The gate severity from the `complexity-*` rules sets the level: `error`
+/// gives `::error` and `warn` gives `::warning`, whatever the band. The band
+/// stays in the title and the message. A saved report without
+/// `effective_severity` (from an older version) keeps the old band mapping:
+/// `critical` and `high` give `::error`, `moderate` gives `::warning`.
+fn complexity_level(finding: &Value, band: &str) -> AnnotationLevel {
+    let band_level = if matches!(band, "critical" | "high") {
         AnnotationLevel::Error
     } else {
         AnnotationLevel::Warning
-    }
+    };
+    gate_level(finding, band_level)
 }
 
 struct ComplexityThresholds {
@@ -1116,7 +1373,7 @@ fn collect_health(env: &Value, out: &mut Vec<Annotation>) {
         let (title, message) = complexity_annotation(finding, &finding_thresholds(finding, &ctx));
         push(
             out,
-            complexity_level(severity),
+            complexity_level(finding, severity),
             s(finding, "path"),
             Anchor::line_col(finding),
             title,
@@ -1126,6 +1383,24 @@ fn collect_health(env: &Value, out: &mut Vec<Annotation>) {
     collect_runtime_coverage(env, out);
     collect_coverage_intelligence(env, out);
     collect_targets(env, out);
+}
+
+fn collect_audit_styling(env: &Value, out: &mut Vec<Annotation>) {
+    for finding in arr(env, "styling_findings") {
+        push(
+            out,
+            gate_level(finding, AnnotationLevel::Warning),
+            s(finding, "path"),
+            Anchor::line_only(finding),
+            format!("fallow/{}", s(finding, "code")),
+            format!(
+                "[{}] {}: {}",
+                s(finding, "code"),
+                s(finding, "sub_kind"),
+                s(finding, "value"),
+            ),
+        );
+    }
 }
 
 fn collect_runtime_coverage(env: &Value, out: &mut Vec<Annotation>) {
@@ -1151,6 +1426,21 @@ fn collect_runtime_coverage(env: &Value, out: &mut Vec<Annotation>) {
                 || s(&evidence, "v8_tracking").to_owned(),
                 |reason| format!("{} ({reason})", s(&evidence, "v8_tracking")),
             );
+        // A statically-unused function whose only remaining references live in
+        // test files is not dead code, so the annotation says so next to the
+        // static verdict rather than leaving a bare "unused".
+        let static_status = if evidence
+            .get("test_only_reference")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            format!(
+                "{} (referenced only from tests)",
+                s(&evidence, "static_status")
+            )
+        } else {
+            s(&evidence, "static_status").to_owned()
+        };
         let advice = arr(finding, "actions")
             .next()
             .and_then(|action| action.get("description"))
@@ -1163,10 +1453,9 @@ fn collect_runtime_coverage(env: &Value, out: &mut Vec<Annotation>) {
             Anchor::line_only(finding),
             format!("Runtime coverage ({verdict})"),
             format!(
-                "Function '{}' is flagged by runtime coverage.\n\n  \u{2022} Verdict: {verdict}\n  \u{2022} Invocations: {invocations}\n  \u{2022} Confidence: {}\n  \u{2022} Static: {}\n  \u{2022} Tests: {}\n  \u{2022} V8: {tracking}\n\n{advice}",
+                "Function '{}' is flagged by runtime coverage.\n\n  \u{2022} Verdict: {verdict}\n  \u{2022} Invocations: {invocations}\n  \u{2022} Confidence: {}\n  \u{2022} Static: {static_status}\n  \u{2022} Tests: {}\n  \u{2022} V8: {tracking}\n\n{advice}",
                 s(finding, "function"),
                 s(finding, "confidence"),
-                s(&evidence, "static_status"),
                 s(&evidence, "test_coverage"),
             ),
         );
@@ -1274,6 +1563,27 @@ fn collect_security(env: &Value, out: &mut Vec<Annotation>) {
                 "Local security candidate (severity: {severity}).\n\n  \u{2022} Sink: {callee}\n  \u{2022} Evidence: {}\n\nTreat this as a candidate for verification, not a confirmed vulnerability.",
                 s(finding, "evidence"),
             ),
+        );
+    }
+}
+
+/// Audit diff-risk findings. Each finding changes the audit verdict, so its
+/// level comes from its `severity`: `error` gives `::error`, any other value
+/// gives `::warning`.
+fn collect_diff_risk(env: &Value, out: &mut Vec<Annotation>) {
+    for finding in arr(env, "findings") {
+        let level = if s(finding, "severity") == "error" {
+            AnnotationLevel::Error
+        } else {
+            AnnotationLevel::Warning
+        };
+        push(
+            out,
+            level,
+            s(finding, "path"),
+            Anchor::gated_line(finding),
+            format!("fallow/{}", s(finding, "rule")),
+            format!("{} ({})", s(finding, "message"), s(finding, "evidence")),
         );
     }
 }

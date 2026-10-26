@@ -131,6 +131,10 @@ pub struct PackageJson {
     /// name-to-path object; every referenced file is an entry point.
     #[serde(default)]
     pub bin: Option<serde_json::Value>,
+    /// The `typescript` field, kept raw. Its `contentMapper.exec` command
+    /// names a script that TypeScript runs.
+    #[serde(default)]
+    pub typescript: Option<serde_json::Value>,
     /// The `exports` field, kept raw because of its many shapes (string,
     /// conditions object, subpath map); referenced files are entry points and
     /// the map drives subpath resolution.
@@ -179,6 +183,16 @@ pub struct PackageJson {
         deserialize_with = "deserialize_optional_string_lenient"
     )]
     pub package_manager: Option<String>,
+    /// The Egg.js `egg` block (for example `framework` and `tscompiler`),
+    /// kept raw so that an unexpected shape does not fail manifest parsing.
+    #[serde(default)]
+    pub egg: Option<serde_json::Value>,
+    /// The Egg.js `eggPlugin` block of a plugin package, kept raw.
+    #[serde(default, rename = "eggPlugin")]
+    pub egg_plugin: Option<serde_json::Value>,
+    /// The tegg `eggModule` block of a module package, kept raw.
+    #[serde(default, rename = "eggModule")]
+    pub egg_module: Option<serde_json::Value>,
 }
 
 impl PackageJson {
@@ -241,21 +255,18 @@ impl PackageJson {
             .unwrap_or_default()
     }
 
-    /// Get required peer dependency names only.
+    /// Get every peer dependency name, required or optional.
     #[must_use]
-    pub fn required_peer_dependency_names(&self) -> Vec<String> {
+    pub fn peer_dependency_names(&self) -> Vec<String> {
         self.peer_dependencies
             .as_ref()
-            .map(|deps| {
-                deps.keys()
-                    .filter(|dep| !self.peer_dependency_is_optional(dep))
-                    .cloned()
-                    .collect()
-            })
+            .map(|deps| deps.keys().cloned().collect())
             .unwrap_or_default()
     }
 
-    fn peer_dependency_is_optional(&self, dep: &str) -> bool {
+    /// Whether `peerDependenciesMeta` marks the peer `dep` as optional.
+    #[must_use]
+    pub fn peer_dependency_is_optional(&self, dep: &str) -> bool {
         self.peer_dependencies_meta
             .as_ref()
             .and_then(|meta| meta.get(dep))
@@ -353,6 +364,119 @@ impl PackageJson {
             _ => Vec::new(),
         }
     }
+
+    /// Dependencies with a `link:` or `file:` spec in `dependencies`,
+    /// `devDependencies` or `optionalDependencies`, as `(name, target)` pairs
+    /// sorted by name.
+    ///
+    /// The target is the path as written, relative to this manifest's
+    /// directory. The caller decides which targets are real package
+    /// directories.
+    #[must_use]
+    pub fn local_link_dependencies(&self) -> Vec<(String, String)> {
+        let mut links: Vec<(String, String)> = [
+            &self.dependencies,
+            &self.dev_dependencies,
+            &self.optional_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|(name, spec)| {
+            let target = spec
+                .strip_prefix("link:")
+                .or_else(|| spec.strip_prefix("file:"))?
+                .trim();
+            (!target.is_empty()).then(|| (name.clone(), target.to_string()))
+        })
+        .collect();
+        links.sort_unstable();
+        links.dedup();
+        links
+    }
+
+    /// The workspace package that the dependency `name` is an alias of.
+    ///
+    /// pnpm installs `"vite": "workspace:@scope/core@*"` as the workspace
+    /// package `@scope/core` under the name `vite`. A `workspace:` spec with
+    /// only a range (`workspace:*`, `workspace:^1.0.0`) or a path
+    /// (`workspace:../core`) is not an alias.
+    #[must_use]
+    pub fn workspace_alias_target(&self, name: &str) -> Option<&str> {
+        [
+            &self.dependencies,
+            &self.dev_dependencies,
+            &self.optional_dependencies,
+            &self.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|deps| deps.get(name))
+        .and_then(|spec| workspace_alias_name(spec))
+    }
+
+    /// Every dependency that the manifest installs under an npm alias, as
+    /// `(alias, aliased package)` pairs.
+    ///
+    /// `"@typescript/native": "npm:typescript@~7.0.2"` installs the package
+    /// `typescript` in `node_modules/@typescript/native`, so the alias
+    /// provides the binaries of `typescript`.
+    #[must_use]
+    pub fn npm_aliases(&self) -> Vec<(String, String)> {
+        let mut aliases: Vec<(String, String)> = [
+            &self.dependencies,
+            &self.dev_dependencies,
+            &self.optional_dependencies,
+            &self.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|deps| deps.iter())
+        .filter_map(|(name, spec)| {
+            let target = npm_alias_name(spec)?;
+            (target != name).then(|| (name.clone(), target.to_string()))
+        })
+        .collect();
+        aliases.sort_unstable();
+        aliases.dedup();
+        aliases
+    }
+}
+
+/// The package name in a `workspace:<name>@<range>` dependency spec.
+fn workspace_alias_name(spec: &str) -> Option<&str> {
+    let rest = spec.trim().strip_prefix("workspace:")?;
+    let separator = if let Some(scoped) = rest.strip_prefix('@') {
+        scoped.find('@')? + 1
+    } else {
+        rest.find('@')?
+    };
+    valid_package_name(&rest[..separator])
+}
+
+/// The package name in an `npm:<name>@<range>` or `npm:<name>` dependency
+/// spec.
+fn npm_alias_name(spec: &str) -> Option<&str> {
+    let rest = spec.trim().strip_prefix("npm:")?;
+    let separator = if let Some(scoped) = rest.strip_prefix('@') {
+        scoped.find('@').map_or(rest.len(), |at| at + 1)
+    } else {
+        rest.find('@').unwrap_or(rest.len())
+    };
+    valid_package_name(&rest[..separator])
+}
+
+/// `name` when it has the shape of a package name: `name` or `@scope/name`.
+fn valid_package_name(name: &str) -> Option<&str> {
+    let is_package_name = !name.is_empty()
+        && !name.starts_with('.')
+        && match name.strip_prefix('@') {
+            Some(scoped) => scoped
+                .split_once('/')
+                .is_some_and(|(scope, base)| !scope.is_empty() && !base.is_empty()),
+            None => !name.contains('/'),
+        };
+    is_package_name.then_some(name)
 }
 
 /// Extract unique subdirectory names referenced by the `exports` field keys.
@@ -797,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn package_json_required_peer_dependency_names_excludes_optional_peers() {
+    fn package_json_peer_dependency_names_include_optional_peers() {
         let pkg: PackageJson = serde_json::from_str(
             r#"{
             "peerDependencies": {"react": "^18", "typescript": "^5"},
@@ -805,7 +929,9 @@ mod tests {
         }"#,
         )
         .unwrap();
-        assert_eq!(pkg.required_peer_dependency_names(), vec!["react"]);
+        let mut names = pkg.peer_dependency_names();
+        names.sort_unstable();
+        assert_eq!(names, vec!["react", "typescript"]);
     }
 
     #[test]
@@ -952,5 +1078,59 @@ mod tests {
         let pkg: PackageJson =
             serde_json::from_str(r#"{"exports": {".": "./dist/index.js"}}"#).unwrap();
         assert!(pkg.exports_subdirectories().is_empty());
+    }
+
+    #[test]
+    fn npm_aliases_read_the_aliased_package_name() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+                "dependencies": {"plain": "npm:left-pad@^1.3.0", "range": "^1.0.0"},
+                "devDependencies": {
+                    "@typescript/native": "npm:typescript@~7.0.2",
+                    "typescript": "npm:@typescript/typescript6@^6.0.2",
+                    "bare": "npm:eslint",
+                    "same": "npm:same@1.0.0",
+                    "path": "npm:./local",
+                    "bad-scope": "npm:@scope@1.0.0",
+                    "workspace": "workspace:@scope/core@*"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pkg.npm_aliases(),
+            [
+                ("@typescript/native", "typescript"),
+                ("bare", "eslint"),
+                ("plain", "left-pad"),
+                ("typescript", "@typescript/typescript6"),
+            ]
+            .map(|(alias, target)| (alias.to_string(), target.to_string()))
+        );
+    }
+
+    #[test]
+    fn workspace_alias_target_reads_the_aliased_package_name() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+                "dependencies": {
+                    "vite": "workspace:@scope/core@*",
+                    "plain": "workspace:other@^1.0.0",
+                    "range": "workspace:*",
+                    "caret": "workspace:^1.0.0",
+                    "path": "workspace:../core",
+                    "npm": "npm:@scope/core@1.0.0",
+                    "bad-scope": "workspace:@scope@1.0.0"
+                },
+                "devDependencies": {"tool": "workspace:@scope/tool@workspace:*"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(pkg.workspace_alias_target("vite"), Some("@scope/core"));
+        assert_eq!(pkg.workspace_alias_target("plain"), Some("other"));
+        assert_eq!(pkg.workspace_alias_target("tool"), Some("@scope/tool"));
+        for name in ["range", "caret", "path", "npm", "bad-scope", "missing"] {
+            assert_eq!(pkg.workspace_alias_target(name), None, "{name}");
+        }
     }
 }

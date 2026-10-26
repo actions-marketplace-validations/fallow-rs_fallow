@@ -15,12 +15,13 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use lightningcss::rules::CssRule;
-use lightningcss::selector::{Component, PseudoClass, Selector, SelectorList};
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use oxc_span::Span;
 use rustc_hash::FxHashSet;
 
+use crate::css_mask::{
+    mask_sass_module_members, mask_view_transition_arguments, mask_with_whitespace,
+};
+use crate::css_module_classes::lightningcss_class_set;
 use crate::{ExportInfo, ExportName, ImportInfo, ImportedName, ModuleInfo, VisibilityTag};
 use fallow_types::discover::FileId;
 
@@ -167,18 +168,24 @@ fn is_style_extension(ext: &str) -> bool {
         || ext.eq_ignore_ascii_case("less")
 }
 
-/// Strip comments from CSS/SCSS source to avoid matching directives inside comments.
 #[cfg(test)]
-fn strip_css_comments(source: &str, is_scss: bool) -> String {
-    let stripped = CSS_COMMENT_RE.replace_all(source, "");
-    if is_scss {
-        SCSS_LINE_COMMENT_RE.replace_all(&stripped, "").into_owned()
-    } else {
-        stripped.into_owned()
-    }
+thread_local! {
+    /// Comment mask passes on this thread, so tests can pin one pass per file.
+    static COMMENT_MASK_PASSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Source bytes that the line lookups read on this thread, so tests can pin
+    /// a linear cost for the located token scans.
+    static LINE_LOOKUP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_line_lookup_bytes(bytes: usize) {
+    LINE_LOOKUP_BYTES.with(|read| read.set(read.get() + bytes));
 }
 
 fn mask_css_comments(source: &str, is_scss: bool) -> String {
+    #[cfg(test)]
+    COMMENT_MASK_PASSES.with(|passes| passes.set(passes.get() + 1));
+    crate::css_masked_bytes::add(source.len() as u64);
     let mut masked = mask_with_whitespace(source, &CSS_COMMENT_RE);
     if is_scss {
         masked = mask_with_whitespace(&masked, &SCSS_LINE_COMMENT_RE);
@@ -206,10 +213,15 @@ fn normalize_css_plugin_path(path: String) -> String {
 /// no parser-backed set to defer the membership decision to.
 #[must_use]
 pub fn extract_css_import_sources(source: &str, is_scss: bool) -> Vec<CssImportSource> {
-    let stripped = mask_css_comments(source, is_scss);
+    import_sources_from_masked(&mask_css_comments(source, is_scss), is_scss)
+}
+
+/// [`extract_css_import_sources`] on a source whose comments are already
+/// masked by [`mask_css_comments`].
+fn import_sources_from_masked(stripped: &str, is_scss: bool) -> Vec<CssImportSource> {
     let mut out = Vec::new();
 
-    for cap in CSS_IMPORT_RE.captures_iter(&stripped) {
+    for cap in CSS_IMPORT_RE.captures_iter(stripped) {
         let raw = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3));
         if let Some(m) = raw {
             let (src, span) = trimmed_match_with_span(m);
@@ -225,7 +237,7 @@ pub fn extract_css_import_sources(source: &str, is_scss: bool) -> Vec<CssImportS
     }
 
     if is_scss {
-        for cap in SCSS_USE_RE.captures_iter(&stripped) {
+        for cap in SCSS_USE_RE.captures_iter(stripped) {
             if let Some(m) = cap.get(1) {
                 let (raw, span) = trimmed_match_with_span(m);
                 out.push(CssImportSource {
@@ -238,7 +250,7 @@ pub fn extract_css_import_sources(source: &str, is_scss: bool) -> Vec<CssImportS
         }
     }
 
-    for cap in CSS_PLUGIN_RE.captures_iter(&stripped) {
+    for cap in CSS_PLUGIN_RE.captures_iter(stripped) {
         if let Some(m) = cap.get(1) {
             let (raw, span) = trimmed_match_with_span(m);
             if !raw.is_empty() && !is_css_url_import(&raw) {
@@ -335,15 +347,19 @@ pub fn scan_theme_blocks(source: &str) -> ThemeScan {
     if !source.contains("@theme") {
         return ThemeScan::default();
     }
-    let masked = mask_theme_source(source);
+    theme_scan_from_masked(source, &mask_theme_source(source))
+}
+
+/// [`scan_theme_blocks`] on a source masked by [`mask_theme_source`].
+fn theme_scan_from_masked(source: &str, masked: &str) -> ThemeScan {
     let mut out = ThemeScan::default();
     let mut seen: FxHashSet<String> = FxHashSet::default();
-    for open in CSS_THEME_OPEN_RE.find_iter(&masked) {
+    for open in CSS_THEME_OPEN_RE.find_iter(masked) {
         let body_start = open.end();
-        let body_end = find_theme_body_end(&masked, body_start);
+        let body_end = find_theme_body_end(masked, body_start);
         collect_theme_declarations(&mut ThemeDeclarationScan {
             source,
-            masked: &masked,
+            masked,
             start: body_start,
             end: body_end,
             out: &mut out.tokens,
@@ -351,7 +367,7 @@ pub fn scan_theme_blocks(source: &str) -> ThemeScan {
         });
         collect_theme_var_reads(
             source,
-            &masked,
+            masked,
             body_start,
             body_end,
             &mut out.theme_var_reads,
@@ -371,14 +387,19 @@ pub fn extract_css_var_reads_located(source: &str) -> Vec<(String, u32)> {
     if !source.contains("var(") {
         return Vec::new();
     }
-    let masked = mask_theme_source(source);
+    css_var_reads_from_masked(source, &mask_theme_source(source))
+}
+
+/// [`extract_css_var_reads_located`] on a source masked by
+/// [`mask_theme_source`].
+fn css_var_reads_from_masked(source: &str, masked: &str) -> Vec<(String, u32)> {
     // Byte ranges of every `@theme { ... }` interior, so reads inside them are
     // skipped (they are the `theme-var` surface, located elsewhere).
     let mut theme_bodies: Vec<(usize, usize)> = Vec::new();
     if masked.contains("@theme") {
-        for open in CSS_THEME_OPEN_RE.find_iter(&masked) {
+        for open in CSS_THEME_OPEN_RE.find_iter(masked) {
             let body_start = open.end();
-            let body_end = find_theme_body_end(&masked, body_start);
+            let body_end = find_theme_body_end(masked, body_start);
             theme_bodies.push((body_start, body_end));
         }
     }
@@ -391,7 +412,7 @@ pub fn extract_css_var_reads_located(source: &str) -> Vec<(String, u32)> {
     // `masked`), matching the original `line_at_offset(source, ..)`.
     let mut last_pos = 0usize;
     let mut last_line = 1u32;
-    for cap in CSS_VAR_REF_RE.captures_iter(&masked) {
+    for cap in CSS_VAR_REF_RE.captures_iter(masked) {
         let (Some(whole), Some(name)) = (cap.get(0), cap.get(1)) else {
             continue;
         };
@@ -463,8 +484,11 @@ fn collect_theme_var_reads(
 }
 
 /// 1-based line number of `offset` in `source`, counting `\n` up to (but not
-/// including) the byte at `offset`. Out-of-range offsets clamp to line 1.
+/// including) the byte at `offset`. Out-of-range offsets clamp to line 1. The
+/// tests use it as the reference for the incremental line counters.
+#[cfg(test)]
 fn line_at_offset(source: &str, offset: usize) -> u32 {
+    note_line_lookup_bytes(offset);
     let count = source
         .get(..offset)
         .map_or(0, |s| s.bytes().filter(|&b| b == b'\n').count());
@@ -477,6 +501,8 @@ fn line_at_offset(source: &str, offset: usize) -> u32 {
 /// `source[..offset]` prefix rescan (issue #1843 follow-up: worst on a single
 /// long line with no newlines).
 fn newlines_between(source: &str, from: usize, to: usize) -> u32 {
+    #[cfg(test)]
+    note_line_lookup_bytes(to.saturating_sub(from));
     let count = source
         .get(from..to)
         .map_or(0, |s| s.bytes().filter(|&b| b == b'\n').count());
@@ -610,23 +636,10 @@ fn theme_declaration_value(source: &str, masked: &str, start: usize, end: usize)
 /// utility is applied only via `@apply` is credited as used.
 #[must_use]
 pub fn extract_apply_tokens(source: &str) -> Vec<String> {
-    // Fast path: skip the masking allocation for the common no-`@apply` file.
-    if !source.contains("@apply") {
-        return Vec::new();
-    }
-    let masked = mask_with_whitespace(&mask_css_comments(source, false), &CSS_NON_SELECTOR_RE);
-    let mut out = Vec::new();
-    for m in CSS_APPLY_RE.find_iter(&masked) {
-        let body = m.as_str().trim_start_matches("@apply");
-        for token in body.split_whitespace() {
-            let token = token.trim_matches('!');
-            if token.is_empty() || token == "important" {
-                continue;
-            }
-            out.push(token.to_owned());
-        }
-    }
-    out
+    extract_apply_tokens_located(source)
+        .into_iter()
+        .map(|(token, _line)| token)
+        .collect()
 }
 
 /// Like [`extract_apply_tokens`], but pairs each class-shaped token with the
@@ -635,13 +648,24 @@ pub fn extract_apply_tokens(source: &str) -> Vec<String> {
 /// offsets so the directive line is recoverable from the match start.
 #[must_use]
 pub fn extract_apply_tokens_located(source: &str) -> Vec<(String, u32)> {
+    // Fast path: skip the masking allocation for the common no-`@apply` file.
     if !source.contains("@apply") {
         return Vec::new();
     }
-    let masked = mask_with_whitespace(&mask_css_comments(source, false), &CSS_NON_SELECTOR_RE);
+    apply_tokens_from_masked(source, &mask_theme_source(source))
+}
+
+/// [`extract_apply_tokens_located`] on a source masked by
+/// [`mask_theme_source`].
+fn apply_tokens_from_masked(source: &str, masked: &str) -> Vec<(String, u32)> {
     let mut out = Vec::new();
-    for m in CSS_APPLY_RE.find_iter(&masked) {
-        let line = line_at_offset(source, m.start());
+    // Matches arrive in source order, so the line advances from the previous
+    // match instead of a rescan of the whole prefix for each match.
+    let mut last_pos = 0usize;
+    let mut line = 1u32;
+    for m in CSS_APPLY_RE.find_iter(masked) {
+        line = line.saturating_add(newlines_between(source, last_pos, m.start()));
+        last_pos = m.start();
         let body = m.as_str().trim_start_matches("@apply");
         for token in body.split_whitespace() {
             let token = token.trim_matches('!');
@@ -654,134 +678,47 @@ pub fn extract_apply_tokens_located(source: &str) -> Vec<(String, u32)> {
     out
 }
 
-/// Mask every regex match in `src` with ASCII spaces (`0x20`) of equal byte
-/// length, so byte offsets in the returned string correspond 1:1 to byte
-/// offsets in the original.
+/// The Tailwind token surfaces of one stylesheet, from one masked copy of the
+/// source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StylesheetTokens {
+    /// The result of [`scan_theme_blocks`].
+    pub theme: ThemeScan,
+    /// The result of [`extract_apply_tokens_located`].
+    pub apply_tokens_located: Vec<(String, u32)>,
+    /// The result of [`extract_css_var_reads_located`].
+    pub css_var_reads_located: Vec<(String, u32)>,
+}
+
+/// Scan one stylesheet for `@theme` tokens, `@apply` tokens and `var()` reads.
 ///
-/// Used to neutralise CSS comments, quoted strings, `url(...)`, and at-rule
-/// preludes before scanning for `.class` selectors, while preserving the
-/// original-source positions that callers need to populate `ExportInfo.span`
-/// (issue #549). The `regex` crate guarantees match boundaries respect UTF-8
-/// char boundaries, so the masked buffer is always valid UTF-8.
-fn mask_with_whitespace(src: &str, re: &regex::Regex) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut cursor = 0;
-    for m in re.find_iter(src) {
-        out.push_str(&src[cursor..m.start()]);
-        for _ in m.start()..m.end() {
-            out.push(' ');
-        }
-        cursor = m.end();
+/// The result is equal to the three separate scans, but the comment and string
+/// mask runs at most once for the source.
+#[must_use]
+pub fn scan_stylesheet_tokens(source: &str) -> StylesheetTokens {
+    let has_theme = source.contains("@theme");
+    let has_apply = source.contains("@apply");
+    let has_var = source.contains("var(");
+    if !(has_theme || has_apply || has_var) {
+        return StylesheetTokens::default();
     }
-    out.push_str(&src[cursor..]);
-    out
-}
-
-/// Collect the authoritative set of class-selector names from a CSS source by
-/// parsing it into a real AST (lightningcss). Returns `None` only on a
-/// catastrophic parse failure (Sass syntax that is not standard CSS), in which
-/// case the caller falls back to the regex scanner. With `error_recovery` on,
-/// individual malformed rules are recovered silently and contribute a partial
-/// set rather than triggering the fallback, so a broken rule drops only its own
-/// classes (a conservative miss) instead of returning `None`.
-///
-/// This is the source of truth for which `.token` occurrences are genuine class
-/// selectors. It natively excludes `@layer foo.bar` layer names, `@import ...
-/// layer(theme.button)` layer references, `@keyframes` step selectors, id and
-/// element selectors, and the contents of comments / strings / `url()`, which
-/// the older regex-only scanner had to approximate with a stack of masking
-/// passes. Classes nested inside `:is()` / `:where()` / `:not()` / `:has()` /
-/// `:any()` / `::slotted()` / `:host()` / `:nth-child(... of ...)` are
-/// collected too, matching the regex scanner's "every `.class` token" behavior.
-fn lightningcss_class_set(source: &str) -> Option<FxHashSet<String>> {
-    let options = ParserOptions {
-        // Recover from individual malformed rules so a single bad rule does not
-        // discard class names from the rest of the file.
-        error_recovery: true,
-        // These files are CSS Modules, so parse standard CSS syntax in CSS Modules
-        // mode. That makes the `:local()` / `:global()` pseudo-classes parse as
-        // real selectors rather than erroring, so classes wrapped in them are
-        // collected (matching the regex scanner). Renaming is a print-time
-        // concern, so the AST class names stay the original author-written names.
-        css_modules: Some(lightningcss::css_modules::Config::default()),
-        ..ParserOptions::default()
-    };
-    let stylesheet = StyleSheet::parse(source, options).ok()?;
-    let mut classes = FxHashSet::default();
-    collect_classes_from_rules(&stylesheet.rules.0, &mut classes);
-    Some(classes)
-}
-
-/// Recursively collect class-selector names from a list of CSS rules, descending
-/// into every grouping rule (`@media`, `@supports`, `@container`, `@layer {}`,
-/// `@document`, `@starting-style`, `@scope`, nested style rules) so a class
-/// declared anywhere contributes to the set.
-fn collect_classes_from_rules(rules: &[CssRule<'_>], classes: &mut FxHashSet<String>) {
-    for rule in rules {
-        match rule {
-            CssRule::Style(style) => {
-                collect_classes_from_selector_list(&style.selectors, classes);
-                collect_classes_from_rules(&style.rules.0, classes);
-            }
-            CssRule::Media(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::Supports(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::Container(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::LayerBlock(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::MozDocument(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::StartingStyle(rule) => collect_classes_from_rules(&rule.rules.0, classes),
-            CssRule::Nesting(rule) => {
-                collect_classes_from_selector_list(&rule.style.selectors, classes);
-                collect_classes_from_rules(&rule.style.rules.0, classes);
-            }
-            CssRule::Scope(rule) => {
-                if let Some(scope_start) = &rule.scope_start {
-                    collect_classes_from_selector_list(scope_start, classes);
-                }
-                if let Some(scope_end) = &rule.scope_end {
-                    collect_classes_from_selector_list(scope_end, classes);
-                }
-                collect_classes_from_rules(&rule.rules.0, classes);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_classes_from_selector_list(list: &SelectorList<'_>, classes: &mut FxHashSet<String>) {
-    for selector in &list.0 {
-        collect_classes_from_selector(selector, classes);
-    }
-}
-
-fn collect_classes_from_selector(selector: &Selector<'_>, classes: &mut FxHashSet<String>) {
-    for component in selector.iter_raw_match_order() {
-        match component {
-            Component::Class(name) => {
-                classes.insert(name.0.to_string());
-            }
-            Component::Is(list)
-            | Component::Where(list)
-            | Component::Has(list)
-            | Component::Negation(list)
-            | Component::Any(_, list) => {
-                for nested in list.as_ref() {
-                    collect_classes_from_selector(nested, classes);
-                }
-            }
-            Component::Slotted(nested) | Component::Host(Some(nested)) => {
-                collect_classes_from_selector(nested, classes);
-            }
-            Component::NthOf(data) => {
-                for nested in data.selectors() {
-                    collect_classes_from_selector(nested, classes);
-                }
-            }
-            // CSS Modules `:local(.foo)` / `:global(.foo)` wrap a real selector.
-            Component::NonTSPseudoClass(
-                PseudoClass::Local { selector } | PseudoClass::Global { selector },
-            ) => collect_classes_from_selector(selector, classes),
-            _ => {}
-        }
+    let masked = mask_theme_source(source);
+    StylesheetTokens {
+        theme: if has_theme {
+            theme_scan_from_masked(source, &masked)
+        } else {
+            ThemeScan::default()
+        },
+        apply_tokens_located: if has_apply {
+            apply_tokens_from_masked(source, &masked)
+        } else {
+            Vec::new()
+        },
+        css_var_reads_located: if has_var {
+            css_var_reads_from_masked(source, &masked)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -795,15 +732,23 @@ fn collect_classes_from_selector(selector: &Selector<'_>, classes: &mut FxHashSe
 /// (issue #549). For SCSS (Sass syntax lightningcss does not parse) and for any
 /// CSS that fails to parse outright, the regex-only scanner is used unchanged.
 pub fn extract_css_module_exports(source: &str, is_scss: bool) -> Vec<ExportInfo> {
-    if !is_scss && let Some(class_set) = lightningcss_class_set(source) {
-        return scan_css_module_exports(source, is_scss, Some(&class_set));
-    }
-    scan_css_module_exports(source, is_scss, None)
+    css_module_exports(source, &mask_css_comments(source, is_scss), is_scss)
 }
 
-/// Scan `source` for `.class` tokens and emit one [`ExportInfo`] per distinct
-/// class (first occurrence wins), with a [`Span`] pointing at the post-dot
-/// identifier in the original source.
+/// [`extract_css_module_exports`] with the comment mask of `source` from
+/// [`mask_css_comments`], so a caller that has the mask does not compute it
+/// again.
+fn css_module_exports(source: &str, comment_masked: &str, is_scss: bool) -> Vec<ExportInfo> {
+    if !is_scss && let Some(class_set) = lightningcss_class_set(source) {
+        return scan_css_module_exports(comment_masked, Some(&class_set));
+    }
+    scan_css_module_exports(comment_masked, None)
+}
+
+/// Scan the comment-masked source for `.class` tokens and emit one
+/// [`ExportInfo`] per distinct class (first occurrence wins), with a [`Span`]
+/// pointing at the post-dot identifier. The mask keeps byte offsets, so the
+/// span is also valid in the original source.
 ///
 /// When `class_filter` is `Some`, only tokens present in the AST-derived set are
 /// emitted, so the parser owns the membership decision and the scanner owns only
@@ -811,11 +756,10 @@ pub fn extract_css_module_exports(source: &str, is_scss: bool) -> Vec<ExportInfo
 /// the at-rule prelude is masked to keep `@layer foo.bar` / `@import ...
 /// layer(...)` segments from being mistaken for classes.
 fn scan_css_module_exports(
-    source: &str,
-    is_scss: bool,
+    comment_masked: &str,
     class_filter: Option<&FxHashSet<String>>,
 ) -> Vec<ExportInfo> {
-    let masked = mask_css_module_class_candidates(source, is_scss, class_filter.is_some());
+    let masked = mask_css_module_class_candidates(comment_masked, class_filter.is_some());
     let mut seen = FxHashSet::default();
     let mut exports = Vec::new();
     for cap in CSS_CLASS_RE.captures_iter(&masked) {
@@ -826,16 +770,216 @@ fn scan_css_module_exports(
     exports
 }
 
-fn mask_css_module_class_candidates(source: &str, is_scss: bool, has_class_filter: bool) -> String {
-    let mut masked = mask_with_whitespace(source, &CSS_COMMENT_RE);
-    if is_scss {
-        masked = mask_with_whitespace(&masked, &SCSS_LINE_COMMENT_RE);
-    }
-    masked = mask_with_whitespace(&masked, &CSS_NON_SELECTOR_RE);
+fn mask_css_module_class_candidates(comment_masked: &str, has_class_filter: bool) -> String {
+    let mut masked = mask_with_whitespace(comment_masked, &CSS_NON_SELECTOR_RE);
+    masked = mask_view_transition_arguments(&masked);
     if !has_class_filter {
         masked = mask_with_whitespace(&masked, &CSS_AT_RULE_PRELUDE_RE);
+        masked = mask_sass_module_members(&masked);
     }
-    masked
+    mask_css_module_global_scopes(masked)
+}
+
+const GLOBAL_KEYWORD: &str = ":global";
+const LOCAL_KEYWORD: &str = ":local";
+
+/// A CSS Modules scope keyword (`:global` or `:local`) at a byte offset.
+#[derive(Clone, Copy)]
+struct ScopeKeyword {
+    is_global: bool,
+    len: usize,
+    /// The keyword opens a `(...)` argument, as in `:global(.foo)`.
+    has_argument: bool,
+}
+
+/// Return the CSS Modules scope keyword that starts at `bytes[i]`, if any.
+/// A longer identifier such as `:global-ish` is not a scope keyword.
+fn scope_keyword_at(bytes: &[u8], i: usize) -> Option<ScopeKeyword> {
+    let rest = &bytes[i..];
+    let (is_global, len) = if rest.starts_with(GLOBAL_KEYWORD.as_bytes()) {
+        (true, GLOBAL_KEYWORD.len())
+    } else if rest.starts_with(LOCAL_KEYWORD.as_bytes()) {
+        (false, LOCAL_KEYWORD.len())
+    } else {
+        return None;
+    };
+    let next = rest.get(len).copied();
+    if next.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return None;
+    }
+    Some(ScopeKeyword {
+        is_global,
+        len,
+        has_argument: next == Some(b'('),
+    })
+}
+
+/// Replace each bare `:global` / `:local` keyword (without a `(...)` argument)
+/// with spaces of equal length, so lightningcss can parse the rule.
+pub(crate) fn blank_bare_css_module_scope_keywords(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains(GLOBAL_KEYWORD) && !source.contains(LOCAL_KEYWORD) {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let bytes = source.as_bytes();
+    let mut out = source.to_string();
+    let mut i = 0;
+    while i < bytes.len() {
+        match scope_keyword_at(bytes, i) {
+            Some(keyword) => {
+                if !keyword.has_argument {
+                    out.replace_range(i..i + keyword.len, &" ".repeat(keyword.len));
+                }
+                i += keyword.len;
+            }
+            None => i += 1,
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The scope of one open parenthesis in a selector.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParenScope {
+    Global,
+    Local,
+    Other,
+}
+
+/// Selector scope state for [`mask_css_module_global_scopes`].
+struct GlobalScopeScan {
+    /// The scope that each open `{` block gives to its nested rules.
+    block_global: Vec<bool>,
+    /// The scope of the current selector, changed by a bare `:global`/`:local`.
+    selector_global: bool,
+    parens: Vec<ParenScope>,
+}
+
+impl GlobalScopeScan {
+    fn inherited(&self) -> bool {
+        self.block_global.last().copied().unwrap_or(false)
+    }
+
+    /// End the current selector or declaration. The next one starts in the
+    /// scope of the enclosing block.
+    fn reset_selector(&mut self) {
+        self.selector_global = self.inherited();
+        self.parens.clear();
+    }
+
+    /// A `:global(...)` or `:local(...)` argument sets the scope for its
+    /// content. Otherwise the selector scope applies.
+    fn is_global(&self) -> bool {
+        self.parens
+            .iter()
+            .rev()
+            .find(|scope| **scope != ParenScope::Other)
+            .map_or(self.selector_global, |scope| *scope == ParenScope::Global)
+    }
+}
+
+/// Blank the `.` of each class token in a CSS Modules global scope, so the
+/// class scanner does not report it. CSS Modules do not put such a class in
+/// the class map of the module (issue #3311).
+///
+/// The input must have comments and strings masked already. These forms make
+/// a global scope:
+/// - `:global(.a .b)`: the classes in the argument are global.
+/// - a bare `:global`: the rest of the selector is global, until a bare
+///   `:local`, a `:local(...)` argument, or the next selector in the list.
+/// - a rule whose selector ends in a global scope: its nested rules start in
+///   the global scope, as Sass and `postcss-nested` compile them.
+///
+/// A source without a block `{` (a `#{` interpolation does not count) uses the
+/// indented Sass syntax, so a line end also ends the selector there.
+fn mask_css_module_global_scopes(masked: String) -> String {
+    if !masked.contains(GLOBAL_KEYWORD) {
+        return masked;
+    }
+    let indented = !masked
+        .match_indices('{')
+        .any(|(i, _)| i == 0 || masked.as_bytes()[i - 1] != b'#');
+    let bytes = masked.as_bytes();
+    let mut blank = Vec::new();
+    let mut scan = GlobalScopeScan {
+        block_global: Vec::new(),
+        selector_global: false,
+        parens: Vec::new(),
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(keyword) = scope_keyword_at(bytes, i) {
+            if keyword.has_argument {
+                scan.parens.push(if keyword.is_global {
+                    ParenScope::Global
+                } else {
+                    ParenScope::Local
+                });
+                i += keyword.len + 1;
+                continue;
+            }
+            if scan.parens.is_empty() {
+                scan.selector_global = keyword.is_global;
+            }
+            i += keyword.len;
+            continue;
+        }
+        match bytes[i] {
+            b'#' if bytes.get(i + 1) == Some(&b'{') => {
+                i = scss_interpolation_end(bytes, i + 2);
+                continue;
+            }
+            b'(' => scan.parens.push(ParenScope::Other),
+            b')' => {
+                scan.parens.pop();
+            }
+            b',' if scan.parens.is_empty() => scan.selector_global = scan.inherited(),
+            b'{' => {
+                scan.block_global.push(scan.selector_global);
+                scan.reset_selector();
+            }
+            b'}' => {
+                scan.block_global.pop();
+                scan.reset_selector();
+            }
+            b';' => scan.reset_selector(),
+            b'\n' if indented => scan.reset_selector(),
+            b'.' if scan.is_global()
+                && bytes
+                    .get(i + 1)
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') =>
+            {
+                blank.push(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut out = masked;
+    for offset in blank {
+        out.replace_range(offset..=offset, " ");
+    }
+    out
+}
+
+/// Return the offset after the `}` that closes a SCSS `#{...}` interpolation
+/// whose content starts at `start`.
+fn scss_interpolation_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 fn push_css_class_export(
@@ -869,16 +1013,18 @@ fn css_class_export(class_name: String, class_match: regex::Match<'_>) -> Export
         members: Vec::new(),
         is_side_effect_used: false,
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     }
 }
 
 /// Build the import edges for a CSS/SCSS source: every `@import`/`@use`/etc.
 /// directive plus a synthetic `tailwindcss` side-effect import when `@apply` or
 /// `@tailwind` is present.
-fn build_css_imports(source: &str, stripped: &str, is_scss: bool) -> Vec<ImportInfo> {
+fn build_css_imports(stripped: &str, is_scss: bool) -> Vec<ImportInfo> {
     let mut imports = Vec::new();
 
-    for css_source in extract_css_import_sources(source, is_scss) {
+    for css_source in import_sources_from_masked(stripped, is_scss) {
         imports.push(ImportInfo {
             source: css_source.normalized,
             imported_name: if css_source.is_plugin {
@@ -926,11 +1072,11 @@ pub(crate) fn parse_css_to_module(
         .and_then(|e| e.to_str())
         .is_some_and(|ext| matches!(ext, "scss" | "sass" | "less"));
 
-    let stripped = mask_css_comments(source, is_scss);
-    let imports = build_css_imports(source, &stripped, is_scss);
+    let stripped = crate::css_mask::mask_sass_shorthand(mask_css_comments(source, is_scss), path);
+    let imports = build_css_imports(&stripped, is_scss);
 
     let exports = if is_css_module_file(path) {
-        extract_css_module_exports(source, is_scss)
+        css_module_exports(source, &stripped, is_scss)
     } else {
         Vec::new()
     };
@@ -1072,12 +1218,131 @@ mod tests {
         assert_eq!(names, vec!["myClass"]);
     }
 
+    fn scss_export_names(source: &str) -> Vec<String> {
+        extract_css_module_exports(source, true)
+            .into_iter()
+            .filter_map(|e| match e.name {
+                ExportName::Named(n) => Some(n),
+                ExportName::Default => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn extracts_class_inside_global_pseudo() {
-        // CSS Modules `:global(.foo)` must surface `foo`: the parser understands
-        // the wrapped selector, which the regex scanner could not on its own.
+    fn skips_class_inside_global_pseudo() {
+        // CSS Modules do not put a `:global(.foo)` class in the class map.
         let names = export_names(":global(.globalClass) { color: red; }");
-        assert_eq!(names, vec!["globalClass"]);
+        assert!(names.is_empty(), "got {names:?}");
+    }
+
+    #[test]
+    fn keeps_local_class_next_to_global_pseudo() {
+        // Issue #3311.
+        let names = export_names(".wrapper :global(.selector) { color: red; }");
+        assert_eq!(names, vec!["wrapper"]);
+    }
+
+    #[test]
+    fn skips_every_class_inside_global_pseudo_with_descendants() {
+        let names = export_names(".panel :global(.outer .inner.mod) { color: red; }");
+        assert_eq!(names, vec!["panel"]);
+    }
+
+    #[test]
+    fn skips_classes_after_bare_global() {
+        let names = export_names(".lead :global .first .second { color: red; }");
+        assert_eq!(names, vec!["lead"]);
+    }
+
+    #[test]
+    fn bare_global_stops_at_local() {
+        let names = export_names(":global .g1 :local(.l1) .g2 :local .l2 .l3, .l4 { color: red; }");
+        assert_eq!(names, vec!["l1", "l2", "l3", "l4"]);
+    }
+
+    #[test]
+    fn bare_global_stops_at_comma() {
+        let names = export_names(":global .g1, .l1 :is(.l2, .l3) { color: red; }");
+        assert_eq!(names, vec!["l1", "l2", "l3"]);
+    }
+
+    #[test]
+    fn global_class_inside_media_query_is_skipped() {
+        let names = export_names("@media (min-width: 1px) { .media :global(.g) { color: red; } }");
+        assert_eq!(names, vec!["media"]);
+    }
+
+    #[test]
+    fn class_both_local_and_global_stays_exported_at_local_span() {
+        let source = ":global(.both) { color: red; }\n.both { color: blue; }";
+        let exports = extract_css_module_exports(source, false);
+        assert_eq!(exports.len(), 1);
+        let span = exports[0].span;
+        assert_eq!(&source[span.start as usize..span.end as usize], "both");
+        assert!(
+            span.start > 20,
+            "span must point at the local rule: {span:?}"
+        );
+    }
+
+    #[test]
+    fn composes_keeps_local_classes() {
+        let names = export_names(
+            ".base { color: red; }\n.button { composes: base; composes: g from global; }",
+        );
+        assert_eq!(names, vec!["base", "button"]);
+    }
+
+    #[test]
+    fn global_in_strings_and_comments_has_no_effect() {
+        let names =
+            export_names("/* :global */ .a { content: \":global\"; }\n.b :global(.c) { }\n.d { }");
+        assert_eq!(names, vec!["a", "b", "d"]);
+    }
+
+    #[test]
+    fn scss_skips_global_pseudo_and_global_block() {
+        let names = scss_export_names(
+            ".card {\n  :global(.g1) { color: red; }\n  .title { color: blue; }\n}\n\
+             :global {\n  .g2 { color: red; }\n  .g3 { :local(.l1) { color: red; } }\n}\n\
+             .after { color: blue; }",
+        );
+        assert_eq!(names, vec!["card", "title", "l1", "after"]);
+    }
+
+    #[test]
+    fn scss_bare_global_in_parent_reaches_nested_rules() {
+        let names = scss_export_names(
+            ".a :global .b {\n  .c { color: red; }\n  &:hover { color: blue; }\n}\n.d { }",
+        );
+        assert_eq!(names, vec!["a", "d"]);
+    }
+
+    #[test]
+    fn scss_interpolation_does_not_end_global_scope() {
+        let names = scss_export_names("$n: x;\n.a :global .b-#{$n} .c { }\n.d { }");
+        assert_eq!(names, vec!["a", "d"]);
+    }
+
+    #[test]
+    fn sass_indented_bare_global_ends_at_line_end() {
+        let names = scss_export_names(".a :global .b\n  color: red\n.c\n  color: blue\n");
+        assert_eq!(names, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn sass_indented_with_interpolation_still_ends_global_at_line_end() {
+        let names = scss_export_names(
+            ".a :global .b\n  color: red\n.c-#{$x}\n  color: blue\n.d\n  color: blue\n",
+        );
+        // The scanner keeps the static prefix `c-` of an interpolated class.
+        assert_eq!(names, vec!["a", "c-", "d"]);
+    }
+
+    #[test]
+    fn global_like_pseudo_names_are_not_global() {
+        let names = export_names(".a:global-ish .b { }");
+        assert!(names.contains(&"b".to_string()), "got {names:?}");
     }
 
     #[test]
@@ -1266,23 +1531,27 @@ mod tests {
     }
 
     #[test]
-    fn strip_css_block_comment() {
-        let result = strip_css_comments("/* removed */ .kept { }", false);
+    fn mask_css_block_comment() {
+        let source = "/* removed */ .kept { }";
+        let result = mask_css_comments(source, false);
         assert!(!result.contains("removed"));
-        assert!(result.contains(".kept"));
+        assert_eq!(result.len(), source.len());
+        assert_eq!(result.find(".kept"), source.find(".kept"));
     }
 
     #[test]
-    fn strip_scss_line_comment() {
-        let result = strip_css_comments("// removed\n.kept { }", true);
+    fn mask_scss_line_comment() {
+        let source = "// removed\n.kept { }";
+        let result = mask_css_comments(source, true);
         assert!(!result.contains("removed"));
-        assert!(result.contains(".kept"));
+        assert_eq!(result.len(), source.len());
+        assert_eq!(result.find(".kept"), source.find(".kept"));
     }
 
     #[test]
-    fn strip_scss_preserves_css_outside_comments() {
+    fn mask_scss_preserves_css_outside_comments() {
         let source = "// line comment\n/* block comment */\n.visible { color: red; }";
-        let result = strip_css_comments(source, true);
+        let result = mask_css_comments(source, true);
         assert!(result.contains(".visible"));
     }
 
@@ -1488,15 +1757,15 @@ mod tests {
     }
 
     #[test]
-    fn strip_css_no_comments() {
+    fn mask_css_no_comments() {
         let source = ".foo { color: red; }";
-        assert_eq!(strip_css_comments(source, false), source);
+        assert_eq!(mask_css_comments(source, false), source);
     }
 
     #[test]
-    fn strip_css_multiple_block_comments() {
+    fn mask_css_multiple_block_comments() {
         let source = "/* comment-one */ .foo { } /* comment-two */ .bar { }";
-        let result = strip_css_comments(source, false);
+        let result = mask_css_comments(source, false);
         assert!(!result.contains("comment-one"));
         assert!(!result.contains("comment-two"));
         assert!(result.contains(".foo"));
@@ -1504,9 +1773,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_scss_does_not_affect_non_scss() {
+    fn mask_scss_does_not_affect_non_scss() {
         let source = "// this stays\n.foo { }";
-        let result = strip_css_comments(source, false);
+        let result = mask_css_comments(source, false);
         assert!(result.contains("// this stays"));
     }
 
@@ -1612,23 +1881,6 @@ mod tests {
         let body = r#"@use "./src/styles/global.scss";"#;
         let imports = extract_css_imports(body, true);
         assert_eq!(imports, vec!["./src/styles/global.scss"]);
-    }
-
-    #[test]
-    fn mask_with_whitespace_preserves_byte_length() {
-        let src = "/* hello */ .foo { }";
-        let masked = mask_with_whitespace(src, &CSS_COMMENT_RE);
-        assert_eq!(masked.len(), src.len());
-        assert!(masked.is_char_boundary(src.len()));
-    }
-
-    #[test]
-    fn mask_with_whitespace_preserves_offsets_around_multibyte() {
-        let src = "/* \u{2713} */ .foo { }";
-        let foo_offset = src.find(".foo").expect("`.foo` present");
-        let masked = mask_with_whitespace(src, &CSS_COMMENT_RE);
-        assert_eq!(masked.len(), src.len());
-        assert_eq!(masked.find(".foo"), Some(foo_offset));
     }
 
     /// Resolve a span's start to (line, col) using the same primitives the
@@ -1912,6 +2164,42 @@ mod tests {
     }
 
     #[test]
+    fn apply_token_lines_match_naive_reference_on_dense_line() {
+        use std::fmt::Write as _;
+        let mut src = String::from("/* a\n b */\n.x {");
+        for i in 0..300 {
+            let _ = write!(src, " @apply p-{i};");
+        }
+        src.push_str(" }\n\n.y { @apply tail-a tail-b; }\r\n.z { @apply last; }\n");
+
+        let got = extract_apply_tokens_located(&src);
+
+        let masked = mask_theme_source(&src);
+        let want: Vec<(String, u32)> = CSS_APPLY_RE
+            .find_iter(&masked)
+            .flat_map(|m| {
+                let line = line_at_offset(&src, m.start());
+                m.as_str()
+                    .trim_start_matches("@apply")
+                    .split_whitespace()
+                    .map(move |token| (token.to_owned(), line))
+            })
+            .collect();
+
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 303);
+        assert!(got[..300].iter().all(|(_, line)| *line == 3));
+        assert_eq!(
+            &got[300..],
+            &[
+                ("tail-a".to_owned(), 5),
+                ("tail-b".to_owned(), 5),
+                ("last".to_owned(), 6),
+            ]
+        );
+    }
+
+    #[test]
     fn theme_string_braces_do_not_truncate_block() {
         let scan = scan_theme_blocks(
             "@theme {\n  --font-label: \"}\";\n  --color-brand: #f00;\n  --color-button: var(--color-brand);\n}",
@@ -1962,6 +2250,96 @@ mod tests {
     fn apply_tokens_strips_important() {
         let tokens = extract_apply_tokens(".x { @apply text-brand! font-bold !important; }");
         assert_eq!(tokens, vec!["text-brand", "font-bold"]);
+    }
+
+    fn line_lookup_bytes(run: impl FnOnce()) -> usize {
+        LINE_LOOKUP_BYTES.with(|read| read.set(0));
+        run();
+        LINE_LOOKUP_BYTES.with(std::cell::Cell::get)
+    }
+
+    /// One dense line with `count` `@apply` directives and `var()` reads,
+    /// followed by a few short lines.
+    fn dense_token_stylesheet(count: usize) -> String {
+        use std::fmt::Write as _;
+        let mut src = String::from("@theme { --color-brand: red; }\n.x {");
+        for i in 0..count {
+            let _ = write!(src, " @apply p-{i}; color: var(--color-{i});");
+        }
+        src.push_str(" }\n.y { @apply tail; color: var(--color-tail); }\n");
+        src
+    }
+
+    #[test]
+    fn located_token_scans_read_each_byte_once_for_lines() {
+        for count in [400, 800] {
+            let src = dense_token_stylesheet(count);
+            let apply = line_lookup_bytes(|| {
+                assert_eq!(extract_apply_tokens_located(&src).len(), count + 1);
+            });
+            let var_reads = line_lookup_bytes(|| {
+                assert_eq!(extract_css_var_reads_located(&src).len(), count + 1);
+            });
+            let combined = line_lookup_bytes(|| {
+                let _ = scan_stylesheet_tokens(&src);
+            });
+            // A prefix rescan for each match reads about count * len / 2
+            // bytes, which is far above len.
+            assert!(apply <= src.len(), "@apply read {apply} of {}", src.len());
+            assert!(
+                var_reads <= src.len(),
+                "var() read {var_reads} of {}",
+                src.len()
+            );
+            assert!(
+                combined <= 2 * src.len(),
+                "scan read {combined} of {}",
+                src.len()
+            );
+        }
+    }
+
+    fn comment_mask_passes(run: impl FnOnce()) -> u32 {
+        COMMENT_MASK_PASSES.with(|passes| passes.set(0));
+        run();
+        COMMENT_MASK_PASSES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_css_module_parse_masks_comments_once() {
+        let source = "/* a */ @import './b.css';\n.card { @apply rounded; } // c\n";
+        for name in ["styles.module.css", "styles.module.scss", "styles.css"] {
+            let passes = comment_mask_passes(|| {
+                parse_css_to_module(FileId(0), Path::new(name), source, 0);
+            });
+            assert_eq!(passes, 1, "comment mask passes for {name}");
+        }
+    }
+
+    #[test]
+    fn a_stylesheet_token_scan_masks_comments_once() {
+        let source = "/* x */\n@theme {\n  --color-brand: red;\n  --color-alt: var(--color-brand);\n}\n.a { @apply bg-brand p-2; color: var(--color-alt); }\n";
+        let mut scan = StylesheetTokens::default();
+        let passes = comment_mask_passes(|| scan = scan_stylesheet_tokens(source));
+        assert_eq!(passes, 1);
+        assert_eq!(scan.theme, scan_theme_blocks(source));
+        assert_eq!(
+            scan.apply_tokens_located,
+            extract_apply_tokens_located(source)
+        );
+        assert_eq!(
+            scan.css_var_reads_located,
+            extract_css_var_reads_located(source)
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_token_scan_skips_the_mask_without_directives() {
+        let source = "/* plain */ .a { color: red; }";
+        let mut scan = StylesheetTokens::default();
+        let passes = comment_mask_passes(|| scan = scan_stylesheet_tokens(source));
+        assert_eq!(passes, 0);
+        assert_eq!(scan, StylesheetTokens::default());
     }
 
     #[test]

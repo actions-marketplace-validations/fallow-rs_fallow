@@ -51,7 +51,7 @@ impl DenoJson {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         let content = content.trim_start_matches('\u{FEFF}');
-        crate::jsonc::parse_to_value(content)
+        crate::jsonc::parse_deno_to_value(content)
             .map_err(|e| format!("Failed to parse {}: {e}", path.display()))
     }
 
@@ -71,7 +71,7 @@ impl DenoJson {
     #[must_use]
     fn workspace_patterns(&self) -> Vec<String> {
         match &self.workspace {
-            Some(DenoWorkspace::Members(members)) | Some(DenoWorkspace::Detailed { members }) => {
+            Some(DenoWorkspace::Members(members) | DenoWorkspace::Detailed { members }) => {
                 members.clone()
             }
             None => Vec::new(),
@@ -114,6 +114,21 @@ pub fn dir_has_deno_json(dir: &Path) -> bool {
 #[must_use]
 pub fn dir_has_package_manifest(dir: &Path) -> bool {
     dir.join("package.json").is_file() || dir_has_deno_json(dir)
+}
+
+/// Whether the manifest in `dir` declares a package.
+///
+/// A `package.json` with no `name` and no dependency field (for example
+/// `{"type":"module"}`, which only sets the module type of the scripts next to
+/// it) declares no package. A Deno config, or a `package.json` that does not
+/// parse, counts as a package, so the caller still reports the directory.
+pub(super) fn manifest_declares_package(dir: &Path) -> bool {
+    if dir_has_deno_json(dir) {
+        return true;
+    }
+    PackageJson::load(&dir.join("package.json")).map_or(true, |pkg| {
+        pkg.name.is_some() || !pkg.all_dependency_names().is_empty()
+    })
 }
 
 /// Load package identity for a workspace member directory.
@@ -276,6 +291,24 @@ mod tests {
         assert!(
             map.iter()
                 .any(|(k, v)| k == "@std/assert" && v == "jsr:@std/assert@1")
+        );
+    }
+
+    #[test]
+    fn loads_loose_config_that_deno_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("deno.jsonc"),
+            "{ workspace: ['./packages/*'] imports: { '@/': './src/' } }",
+        )
+        .unwrap();
+
+        let (path, deno) = DenoJson::load_from_dir(dir.path()).unwrap().unwrap();
+        assert!(path.ends_with("deno.jsonc"));
+        assert_eq!(deno.workspace_patterns(), vec!["./packages/*".to_string()]);
+        assert_eq!(
+            deno.import_map_entries(),
+            vec![("@/".to_string(), "./src/".to_string())]
         );
     }
 

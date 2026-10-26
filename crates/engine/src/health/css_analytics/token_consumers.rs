@@ -13,8 +13,8 @@ pub(super) struct TokenConsumersInput<'a> {
 
 fn collect_located_utility_consumers(
     input: &TokenConsumersInput<'_>,
-) -> Vec<(String, String, u32)> {
-    let mut located: Vec<(String, String, u32)> = Vec::new();
+) -> Vec<(String, std::sync::Arc<str>, u32)> {
+    let mut located = Vec::new();
     for file in input.files {
         let path = &file.path;
         let extension = path.extension().and_then(|ext| ext.to_str());
@@ -83,7 +83,7 @@ fn token_consumer_candidates(input: &TokenConsumersInput<'_>) -> Vec<ThemeTokenC
 fn build_token_consumer(
     input: &TokenConsumersInput<'_>,
     candidate: ThemeTokenCandidate,
-    utility_located: &[(String, String, u32)],
+    utility_located: &[(String, std::sync::Arc<str>, u32)],
 ) -> fallow_output::TokenConsumers {
     use fallow_output::TOKEN_CONSUMER_SAMPLE_CAP;
 
@@ -104,7 +104,7 @@ fn build_token_consumer(
 fn token_consumer_locations(
     input: &TokenConsumersInput<'_>,
     candidate: &ThemeTokenCandidate,
-    utility_located: &[(String, String, u32)],
+    utility_located: &[(String, std::sync::Arc<str>, u32)],
 ) -> Vec<fallow_output::TokenConsumerLocation> {
     let dash_name = format!("-{}", candidate.name);
     let raw = candidate.token.trim_start_matches('-');
@@ -155,16 +155,16 @@ fn append_exact_token_consumers(
     }
 }
 
-fn append_suffix_token_consumers(
+fn append_suffix_token_consumers<P: AsRef<str>>(
     consumers: &mut Vec<fallow_output::TokenConsumerLocation>,
-    located: &[(String, String, u32)],
+    located: &[(String, P, u32)],
     suffix: &str,
     kind: fallow_output::ConsumerKind,
 ) {
     for (token, path, line) in located {
         if token.len() > suffix.len() && token.ends_with(suffix) {
             consumers.push(fallow_output::TokenConsumerLocation {
-                path: path.clone(),
+                path: path.as_ref().to_owned(),
                 line: *line,
                 kind,
             });
@@ -341,7 +341,8 @@ fn resolve_css_in_js_import_targets(
     modules: &[fallow_types::extract::ModuleInfo],
     config: &ResolvedConfig,
 ) -> ResolvedCssInJsImportTargets {
-    let workspaces = fallow_config::discover_workspaces(&config.root);
+    let workspaces =
+        fallow_config::discover_workspaces_with_patterns(&config.root, &config.workspace_patterns);
     let active_plugins: Vec<String> = Vec::new();
     let path_aliases: Vec<(String, String)> = Vec::new();
     let auto_imports: Vec<fallow_config::AutoImportRule> = Vec::new();
@@ -354,8 +355,10 @@ fn resolve_css_in_js_import_targets(
         active_plugins: &active_plugins,
         path_aliases: &path_aliases,
         auto_imports: &auto_imports,
+        jsx_import_sources: &[],
         scss_include_paths: &scss_include_paths,
         static_dir_mappings: &static_dir_mappings,
+        framework_static_dir_mappings: &static_dir_mappings,
         root: &config.root,
         extra_conditions: &config.resolve.conditions,
     };

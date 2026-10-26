@@ -9,6 +9,7 @@ import {
 import { runBaselineCommand } from "./baselineCommand.js";
 import { shouldAcceptLspAnalysisComplete } from "./analysisNotification.js";
 import { startClient, stopClient, restartClient } from "./client.js";
+import { cancelReleaseRetry } from "./download.js";
 import { createSingleFlight } from "./analysis-single-flight.js";
 import {
   getHealthEnabled,
@@ -60,6 +61,7 @@ import {
 } from "./license.js";
 import { DiagnosticFilter } from "./diagnosticFilter.js";
 import { registerDiagnosticMuteUi } from "./diagnosticMute.js";
+import { registerFindingIdUi } from "./findingId.js";
 import {
   createDiagnosticStatusBar,
   disposeDiagnosticStatusBar,
@@ -103,6 +105,7 @@ import { configureBundledTypeAwareCompanion } from "./typeAwareCompanion.js";
 import { killActiveChildren } from "./process-registry.js";
 import type {
   AuditOutput,
+  FallowAnalysisScope,
   FallowCheckResult,
   FallowDupesResult,
   HealthOutput,
@@ -135,6 +138,7 @@ const MUTED_ALL_NUDGE_KEY = "fallow.mutedAllNudgeShown.v1";
 let outputChannel: vscode.LogOutputChannel;
 let lastCheckResult: FallowCheckResult | null = null;
 let lastDupesResult: FallowDupesResult | null = null;
+let lastAnalysisScope: FallowAnalysisScope | null = null;
 let lastHealthResult: HealthOutput | null = null;
 let lastCoverageReport: RuntimeCoverageReport | null = null;
 let lastAuditResult: AuditOutput | null = null;
@@ -222,6 +226,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
     },
   });
   registerDiagnosticMuteUi(context, diagnosticFilter);
+  registerFindingIdUi(context);
 
   // Once-ever nudge: when EVERY Fallow finding is hidden (the "Hide All"
   // toggle), users who reinstalled often don't realize the mute state persisted
@@ -366,11 +371,12 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
       },
       async () => {
         try {
-          const { check, dupes } = await runAnalysis(context, outputChannel, {
+          const { check, dupes, scope } = await runAnalysis(context, outputChannel, {
             force: options.force === true,
           });
           lastCheckResult = check;
           lastDupesResult = dupes;
+          lastAnalysisScope = scope;
           updateViews();
           probeWorkspaceVisibility();
           void vscode.commands.executeCommand("setContext", "fallow.hasAnalyzed", true);
@@ -566,15 +572,12 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
   const healthView = vscode.window.createTreeView("fallow.health", {
     treeDataProvider: healthProvider,
   });
-  healthProvider.setView(healthView);
   const securityView = vscode.window.createTreeView("fallow.security", {
     treeDataProvider: securityProvider,
   });
-  securityProvider.setView(securityView);
   const coverageView = vscode.window.createTreeView("fallow.runtimeCoverage", {
     treeDataProvider: coverageProvider,
   });
-  coverageProvider.setView(coverageView);
   context.subscriptions.push(deadCodeView, duplicatesView, healthView, securityView, coverageView);
 
   const onHealthViewVisible = (): void => {
@@ -662,7 +665,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
   const updateViews = (): void => {
     deadCodeProvider.update(lastCheckResult);
     duplicatesProvider.update(lastDupesResult);
-    updateStatusBar(lastCheckResult, lastDupesResult);
+    updateStatusBar(lastCheckResult, lastDupesResult, lastAnalysisScope);
   };
 
   const runCliAnalysisCommand = async (): Promise<void> => {
@@ -675,6 +678,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
         vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [],
       changedSince: () =>
         vscode.workspace.getConfiguration("fallow").get<string>("changedSince", ""),
+      hasPackageBaselines: () => (lastAnalysisScope?.package_baselines?.length ?? 0) > 0,
       confirm: async (message) =>
         (await vscode.window.showWarningMessage(message, { modal: true }, "Set Baseline")) ===
         "Set Baseline",
@@ -1046,14 +1050,14 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
     ),
   );
 
-  // Fallback command for Code Lens items with 0 references (display-only)
+  // Fallback command for display-only Code Lens items that have no click target
   context.subscriptions.push(vscode.commands.registerCommand("fallow.noop", () => {}));
 
   context.subscriptions.push(
     vscode.commands.registerCommand(OPEN_FILE_COMMAND, openFileCommandHandler),
   );
 
-  // The "N references" Code Lens routes here instead of calling the built-in
+  // The "imported by N files" Code Lens routes here instead of calling the built-in
   // `editor.action.showReferences` directly: that built-in validates its args
   // with `instanceof URI / Position / Location`, which the LSP's JSON wire
   // payload (a string URI, a plain position, plain locations) fails with
@@ -1249,6 +1253,7 @@ export const activate = async (context: vscode.ExtensionContext): Promise<Extens
 };
 
 export const deactivate = async (): Promise<void> => {
+  cancelReleaseRetry();
   disposeStatusBar();
   disposeLicenseStatusBar();
   disposeWorkspacePicker();

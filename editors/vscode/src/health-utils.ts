@@ -8,7 +8,7 @@ import { appendCommonScopeArgs, type BuiltCliArgs } from "./cli-args-utils.js";
  * or VS Code access) so the argv-construction rules can be unit-tested.
  */
 export interface HealthArgsOptions {
-  /** Include git churn hotspots (`--hotspots`). Touches git history. */
+  /** Show git churn hotspots (`--hotspots`); targets still read git history. */
   readonly hotspots: boolean;
   /** Cap on complexity findings serialized into the tree (`--top <N>`). */
   readonly topFindings: number;
@@ -44,10 +44,10 @@ export interface HealthArgsOptions {
  * the Health view. Kept pure so flag-forwarding rules can be unit-tested.
  *
  * `fallow health` shows every section by default; passing ANY section flag
- * switches it to "only these sections". We always request the cheap sections
- * (`--score --complexity --targets`, no git) and add `--hotspots` only when the
- * user opted in, since that section walks git history. The combined sidebar run
- * is untouched (it keeps `--skip health`); this is a separate, lazy spawn.
+ * switches it to "only these sections". We always request score, complexity,
+ * and targets. Targets use git history even when the hotspot list is hidden;
+ * `--hotspots` controls that visible section. The combined sidebar run keeps
+ * `--skip health`; this is a separate, lazy spawn.
  */
 export const buildHealthArgs = (options: HealthArgsOptions): BuiltCliArgs => {
   const args = ["health", "--format", "json", "--quiet", "--score", "--complexity", "--targets"];
@@ -233,12 +233,8 @@ export interface PenaltyContribution {
 }
 
 /**
- * Human-readable labels for the penalty components shown in the tooltip. The
- * key set must stay in lockstep with the `HealthScorePenalties` wire contract
- * (`crates/cli/src/health_types/scores.rs` via the generated TS interface): a
- * new penalty field that is not labelled here is silently omitted from the
- * score tooltip. The parity is guarded by a test in `health-utils.test.ts` that
- * diffs these keys against the generated `HealthScorePenalties` interface.
+ * Human-readable penalty labels. The Record type keeps their keys in sync with
+ * the generated HealthScorePenalties contract during type checking.
  */
 const PENALTY_LABELS: Record<keyof HealthScorePenalties, string> = {
   dead_files: "Dead files",
@@ -254,16 +250,6 @@ const PENALTY_LABELS: Record<keyof HealthScorePenalties, string> = {
   duplication: "Duplication",
   prop_drilling: "Prop drilling",
 };
-
-/**
- * The penalty wire keys this module knows how to label. Exposed so a drift test
- * can assert it matches the generated `HealthScorePenalties` contract; a Rust
- * penalty field that flows through codegen but is missing here would otherwise
- * be silently dropped from the score tooltip.
- */
-export const recognizedPenaltyKeys: ReadonlyArray<keyof HealthScorePenalties> = Object.keys(
-  PENALTY_LABELS,
-) as (keyof HealthScorePenalties)[];
 
 /**
  * Sorted, non-zero penalty contributors for the score tooltip, highest first.

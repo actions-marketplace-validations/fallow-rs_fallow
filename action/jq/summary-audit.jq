@@ -1,3 +1,7 @@
+# Legacy renderer for fallow before 3.4.2. The action runs this file only when
+# the binary has no `fallow report`. Do not add new issue kinds: the binaries
+# that use this file do not emit them. Newer binaries render natively.
+
 def plural(n; word): "\(n) \(word)\(if n == 1 then "" else "s" end)";
 def rel_path: if startswith("/") then (split("/") | if length > 3 then .[-3:] | join("/") else join("/") end) else . end;
 # Mirrors markdown_table_code_span in the native renderer: code span whose
@@ -53,6 +57,9 @@ def dead_code_rows:
    [ (.dead_code.unused_component_emits // [])[] | {kind:"Unused component emit", location:path_line, item:("`\(.component_name)` emit `\(.emit_name)`"), introduced:.introduced} ] +
    [ (.dead_code.unused_component_inputs // [])[] | {kind:"Unused component input", location:path_line, item:("`\(.component_name).\(.input_name)`"), introduced:.introduced} ] +
    [ (.dead_code.unused_component_outputs // [])[] | {kind:"Unused component output", location:path_line, item:("`\(.component_name)` output `\(.output_name)`"), introduced:.introduced} ] +
+   [ (.dead_code.unused_effect_layers // [])[] | {kind:"Unused Effect layer", location:path_line, item:("`\(.name)`"), introduced:.introduced} ] +
+   [ (.dead_code.unused_tagged_errors // [])[] | {kind:"Unused tagged error", location:path_line, item:("`\(.name)` tag `\(.tag)`"), introduced:.introduced} ] +
+   [ (.dead_code.unproduced_catch_tags // [])[] | {kind:"Unproduced catch tag", location:path_line, item:("catchTag `\(.tag)`"), introduced:.introduced} ] +
    [ (.dead_code.unused_svelte_events // [])[] | {kind:"Unused Svelte event", location:path_line, item:("`\(.component_name)` event `\(.event_name)`"), introduced:.introduced} ] +
    [ (.dead_code.unprovided_injects // [])[] | {kind:"Unprovided inject", location:path_line, item:("`\(.key_name)` (\(.framework))"), introduced:.introduced} ] +
    [ (.dead_code.unused_load_data_keys // [])[] | {kind:"Unused load data key", location:path_line, item:("`\(.key_name)`"), introduced:.introduced} ] +
@@ -105,10 +112,14 @@ styling_rows as $styling_rows |
 "## Fallow Audit\n\n" +
 "> \($verdict | verdict_label) · \(plural($files; "changed file")) · \($elapsed)ms\n\n" +
 "| Category | Findings | Introduced | Inherited |\n|:---------|---------:|-----------:|----------:|\n" +
-"| Dead code | \($dead) | \($attr.dead_code_introduced // 0) | \($attr.dead_code_inherited // 0) |\n" +
-"| Complexity | \($complex) | \($attr.complexity_introduced // 0) | \($attr.complexity_inherited // 0) |\n" +
-"| Duplication | \($dupes) | \($attr.duplication_introduced // 0) | \($attr.duplication_inherited // 0) |\n" +
-"| Styling | \($styling) | \($attr.styling_introduced // 0) | \($attr.styling_inherited // 0) |\n\n" +
+(if ($summary.dead_code_skipped // false) then "| Dead code | skipped | - | - |\n"
+ else "| Dead code | \($dead) | \($attr.dead_code_introduced // 0) | \($attr.dead_code_inherited // 0) |\n" end) +
+(if ($summary.complexity_skipped // false) then "| Complexity | skipped | - | - |\n"
+ else "| Complexity | \($complex) | \($attr.complexity_introduced // 0) | \($attr.complexity_inherited // 0) |\n" end) +
+(if ($summary.duplication_skipped // false) then "| Duplication | skipped | - | - |\n"
+ else "| Duplication | \($dupes) | \($attr.duplication_introduced // 0) | \($attr.duplication_inherited // 0) |\n" end) +
+(if ($summary.complexity_skipped // false) then "| Styling | skipped | - | - |\n\n"
+ else "| Styling | \($styling) | \($attr.styling_introduced // 0) | \($attr.styling_inherited // 0) |\n\n" end) +
 (if ($attr.duplication_demoted // 0) > 0 then
   "> \(plural($attr.duplication_demoted; "introduced clone group")) demoted to inherited (not written by this changeset)\n\n"
 else "" end) +

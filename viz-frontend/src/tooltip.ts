@@ -1,5 +1,16 @@
 import type { AppState } from "./state";
-import { basename, dirname, dupRatio, formatCount, formatSize } from "./data";
+import type { Lens } from "./types";
+import {
+  basename,
+  dirname,
+  dupRatio,
+  formatCount,
+  formatSize,
+  healthRiskForFile,
+  lensFindingLevel,
+  securityCandidatesForFile,
+} from "./data";
+import { healthReason, securityCategoryLabel, severityRank } from "./explain";
 
 let tipEl: HTMLDivElement | null = null;
 
@@ -76,7 +87,7 @@ export interface TipDock {
 const severityLine = (state: AppState, fileIndex: number): HTMLElement | null => {
   const file = state.data.files[fileIndex];
   if (file.status === "unused") {
-    return line("sev-error tip-line", "Unused, nothing imports this file");
+    return line("sev-error tip-line", "Unused: no file imports this file");
   }
   if (state.index.violationSources.has(fileIndex)) {
     const count = state.data.violations.filter((violation) => violation.from === fileIndex).length;
@@ -96,28 +107,53 @@ const severityLine = (state: AppState, fileIndex: number): HTMLElement | null =>
   return null;
 };
 
+const OVERVIEW_LENSES: ReadonlyArray<[Lens, string]> = [
+  ["unused", "Unused"],
+  ["duplication", "Duplication"],
+  ["architecture", "Architecture"],
+  ["health", "Health"],
+  ["security", "Security"],
+];
+
 /** One extra line only when the active lens has something to add. */
 const lensLine = (state: AppState, fileIndex: number): HTMLElement | null => {
   const file = state.data.files[fileIndex];
-  if (state.lens === "dupes" && file.dup_lines > 0) {
+  if (state.lens === "duplication" && file.dup_lines > 0) {
     return line(
       "sev-warn tip-line",
       `${formatCount(file.dup_lines)} duplicated lines, ${Math.round(dupRatio(file) * 100)}% of the file`,
     );
   }
-  if (state.lens === "hotspots" && file.max_cyclomatic > 0) {
-    const cls =
-      file.max_cyclomatic >= 20
-        ? "sev-error"
-        : file.max_cyclomatic >= 10
-          ? "sev-warn"
-          : "tip-muted";
-    return line(
-      `${cls} tip-line`,
-      `Complexity ${formatCount(file.max_cyclomatic)}, nesting ${formatCount(file.max_cognitive)}`,
+  if (state.lens === "health") {
+    const health = state.data.health.files.find(
+      (candidate) => candidate.file === fileIndex || candidate.path === file.path,
     );
+    const risk = healthRiskForFile(state.data, fileIndex);
+    if (!health || risk === null) return null;
+    const cls = risk >= 30 ? "sev-error" : risk >= 10 ? "sev-warn" : "tip-muted";
+    return line(`${cls} tip-line`, healthReason(health, "Below the Health thresholds"));
   }
-  if (state.lens === "boundaries" && file.zone !== undefined) {
+  if (state.lens === "security") {
+    const candidates = securityCandidatesForFile(state.data, fileIndex);
+    if (candidates.length === 0) return null;
+    const high = candidates.some((candidate) => severityRank(candidate.severity) >= 3);
+    const labels = [
+      ...new Set(
+        candidates.map((candidate) => securityCategoryLabel(candidate.category, candidate.title)),
+      ),
+    ];
+    const more = labels.length > 1 ? ` +${formatCount(labels.length - 1)} more` : "";
+    return line(`${high ? "sev-error" : "sev-warn"} tip-line`, `${labels[0]}${more}`);
+  }
+  if (state.lens === "overview") {
+    const flagged = OVERVIEW_LENSES.filter(
+      ([lens]) => lensFindingLevel(lens, state.index, file, fileIndex) > 0,
+    ).map(([, name]) => name);
+    if (flagged.length === 0) return null;
+    const high = lensFindingLevel("overview", state.index, file, fileIndex) === 2;
+    return line(`${high ? "sev-error" : "sev-warn"} tip-line`, `Findings: ${flagged.join(", ")}`);
+  }
+  if (state.lens === "architecture" && file.zone !== undefined) {
     const zone = state.data.zones[file.zone]?.name;
     return zone ? line("tip-muted tip-line", `Zone ${zone}`) : null;
   }
@@ -169,6 +205,9 @@ export const showFileTooltip = (
   // No generic "click for details" line: the pointer cursor already says
   // the node is clickable, and the severity/lens lines carry the substance.
 
+  // The docked card takes the width the canvas reserves for it, so the
+  // hover labels keep clear of the whole card.
+  tip.style.width = dock ? `${TIP_W}px` : "";
   if (dock) {
     tip.style.display = "block";
     const rect = fileTipCanvasRect(dock.nodeX, dock.nodeY, dock.usableW, dock.canvas.height);
@@ -238,6 +277,7 @@ export const showDirTooltip = (
 };
 
 const position = (tip: HTMLDivElement, mouseX: number, mouseY: number): void => {
+  tip.style.width = "";
   tip.style.display = "block";
   const rect = tip.getBoundingClientRect();
   let left = mouseX + 14;

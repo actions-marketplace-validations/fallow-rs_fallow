@@ -1,8 +1,8 @@
 # Conformance Test Suite
 
-Compares fallow's dead code detection results against [knip](https://github.com/webpro-nl/knip) on 8 real-world open-source projects, producing a structured report of agreements and disagreements.
+This suite compares fallow's dead code detection with [knip](https://github.com/webpro-nl/knip) on real-world open-source projects. It reports agreements and disagreements.
 
-This suite is **informational** -- it does not fail on disagreements. Differences between the tools are expected due to different analysis strategies and heuristics.
+This suite is informational. It does not fail on disagreements. Differences between the tools are expected due to different analysis strategies and heuristics.
 
 ## Test Projects
 
@@ -68,7 +68,7 @@ Both scripts output:
 
 The report breaks down findings into three categories:
 
-- **Agreed**: Issues found by both fallow and knip. High confidence these are real issues.
+- **Agreed**: Issues found by both fallow and knip. Agreement does not independently establish that these are real issues.
 - **Fallow-only**: Issues found by fallow but not knip. Could be:
   - True positives that knip misses (fallow wins)
   - False positives in fallow (needs investigation)
@@ -77,6 +77,28 @@ The report breaks down findings into three categories:
   - False positives in knip (fallow correctly ignores them)
 
 The agreement percentage is calculated as `agreed / total_unique_issues * 100`.
+
+## Adjudication Register
+
+The agreement percentage does not establish which tool is correct. The report
+joins every disagreement row against `adjudications.json`, keyed on
+`(project, issue_type, path, export_name)`. Each record has a `verdict`
+(`fallow_wrong`, `knip_wrong`, or `model_difference`), a `cause` from the
+pipeline vocabulary the `debug-false-positive` skill uses, plus the
+`knip_version`, `corpus_ref`, `reviewed_on` date, and the tracking `issue`.
+
+The aggregated summary reports `adjudicated_fallow_wrong`,
+`adjudicated_knip_wrong`, `adjudicated_model_difference`, and `unadjudicated`.
+The four buckets partition the disagreements. `unadjudicated` records the
+backlog that has not been reviewed. An unknown verdict, an unknown cause, a duplicate
+key, or a record missing a declared field is a hard error.
+
+Write the verdict before the fix. The `conformance-loop` skill makes this a
+separate step so classifications go into the register instead of remaining
+only in session context or the ignored `.plans/` directory.
+
+The register does not gate CI. The lane stays `continue-on-error: true` while
+the unadjudicated count settles.
 
 ## Issue Type Mapping
 
@@ -100,7 +122,8 @@ The agreement percentage is calculated as `agreed / total_unique_issues * 100`.
 | `run.sh` | Single-project comparison (fallow vs knip) |
 | `run-all.sh` | Multi-project orchestrator (clone, run, aggregate) |
 | `compare.py` | Normalizes and compares tool outputs for one project |
-| `aggregate.py` | Combines per-project reports into overall summary |
+| `aggregate.py` | Combines per-project reports into overall summary, joined against the adjudication register |
+| `adjudications.json` | Reviewed verdicts and causes for individual disagreements |
 
 ## Aggregated JSON Report Schema
 
@@ -112,7 +135,11 @@ The agreement percentage is calculated as `agreed / total_unique_issues * 100`.
     "agreed": 100,
     "fallow_only": 50,
     "knip_only": 20,
-    "agreement_pct": 58.8
+    "agreement_pct": 58.8,
+    "adjudicated_fallow_wrong": 4,
+    "adjudicated_knip_wrong": 6,
+    "adjudicated_model_difference": 10,
+    "unadjudicated": 50
   },
   "projects": {
     "preact": { "fallow_total": 10, "knip_total": 8, "agreed": 6, ... },
@@ -130,9 +157,3 @@ The agreement percentage is calculated as `agreed / total_unique_issues * 100`.
   }
 }
 ```
-
-## CI
-
-The conformance suite runs daily via `.github/workflows/conformance.yml` and can be triggered manually. Results are posted to the GitHub Actions step summary with per-project and per-issue-type breakdowns. It never fails the CI pipeline -- it is purely informational.
-
-Per-project agreement rates are tracked over time via benchmark-action and visible on the [metrics dashboard](https://fallow-rs.github.io/fallow/dev/conformance/).

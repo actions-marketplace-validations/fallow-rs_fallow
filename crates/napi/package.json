@@ -1,7 +1,7 @@
 {
   "name": "@fallow-cli/fallow-node",
-  "version": "3.21.0",
-  "description": "Native Node.js bindings for fallow, codebase intelligence for TypeScript and JavaScript. Finds unused code, duplication, circular dependencies, complexity hotspots, architecture drift, and design-system styling drift. Optional runtime intelligence layer (Fallow Runtime) adds production execution evidence.",
+  "version": "3.36.0",
+  "description": "Native Node.js bindings for fallow, codebase intelligence for TypeScript and JavaScript: health, complexity, duplication, architecture, and unused code.",
   "main": "loader.js",
   "types": "index.d.ts",
   "exports": {
@@ -33,7 +33,7 @@
     "url": "git+https://github.com/fallow-rs/fallow.git",
     "directory": "crates/napi"
   },
-  "homepage": "https://docs.fallow.tools",
+  "homepage": "https://fallow.tools/docs/",
   "bugs": {
     "url": "https://github.com/fallow-rs/fallow/issues"
   },
@@ -64,18 +64,18 @@
     "test": "node test.mjs"
   },
   "devDependencies": {
-    "@napi-rs/cli": "3.8.6"
+    "@napi-rs/cli": "3.10.8"
   },
   "optionalDependencies": {
-    "@fallow-cli/fallow-node-darwin-arm64": "3.21.0",
-    "@fallow-cli/fallow-node-darwin-x64": "3.21.0",
-    "@fallow-cli/fallow-node-linux-arm64-gnu": "3.21.0",
-    "@fallow-cli/fallow-node-linux-arm64-musl": "3.21.0",
-    "@fallow-cli/fallow-node-linux-x64-gnu": "3.21.0",
-    "@fallow-cli/fallow-node-linux-x64-musl": "3.21.0",
-    "@fallow-cli/fallow-node-win32-arm64-msvc": "3.21.0",
-    "@fallow-cli/fallow-node-win32-x64-msvc": "3.21.0",
-    "fallow-similar-code": "3.21.0",
-    "fallow-type-aware": "3.21.0"
+    "@fallow-cli/fallow-node-darwin-arm64": "3.36.0",
+    "@fallow-cli/fallow-node-darwin-x64": "3.36.0",
+    "@fallow-cli/fallow-node-linux-arm64-gnu": "3.36.0",
+    "@fallow-cli/fallow-node-linux-arm64-musl": "3.36.0",
+    "@fallow-cli/fallow-node-linux-x64-gnu": "3.36.0",
+    "@fallow-cli/fallow-node-linux-x64-musl": "3.36.0",
+    "@fallow-cli/fallow-node-win32-arm64-msvc": "3.36.0",
+    "@fallow-cli/fallow-node-win32-x64-msvc": "3.36.0",
+    "fallow-similar-code": "3.36.0",
+    "fallow-type-aware": "3.36.0"
   }
 }

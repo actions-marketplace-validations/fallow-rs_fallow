@@ -351,7 +351,10 @@ pub fn extract_sfc_styles(source: &str) -> Vec<SfcStyle> {
         .collect()
 }
 
-fn ranges_to_gaps(source: &str, ranges: &[(usize, usize)]) -> Vec<SourceRegion> {
+/// Turn masked `ranges` into the gap regions between them, preserving byte
+/// offsets. `ranges` must be sorted by start offset; unsorted input silently
+/// drops the gaps that precede an out-of-order range.
+pub(crate) fn ranges_to_gaps(source: &str, ranges: &[(usize, usize)]) -> Vec<SourceRegion> {
     let mut regions = Vec::new();
     let mut cursor = 0;
     for &(start, end) in ranges {
@@ -436,8 +439,8 @@ pub(crate) fn parse_sfc_to_module(
     apply_template_usage(TemplateUsageInput {
         kind,
         source,
-        template_visible_imports: &template_visible_imports,
-        template_visible_bound_targets: &template_visible_bound_targets,
+        template_visible_imports,
+        template_visible_bound_targets,
         template_visible_iterable_types: &template_visible_iterable_types,
         props_return_binding: props_return_binding.as_deref(),
         credit_load_data: kind == SfcKind::Svelte && is_sveltekit_route_data_component(path),
@@ -465,6 +468,7 @@ pub(crate) fn parse_sfc_to_module(
 
     append_template_asset_imports(source, &mut combined);
     dedup_import_binding_lists(&mut combined);
+    apply_component_contracts(kind, source, &mut combined);
 
     combined
 }
@@ -594,13 +598,25 @@ fn merge_script_into_module(input: &mut SfcScriptMergeInput<'_>) {
     )
     .parse();
     let mut extractor = ModuleInfoExtractor::new();
+    extractor.set_top_level_is_component_body(is_template_visible_script(input.kind, input.script));
     extractor.visit_program(&parser_return.program);
     let empty_template_used = FxHashSet::default();
-    let semantic_usage = crate::parse::compute_semantic_usage_for_extractor(
+    let mut semantic_usage = crate::parse::compute_semantic_usage_for_extractor(
         &parser_return.program,
         &mut extractor,
         &empty_template_used,
     );
+    if input.kind == SfcKind::Vue || is_template_visible_script(input.kind, input.script) {
+        crate::component_contracts::merge(
+            &mut input.combined.component_contracts,
+            std::mem::take(&mut semantic_usage.component_contracts),
+            input.script.byte_offset as u32,
+            Some(match input.kind {
+                SfcKind::Vue => fallow_types::extract::ComponentFramework::Vue,
+                SfcKind::Svelte => fallow_types::extract::ComponentFramework::Svelte,
+            }),
+        );
+    }
     let extraction = ExtractionResult::contiguous(&input.script.body, input.script.byte_offset);
     extractor.remap_spans_with(|span| extraction.remap_span(span));
     extractor.resolve_typed_destructure_bindings();
@@ -887,7 +903,10 @@ fn apply_emits_harvest(
     }
 }
 
-fn translate_script_complexity(
+/// Score the functions of an SFC `<script>` or an Astro frontmatter
+/// (cyclomatic and cognitive complexity). Each function line and column moves
+/// from the script-body coordinates to the coordinates of the full source file.
+pub(crate) fn translate_script_complexity(
     script: &SfcScript,
     program: &oxc_ast::ast::Program<'_>,
     sfc_line_offsets: &[u32],
@@ -895,8 +914,10 @@ fn translate_script_complexity(
     let script_line_offsets = compute_line_offsets(&script.body);
     let mut complexity =
         crate::complexity::compute_complexity(program, &script.body, &script_line_offsets);
-    let (body_start_line, body_start_col) =
-        byte_offset_to_line_col(sfc_line_offsets, script.byte_offset as u32);
+    let (body_start_line, body_start_col) = byte_offset_to_line_col(
+        sfc_line_offsets,
+        u32::try_from(script.byte_offset).unwrap_or(u32::MAX),
+    );
 
     for function in &mut complexity {
         function.line = body_start_line + function.line.saturating_sub(1);
@@ -979,13 +1000,46 @@ fn merge_style_into_module(style: &SfcStyle, combined: &mut ModuleInfo) {
     }
 }
 
-fn source_type_for_script(script: &SfcScript) -> SourceType {
-    match (script.is_typescript, script.is_jsx) {
+pub(crate) fn source_type_for_script(script: &SfcScript) -> SourceType {
+    source_type_for(script.is_typescript, script.is_jsx)
+}
+
+fn source_type_for(is_typescript: bool, is_jsx: bool) -> SourceType {
+    match (is_typescript, is_jsx) {
         (true, true) => SourceType::tsx(),
         (true, false) => SourceType::ts(),
         (false, true) => SourceType::jsx(),
         (false, false) => SourceType::mjs(),
     }
+}
+
+/// Join the inline `<script>` blocks of a Vue or Svelte SFC into one program
+/// source for whole-file binding analysis.
+///
+/// The SFC compilers merge `<script>` and `<script setup>` (Vue) or the module
+/// and instance scripts (Svelte) into one module, so a binding in one block is
+/// visible in the other. Each `generic="..."` constraint is kept as an
+/// unexported type alias, so a type that only the constraint uses still has a
+/// reference. The result uses TypeScript when any block uses TypeScript.
+/// Returns `None` when the SFC has no inline script.
+#[must_use]
+pub fn sfc_merged_script_source(source: &str) -> Option<(String, SourceType)> {
+    let scripts: Vec<SfcScript> = extract_sfc_scripts(source)
+        .into_iter()
+        .filter(|script| script.src.is_none())
+        .collect();
+    if scripts.is_empty() {
+        return None;
+    }
+    let is_typescript = scripts.iter().any(|script| script.is_typescript);
+    let is_jsx = scripts.iter().any(|script| script.is_jsx);
+    let mut merged = String::new();
+    for script in &scripts {
+        let body = build_generic_attr_probe_source(script);
+        merged.push_str(body.as_deref().unwrap_or(&script.body));
+        merged.push_str("\n;\n");
+    }
+    Some((merged, source_type_for(is_typescript, is_jsx)))
 }
 
 /// Build an augmented script body that pins the `generic="..."` constraint as
@@ -1007,8 +1061,8 @@ fn build_generic_attr_probe_source(script: &SfcScript) -> Option<String> {
 struct TemplateUsageInput<'a> {
     kind: SfcKind,
     source: &'a str,
-    template_visible_imports: &'a FxHashSet<String>,
-    template_visible_bound_targets: &'a FxHashMap<String, String>,
+    template_visible_imports: FxHashSet<String>,
+    template_visible_bound_targets: FxHashMap<String, String>,
     template_visible_iterable_types: &'a FxHashMap<String, String>,
     props_return_binding: Option<&'a str>,
     credit_load_data: bool,
@@ -1051,13 +1105,13 @@ fn apply_template_usage(input: TemplateUsageInput<'_>) {
 /// load prop. Crediting a prop name against an import is inert. Also sets
 /// `has_load_data_whole_use` when a route spreads / passes the whole `data` prop.
 fn build_template_credited_set(
-    template_visible_imports: &FxHashSet<String>,
+    template_visible_imports: FxHashSet<String>,
     props_return_binding: Option<&str>,
     credit_load_data: bool,
     source: &str,
     combined: &mut ModuleInfo,
 ) -> FxHashSet<String> {
-    let mut credited: FxHashSet<String> = template_visible_imports.clone();
+    let mut credited = template_visible_imports;
     // unused-load-data-key Primitive B: a SvelteKit route component receives a
     // `data` prop populated by the route's `load()` return object. Credit `data`
     // as a recognized root so its template member accesses (`data.<key>`) are
@@ -1095,29 +1149,20 @@ fn compute_template_usage(
     kind: SfcKind,
     source: &str,
     credited: &FxHashSet<String>,
-    template_visible_bound_targets: &FxHashMap<String, String>,
+    mut template_visible_bound_targets: FxHashMap<String, String>,
     template_visible_iterable_types: &FxHashMap<String, String>,
     credit_load_data: bool,
 ) -> crate::template_usage::TemplateUsage {
-    if credit_load_data && template_visible_bound_targets.contains_key("data") {
-        let mut filtered = template_visible_bound_targets.clone();
-        filtered.remove("data");
-        collect_template_usage_with_bound_targets(
-            kind,
-            source,
-            credited,
-            &filtered,
-            template_visible_iterable_types,
-        )
-    } else {
-        collect_template_usage_with_bound_targets(
-            kind,
-            source,
-            credited,
-            template_visible_bound_targets,
-            template_visible_iterable_types,
-        )
+    if credit_load_data {
+        template_visible_bound_targets.remove("data");
     }
+    collect_template_usage_with_bound_targets(
+        kind,
+        source,
+        credited,
+        &template_visible_bound_targets,
+        template_visible_iterable_types,
+    )
 }
 
 /// Mark each harvested prop `used_in_template` when the template references it by
@@ -1260,6 +1305,26 @@ mod tests {
     use fallow_types::extract::{
         ClassThisMemberAccessFact, ClassThisWholeObjectUseFact, SemanticFactView,
     };
+
+    #[test]
+    fn merged_script_source_joins_inline_blocks_as_typescript() {
+        let source = r#"<script>export const a = 1;</script>
+<script setup lang="ts" generic="T extends Item">defineProps<{ a: T }>();</script>
+<script src="./external.ts"></script>"#;
+        let (merged, source_type) =
+            sfc_merged_script_source(source).expect("inline scripts give a source");
+        assert!(source_type.is_typescript());
+        assert!(merged.contains("export const a = 1;"));
+        assert!(merged.contains("defineProps<{ a: T }>();"));
+        assert!(merged.contains("<T extends Item>"));
+        assert!(!merged.contains("external"));
+    }
+
+    #[test]
+    fn merged_script_source_is_none_without_inline_script() {
+        assert!(sfc_merged_script_source("<template><div /></template>").is_none());
+        assert!(sfc_merged_script_source(r#"<script src="./a.ts"></script>"#).is_none());
+    }
 
     #[test]
     fn is_sfc_file_vue() {
@@ -1682,14 +1747,6 @@ export const foo = 1;
             false,
         );
         assert!(!info.suppressions.is_empty());
-    }
-
-    #[test]
-    fn source_type_jsx_detection() {
-        let scripts = extract_sfc_scripts(r#"<script lang="jsx">const el = <div />;</script>"#);
-        assert_eq!(scripts.len(), 1);
-        assert!(!scripts[0].is_typescript);
-        assert!(scripts[0].is_jsx);
     }
 
     #[test]
@@ -2120,4 +2177,62 @@ export const foo = 1;
                 [0];
         assert!(info.svelte_listened_events.contains(&"save".to_string()));
     }
+}
+
+fn apply_component_contracts(kind: SfcKind, source: &str, combined: &mut ModuleInfo) {
+    let framework = match kind {
+        SfcKind::Vue => fallow_types::extract::ComponentFramework::Vue,
+        SfcKind::Svelte => fallow_types::extract::ComponentFramework::Svelte,
+    };
+    let callers = crate::sfc_template::component_contracts::collect(
+        &mask_non_markup_regions(source),
+        &combined.imports,
+        framework,
+        0,
+        combined
+            .component_contracts
+            .as_deref()
+            .map_or(&[], |facts| facts.spread_bindings.as_slice()),
+        combined
+            .component_contracts
+            .as_deref()
+            .map_or(&[], |facts| facts.aliases.as_slice()),
+    );
+    crate::component_contracts::merge(&mut combined.component_contracts, callers, 0, None);
+    if let Some(facts) = &mut combined.component_contracts {
+        let credited: FxHashSet<String> = facts
+            .declarations
+            .iter()
+            .flat_map(|prop| [prop.local.clone(), prop.name.clone()])
+            .collect();
+        let usage = collect_template_usage_with_bound_targets(
+            kind,
+            source,
+            &credited,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        for declaration in &mut facts.declarations {
+            declaration.is_used |= usage.used_bindings.contains(&declaration.local)
+                || usage.member_accesses.iter().any(|access| {
+                    access.object == declaration.local && access.member == declaration.name
+                });
+        }
+    }
+    if let Some(facts) = &mut combined.component_contracts {
+        for declaration in &mut facts.declarations {
+            if let Some(prop) = combined
+                .component_props
+                .iter()
+                .find(|prop| prop.name == declaration.name)
+            {
+                declaration.is_used |= prop.used_in_template;
+            }
+            declaration.incomplete |= combined.has_props_attrs_fallthrough
+                || combined.has_define_expose
+                || combined.has_define_model;
+        }
+    }
+
+    crate::component_contracts::attach_sfc_default_export(combined);
 }

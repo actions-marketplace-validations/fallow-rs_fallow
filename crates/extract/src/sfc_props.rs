@@ -16,11 +16,11 @@
 //! of the props return, `defineExpose` / `defineModel`) sets an abstain flag so
 //! the detector skips the whole file rather than risk a false positive.
 
+use crate::js_text::JsText;
+use fallow_types::extract::{ComponentEmit, ComponentProp};
 use oxc_ast::ast::*;
 use oxc_semantic::SemanticBuilder;
 use rustc_hash::{FxHashMap, FxHashSet};
-
-use fallow_types::extract::{ComponentEmit, ComponentProp};
 
 /// Result of harvesting `defineProps` from a `<script setup>` program.
 #[derive(Debug, Default)]
@@ -438,7 +438,7 @@ fn collect_define_props_names(
             Expression::ArrayExpression(arr) => {
                 for element in &arr.elements {
                     if let ArrayExpressionElement::StringLiteral(lit) = element {
-                        prop_names.push((lit.value.to_string(), lit.span.start));
+                        prop_names.push((lit.value.text().into_owned(), lit.span.start));
                     } else if !matches!(element, ArrayExpressionElement::Elision(_)) {
                         // A non-literal array element (spread / computed): abstain.
                         harvest.has_unharvestable_props = true;
@@ -453,7 +453,7 @@ fn collect_define_props_names(
 
 /// The static name of an object-property or type-property key.
 fn property_key_name(key: &PropertyKey<'_>) -> Option<String> {
-    key.static_name().map(|name| name.to_string())
+    key.static_name().map(|name| name.text().into_owned())
 }
 
 /// The local binding name of a destructured prop value, peeling an
@@ -689,12 +689,12 @@ fn scan_astro_props_statement(
 ) {
     // The `Props` interface / type alias may be bare or `export`-wrapped.
     if let Some(decl) = props_interface_declaration(stmt) {
-        if !decl.extends.is_empty() {
+        if decl.extends.is_empty() {
+            collect_ts_signature_props(&decl.body.body, &mut scan.prop_names);
+        } else {
             // `interface Props extends ImportedBase`: the inherited names require
             // cross-file resolution. Abstain.
             harvest.has_unharvestable_props = true;
-        } else {
-            collect_ts_signature_props(&decl.body.body, &mut scan.prop_names);
         }
         return;
     }
@@ -733,7 +733,7 @@ fn props_interface_declaration<'a, 'b>(
 ) -> Option<&'b TSInterfaceDeclaration<'a>> {
     let decl = match stmt {
         Statement::TSInterfaceDeclaration(decl) => decl.as_ref(),
-        Statement::ExportNamedDeclaration(export) => match export.declaration.as_ref()? {
+        Statement::ExportDeclaration(export) => match &export.declaration {
             Declaration::TSInterfaceDeclaration(decl) => decl.as_ref(),
             _ => return None,
         },
@@ -749,7 +749,7 @@ fn props_type_alias_declaration<'a, 'b>(
 ) -> Option<&'b TSTypeAliasDeclaration<'a>> {
     let alias = match stmt {
         Statement::TSTypeAliasDeclaration(alias) => alias.as_ref(),
-        Statement::ExportNamedDeclaration(export) => match export.declaration.as_ref()? {
+        Statement::ExportDeclaration(export) => match &export.declaration {
             Declaration::TSTypeAliasDeclaration(alias) => alias.as_ref(),
             _ => return None,
         },
@@ -1081,7 +1081,7 @@ fn collect_define_emits_names(
             Expression::ArrayExpression(arr) => {
                 for element in &arr.elements {
                     if let ArrayExpressionElement::StringLiteral(lit) = element {
-                        emit_names.push((lit.value.to_string(), lit.span.start));
+                        emit_names.push((lit.value.text().into_owned(), lit.span.start));
                     } else if !matches!(element, ArrayExpressionElement::Elision(_)) {
                         harvest.has_unharvestable_emits = true;
                     }
@@ -1102,7 +1102,7 @@ fn call_signature_event_name(sig: &TSCallSignatureDeclaration<'_>) -> Option<(St
     if let TSType::TSLiteralType(lit) = &type_annotation.type_annotation
         && let TSLiteral::StringLiteral(str_lit) = &lit.literal
     {
-        return Some((str_lit.value.to_string(), sig.span.start));
+        return Some((str_lit.value.text().into_owned(), sig.span.start));
     }
     None
 }
@@ -1128,7 +1128,7 @@ impl<'a> oxc_ast_visit::Visit<'a> for EmitBindingVisitor<'a> {
         {
             match call.arguments.first().and_then(|arg| arg.as_expression()) {
                 Some(Expression::StringLiteral(lit)) => {
-                    self.emitted.insert(lit.value.to_string());
+                    self.emitted.insert(lit.value.text().into_owned());
                 }
                 // `emit(someVar)` / `emit(\`x\`)` / `emit()`: the event cannot be
                 // known statically. Abstain on the whole file.
@@ -1372,7 +1372,7 @@ fn collect_options_prop_names(
         Expression::ArrayExpression(arr) => {
             for element in &arr.elements {
                 if let ArrayExpressionElement::StringLiteral(lit) = element {
-                    prop_names.push((lit.value.to_string(), lit.span.start));
+                    prop_names.push((lit.value.text().into_owned(), lit.span.start));
                 } else if !matches!(element, ArrayExpressionElement::Elision(_)) {
                     harvest.has_unharvestable_props = true;
                 }
@@ -1468,7 +1468,7 @@ fn collect_options_emit_names(
         Expression::ArrayExpression(arr) => {
             for element in &arr.elements {
                 if let ArrayExpressionElement::StringLiteral(lit) = element {
-                    emit_names.push((lit.value.to_string(), lit.span.start));
+                    emit_names.push((lit.value.text().into_owned(), lit.span.start));
                 } else if !matches!(element, ArrayExpressionElement::Elision(_)) {
                     harvest.has_unharvestable_emits = true;
                 }
@@ -1520,7 +1520,7 @@ impl<'a> oxc_ast_visit::Visit<'a> for ThisMemberVisitor {
         {
             match call.arguments.first().and_then(|arg| arg.as_expression()) {
                 Some(Expression::StringLiteral(lit)) => {
-                    self.usage.emitted.insert(lit.value.to_string());
+                    self.usage.emitted.insert(lit.value.text().into_owned());
                 }
                 // `this.$emit(someVar)` / `this.$emit()`: event unknowable.
                 _ => self.usage.has_dynamic_emit = true,

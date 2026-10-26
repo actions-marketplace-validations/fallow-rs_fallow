@@ -139,23 +139,32 @@ fn skill_refuses_foreign_skill_without_force() {
     .unwrap();
     let ctx = ctx(dir.path(), Mode::Install);
     let steps = skill::install(&ctx, &[Harness::Codex]);
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].status, StepStatus::Refused, "{steps:?}");
-    assert_eq!(steps[0].reason, Some(Reason::SkillNameTaken));
+    assert_eq!(steps.len(), skill::RELEASED_SKILLS.len(), "{steps:?}");
+    let refused = steps
+        .iter()
+        .find(|s| s.path.as_deref() == Some(".agents/skills/fallow"))
+        .unwrap();
+    assert_eq!(refused.status, StepStatus::Refused, "{steps:?}");
+    assert_eq!(refused.reason, Some(Reason::SkillNameTaken));
+    assert!(
+        steps
+            .iter()
+            .filter(|s| s.path.as_deref() != Some(".agents/skills/fallow"))
+            .all(|s| s.status != StepStatus::Refused),
+        "a foreign `fallow` skill must not block the other skills: {steps:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
         "---\nname: fallow\n---\nmaintainer skill\n"
     );
 }
 
-#[test]
-fn skill_writes_stub_when_node_modules_ships_the_skill() {
-    let dir = tempfile::tempdir().unwrap();
-    let shipped = dir.path().join("node_modules/fallow/skills/fallow");
+fn ship_skill(root: &Path, name: &str) {
+    let shipped = root.join("node_modules/fallow/skills").join(name);
     std::fs::create_dir_all(shipped.join("agents")).unwrap();
     std::fs::write(
         shipped.join("SKILL.md"),
-        "---\nname: fallow\ndescription: Shipped description.\nlicense: MIT\n---\n\n# Full skill\n",
+        format!("---\nname: {name}\ndescription: Shipped description.\nlicense: MIT\n---\n\n# Full skill\n"),
     )
     .unwrap();
     std::fs::write(
@@ -163,26 +172,43 @@ fn skill_writes_stub_when_node_modules_ships_the_skill() {
         "interface:\n  display_name: \"Fallow\"\n",
     )
     .unwrap();
+}
+
+#[test]
+fn released_skills_are_fallow_and_fallow_setup() {
+    let names: Vec<&str> = skill::RELEASED_SKILLS.iter().map(|s| s.name).collect();
+    assert_eq!(names, ["fallow", "fallow-setup"]);
+}
+
+#[test]
+fn skill_writes_stub_when_node_modules_ships_the_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    for released in skill::RELEASED_SKILLS {
+        ship_skill(dir.path(), released.name);
+    }
     let ctx = ctx(dir.path(), Mode::Install);
     let steps = skill::install(&ctx, &[Harness::Claude, Harness::Cursor]);
-    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(steps.len(), 2 * skill::RELEASED_SKILLS.len(), "{steps:?}");
     assert!(
         steps.iter().all(|s| s.status == StepStatus::Written),
         "{steps:?}"
     );
     for base in [".agents", ".claude"] {
-        let text =
-            std::fs::read_to_string(dir.path().join(base).join("skills/fallow/SKILL.md")).unwrap();
-        assert!(text.starts_with("---\nname: fallow\ndescription: Shipped description.\n"));
-        assert!(text.contains("skill=stub version="));
-        assert!(text.contains("node_modules/fallow/skills/fallow/SKILL.md"));
-        assert!(text.contains("## Fallow task map"));
-        assert!(
-            dir.path()
-                .join(base)
-                .join("skills/fallow/agents/openai.yaml")
-                .is_file()
-        );
+        for name in ["fallow", "fallow-setup"] {
+            let skill_dir = dir.path().join(base).join("skills").join(name);
+            let text = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+            assert!(text.starts_with(&format!(
+                "---\nname: {name}\ndescription: Shipped description.\n"
+            )));
+            assert!(text.contains("skill=stub version="));
+            assert!(text.contains(&format!("node_modules/fallow/skills/{name}/SKILL.md")));
+            assert_eq!(
+                text.contains("## Fallow task map"),
+                name == "fallow",
+                "{text}"
+            );
+            assert!(skill_dir.join("agents/openai.yaml").is_file());
+        }
     }
 
     let again = skill::install(&ctx, &[Harness::Claude, Harness::Cursor]);
@@ -206,24 +232,145 @@ fn skill_writes_stub_when_node_modules_ships_the_skill() {
 
 #[test]
 fn skill_embedded_copy_round_trips_when_available() {
-    if skill::EMBEDDED_SKILL.is_empty() {
+    if skill::EMBEDDED_SKILLS.is_empty() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), Mode::Install);
     let steps = skill::install(&ctx, &[Harness::Codex]);
-    assert_eq!(steps[0].status, StepStatus::Written, "{steps:?}");
-    let skill_dir = dir.path().join(".agents/skills/fallow");
-    let text = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
-    assert!(text.starts_with("---\nname: fallow\n"));
-    assert!(text.contains("skill=embedded version="));
-    assert!(skill_dir.join("references/cli-reference.md").is_file());
-    assert_eq!(
-        skill::inspect(&skill_dir),
+    assert!(
+        steps.iter().all(|s| s.status == StepStatus::Written),
+        "{steps:?}"
+    );
+    for (name, reference) in [
+        ("fallow", "references/cli-reference.md"),
+        ("fallow-setup", "references/ci-gate.md"),
+    ] {
+        let skill_dir = dir.path().join(".agents/skills").join(name);
+        let text = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(text.starts_with(&format!("---\nname: {name}\n")));
+        assert!(text.contains("skill=embedded version="));
+        assert!(skill_dir.join(reference).is_file());
+        assert_eq!(
+            skill::inspect(&skill_dir),
+            skill::SkillState::Managed {
+                flavor: skill::Flavor::Embedded,
+                version: env!("CARGO_PKG_VERSION").to_string()
+            }
+        );
+    }
+}
+
+#[test]
+fn every_released_skill_is_embedded_when_the_tree_is_available() {
+    if skill::EMBEDDED_SKILLS.is_empty() {
+        return;
+    }
+    let embedded: Vec<&str> = skill::EMBEDDED_SKILLS.iter().map(|s| s.name).collect();
+    let released: Vec<&str> = skill::RELEASED_SKILLS.iter().map(|s| s.name).collect();
+    assert_eq!(embedded, released);
+}
+
+#[test]
+fn skill_falls_back_to_embedded_copy_when_node_modules_lacks_a_skill() {
+    if skill::EMBEDDED_SKILLS.is_empty() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    ship_skill(dir.path(), "fallow");
+    let ctx = ctx(dir.path(), Mode::Install);
+    let steps = skill::install(&ctx, &[Harness::Codex]);
+    assert!(
+        steps.iter().all(|s| s.status == StepStatus::Written),
+        "{steps:?}"
+    );
+    let base = dir.path().join(".agents/skills");
+    assert!(matches!(
+        skill::inspect(&base.join("fallow")),
+        skill::SkillState::Managed {
+            flavor: skill::Flavor::Stub,
+            ..
+        }
+    ));
+    assert!(matches!(
+        skill::inspect(&base.join("fallow-setup")),
         skill::SkillState::Managed {
             flavor: skill::Flavor::Embedded,
-            version: env!("CARGO_PKG_VERSION").to_string()
+            ..
         }
+    ));
+}
+
+#[test]
+fn skill_switch_from_embedded_to_stub_removes_old_references() {
+    if skill::EMBEDDED_SKILLS.is_empty() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), Mode::Install);
+    skill::install(&ctx, &[Harness::Codex]);
+    let skill_dir = dir.path().join(".agents/skills/fallow-setup");
+    assert!(skill_dir.join("references/ci-gate.md").is_file());
+
+    ship_skill(dir.path(), "fallow-setup");
+    let steps = skill::install(&ctx, &[Harness::Codex]);
+    assert!(
+        steps.iter().all(|s| s.status != StepStatus::Failed),
+        "{steps:?}"
+    );
+    assert!(matches!(
+        skill::inspect(&skill_dir),
+        skill::SkillState::Managed {
+            flavor: skill::Flavor::Stub,
+            ..
+        }
+    ));
+    assert!(
+        !skill_dir.join("references").exists(),
+        "the pointer stub must not keep the references of the embedded copy"
+    );
+}
+
+#[test]
+fn skill_embedded_copy_resolves_every_relative_link() {
+    if skill::EMBEDDED_SKILLS.is_empty() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), Mode::Install);
+    let steps = skill::install(&ctx, &[Harness::Codex]);
+    assert!(
+        steps.iter().all(|s| s.status == StepStatus::Written),
+        "{steps:?}"
+    );
+    let mut broken = Vec::new();
+    for (embedded, file) in skill::EMBEDDED_SKILLS.iter().flat_map(|embedded| {
+        embedded
+            .files
+            .iter()
+            .filter(|f| Path::new(f.path).extension().is_some_and(|ext| ext == "md"))
+            .map(move |file| (embedded, file))
+    }) {
+        let skill_dir = dir.path().join(".agents/skills").join(embedded.name);
+        let path = skill_dir.join(file.path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        for target in text
+            .split("](")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next())
+        {
+            let target = target.split('#').next().unwrap_or_default();
+            if target.is_empty() || target.contains("://") || target.starts_with("mailto:") {
+                continue;
+            }
+            if !path.parent().unwrap().join(target).is_file() {
+                broken.push(format!("{}/{} -> {target}", embedded.name, file.path));
+            }
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "embedded skill has broken links: {broken:?}"
     );
 }
 
@@ -399,7 +546,10 @@ fn mcp_command_shapes_are_recognized_as_fallow_owned() {
 #[test]
 fn every_reason_is_documented_in_backwards_compatibility() {
     let doc = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/backwards-compatibility.md"),
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../docs/backwards-compatibility.md"),
     )
     .unwrap();
     for reason in Reason::ALL {
@@ -557,6 +707,96 @@ fn cursor_hooks_are_reported_unsupported() {
     assert_eq!(steps[0].reason, Some(Reason::UnsupportedHarness));
 }
 
+fn step_status<'a>(steps: &'a [StepReport], path: &str) -> &'a StepReport {
+    steps
+        .iter()
+        .find(|s| s.path.as_deref() == Some(path))
+        .unwrap_or_else(|| panic!("no row for {path} in {steps:?}"))
+}
+
+#[test]
+fn codex_hooks_install_the_native_gate_next_to_the_routing_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = ctx(dir.path(), Mode::Install);
+    let steps = hooks::install(&install, &[Harness::Codex]);
+    for path in [
+        "AGENTS.md",
+        ".codex/hooks.json",
+        ".codex/hooks/fallow-gate.sh",
+    ] {
+        let row = step_status(&steps, path);
+        assert_eq!(row.status, StepStatus::Written, "{row:?}");
+        assert_eq!(row.harness, Some(Harness::Codex));
+        assert_eq!(row.step, Step::Hooks);
+    }
+    assert_eq!(
+        step_status(&steps, "AGENTS.md").detail.as_deref(),
+        Some("routing block")
+    );
+
+    let again = hooks::install(&install, &[Harness::Codex]);
+    assert!(
+        again.iter().all(|s| s.status == StepStatus::Unchanged),
+        "{again:?}"
+    );
+
+    let uninstall = ctx(dir.path(), Mode::Uninstall);
+    let steps = hooks::uninstall(&uninstall, &[Harness::Codex]);
+    for path in [".codex/hooks.json", ".codex/hooks/fallow-gate.sh"] {
+        assert_eq!(step_status(&steps, path).status, StepStatus::Removed);
+    }
+    assert!(!dir.path().join(".codex/hooks.json").exists());
+}
+
+#[test]
+fn codex_hooks_dry_run_reports_the_plan_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let dry = Ctx {
+        dry_run: true,
+        ..ctx(dir.path(), Mode::Install)
+    };
+    let steps = hooks::install(&dry, &[Harness::Codex]);
+    let json = serde_json::to_value(&steps).unwrap();
+    let rows = json.as_array().unwrap();
+    for path in [
+        "AGENTS.md",
+        ".codex/hooks.json",
+        ".codex/hooks/fallow-gate.sh",
+    ] {
+        assert!(
+            rows.iter().any(|row| row["path"] == path
+                && row["status"] == "written"
+                && row["harness"] == "codex"
+                && row["step"] == "hooks"),
+            "{path} missing from {json}"
+        );
+    }
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn codex_hooks_under_user_scope_write_to_home_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let user = Ctx {
+        home: Some(home.path().to_path_buf()),
+        user: true,
+        ..ctx(dir.path(), Mode::Install)
+    };
+    let steps = hooks::install(&user, &[Harness::Codex]);
+    assert_eq!(
+        step_status(&steps, "~/.codex/hooks.json").status,
+        StepStatus::Written
+    );
+    assert_eq!(
+        step_status(&steps, "~/.codex/hooks/fallow-gate.sh").scope,
+        Scope::Local
+    );
+    assert!(steps.iter().all(|s| s.path.as_deref() != Some("AGENTS.md")));
+    assert!(!dir.path().join("AGENTS.md").exists());
+    assert!(home.path().join(".codex/hooks.json").is_file());
+}
+
 #[test]
 fn display_path_uses_root_then_home_then_absolute() {
     let root = Path::new("/work/app");
@@ -662,11 +902,12 @@ impl StepReport {
 fn resolve_root_prefers_git_toplevel_unless_explicit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dunce::canonicalize(dir.path()).unwrap();
-    let status = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&root)
-        .status()
-        .unwrap();
+    let status =
+        fallow_engine::changed_files::clear_ambient_git_env(&mut std::process::Command::new("git"))
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
     assert!(status.success());
     let nested = root.join("packages").join("web");
     std::fs::create_dir_all(&nested).unwrap();

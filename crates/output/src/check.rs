@@ -13,10 +13,10 @@ use fallow_types::workspace::WorkspaceDiagnostic;
 use serde::Serialize;
 
 use crate::HealthReport;
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 
 /// Current schema version for the dead-code/check JSON envelope.
-pub const CHECK_SCHEMA_VERSION: u32 = 9;
+pub const CHECK_SCHEMA_VERSION: u32 = 10;
 
 /// Schema projection for the dead-code envelope's exact version.
 #[cfg(feature = "schema")]
@@ -24,6 +24,83 @@ pub const CHECK_SCHEMA_VERSION: u32 = 9;
 #[derive(schemars::JsonSchema)]
 #[schemars(extend("const" = CHECK_SCHEMA_VERSION))]
 struct CheckSchemaVersion(u32);
+
+/// Current schema version for the `fallow architecture` JSON envelope.
+///
+/// The architecture body is the dead-code body, so a change to that shared
+/// body bumps this version and [`CHECK_SCHEMA_VERSION`] together.
+pub const ARCHITECTURE_SCHEMA_VERSION: u32 = 1;
+
+/// Schema projection for the architecture envelope's exact version.
+///
+/// The schema emitter registers this type by name and points the
+/// `ArchitectureOutput` and `ArchitectureGroupedOutput` definitions at it.
+#[cfg(feature = "schema")]
+#[allow(dead_code, reason = "schema-only type used by the field projection")]
+#[derive(schemars::JsonSchema)]
+#[schemars(extend("const" = ARCHITECTURE_SCHEMA_VERSION))]
+pub struct ArchitectureSchemaVersion(u32);
+
+/// The commands that share the dead-code JSON body.
+///
+/// `fallow dead-code` and `fallow architecture` serialize the same
+/// [`CheckOutput`] and [`CheckGroupedOutput`] structs. Only the root `kind`
+/// and `schema_version` are different. A closed enum keeps an unknown kind
+/// string off the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckEnvelope {
+    /// `fallow dead-code`, and every embedded `check` section.
+    #[default]
+    DeadCode,
+    /// `fallow architecture`.
+    Architecture,
+}
+
+impl CheckEnvelope {
+    /// The root `kind` of the flat envelope.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::DeadCode => "dead-code",
+            Self::Architecture => "architecture",
+        }
+    }
+
+    /// The root `kind` of the `--group-by` envelope.
+    #[must_use]
+    pub const fn grouped_kind(self) -> &'static str {
+        match self {
+            Self::DeadCode => "dead-code-grouped",
+            Self::Architecture => "architecture-grouped",
+        }
+    }
+
+    /// The `schema_version` that the envelope reports.
+    #[must_use]
+    pub const fn schema_version(self) -> u32 {
+        match self {
+            Self::DeadCode => CHECK_SCHEMA_VERSION,
+            Self::Architecture => ARCHITECTURE_SCHEMA_VERSION,
+        }
+    }
+
+    /// The subcommand that writes the envelope.
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::DeadCode => "dead-code",
+            Self::Architecture => "architecture",
+        }
+    }
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` passes the field by reference"
+)]
+const fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
 
 /// Envelope emitted by `fallow dead-code --format json` (plus the `check`
 /// block inside the combined and audit envelopes).
@@ -62,9 +139,46 @@ pub struct CheckOutput {
     /// Which baseline snapshot was matched, in baseline runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<BaselineMatch>,
+    /// This run's view of the loaded baseline, present only in baseline runs.
+    /// Carries the staleness counts, the advisory verdict and `gate_trips`, the
+    /// same boolean `--fail-on-stale-baseline` exits on, so a CI integration
+    /// reads one field instead of restating the rule. Read `change_scoped`
+    /// before dividing `matched_entries` by `baseline_entries`: a narrowed run
+    /// can report `matched_entries: 0` on a healthy baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// The answer to `--finding-id`, present only when the run received one
+    /// or more `--finding-id` values. The report then holds only the
+    /// requested findings. Read `missing` as resolved only when `conclusive`
+    /// is true; a scope, a baseline or a filter can hide a finding that still
+    /// exists. See [`crate::FindingIdQuery`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id_query: Option<crate::FindingIdQuery>,
     /// Regression verdict against the baseline, in `--fail-on-regression` runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regression: Option<RegressionResult>,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
+    /// Applied Git refs for exact workspace packages. Absent when no package
+    /// baselines were selected, including runs with a global changed-since ref.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_baselines: Vec<crate::PackageBaselineStatus>,
     /// `_meta` block with docs and rule definitions, when `--explain` was
     /// passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -74,20 +188,51 @@ pub struct CheckOutput {
     ///
     /// - workspace discovery, at config load: `undeclared-workspace`,
     ///   `malformed-package-json`, `glob-matched-no-package-json`,
-    ///   `malformed-tsconfig`, `tsconfig-reference-dir-missing`;
+    ///   `workspace-glob-outside-root`, `workspace-pattern-dir-missing`,
+    ///   `nested-project-root`, `malformed-tsconfig`,
+    ///   `tsconfig-reference-dir-missing`;
     /// - source discovery, during the file walk: `skipped-large-file`,
     ///   `skipped-minified-file`, `skipped-source-dotdir`,
-    ///   `source-read-failure`;
+    ///   `excluded-by-default-ignore`, `source-read-failure`,
+    ///   `source-parse-degraded`, `source-nesting-too-deep`;
     /// - dead-code analysis, from the dependency-catalog and override
     ///   detectors: `malformed-pnpm-workspace-yaml`,
-    ///   `bun-lockb-override-resolution-skipped`.
+    ///   `bun-lockb-override-resolution-skipped`;
+    /// - framework plugins, while they read their own build configs:
+    ///   `plugin-config-unreadable`, `plugin-effect-not-modeled`;
+    /// - the dead-code result, for config patterns that matched nothing:
+    ///   `ignore-dependencies-glob-unmatched`,
+    ///   `ignore-findings-pattern-unmatched`.
     ///
-    /// Analysis-stage kinds therefore reach only the envelopes whose run
-    /// includes a dead-code analyze pass, never a standalone
+    /// Analysis-stage and plugin-stage kinds therefore reach only the envelopes
+    /// whose run includes a dead-code analyze pass, never a standalone
     /// `fallow dupes --format json`. `path` is project-root-relative with
     /// forward slashes; the array is omitted when empty. The same list is
     /// repeated on each top-level command's envelope so single-command
     /// consumers see it without having to look at a separate top-level field.
+    ///
+    /// A diagnostic here is advisory and never withholds a finding. Where an
+    /// entry reports a source file this run never fully analyzed
+    /// (`source-parse-degraded`, `source-nesting-too-deep`,
+    /// `source-read-failure`, `skipped-large-file`, `skipped-minified-file`,
+    /// `skipped-source-dotdir`) it can distort a verdict, so the affected
+    /// `unused_files[]`, `unused_exports[]`, and dependency entries
+    /// additionally carry the caveat themselves in their own
+    /// optional `reachability_caveats[]` array, and a reader who never scrolls
+    /// back up to this list still sees it. `fallow fix` reads the same array
+    /// and withholds the removal while a caveat stands.
+    ///
+    /// `excluded-by-default-ignore` is the one source-discovery kind that
+    /// reports unseen files WITHOUT raising a caveat. It names a built-in
+    /// ignore pattern (`**/dist/**`, `**/build/**`, `**/coverage/**`, or one
+    /// of the four minified-bundle globs) that removed candidate source files
+    /// from the walk, which is designed behavior on generated output rather
+    /// than a degraded run, so it is advisory only and no finding inherits it.
+    /// One entry per pattern, never per file, so the array stays bounded on a
+    /// project of any size. Gitignored trees are pruned before the walk sees
+    /// them and count zero, and `**/node_modules/**` is never reported:
+    /// installed dependencies are not the first-party source the kind is
+    /// about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Read-only follow-up commands computed from this run's findings, emitted
@@ -128,6 +273,55 @@ pub struct CheckGroupedOutput {
     pub total_issues: usize,
     /// One bucket per resolver key.
     pub groups: Vec<CheckGroupedEntry>,
+    /// `true` when the `unused-load-data-key` detector abstained for the whole
+    /// project. The abstain has no file, so it is on the root and not in a
+    /// group. An empty `unused_load_data_keys` with this flag set does not
+    /// mean the project is clean: the rule could not run safely. Serialized
+    /// only when `true`, like the flat `CheckOutput` field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unused_load_data_keys_global_abstain: bool,
+    /// Number of export and member findings that the run hid because their
+    /// file is an unused file. The count covers the whole run, so it is on
+    /// the root and not in a group. Serialized only when not zero, like the
+    /// flat `CheckOutput` field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cascade_hidden: usize,
+    /// This run's view of the loaded baseline, present only in baseline runs.
+    /// Carries the staleness counts, the advisory verdict and `gate_trips`, the
+    /// same boolean `--fail-on-stale-baseline` exits on, so a CI integration
+    /// reads one field instead of restating the rule. Read `change_scoped`
+    /// before dividing `matched_entries` by `baseline_entries`: a narrowed run
+    /// can report `matched_entries: 0` on a healthy baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_staleness: Option<crate::BaselineStaleness>,
+    /// The answer to `--finding-id`, present only when the run received one
+    /// or more `--finding-id` values. The report then holds only the
+    /// requested findings. Read `missing` as resolved only when `conclusive`
+    /// is true; a scope, a baseline or a filter can hide a finding that still
+    /// exists. See [`crate::FindingIdQuery`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id_query: Option<crate::FindingIdQuery>,
+    /// The verdict of every gate this run evaluated, keyed by name. The CLI
+    /// always emits it, with the command's default exit rule in it also when
+    /// no flag armed a gate, so a CI integration reads the verdict instead of
+    /// guessing from a process status it usually cannot see. A gate fails the
+    /// build when `status` is `fail` AND `enforced` is true. The typed
+    /// programmatic API runs no CLI gate and leaves it absent. See
+    /// [`crate::GateOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_outcomes: Option<crate::GateOutcomes>,
+    /// Every narrowing or shaping request this run RECEIVED, keyed by name,
+    /// absent when it was asked for nothing. An entry whose `status` is not
+    /// `applied` means the run could not do what it was asked and reported
+    /// something WIDER instead, so what follows is a valid report of a scope
+    /// nobody requested. Honoured requests are published too, with
+    /// `status: "applied"`, so an absent object means "nothing was asked for",
+    /// never "nothing failed". See [`crate::RequestOutcomes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_outcomes: Option<crate::RequestOutcomes>,
+    /// Applied package Git refs, omitted outside package-baseline runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_baselines: Vec<crate::PackageBaselineStatus>,
     /// `_meta` block with docs and rule definitions, when `--explain` was
     /// passed.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
@@ -227,7 +421,12 @@ pub fn build_check_output(input: CheckOutputInput) -> CheckOutput {
         results,
         baseline_deltas: None,
         baseline: None,
+        baseline_staleness: None,
+        finding_id_query: None,
         regression: None,
+        gate_outcomes: None,
+        request_outcomes: None,
+        package_baselines: Vec::new(),
         meta: input.meta,
         workspace_diagnostics: input.workspace_diagnostics,
         next_steps: input.next_steps,
@@ -237,10 +436,9 @@ pub fn build_check_output(input: CheckOutputInput) -> CheckOutput {
 fn serialize_check_family_json_output<T: Serialize>(
     output: T,
     kind: &'static str,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(output, kind, mode)?;
+    let mut value = serialize_named_json_output(output, kind)?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -252,10 +450,9 @@ fn serialize_check_family_json_output<T: Serialize>(
 /// Returns a serde error when the dead-code output cannot be converted to JSON.
 pub fn serialize_check_json_output(
     output: CheckOutput,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_check_family_json_output(output, "dead-code", mode, analysis_run_id)
+    serialize_check_family_json_output(output, "dead-code", analysis_run_id)
 }
 
 /// Serialize `fallow dead-code --group-by ... --format json`.
@@ -266,10 +463,40 @@ pub fn serialize_check_json_output(
 /// to JSON.
 pub fn serialize_check_grouped_json_output(
     output: CheckGroupedOutput,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    serialize_check_family_json_output(output, "dead-code-grouped", mode, analysis_run_id)
+    serialize_check_family_json_output(output, "dead-code-grouped", analysis_run_id)
+}
+
+/// Serialize `fallow architecture --format json`.
+///
+/// The body is the dead-code body. The caller sets `schema_version` to
+/// [`ARCHITECTURE_SCHEMA_VERSION`].
+///
+/// # Errors
+///
+/// Returns a serde error when the output cannot be converted to JSON.
+pub fn serialize_architecture_json_output(
+    output: CheckOutput,
+    analysis_run_id: Option<&str>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    serialize_check_family_json_output(output, CheckEnvelope::Architecture.kind(), analysis_run_id)
+}
+
+/// Serialize `fallow architecture --group-by ... --format json`.
+///
+/// # Errors
+///
+/// Returns a serde error when the grouped output cannot be converted to JSON.
+pub fn serialize_architecture_grouped_json_output(
+    output: CheckGroupedOutput,
+    analysis_run_id: Option<&str>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    serialize_check_family_json_output(
+        output,
+        CheckEnvelope::Architecture.grouped_kind(),
+        analysis_run_id,
+    )
 }
 
 /// Mark every duplicate-export finding as fixable through a config edit when
@@ -299,6 +526,9 @@ macro_rules! visit_suppress_line_findings {
         }
         for finding in &results.private_type_leaks {
             $visit(&finding.leak.path, finding.leak.line, &finding.actions);
+        }
+        for finding in &results.deprecated_exports_in_use {
+            $visit(&finding.export.path, finding.export.line, &finding.actions);
         }
         for finding in &results.unused_enum_members {
             $visit(&finding.member.path, finding.member.line, &finding.actions);
@@ -333,6 +563,11 @@ macro_rules! visit_suppress_line_findings {
         for finding in &results.circular_dependencies {
             if let Some(path) = finding.cycle.files.first() {
                 $visit(path, finding.cycle.line, &finding.actions);
+            }
+        }
+        for finding in &results.package_cycles {
+            if let Some(edge) = finding.cycle.edges.first() {
+                $visit(&edge.path, edge.line, &finding.actions);
             }
         }
         for finding in &results.boundary_violations {
@@ -422,6 +657,9 @@ macro_rules! visit_suppress_line_findings {
         for finding in &results.unused_component_props {
             $visit(&finding.prop.path, finding.prop.line, &finding.actions);
         }
+        for finding in &results.absent_component_props {
+            $visit(&finding.prop.path, finding.prop.line, &finding.actions);
+        }
         for finding in &results.unused_component_emits {
             $visit(&finding.emit.path, finding.emit.line, &finding.actions);
         }
@@ -433,6 +671,19 @@ macro_rules! visit_suppress_line_findings {
         }
         for finding in &results.unused_svelte_events {
             $visit(&finding.event.path, finding.event.line, &finding.actions);
+        }
+        for finding in &results.unused_effect_layers {
+            $visit(&finding.layer.path, finding.layer.line, &finding.actions);
+        }
+        for finding in &results.unused_tagged_errors {
+            $visit(&finding.error.path, finding.error.line, &finding.actions);
+        }
+        for finding in &results.unproduced_catch_tags {
+            $visit(
+                &finding.catch_tag.path,
+                finding.catch_tag.line,
+                &finding.actions,
+            );
         }
         for finding in &results.unused_server_actions {
             $visit(&finding.action.path, finding.action.line, &finding.actions);
@@ -477,6 +728,13 @@ macro_rules! visit_suppress_line_findings_mut {
         }
         for finding in &mut results.private_type_leaks {
             $visit(&finding.leak.path, finding.leak.line, &mut finding.actions);
+        }
+        for finding in &mut results.deprecated_exports_in_use {
+            $visit(
+                &finding.export.path,
+                finding.export.line,
+                &mut finding.actions,
+            );
         }
         for finding in &mut results.unused_enum_members {
             $visit(
@@ -527,6 +785,11 @@ macro_rules! visit_suppress_line_findings_mut {
         for finding in &mut results.circular_dependencies {
             if let Some(path) = finding.cycle.files.first() {
                 $visit(path, finding.cycle.line, &mut finding.actions);
+            }
+        }
+        for finding in &mut results.package_cycles {
+            if let Some(edge) = finding.cycle.edges.first() {
+                $visit(&edge.path, edge.line, &mut finding.actions);
             }
         }
         for finding in &mut results.boundary_violations {
@@ -644,6 +907,9 @@ macro_rules! visit_suppress_line_findings_mut {
         for finding in &mut results.unused_component_props {
             $visit(&finding.prop.path, finding.prop.line, &mut finding.actions);
         }
+        for finding in &mut results.absent_component_props {
+            $visit(&finding.prop.path, finding.prop.line, &mut finding.actions);
+        }
         for finding in &mut results.unused_component_emits {
             $visit(&finding.emit.path, finding.emit.line, &mut finding.actions);
         }
@@ -665,6 +931,27 @@ macro_rules! visit_suppress_line_findings_mut {
             $visit(
                 &finding.event.path,
                 finding.event.line,
+                &mut finding.actions,
+            );
+        }
+        for finding in &mut results.unused_effect_layers {
+            $visit(
+                &finding.layer.path,
+                finding.layer.line,
+                &mut finding.actions,
+            );
+        }
+        for finding in &mut results.unused_tagged_errors {
+            $visit(
+                &finding.error.path,
+                finding.error.line,
+                &mut finding.actions,
+            );
+        }
+        for finding in &mut results.unproduced_catch_tags {
+            $visit(
+                &finding.catch_tag.path,
+                finding.catch_tag.line,
                 &mut finding.actions,
             );
         }
@@ -924,6 +1211,8 @@ fn suppression_kind_rank(kind: &str) -> usize {
         "unprovided-inject" => 15,
         "unrendered-component" => 16,
         "unused-server-action" => 17,
+        "deprecated-export-in-use" => 18,
+        "package-cycle" => 19,
         _ => usize::MAX,
     }
 }
@@ -933,10 +1222,12 @@ fn suppression_kind_rank(kind: &str) -> usize {
 pub fn build_check_summary(results: &AnalysisResults) -> CheckSummary {
     CheckSummary {
         total_issues: results.total_issues(),
+        prop_drilling_chains: results.enforced_prop_drilling_count(),
         unused_files: results.unused_files.len(),
         unused_exports: results.unused_exports.len(),
         unused_types: results.unused_types.len(),
         private_type_leaks: results.private_type_leaks.len(),
+        deprecated_exports_in_use: results.deprecated_exports_in_use.len(),
         unused_dependencies: results.unused_dependencies.len()
             + results.unused_dev_dependencies.len()
             + results.unused_optional_dependencies.len(),
@@ -951,6 +1242,7 @@ pub fn build_check_summary(results: &AnalysisResults) -> CheckSummary {
         dev_dependencies_in_production: results.dev_dependencies_in_production.len(),
         circular_dependencies: results.circular_dependencies.len(),
         re_export_cycles: results.re_export_cycles.len(),
+        package_cycles: results.package_cycles.len(),
         boundary_violations: results.boundary_violations.len(),
         boundary_coverage_violations: results.boundary_coverage_violations.len(),
         boundary_call_violations: results.boundary_call_violations.len(),
@@ -967,10 +1259,14 @@ pub fn build_check_summary(results: &AnalysisResults) -> CheckSummary {
         unprovided_injects: results.unprovided_injects.len(),
         unrendered_components: results.unrendered_components.len(),
         unused_component_props: results.unused_component_props.len(),
+        absent_component_props: results.absent_component_props.len(),
         unused_component_emits: results.unused_component_emits.len(),
         unused_component_inputs: results.unused_component_inputs.len(),
         unused_component_outputs: results.unused_component_outputs.len(),
         unused_svelte_events: results.unused_svelte_events.len(),
+        unused_effect_layers: results.unused_effect_layers.len(),
+        unused_tagged_errors: results.unused_tagged_errors.len(),
+        unproduced_catch_tags: results.unproduced_catch_tags.len(),
         unused_server_actions: results.unused_server_actions.len(),
         unused_load_data_keys: results.unused_load_data_keys.len(),
         route_collisions: results.route_collisions.len(),
@@ -983,7 +1279,7 @@ mod tests {
     use super::*;
     use crate::{ComplexityViolation, ExceededThreshold, FindingSeverity, HealthFinding};
     use fallow_types::output_dead_code::{
-        UnusedExportFinding, UnusedFileFinding, UnusedTypeFinding,
+        ReachabilityCaveat, UnusedExportFinding, UnusedFileFinding, UnusedTypeFinding,
     };
     use fallow_types::results::{UnusedExport, UnusedFile};
     use fallow_types::workspace::WorkspaceDiagnosticKind;
@@ -1028,6 +1324,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -1039,6 +1337,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let output = build_check_output(CheckOutputInput {
@@ -1075,6 +1375,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let mut health = HealthReport {
             findings: vec![HealthFinding::new(
@@ -1084,6 +1386,7 @@ mod tests {
                     line: 7,
                     col: 0,
                     cyclomatic: 22,
+                    standard_cyclomatic: None,
                     cognitive: 18,
                     line_count: 40,
                     param_count: 1,
@@ -1093,7 +1396,9 @@ mod tests {
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
                     severity: FindingSeverity::High,
+                    effective_severity: None,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
@@ -1143,24 +1448,152 @@ mod tests {
             next_steps: Vec::new(),
         });
 
-        let value =
-            serialize_check_json_output(output, RootEnvelopeMode::Tagged, Some("run-check"))
-                .expect("check output should serialize");
+        let value = serialize_check_json_output(output, Some("run-check"))
+            .expect("check output should serialize");
 
         assert_eq!(value["kind"], "dead-code");
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-check");
     }
 
     #[test]
+    fn architecture_json_output_has_architecture_kind_and_version() {
+        let envelope = CheckEnvelope::Architecture;
+        let output = build_check_output(CheckOutputInput {
+            schema_version: envelope.schema_version(),
+            version: "0.0.0".to_string(),
+            elapsed: Duration::from_millis(1),
+            results: AnalysisResults::default(),
+            config_fixable: false,
+            meta: None,
+            workspace_diagnostics: Vec::new(),
+            next_steps: Vec::new(),
+        });
+
+        let value = serialize_architecture_json_output(output, Some("run-arch"))
+            .expect("architecture output should serialize");
+
+        assert_eq!(value["kind"], "architecture");
+        assert_eq!(value["schema_version"], ARCHITECTURE_SCHEMA_VERSION);
+        assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-arch");
+    }
+
+    #[test]
+    fn check_envelope_names_each_family_member() {
+        assert_eq!(CheckEnvelope::DeadCode.kind(), "dead-code");
+        assert_eq!(CheckEnvelope::DeadCode.grouped_kind(), "dead-code-grouped");
+        assert_eq!(
+            CheckEnvelope::DeadCode.schema_version(),
+            CHECK_SCHEMA_VERSION
+        );
+        assert_eq!(CheckEnvelope::DeadCode.command(), "dead-code");
+        assert_eq!(CheckEnvelope::Architecture.kind(), "architecture");
+        assert_eq!(
+            CheckEnvelope::Architecture.grouped_kind(),
+            "architecture-grouped"
+        );
+        assert_eq!(
+            CheckEnvelope::Architecture.schema_version(),
+            ARCHITECTURE_SCHEMA_VERSION
+        );
+        assert_eq!(CheckEnvelope::Architecture.command(), "architecture");
+    }
+
+    /// The degraded-parse caveat has to travel WITH the finding it can distort,
+    /// because a reader looking at a `delete-file` action never sees the
+    /// diagnostic at the other end of the envelope. It is advisory about the
+    /// FINDING and decisive only about the MUTATION: the actions array keeps
+    /// its shape and its order, the mutating action reports
+    /// `auto_fixable: false`, and a clean finding stays byte-identical.
+    #[test]
+    fn reachability_caveats_are_absent_when_clean_and_named_when_flagged() {
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: "/project/src/clean.ts".into(),
+            }));
+        let mut flagged = UnusedFileFinding::with_actions(UnusedFile {
+            path: "/project/src/orphan.ts".into(),
+        });
+        flagged.reachability_caveats = vec![
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ];
+        results.unused_files.push(flagged);
+
+        let output = build_check_output(CheckOutputInput {
+            schema_version: 7,
+            version: "0.0.0".to_string(),
+            elapsed: Duration::from_millis(1),
+            results,
+            config_fixable: false,
+            meta: None,
+            workspace_diagnostics: Vec::new(),
+            next_steps: Vec::new(),
+        });
+        let value =
+            serialize_check_json_output(output, None).expect("dead-code output should serialize");
+
+        let entries = value["unused_files"]
+            .as_array()
+            .expect("unused_files array")
+            .clone();
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| {
+                    entry["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with(name))
+                })
+                .cloned()
+                .expect("finding present")
+        };
+
+        assert!(
+            find("clean.ts").get("reachability_caveats").is_none(),
+            "a finding with no caveat must keep the previous wire shape exactly"
+        );
+
+        let flagged = find("orphan.ts");
+        assert_eq!(
+            flagged["reachability_caveats"],
+            serde_json::json!(["incomplete-file-analysis", "incomplete-import-graph"]),
+            "both caveats are named on the wire, in declaration order"
+        );
+        assert_eq!(
+            flagged["actions"].as_array().map(Vec::len),
+            Some(2),
+            "the caveat never trims the finding's actions"
+        );
+        assert_eq!(
+            flagged["actions"][0]["type"], "delete-file",
+            "nor reorders them, so a consumer reading actions[0].type is unaffected"
+        );
+        assert_eq!(
+            flagged["actions"][0]["auto_fixable"],
+            serde_json::json!(false),
+            "but the mutation it gates must not advertise itself as applicable"
+        );
+    }
+
+    #[test]
     fn grouped_check_json_output_uses_output_owned_root_contract() {
         let root = std::path::Path::new("/project");
         let output = CheckGroupedOutput {
+            gate_outcomes: None,
+            request_outcomes: None,
+            package_baselines: Vec::new(),
+            baseline_staleness: None,
+            finding_id_query: None,
             schema_version: SchemaVersion(7),
             version: ToolVersion("0.0.0".to_string()),
             elapsed_ms: ElapsedMs(1),
             grouped_by: GroupByMode::Directory,
             total_issues: 0,
             groups: Vec::new(),
+            unused_load_data_keys_global_abstain: false,
+            cascade_hidden: 0,
             meta: None,
             workspace_diagnostics: vec![WorkspaceDiagnostic::new(
                 root,
@@ -1172,12 +1605,8 @@ mod tests {
             next_steps: Vec::new(),
         };
 
-        let value = serialize_check_grouped_json_output(
-            output,
-            RootEnvelopeMode::Tagged,
-            Some("run-group"),
-        )
-        .expect("grouped check output should serialize");
+        let value = serialize_check_grouped_json_output(output, Some("run-group"))
+            .expect("grouped check output should serialize");
 
         assert_eq!(value["kind"], "dead-code-grouped");
         assert_eq!(value["_meta"]["telemetry"]["analysis_run_id"], "run-group");
@@ -1189,6 +1618,32 @@ mod tests {
             value["workspace_diagnostics"][0]["kind"],
             "source-read-failure"
         );
+    }
+
+    #[test]
+    fn architecture_grouped_json_output_has_grouped_kind() {
+        let output = CheckGroupedOutput {
+            gate_outcomes: None,
+            request_outcomes: None,
+            package_baselines: Vec::new(),
+            baseline_staleness: None,
+            finding_id_query: None,
+            schema_version: SchemaVersion(ARCHITECTURE_SCHEMA_VERSION),
+            version: ToolVersion("0.0.0".to_string()),
+            elapsed_ms: ElapsedMs(1),
+            grouped_by: GroupByMode::Directory,
+            total_issues: 0,
+            groups: Vec::new(),
+            unused_load_data_keys_global_abstain: false,
+            cascade_hidden: 0,
+            meta: None,
+            workspace_diagnostics: Vec::new(),
+            next_steps: Vec::new(),
+        };
+        let grouped = serialize_architecture_grouped_json_output(output, None)
+            .expect("grouped architecture output should serialize");
+        assert_eq!(grouped["kind"], "architecture-grouped");
+        assert_eq!(grouped["schema_version"], ARCHITECTURE_SCHEMA_VERSION);
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub type RefactoringSuggestion = fallow_types::duplicates::RefactoringSuggestion
 
 pub use detector::{
     CloneFingerprintKey, CloneFingerprintSet, FINGERPRINT_PREFIX, clone_fingerprint,
-    dominant_identifier, fingerprint_for_fragment, group_refactoring_suggestion,
+    dominant_identifier, group_refactoring_suggestion, is_unparsed_collision_key,
 };
 
 /// Refresh clone-family and mirrored-directory fields after clone groups change.
@@ -49,16 +49,94 @@ pub fn refresh_clone_families(report: &mut DuplicationReport, root: &Path) {
         detector::families::detect_mirrored_directories(&report.clone_families, root);
 }
 
-/// Refresh near-clone metrics after a caller filters group instances.
-#[doc(hidden)]
-pub fn refresh_clone_group_metrics(group: &mut CloneGroup) {
-    detector::refresh_near_group_metrics(group);
+/// Rebuild the fields that a scope filter invalidates: clone families,
+/// mirrored directories, statistics and the report order.
+///
+/// A scope filter (`--changed-since`, `--workspace`, a diff) narrows the corpus,
+/// so `stats` describes the narrowed corpus after this call. A presentation cap
+/// such as `--top` must not call this.
+pub fn refresh_scoped_report(report: &mut DuplicationReport, root: &Path) {
+    refresh_clone_families(report, root);
+    report.stats = recompute_stats(report);
+    report.sort();
+}
+
+/// The scope of one duplication run, as the surface resolved it.
+///
+/// Every field is optional. A field that is `None` does not narrow the run.
+#[derive(Debug, Clone, Copy)]
+pub struct DuplicationScope<'a> {
+    /// The resolved change scope: a global changed-file set or the
+    /// configured package baselines.
+    pub changes: Option<&'a crate::change_scope::ChangeScope>,
+    /// A unified diff. Finding paths resolve against the report root.
+    pub diff: Option<&'a fallow_output::DiffIndex>,
+    /// `--workspace`, `--changed-workspaces` and a positional path: the union
+    /// of these roots.
+    pub workspace_roots: Option<&'a [PathBuf]>,
+}
+
+/// Narrow a duplication report to the scope of the run.
+///
+/// The CLI, the programmatic API and the MCP typed path call this one function,
+/// so a scope narrows the same way on every surface. Each filter keeps a clone
+/// group when at least one instance is in scope, and keeps every instance of
+/// that group: a reviewer sees the full clone family. The filters run in this
+/// order: changed files, the diff, the workspace roots.
+pub fn apply_scope(report: &mut DuplicationReport, scope: &DuplicationScope<'_>, root: &Path) {
+    if let Some(changes) = scope.changes {
+        changes.retain_duplication(report, root);
+    }
+    if let Some(diff) = scope.diff {
+        crate::diff_scope::filter_duplication_by_diff(report, diff, root);
+    }
+    if let Some(roots) = scope.workspace_roots {
+        filter_to_workspaces(report, roots, root);
+    }
+}
+
+/// Keep only the clone groups with at least one instance under one of the
+/// workspace roots.
+///
+/// The full cross-workspace index is still built, so a group can hold an
+/// instance in the selected workspace and one in another workspace. The group
+/// stays whole: the documented rule is that a group is in scope when one of
+/// its instances is. Clone families, statistics and the order are rebuilt from
+/// the groups that stay.
+pub fn filter_to_workspaces(report: &mut DuplicationReport, roots: &[PathBuf], root: &Path) {
+    report.clone_groups.retain(|group| {
+        group
+            .instances
+            .iter()
+            .any(|instance| roots.iter().any(|scope| instance.file.starts_with(scope)))
+    });
+    refresh_scoped_report(report, root);
+}
+
+/// Keep only the `n` highest-ranked clone groups (`--top`).
+///
+/// `stats` keeps describing the corpus the run measured. Truncation is a
+/// presentation choice, so rewriting `clone_groups` or `clone_instances` from
+/// the truncated array would put two scopes in one object next to the
+/// untouched `files_with_clones` and `duplication_percentage`. Consumers read
+/// the shown and omitted split from `DuplicationReport::clone_groups_shown`
+/// and `clone_groups_omitted`.
+pub fn apply_top(report: &mut DuplicationReport, n: usize, root: &Path) {
+    report.sort();
+    report.clone_groups.truncate(n);
+    refresh_clone_families(report, root);
+    report.sort();
 }
 
 /// Recompute duplication statistics after clone groups have been filtered.
 ///
 /// Uses per-file line deduplication, matching the detector's stats model, so
 /// overlapping clone instances do not inflate the duplicated line count.
+///
+/// `clone_families` is read from `report.clone_families`, so a scope filter
+/// must call [`refresh_clone_families`] before this. A presentation cap such
+/// as `--top` must not call this at all: it truncates the arrays while `stats`
+/// keeps describing the corpus the run measured.
 #[must_use]
 pub fn recompute_stats(report: &DuplicationReport) -> DuplicationStats {
     let mut files_with_clones: FxHashSet<&Path> = FxHashSet::default();
@@ -88,6 +166,7 @@ pub fn recompute_stats(report: &DuplicationReport) -> DuplicationStats {
         total_tokens: report.stats.total_tokens,
         duplicated_tokens: duplicated_tokens.min(report.stats.total_tokens),
         clone_groups: report.clone_groups.len(),
+        clone_families: report.clone_families.len(),
         clone_instances,
         duplication_percentage: if report.stats.total_lines > 0 {
             (duplicated_lines as f64 / report.stats.total_lines as f64) * 100.0
@@ -100,10 +179,12 @@ pub fn recompute_stats(report: &DuplicationReport) -> DuplicationStats {
     }
 }
 
-/// Compare two JS/TS sources by duplicate-token kind sequence.
+/// Compare JS/TS sources for audit-safe reuse of the current analysis at base.
 ///
-/// This keeps CLI audit's non-behavioral change check from depending on the
-/// tokenizer module shape.
+/// Token kinds retain identifiers and ordinary literal values. Template and
+/// regex token kinds omit content, so their raw source spans must also match.
+/// Whole-template comparison conservatively rejects formatting changes inside
+/// interpolation expressions. The boolean is forwarded as tokenizer `skip_imports`.
 #[must_use]
 pub fn source_token_kinds_equivalent(
     path: &Path,
@@ -113,11 +194,32 @@ pub fn source_token_kinds_equivalent(
 ) -> bool {
     let current_tokens = detector::tokenize::tokenize_file(path, current, cross_language);
     let base_tokens = detector::tokenize::tokenize_file(path, base, cross_language);
+    if current_tokens.tokens.len() != base_tokens.tokens.len() {
+        return false;
+    }
     current_tokens
         .tokens
         .iter()
-        .map(|token| &token.kind)
-        .eq(base_tokens.tokens.iter().map(|token| &token.kind))
+        .zip(&base_tokens.tokens)
+        .all(|(current_token, base_token)| {
+            if current_token.kind != base_token.kind {
+                return false;
+            }
+            if matches!(
+                current_token.kind,
+                detector::token_types::TokenKind::TemplateLiteral
+                    | detector::token_types::TokenKind::RegExpLiteral
+            ) {
+                return match (
+                    current.get(current_token.span.start as usize..current_token.span.end as usize),
+                    base.get(base_token.span.start as usize..base_token.span.end as usize),
+                ) {
+                    (Some(current_literal), Some(base_literal)) => current_literal == base_literal,
+                    _ => false,
+                };
+            }
+            true
+        })
 }
 
 /// Run duplication detection on a discovered file set.
@@ -130,17 +232,6 @@ pub fn find_duplicates(
     detector::find_duplicates(root, files, config)
 }
 
-/// Run cached duplication detection inside the engine boundary.
-#[must_use]
-pub(crate) fn find_duplicates_cached(
-    root: &Path,
-    files: &[DiscoveredFile],
-    config: &DuplicatesConfig,
-    cache_dir: &Path,
-) -> DuplicationReport {
-    detector::find_duplicates_cached(root, files, config, cache_dir)
-}
-
 /// Run duplication detection and include metadata about built-in ignored files.
 #[must_use]
 pub fn find_duplicates_with_defaults(
@@ -149,15 +240,7 @@ pub fn find_duplicates_with_defaults(
     config: &DuplicatesConfig,
     cache_dir: Option<&Path>,
 ) -> DuplicationAnalysis {
-    let (report, default_ignore_skips) = if let Some(cache_dir) = cache_dir {
-        detector::find_duplicates_cached_with_default_ignore_skips(root, files, config, cache_dir)
-    } else {
-        detector::find_duplicates_with_default_ignore_skips(root, files, config)
-    };
-    DuplicationAnalysis {
-        report,
-        default_ignore_skips,
-    }
+    detector::detect_duplicates(root, files, config, None, cache_dir)
 }
 
 /// Run focused duplication detection and include metadata about built-in ignored files.
@@ -170,26 +253,7 @@ pub fn find_duplicates_touching_files_with_defaults(
     cache_dir: Option<&Path>,
 ) -> DuplicationAnalysis {
     let changed_files = changed_files.iter().cloned().collect::<FxHashSet<_>>();
-    let (report, default_ignore_skips) = if let Some(cache_dir) = cache_dir {
-        detector::find_duplicates_touching_files_cached_with_default_ignore_skips(
-            root,
-            files,
-            config,
-            &changed_files,
-            cache_dir,
-        )
-    } else {
-        detector::find_duplicates_touching_files_with_default_ignore_skips(
-            root,
-            files,
-            config,
-            &changed_files,
-        )
-    };
-    DuplicationAnalysis {
-        report,
-        default_ignore_skips,
-    }
+    detector::detect_duplicates(root, files, config, Some(&changed_files), cache_dir)
 }
 
 #[cfg(test)]
@@ -200,6 +264,7 @@ mod tests {
 
     fn instance(file: &str, start_line: usize, end_line: usize) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(file),
             start_line,
             end_line,

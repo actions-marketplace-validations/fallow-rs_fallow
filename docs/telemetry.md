@@ -1,6 +1,6 @@
 # Telemetry
 
-Fallow's product telemetry is opt-in and off by default. It exists to improve agent, CI, JSON, MCP, and editor workflows.
+Fallow's product telemetry is opt-in and off by default. It collects coarse usage data for agent, CI, JSON, MCP, and editor workflows.
 
 Fallow does not collect repository names, file paths, package names, dependency names, workspace names, source code, config values, environment variable names or values, raw command lines, raw errors, or stack traces.
 
@@ -111,7 +111,7 @@ Field purposes:
 
 | Field | Purpose |
 | --- | --- |
-| `workflow` | Prioritize the audit, dead-code, health, duplication, CI, runtime-coverage setup, impact, security, fix, explain, project-inventory, setup, and license workflows. Project-inventory, setup, and license are coarse buckets and do not expose raw commands, config values, repository identifiers, or license identifiers. |
+| `workflow` | Prioritize the audit, dead-code, architecture, health, duplication, CI, runtime-coverage setup, impact, security, fix, explain, project-inventory, setup, and license workflows. Project-inventory, setup, and license are coarse buckets and do not expose raw commands, config values, repository identifiers, or license identifiers. |
 | `integration_surface` | Understand whether Fallow is used through human CLI, CLI JSON, MCP, CI, editor, or programmatic surfaces. |
 | `invocation_context` | Separate human, CI, editor, and agent-driven use without uploading detection evidence. |
 | `agent_source` | Improve compatibility with specific agent integrations using a documented allowlist. |
@@ -126,7 +126,7 @@ Field purposes:
 | `file_count_bucket` | Segment slow runs by coarse analyzed-file scale (`0-99`, `100-499`, `500-1999`, `2000+`, or `unknown`) without uploading exact counts. Combined and audit workflows keep the largest bucket reported by their sub-analyses. |
 | `function_count_bucket` | Segment slow runs by coarse analyzed-function scale (`0-999`, `1000-9999`, `10000+`, or `unknown`) without uploading exact counts. The field is omitted when no cheap function count is available. |
 | `avg_fan_out_bucket` | Segment slow runs by coarse average fan-out (`0`, `<1`, `1-2`, `3+`, or `unknown`) when a workflow already retained a module graph. The bucket is derived from existing module and edge counts only, with no dependency traversal, graph diameter, depth, or coupling analysis added for telemetry. |
-| `findings_present` | Whether the analysis surfaced any findings, decoupled from the exit-code gate (so informational analyses like default-config `dupes`, which never exit non-zero, are still measurable). On the combined and audit workflows it is an OR across the sub-analyses; per-analysis find-rate is answerable on the standalone `dead_code`, `dupes`, `health`, and `security` workflows. |
+| `findings_present` | Whether the analysis surfaced any findings, decoupled from the exit-code gate (so informational analyses like default-config `dupes`, which never exit non-zero, are still measurable). On the combined and audit workflows it is an OR across the sub-analyses; per-analysis find-rate is answerable on the standalone `dead_code`, `architecture`, `dupes`, `health`, and `security` workflows. |
 | `result_count_bucket` | Coarse result volume, one of `0`, `1-9`, `10-99`, `100+`, or `unknown`. Exact counts, paths, finding names, rule ids, and snippets are never uploaded. |
 | `report_truncated` / `truncation_reason` | Whether a report/comment output path was truncated and why. Reasons are `comment_limit`, `max_items`, `size_limit`, or `unknown`. |
 | `cache_state` | Segment combined code-quality review durations into cold, warm, partial, or unknown cache states without uploading cache paths, cache directories, raw counts, or exact timings. |
@@ -206,8 +206,8 @@ When telemetry is enabled and sending events:
 - no cookies are used
 - telemetry requests do not carry an authentication token
 - two private headers may accompany the request, both for server-side grouping and never written into the event body: `X-Fallow-Parent-Run` (a sanitized per-run correlation token, only when `--parent-run` was passed) and `X-Fallow-Install` (the anonymous random install grouping token described under "Agent Follow-up"). The install token is deleted on `fallow telemetry disable`
-- your command never waits on the network: at exit Fallow appends the event to a small local spool file (`telemetry-spool.jsonl`, next to `telemetry.json` in your config directory), which is sub-millisecond and network-free, so telemetry adds no latency to the run
-- a later telemetry-enabled run uploads the spooled events on a background thread while it works, so a fast run now defers its event instead of dropping it; delivery is still best-effort and the spool is bounded, so events on a machine that stays offline (or never runs Fallow again) may be dropped, and counts remain a rough, biased sample rather than an exact usage count
+- your command does not wait for a telemetry upload. At exit Fallow appends the event to a local spool file (`telemetry-spool.jsonl`, next to `telemetry.json` in your config directory). This step uses local file I/O and makes no network request
+- a later telemetry-enabled run uploads the spooled events on a background thread while Fallow runs. Delivery is best-effort and the spool is bounded. Events may be dropped if the machine stays offline or never runs Fallow again. Counts are a rough, biased sample of usage
 - network errors are ignored and never affect command output or exit code
 - telemetry is never written to stdout
 - server-side handling must not enrich telemetry with customer, repository, organization, git, package-registry, or license data

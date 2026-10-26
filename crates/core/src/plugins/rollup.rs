@@ -8,9 +8,14 @@ use super::{Plugin, PluginResult};
 
 const ENABLERS: &[&str] = &["rollup"];
 
-const CONFIG_PATTERNS: &[&str] = &["rollup.config.{js,ts,mjs,cjs}"];
+/// A package with one rollup build per target names each config
+/// `rollup.config.<target>.mjs`, such as `rollup.config.sdk-dts.mjs`.
+const CONFIG_PATTERNS: &[&str] = &[
+    "rollup.config.{js,ts,mjs,cjs}",
+    "rollup.config.*.{js,ts,mjs,cjs}",
+];
 
-const ALWAYS_USED: &[&str] = &["rollup.config.{js,ts,mjs,cjs}"];
+const ALWAYS_USED: &[&str] = CONFIG_PATTERNS;
 
 const TOOLING_DEPENDENCIES: &[&str] = &["rollup"];
 
@@ -20,12 +25,17 @@ define_plugin! {
     config_patterns: CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
         super::add_import_referenced_dependencies(&mut result, source, config_path);
 
-        let inputs = config_parser::extract_config_string_or_array(source, config_path, &["input"]);
-        result.extend_entry_patterns(inputs);
+        // A rollup config can export an array with one config per output.
+        let inputs = config_parser::extract_config_array_or_object_string_or_array(
+            source,
+            config_path,
+            &["input"],
+        );
+        result.extend_entry_patterns_and_dependencies(inputs, root);
 
         let external =
             config_parser::extract_config_shallow_strings(source, config_path, "external");
@@ -138,5 +148,87 @@ mod tests {
         let result =
             plugin.resolve_config(Path::new("rollup.config.js"), source, Path::new("/project"));
         assert!(result.entry_patterns.is_empty());
+    }
+
+    /// A package with one rollup build per target names each config
+    /// `rollup.config.<target>.mjs` and runs it with `rollup -c`.
+    #[test]
+    fn named_rollup_config_variants_are_config_files() {
+        let plugin = RollupPlugin;
+        let matches = |patterns: &[&str], name: &str| {
+            patterns.iter().any(|pattern| {
+                globset::Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(name))
+            })
+        };
+        for name in [
+            "rollup.config.js",
+            "rollup.config.sdk-dts.mjs",
+            "rollup.config.browser.ts",
+            "rollup.config.node.cjs",
+        ] {
+            assert!(matches(plugin.config_patterns(), name), "{name}");
+            assert!(matches(plugin.always_used(), name), "{name}");
+        }
+        for name in ["rollup.configs.js", "rollup.config.node.json", "rollup.ts"] {
+            assert!(!matches(plugin.config_patterns(), name), "{name}");
+            assert!(!matches(plugin.always_used(), name), "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_config_reads_the_input_of_each_config_in_an_array() {
+        let source = r#"
+            export default [
+                { input: "src/sdk/define/index.ts", output: { file: "dist/define.d.ts" } },
+                { input: "src/sdk/billing/index.ts", output: { file: "dist/billing.d.ts" } }
+            ];
+        "#;
+        let result = RollupPlugin.resolve_config(
+            Path::new("rollup.config.sdk-dts.mjs"),
+            source,
+            Path::new("/project"),
+        );
+        let patterns: Vec<&str> = result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        for expected in ["src/sdk/define/index.ts", "src/sdk/billing/index.ts"] {
+            assert!(patterns.contains(&expected), "{expected}: got {patterns:?}");
+        }
+    }
+
+    /// A bare `input` value is either a module request or a path that rollup
+    /// resolves against the working directory, so it credits the package and
+    /// keeps the entry pattern (issue #2753).
+    #[test]
+    fn a_bare_input_credits_the_package_and_keeps_the_entry_pattern() {
+        let source = r#"export default { input: ["my-lib/client", "src/app", "./src/main.js"] };"#;
+        let result = RollupPlugin.resolve_config(
+            Path::new("rollup.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"my-lib".to_string()),
+            "got {:?}",
+            result.referenced_dependencies
+        );
+        let patterns: Vec<&str> = result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        for expected in ["my-lib/client", "src/app", "src/main.js"] {
+            assert!(patterns.contains(&expected), "{expected}: got {patterns:?}");
+        }
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| pattern.starts_with("src/app.{")),
+            "an extensionless input resolves to the file, got {patterns:?}"
+        );
     }
 }

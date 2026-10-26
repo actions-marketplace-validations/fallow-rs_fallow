@@ -5,26 +5,38 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
-use fallow_process::{ProcessTree, cleanup_std_child, configure_std_command};
+use fallow_process::{
+    ProcessTree, cleanup_std_child, configure_std_command, spawn_retrying_busy_executable,
+};
 
 const STDERR_LIMIT_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Run one subprocess host call until it exits, the deadline passes, the
+/// output cap is hit, or the client cancels `request`. Each stop except a
+/// normal exit kills the owned process tree.
 pub(super) fn run_fallow_sync(
     binary: &str,
     tool: &'static str,
     args: &[String],
     deadline: Instant,
+    request: Option<&CancellationToken>,
     max_output_bytes: usize,
 ) -> Result<String, String> {
     let mut stdout_file = tempfile::NamedTempFile::new()
         .map_err(|err| format!("failed to create stdout temp file: {err}"))?;
     let mut stderr_file = tempfile::NamedTempFile::new()
         .map_err(|err| format!("failed to create stderr temp file: {err}"))?;
+    let exit_one_is_error = crate::tools::type_aware_complete_required(args);
     let mut command = Command::new(binary);
+    // The MCP server speaks JSON-RPC on its own stdin. A child that inherits
+    // it could consume protocol frames, so it reads from the null device,
+    // the same as the direct tool route.
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file.reopen().map_err(|err| {
             format!("failed to reopen stdout temp file: {err}")
         })?))
@@ -76,15 +88,27 @@ pub(super) fn run_fallow_sync(
 
                 let stdout = read_file(stdout_file.as_file_mut(), "stdout")?;
                 let stderr = read_limited_file(stderr_file.as_file_mut(), STDERR_LIMIT_BYTES)?;
-                normalize_output(status.code().unwrap_or(-1), &stdout, &stderr)
+                normalize_output(
+                    status.code().unwrap_or(-1),
+                    &stdout,
+                    &stderr,
+                    exit_one_is_error,
+                )
             })();
             return with_completed_cleanup(result, &cleanup.errors);
         }
 
         if Instant::now() >= deadline {
             let cleanup = cleanup_std_child(Some(&process_tree), &mut child);
-            return Err(with_cleanup_errors(
+            return Err(with_cleanup_context(
                 "code mode execution timed out while running fallow".to_string(),
+                &cleanup.errors,
+            ));
+        }
+        if super::is_cancelled(request) {
+            let cleanup = cleanup_std_child(Some(&process_tree), &mut child);
+            return Err(with_cleanup_context(
+                super::CANCELLED_BY_CLIENT.to_string(),
                 &cleanup.errors,
             ));
         }
@@ -97,7 +121,7 @@ pub(super) fn run_fallow_sync(
         };
         if stdout_len > max_output_bytes as u64 {
             let cleanup = cleanup_std_child(Some(&process_tree), &mut child);
-            return Err(with_cleanup_errors(
+            return Err(with_cleanup_context(
                 format!("code mode host output exceeded {max_output_bytes} bytes"),
                 &cleanup.errors,
             ));
@@ -112,7 +136,7 @@ fn spawn_managed_child(
     binary: &str,
 ) -> Result<(std::process::Child, ProcessTree), String> {
     configure_std_command(&mut command);
-    let mut child = command.spawn().map_err(|err| {
+    let mut child = spawn_retrying_busy_executable(&mut command).map_err(|err| {
         format!(
             "failed to execute fallow binary '{binary}': {err}. Ensure fallow is installed and available in PATH, or set FALLOW_BIN."
         )
@@ -128,6 +152,40 @@ fn spawn_managed_child(
         }
     };
     Ok((child, process_tree))
+}
+
+/// Messages the snippet acts on and the response envelope documents. They are
+/// part of the Code Mode contract, so they must read the same on every run.
+fn is_contract_refusal(message: &str) -> bool {
+    message.starts_with("code mode host output exceeded")
+        || message == "code mode execution timed out while running fallow"
+        || message == super::CANCELLED_BY_CLIENT
+}
+
+/// Report best-effort teardown failures without letting them reach the caller.
+/// Killing the process group is a cleanup concern, not part of the host call's
+/// outcome, and on macOS it fails whenever the leader has already become an
+/// unreaped zombie. Folding that into a contract refusal would make a message
+/// the agent reads depend on how the kernel scheduled the child's exit.
+fn log_cleanup_errors(context: &str, cleanup_errors: &[String]) {
+    if cleanup_errors.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        context,
+        errors = cleanup_errors.join("; "),
+        "fallow subprocess cleanup reported errors"
+    );
+}
+
+/// Attach cleanup context to an error, except when the error is a contract
+/// refusal, which keeps its exact wording and logs the cleanup instead.
+fn with_cleanup_context(message: String, cleanup_errors: &[String]) -> String {
+    if is_contract_refusal(&message) {
+        log_cleanup_errors(&message, cleanup_errors);
+        return message;
+    }
+    with_cleanup_errors(message, cleanup_errors)
 }
 
 fn with_cleanup_errors(message: String, cleanup_errors: &[String]) -> String {
@@ -156,6 +214,10 @@ fn with_structured_cleanup_errors(error: String, cleanup_errors: &[String]) -> S
     if cleanup_errors.is_empty() {
         return error;
     }
+    if is_contract_refusal(&error) {
+        log_cleanup_errors(&error, cleanup_errors);
+        return error;
+    }
 
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&error) else {
         return with_cleanup_errors(error, cleanup_errors);
@@ -165,6 +227,12 @@ fn with_structured_cleanup_errors(error: String, cleanup_errors: &[String]) -> S
     };
     object.insert("cleanup_errors".to_string(), json!(cleanup_errors));
     serde_json::to_string(&value).unwrap_or_else(|_| with_cleanup_errors(error, cleanup_errors))
+}
+
+/// Append the run's gate verdicts, or pass the original bytes through when
+/// there is nothing to state.
+fn annotate(body: String) -> String {
+    crate::tools::gate_verdicts::annotate_envelope(&body).unwrap_or(body)
 }
 
 fn file_len(file: &fs::File) -> Result<u64, String> {
@@ -190,34 +258,25 @@ fn read_limited_file(file: &mut fs::File, limit: usize) -> Result<Vec<u8>, Strin
     read_file(file, "stderr")
 }
 
+/// Translate one completed Code Mode subprocess into the host call's body.
+///
+/// Calls the exit-code policy of the direct tool route,
+/// [`crate::tools::cli_exit_body`], so a run that requires complete type-aware
+/// evidence fails the same way on both surfaces. It shares the gate-verdict
+/// annotation too: a snippet reading a gated run must see the same warnings a
+/// direct tool call sees, or the two surfaces disagree about what the same
+/// analysis concluded.
 pub(super) fn normalize_output(
     exit_code: i32,
     stdout: &[u8],
     stderr: &[u8],
+    exit_one_is_error: bool,
 ) -> Result<String, String> {
-    let stdout = String::from_utf8_lossy(stdout).to_string();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-
-    match exit_code {
-        0 | 1 => Ok(if stdout.is_empty() {
-            "{}".to_string()
-        } else {
-            stdout
-        }),
-        _ if !stdout.is_empty() && serde_json::from_str::<serde_json::Value>(&stdout).is_ok() => {
-            Err(stdout)
-        }
-        _ => Err(json!({
-            "error": true,
-            "message": if stderr.is_empty() {
-                format!("fallow exited with code {exit_code}")
-            } else {
-                stderr
-            },
-            "exit_code": exit_code
-        })
-        .to_string()),
-    }
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    crate::tools::cli_exit_body(exit_code, &stdout, stderr.trim(), exit_one_is_error)
+        .map(annotate)
+        .map_err(annotate)
 }
 
 #[cfg(all(test, unix))]
@@ -257,6 +316,10 @@ mod tests {
         false
     }
 
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "test helper: a panic fails the test"
+    )]
     fn run_completed_subprocess(
         completion_script: &str,
         max_output_bytes: usize,
@@ -276,6 +339,7 @@ mod tests {
             "test",
             &args,
             Instant::now() + Duration::from_secs(5),
+            None,
             max_output_bytes,
         );
         let descendant_pid: u32 = fs::read_to_string(&descendant_pid_path)
@@ -314,6 +378,126 @@ mod tests {
         )
         .expect_err("completed subprocess should enforce the output limit");
         assert_eq!(error, "code mode host output exceeded 16 bytes");
+    }
+
+    /// A client cancel kills the whole process tree of a running host call
+    /// long before its deadline.
+    #[test]
+    fn a_client_cancel_kills_the_subprocess_tree() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let args = [
+            "-c".to_string(),
+            r#"trap '' HUP; sleep 30 & echo $! > "$1"; sleep 30"#.to_string(),
+            "fallow-code-mode-cancel-test".to_string(),
+            descendant_pid_path.to_string_lossy().into_owned(),
+        ];
+        let request = CancellationToken::new();
+        let canceller = {
+            let request = request.clone();
+            let descendant_pid_path = descendant_pid_path.clone();
+            thread::spawn(move || {
+                let give_up_at = Instant::now() + Duration::from_secs(10);
+                while !descendant_pid_path.exists() && Instant::now() < give_up_at {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                request.cancel();
+            })
+        };
+
+        let started = Instant::now();
+        let result = run_fallow_sync(
+            "/bin/sh",
+            "test",
+            &args,
+            Instant::now() + Duration::from_secs(60),
+            Some(&request),
+            1024,
+        );
+        canceller.join().expect("the canceller ends");
+        let descendant_pid: u32 = fs::read_to_string(&descendant_pid_path)
+            .expect("descendant PID file")
+            .trim()
+            .parse()
+            .expect("descendant PID");
+        let _cleanup = ProcessCleanup(descendant_pid);
+
+        assert_eq!(
+            result.expect_err("a cancelled host call must fail"),
+            super::super::CANCELLED_BY_CLIENT
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the cancel, not the deadline, must end the host call"
+        );
+        assert!(
+            wait_for_process_exit(descendant_pid),
+            "cancelled subprocess descendant {descendant_pid} survived"
+        );
+    }
+
+    fn run_script(script: &str, extra_args: &[&str]) -> Result<String, String> {
+        let mut args = vec!["-c".to_string(), script.to_string()];
+        args.extend(extra_args.iter().map(ToString::to_string));
+        run_fallow_sync(
+            "/bin/sh",
+            "test",
+            &args,
+            Instant::now() + Duration::from_secs(5),
+            None,
+            1024,
+        )
+    }
+
+    /// Mirrors the direct-route completeness test: a run that requires
+    /// complete type-aware evidence and reports partial evidence fails on
+    /// both surfaces.
+    #[test]
+    fn required_complete_type_aware_run_with_partial_evidence_is_an_error() {
+        let body = r#"{"_meta":{"type_aware":{"identity":{"completeness":"partial"}}}}"#;
+        let error = run_script(
+            &format!("printf '{body}'; exit 1"),
+            &["fallow", "--type-aware-require", "complete"],
+        )
+        .expect_err("exit 1 with incomplete required evidence must be an error");
+        assert_eq!(error, body);
+    }
+
+    #[test]
+    fn configured_complete_requirement_turns_incomplete_exit_one_into_error() {
+        let body = json!({
+            "_meta": {
+                "type_aware": {
+                    "required_completeness": "complete",
+                    "identity": { "completeness": "partial" }
+                }
+            }
+        })
+        .to_string();
+        assert!(normalize_output(1, body.as_bytes(), b"", false).is_err());
+    }
+
+    #[test]
+    fn best_effort_incomplete_exit_one_stays_a_success_body() {
+        let body = r#"{"_meta":{"type_aware":{"identity":{"completeness":"partial"}}}}"#;
+        let output = run_script(&format!("printf '{body}'; exit 1"), &[])
+            .expect("best-effort exit 1 stays a success body");
+        assert_eq!(output, body);
+    }
+
+    /// The MCP server reads JSON-RPC frames from its own stdin, so a child
+    /// must never share it.
+    #[test]
+    // This test discriminates only when the test runner's own stdin is not
+    // `/dev/null`. In CI the runner stdin is often `/dev/null`, and then an
+    // inherited stdin also passes. Run it with `< /dev/zero` to check the fix.
+    fn subprocess_stdin_is_the_null_device() {
+        let output = run_script(
+            r#"if [ /dev/stdin -ef /dev/null ]; then printf '{"stdin":"null"}'; else printf '{"stdin":"inherited"}'; fi"#,
+            &[],
+        )
+        .expect("probe script succeeds");
+        assert_eq!(output, r#"{"stdin":"null"}"#);
     }
 
     #[test]
@@ -412,6 +596,7 @@ $child.Id | Set-Content -NoNewline -LiteralPath $DescendantPidPath
             "test",
             &args,
             Instant::now() + FIXTURE_COMPLETION_TIMEOUT,
+            None,
             1024,
         )
         .expect("completed subprocess should preserve successful output");
@@ -427,5 +612,49 @@ $child.Id | Set-Content -NoNewline -LiteralPath $DescendantPidPath
             wait_for_process_exit(descendant_pid),
             "completed subprocess descendant {descendant_pid} survived"
         );
+    }
+
+    #[test]
+    fn contract_refusals_keep_their_exact_wording_when_cleanup_fails() {
+        let cleanup = vec![
+            "failed to terminate subprocess tree: Operation not permitted (os error 1)".to_string(),
+        ];
+        for message in [
+            "code mode host output exceeded 500 bytes",
+            "code mode execution timed out while running fallow",
+            super::super::CANCELLED_BY_CLIENT,
+        ] {
+            assert_eq!(
+                with_cleanup_context(message.to_string(), &cleanup),
+                message,
+                "a message the snippet acts on must not depend on teardown timing"
+            );
+            assert_eq!(
+                with_structured_cleanup_errors(message.to_string(), &cleanup),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn operational_failures_still_carry_their_cleanup_context() {
+        let cleanup = vec!["failed to reap direct subprocess after retry: boom".to_string()];
+        let joined = with_cleanup_context(
+            "failed to configure fallow subprocess tree: nope".to_string(),
+            &cleanup,
+        );
+        assert!(joined.contains("failed to configure fallow subprocess tree: nope"));
+        assert!(joined.contains("cleanup errors: failed to reap direct subprocess after retry"));
+    }
+
+    #[test]
+    fn structured_programmatic_errors_still_gain_cleanup_errors() {
+        let cleanup = vec!["failed to terminate subprocess tree: boom".to_string()];
+        let error = with_structured_cleanup_errors(
+            r#"{"error":true,"code":"config-invalid"}"#.to_string(),
+            &cleanup,
+        );
+        let value: serde_json::Value = serde_json::from_str(&error).expect("structured error");
+        assert_eq!(value["cleanup_errors"][0], cleanup[0]);
     }
 }

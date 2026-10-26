@@ -98,6 +98,9 @@ pub fn correlate_with_dead_code(flags: &mut [FeatureFlag], results: &AnalysisRes
 fn flag_use_to_feature_flag(flag_use: &FlagUse, path: PathBuf) -> FeatureFlag {
     let (kind, confidence) = match flag_use.kind {
         FlagUseKind::EnvVar => (FlagKind::EnvironmentVariable, FlagConfidence::High),
+        FlagUseKind::SdkCall if flag_use.facts.unconfirmed_sdk() => {
+            (FlagKind::SdkCall, FlagConfidence::Medium)
+        }
         FlagUseKind::SdkCall => (FlagKind::SdkCall, FlagConfidence::High),
         FlagUseKind::ConfigObject => (FlagKind::ConfigObject, FlagConfidence::Low),
     };
@@ -121,7 +124,7 @@ fn flag_use_to_feature_flag(flag_use: &FlagUse, path: PathBuf) -> FeatureFlag {
 #[cfg(test)]
 mod tests {
     use fallow_types::discover::{DiscoveredFile, EntryPoint, FileId};
-    use fallow_types::extract::compute_line_offsets;
+    use fallow_types::extract::{FlagSiteFacts, compute_line_offsets};
     use fallow_types::output_dead_code::UnusedExportFinding;
     use fallow_types::results::{AnalysisResults, UnusedExport};
 
@@ -170,6 +173,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         })
     }
 
@@ -205,6 +210,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         // FileId(5) maps to index 5, but graph only has index 0: should be skipped.
         let module = module_with_flags(FileId(5), vec![flag_use]);
@@ -228,6 +234,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         let module = module_with_flags(FileId(0), vec![flag_use]);
         let flags = collect_feature_flags(&[module], &graph);
@@ -258,6 +265,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: Some("Unleash".to_string()),
+            facts: FlagSiteFacts::default(),
         };
         let module = module_with_flags(FileId(0), vec![flag_use]);
         let flags = collect_feature_flags(&[module], &graph);
@@ -265,6 +273,28 @@ mod tests {
         assert_eq!(flags[0].kind, FlagKind::SdkCall);
         assert_eq!(flags[0].confidence, FlagConfidence::High);
         assert_eq!(flags[0].sdk_name.as_deref(), Some("Unleash"));
+    }
+
+    /// An SdkCall flag use with an unconfirmed generic SDK name maps to
+    /// Medium confidence.
+    #[test]
+    #[expect(deprecated, reason = "testing the deprecated public API")]
+    fn collect_feature_flags_unconfirmed_sdk_call_has_medium_confidence() {
+        let graph = graph_with_module(FileId(0), PathBuf::from("/project/src/form.ts"));
+        let flag_use = FlagUse {
+            flag_name: "email".to_string(),
+            kind: FlagUseKind::SdkCall,
+            line: 2,
+            col: 0,
+            guard_span_start: None,
+            guard_span_end: None,
+            sdk_name: None,
+            facts: FlagSiteFacts::default().with_unconfirmed_sdk(true),
+        };
+        let module = module_with_flags(FileId(0), vec![flag_use]);
+        let flags = collect_feature_flags(&[module], &graph);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].confidence, FlagConfidence::Medium);
     }
 
     /// A ConfigObject flag use maps to Low confidence.
@@ -280,6 +310,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         let module = module_with_flags(FileId(0), vec![flag_use]);
         let flags = collect_feature_flags(&[module], &graph);
@@ -301,6 +332,7 @@ mod tests {
                 guard_span_start: None,
                 guard_span_end: None,
                 sdk_name: None,
+                facts: FlagSiteFacts::default(),
             },
             FlagUse {
                 flag_name: "FLAG_B".to_string(),
@@ -310,6 +342,7 @@ mod tests {
                 guard_span_start: None,
                 guard_span_end: None,
                 sdk_name: None,
+                facts: FlagSiteFacts::default(),
             },
         ];
         let module = module_with_flags(FileId(0), flag_uses);
@@ -338,6 +371,7 @@ mod tests {
             guard_span_start: Some(1),
             guard_span_end: Some(5),
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         let mut module = module_with_flags(FileId(0), vec![flag_use]);
         module.line_offsets = line_offsets;
@@ -368,6 +402,7 @@ mod tests {
             guard_span_start: Some(10),
             guard_span_end: Some(50),
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         // Leave line_offsets empty (the default in module_with_flags).
         let module = module_with_flags(FileId(0), vec![flag_use]);
@@ -397,6 +432,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
         let mut module = module_with_flags(FileId(0), vec![flag_use]);
         module.line_offsets = compute_line_offsets("some\ncontent\nhere\n");
@@ -590,6 +626,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         });
         let mut results = AnalysisResults::default();
         results.unused_types.push(unused_type);
@@ -633,6 +671,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         correlate_with_dead_code(&mut flags, &results);
@@ -776,6 +816,7 @@ mod tests {
             guard_span_start: Some(100),
             guard_span_end: Some(200),
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
 
         let result = flag_use_to_feature_flag(&flag_use, PathBuf::from("src/config.ts"));
@@ -796,6 +837,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: Some("LaunchDarkly".to_string()),
+            facts: FlagSiteFacts::default(),
         };
 
         let result = flag_use_to_feature_flag(&flag_use, PathBuf::from("src/hooks.ts"));
@@ -814,6 +856,7 @@ mod tests {
             guard_span_start: None,
             guard_span_end: None,
             sdk_name: None,
+            facts: FlagSiteFacts::default(),
         };
 
         let result = flag_use_to_feature_flag(&flag_use, PathBuf::from("src/app.ts"));

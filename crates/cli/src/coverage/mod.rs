@@ -5,12 +5,16 @@
 //! - `setup`: resumable first-run state machine (optional license + sidecar
 //!   + recipe + auto-handoff to `fallow health --runtime-coverage`).
 //! - `analyze`: focused runtime coverage analysis. Local mode reads a coverage
-//!   artifact; cloud mode explicitly fetches runtime facts from fallow cloud.
-//! - `upload-inventory`: push a static function inventory to fallow cloud,
+//!   artifact; cloud mode explicitly fetches runtime facts from Fallow Cloud.
+//! - `upload-inventory`: push a static function inventory to Fallow Cloud,
 //!   unlocking the `untracked` filter on the dashboard by pairing runtime
 //!   coverage data with the AST view of "every function that exists".
 //! - `upload-source-maps`: push build source maps so bundled runtime coverage
 //!   can resolve back to original source files.
+//! - `review-packet`: read the production facts of changed files or functions
+//!   from Fallow Cloud in one small request.
+//! - `deployment-changes`: read how production behavior changed between two
+//!   deployments.
 
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
@@ -31,18 +35,22 @@ use crate::license;
 
 pub use analyze::AnalyzeArgs;
 pub use analyze::benchmark_local_json;
+pub use cloud_reads::{DeploymentChangesArgs, ReviewPacketArgs};
 pub use upload_inventory::UploadInventoryArgs;
 pub use upload_source_maps::UploadSourceMapsArgs;
 pub use upload_static_findings::UploadStaticFindingsArgs;
 
 mod analyze;
 mod cloud_client;
+mod cloud_reads;
+mod cloud_transport;
+mod source_map_sources;
 pub mod upload_common;
 mod upload_inventory;
 mod upload_source_maps;
 mod upload_static_findings;
 
-const COVERAGE_DOCS_URL: &str = "https://docs.fallow.tools/analysis/runtime-coverage";
+const COVERAGE_DOCS_URL: &str = "https://fallow.tools/docs/analysis/runtime-coverage/";
 pub use crate::exit_codes::{
     COVERAGE_UPLOAD_AUTH_REJECTED_EXIT_CODE, COVERAGE_UPLOAD_PAYLOAD_TOO_LARGE_EXIT_CODE,
     COVERAGE_UPLOAD_SERVER_ERROR_EXIT_CODE, COVERAGE_UPLOAD_VALIDATION_EXIT_CODE,
@@ -57,12 +65,16 @@ pub enum CoverageSubcommand {
     Setup(SetupArgs),
     /// Analyze runtime coverage from a local artifact or explicit cloud source.
     Analyze(AnalyzeArgs),
-    /// Upload a static function inventory to fallow cloud.
+    /// Upload a static function inventory to Fallow Cloud.
     UploadInventory(UploadInventoryArgs),
-    /// Upload JavaScript source maps to fallow cloud.
+    /// Upload JavaScript source maps to Fallow Cloud.
     UploadSourceMaps(UploadSourceMapsArgs),
-    /// Upload static dead-code findings to fallow cloud.
+    /// Upload static dead-code findings to Fallow Cloud.
     UploadStaticFindings(UploadStaticFindingsArgs),
+    /// Read the production facts of changed functions from Fallow Cloud.
+    ReviewPacket(ReviewPacketArgs),
+    /// Read the deployment change report from Fallow Cloud.
+    DeploymentChanges(DeploymentChangesArgs),
 }
 
 /// Context shared by `fallow coverage` subcommands.
@@ -348,6 +360,10 @@ pub fn run(subcommand: CoverageSubcommand, ctx: &RunContext<'_>) -> ExitCode {
         CoverageSubcommand::UploadSourceMaps(args) => upload_source_maps::run(&args, ctx.root),
         CoverageSubcommand::UploadStaticFindings(args) => {
             upload_static_findings::run(&args, ctx.root, ctx.allow_remote_extends)
+        }
+        CoverageSubcommand::ReviewPacket(args) => cloud_reads::run_review_packet(&args, ctx),
+        CoverageSubcommand::DeploymentChanges(args) => {
+            cloud_reads::run_deployment_changes(&args, ctx)
         }
     }
 }
@@ -751,7 +767,6 @@ fn build_setup_json(root: &Path, explain: bool) -> serde_json::Value {
     let envelope = build_setup_envelope(root, explain);
     fallow_output::serialize_coverage_setup_json_output(
         envelope,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .expect("CoverageSetupOutput serializes infallibly")
@@ -1085,10 +1100,19 @@ fn setup_json_warnings(root: &Path, context: &CoverageSetupContext) -> Vec<Strin
 /// dashboard's Untracked filter needs a second CI step to light up.
 fn print_upload_inventory_hint() {
     println!();
-    println!("Next, in CI, upload the static function inventory so the dashboard's");
-    println!("Untracked filter lights up:");
-    println!("  fallow coverage upload-inventory");
-    println!("Set FALLOW_API_KEY on the runner. See {COVERAGE_DOCS_URL} for the full CI snippet.");
+    for line in upload_inventory_hint_lines() {
+        println!("{line}");
+    }
+}
+
+fn upload_inventory_hint_lines() -> Vec<String> {
+    vec![
+        "Next, in CI, upload the static function inventory so the dashboard's".to_owned(),
+        "Untracked filter lights up:".to_owned(),
+        "  fallow coverage upload-inventory".to_owned(),
+        "Set FALLOW_API_KEY on the runner. The full CI snippet is in the docs:".to_owned(),
+        format!("  {COVERAGE_DOCS_URL}"),
+    ]
 }
 
 fn handle_license_step(
@@ -1386,18 +1410,7 @@ fn install_sidecar(
 }
 
 fn detect_setup_context(root: &Path) -> CoverageSetupContext {
-    let package_json = PackageJson::load(&root.join("package.json")).ok();
-    let framework = detect_framework(package_json.as_ref());
-    let package_manager = detect_package_manager(root);
-    let scripts = package_json.as_ref().and_then(|pkg| pkg.scripts.as_ref());
-    CoverageSetupContext {
-        framework,
-        package_manager,
-        has_build_script: scripts.is_some_and(|scripts| scripts.contains_key("build")),
-        has_start_script: scripts.is_some_and(|scripts| scripts.contains_key("start")),
-        has_preview_script: scripts.is_some_and(|scripts| scripts.contains_key("preview")),
-        node_entry_path: detect_node_entry_path(root, package_json.as_ref()),
-    }
+    detect_setup_context_with_package_manager(root, None)
 }
 
 fn detect_setup_members(root: &Path) -> Vec<CoverageSetupMember> {
@@ -1843,12 +1856,30 @@ fn path_to_json_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CoverageSetupContext, FrameworkKind, PackageManager, SetupArgs, build_setup_json,
-        detect_coverage_artifact, detect_framework, detect_package_manager, handle_license_step,
-        load_setup_state, recipe_contents, recipe_state_is_current, record_recipe_state,
-        record_sidecar_state, render_setup_json, run_setup, setup_context_fingerprint,
-        setup_state_path, sidecar_state_is_current, write_recipe,
+        COVERAGE_DOCS_URL, CoverageSetupContext, FrameworkKind, PackageManager, SetupArgs,
+        build_setup_json, detect_coverage_artifact, detect_framework, detect_package_manager,
+        handle_license_step, load_setup_state, recipe_contents, recipe_state_is_current,
+        record_recipe_state, record_sidecar_state, render_setup_json, run_setup,
+        setup_context_fingerprint, setup_state_path, sidecar_state_is_current,
+        upload_inventory_hint_lines, write_recipe,
     };
+
+    #[test]
+    fn upload_inventory_hint_fits_eighty_columns_with_the_docs_url_on_its_own_line() {
+        let lines = upload_inventory_hint_lines();
+        let url_line = format!("  {COVERAGE_DOCS_URL}");
+        assert_eq!(lines.last(), Some(&url_line));
+        for line in &lines[..lines.len() - 1] {
+            assert!(
+                line.chars().count() <= 80,
+                "wider than 80 columns: {line:?}"
+            );
+            assert!(
+                !line.contains(COVERAGE_DOCS_URL),
+                "URL not on its own line: {line:?}"
+            );
+        }
+    }
     use fallow_config::PackageJson;
     use fallow_license::LicenseStatus;
     use std::path::{Path, PathBuf};
@@ -2616,7 +2647,7 @@ mod tests {
         assert_eq!(payload["schema_version"], "1");
         assert_eq!(
             payload["_meta"]["docs_url"],
-            "https://docs.fallow.tools/cli/coverage#agent-readable-json"
+            "https://fallow.tools/docs/cli/coverage/#agent-readable-json"
         );
         assert!(
             payload["_meta"]["field_definitions"]

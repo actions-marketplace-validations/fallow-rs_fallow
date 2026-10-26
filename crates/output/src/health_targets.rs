@@ -4,7 +4,7 @@
 ///
 /// Derived from the project's metric distribution (percentile-based with floors).
 /// Exposed in JSON output so consumers can interpret scores in context.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[allow(
     clippy::struct_field_names,
@@ -40,6 +40,9 @@ pub enum RecommendationCategory {
     ExtractDependencies,
     /// Multiple complex functions lack test dependency path.
     AddTestCoverage,
+    /// File changes together with another file in most commits, but no import
+    /// or re-export chain connects them.
+    ResolveHiddenCoupling,
 }
 
 impl RecommendationCategory {
@@ -54,6 +57,7 @@ impl RecommendationCategory {
             Self::ExtractComplexFunctions => "complexity",
             Self::ExtractDependencies => "coupling",
             Self::AddTestCoverage => "untested risk",
+            Self::ResolveHiddenCoupling => "hidden coupling",
         }
     }
 
@@ -68,16 +72,18 @@ impl RecommendationCategory {
             Self::ExtractComplexFunctions => "complexity",
             Self::ExtractDependencies => "coupling",
             Self::AddTestCoverage => "untested_risk",
+            Self::ResolveHiddenCoupling => "hidden_coupling",
         }
     }
 }
 
 /// A contributing factor that triggered or strengthened a recommendation.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContributingFactor {
     /// Metric name (matches JSON field names: `"fan_in"`, `"dead_code_ratio"`, etc.).
-    pub metric: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub metric: crate::static_str::StaticStr,
     /// Raw metric value for programmatic use.
     pub value: f64,
     /// Threshold that was exceeded.
@@ -173,7 +179,7 @@ impl Confidence {
 ///
 /// Provides enough detail for an AI agent to act on a recommendation
 /// without a second tool call.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TargetEvidence {
     /// Names of unused exports (populated for `RemoveDeadCode` targets).
@@ -191,10 +197,27 @@ pub struct TargetEvidence {
     /// Other duplicate-code instances that share a clone group with this target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clone_siblings: Vec<CloneSiblingEvidence>,
+    /// Files that change together with this target without a static edge
+    /// (populated for `ResolveHiddenCoupling` targets), strongest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub co_change_partners: Vec<CoChangePartnerEvidence>,
+}
+
+/// A hidden change-coupling partner referenced in target evidence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CoChangePartnerEvidence {
+    /// File that changes together with the target.
+    #[serde(serialize_with = "fallow_types::serde_path::serialize")]
+    pub path: std::path::PathBuf,
+    /// Commits that changed both files.
+    pub shared_revisions: u32,
+    /// Coupling degree from 0 to 1.
+    pub degree: f64,
 }
 
 /// A direct importer referenced in target evidence.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DirectCallerEvidence {
     /// File that directly imports the target.
@@ -206,7 +229,7 @@ pub struct DirectCallerEvidence {
 }
 
 /// Symbol details for a direct importer.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DirectCallerSymbolEvidence {
     /// Imported binding name.
@@ -218,7 +241,7 @@ pub struct DirectCallerSymbolEvidence {
 }
 
 /// A duplicate-code sibling referenced in target evidence.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CloneSiblingEvidence {
     /// File containing the sibling clone instance.
@@ -233,7 +256,7 @@ pub struct CloneSiblingEvidence {
 }
 
 /// A function referenced in target evidence.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EvidenceFunction {
     /// Function name.
@@ -246,7 +269,7 @@ pub struct EvidenceFunction {
 
 /// One prioritized refactoring recommendation in the health report's
 /// `refactoring_targets` section.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RefactoringTarget {
     /// Absolute file path (stripped to relative in output).
@@ -284,22 +307,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn category_labels_are_non_empty() {
-        let categories = [
-            RecommendationCategory::UrgentChurnComplexity,
-            RecommendationCategory::BreakCircularDependency,
-            RecommendationCategory::SplitHighImpact,
-            RecommendationCategory::RemoveDeadCode,
-            RecommendationCategory::ExtractComplexFunctions,
-            RecommendationCategory::ExtractDependencies,
-            RecommendationCategory::AddTestCoverage,
-        ];
-        for cat in &categories {
-            assert!(!cat.label().is_empty(), "{cat:?} should have a label");
-        }
-    }
-
-    #[test]
     fn category_labels_are_unique() {
         let categories = [
             RecommendationCategory::UrgentChurnComplexity,
@@ -309,6 +316,7 @@ mod tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
             RecommendationCategory::AddTestCoverage,
+            RecommendationCategory::ResolveHiddenCoupling,
         ];
         let labels: Vec<&str> = categories
             .iter()
@@ -353,14 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn confidence_labels_are_non_empty() {
-        let levels = [Confidence::High, Confidence::Medium, Confidence::Low];
-        for level in &levels {
-            assert!(!level.label().is_empty(), "{level:?} should have a label");
-        }
-    }
-
-    #[test]
     fn confidence_serializes_as_snake_case() {
         let json = serde_json::to_string(&Confidence::High).unwrap();
         assert_eq!(json, r#""high""#);
@@ -386,25 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn category_compact_labels_are_non_empty() {
-        let categories = [
-            RecommendationCategory::UrgentChurnComplexity,
-            RecommendationCategory::BreakCircularDependency,
-            RecommendationCategory::SplitHighImpact,
-            RecommendationCategory::RemoveDeadCode,
-            RecommendationCategory::ExtractComplexFunctions,
-            RecommendationCategory::ExtractDependencies,
-            RecommendationCategory::AddTestCoverage,
-        ];
-        for cat in &categories {
-            assert!(
-                !cat.compact_label().is_empty(),
-                "{cat:?} should have a compact_label"
-            );
-        }
-    }
-
-    #[test]
     fn category_compact_labels_are_unique() {
         let categories = [
             RecommendationCategory::UrgentChurnComplexity,
@@ -414,6 +395,7 @@ mod tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
             RecommendationCategory::AddTestCoverage,
+            RecommendationCategory::ResolveHiddenCoupling,
         ];
         let labels: Vec<&str> = categories
             .iter()
@@ -433,6 +415,7 @@ mod tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
             RecommendationCategory::AddTestCoverage,
+            RecommendationCategory::ResolveHiddenCoupling,
         ];
         for cat in &categories {
             assert!(
@@ -441,18 +424,6 @@ mod tests {
                 cat,
                 cat.compact_label()
             );
-        }
-    }
-
-    #[test]
-    fn effort_labels_are_non_empty() {
-        let efforts = [
-            EffortEstimate::Low,
-            EffortEstimate::Medium,
-            EffortEstimate::High,
-        ];
-        for effort in &efforts {
-            assert!(!effort.label().is_empty(), "{effort:?} should have a label");
         }
     }
 
@@ -480,6 +451,7 @@ mod tests {
             cycle_path: vec![],
             direct_callers: vec![],
             clone_siblings: vec![],
+            co_change_partners: vec![],
         };
         let json = serde_json::to_string(&evidence).unwrap();
         assert!(!json.contains("unused_exports"));
@@ -513,6 +485,7 @@ mod tests {
                 end_line: 20,
                 fingerprint: "dup:12345678".into(),
             }],
+            co_change_partners: vec![],
         };
         let json = serde_json::to_string(&evidence).unwrap();
         assert!(json.contains("unused_exports"));

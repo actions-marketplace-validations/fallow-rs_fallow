@@ -20,7 +20,7 @@ pub use fallow_output::{
     ReviewUnitFact, RiskClass,
 };
 use fallow_types::results::AnalysisResults;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::audit::AuditResult;
 use crate::report::sink::outln;
@@ -112,15 +112,12 @@ pub fn build_triage(
 /// Derive the Stage 1 graph facts from the analysis results plus the impact
 /// closure.
 ///
-/// `boundaries_touched` is the deduped, sorted boundary-violation zone set;
-/// `reachable_from` is the impact closure's affected-not-shown set (modules the
-/// changed code reaches / affects, none in the diff). `exports_added` /
-/// `api_width_delta` stay stubbed until the export-surface delta.
+/// `boundaries_touched` is the deduped, sorted boundary-violation zone set.
+/// `exports_added` / `api_width_delta` stay stubbed until the export-surface
+/// delta. The set of modules the changed code reaches is Stage 3's impact
+/// closure, which owns both its magnitude and its paths.
 #[must_use]
-pub fn derive_graph_facts(
-    results: &AnalysisResults,
-    closure: Option<&fallow_engine::module_graph::ImpactClosurePaths>,
-) -> GraphFacts {
+pub fn derive_graph_facts(results: &AnalysisResults) -> GraphFacts {
     let mut zones: FxHashSet<String> = FxHashSet::default();
     for finding in &results.boundary_violations {
         zones.insert(finding.violation.from_zone.clone());
@@ -129,14 +126,9 @@ pub fn derive_graph_facts(
     let mut boundaries_touched: Vec<String> = zones.into_iter().collect();
     boundaries_touched.sort();
 
-    let reachable_from = closure
-        .map(|c| c.affected_not_shown.clone())
-        .unwrap_or_default();
-
     GraphFacts {
         exports_added: 0,
         api_width_delta: 0,
-        reachable_from,
         boundaries_touched,
     }
 }
@@ -145,7 +137,23 @@ pub fn derive_graph_facts(
 /// closure (computed on the brief path). Returns an empty closure when no graph
 /// was retained (the closure is `None`).
 #[must_use]
-fn build_impact_closure_facts(result: &AuditResult) -> ImpactClosureFacts {
+fn build_impact_closure_facts(
+    result: &AuditResult,
+    diff_index: Option<&fallow_output::DiffIndex>,
+) -> ImpactClosureFacts {
+    let mut facts = build_graph_impact_closure_facts(result, diff_index);
+    if let Some(check) = result.check.as_ref() {
+        facts.set_co_change_gaps(&check.co_change_gaps);
+    }
+    facts
+}
+
+/// The graph part of the Stage 3 facts: affected set, coordination gaps and
+/// the literal-search gap.
+fn build_graph_impact_closure_facts(
+    result: &AuditResult,
+    diff_index: Option<&fallow_output::DiffIndex>,
+) -> ImpactClosureFacts {
     let Some(closure) = result
         .check
         .as_ref()
@@ -163,9 +171,209 @@ fn build_impact_closure_facts(result: &AuditResult) -> ImpactClosureFacts {
             note: COORDINATION_GAP_NOTE.to_string(),
         })
         .collect();
-    ImpactClosureFacts {
-        affected_not_shown: closure.affected_not_shown.clone(),
-        coordination_gap,
+    let mut facts = ImpactClosureFacts::new(&closure.affected_not_shown, coordination_gap);
+    facts.search_gap = build_search_gap_facts(result, diff_index);
+    facts
+}
+
+/// Build the literal-search gap facts: the `missed` and `renamed` consumers of
+/// each export whose declaration statement overlaps an added diff line.
+/// Returns `None` when no diff is known or no such consumer exists.
+fn build_search_gap_facts(
+    result: &AuditResult,
+    diff_index: Option<&fallow_output::DiffIndex>,
+) -> Option<fallow_output::SearchGapFacts> {
+    use fallow_types::trace::SearchVisibility;
+
+    let diff_index = diff_index?;
+    let gaps = result.check.as_ref()?.search_gaps.as_ref()?;
+    let mut exports: Vec<fallow_output::ExportSearchGapFact> = gaps
+        .iter()
+        .filter(|gap| {
+            let key = diff_index.key_for_root_relative(&gap.file);
+            let (start, end) = gap.declaration_lines;
+            diff_index.range_overlaps_added(&key, u64::from(start), u64::from(end))
+        })
+        .map(|gap| {
+            let mut consumers: Vec<&fallow_engine::module_graph::ConsumerSearchGapPaths> =
+                gap.consumers.iter().collect();
+            consumers.sort_by(|a, b| {
+                let missed = |c: &fallow_engine::module_graph::ConsumerSearchGapPaths| {
+                    c.check.visibility != SearchVisibility::Missed
+                };
+                missed(a)
+                    .cmp(&missed(b))
+                    .then_with(|| a.consumer_file.cmp(&b.consumer_file))
+            });
+            fallow_output::ExportSearchGapFact {
+                file: gap.file.clone(),
+                export_name: gap.export_name.clone(),
+                line: gap.line,
+                total: consumers.len(),
+                consumers: consumers
+                    .into_iter()
+                    .take(fallow_output::SEARCH_GAP_CONSUMER_CAP)
+                    .map(|consumer| fallow_output::SearchGapConsumerFact {
+                        consumer_file: consumer.consumer_file.clone(),
+                        line: consumer.check.line,
+                        search_visibility: consumer.check.visibility,
+                        reason: consumer.check.reason,
+                        search_as: consumer.check.search_as.clone(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    if exports.is_empty() {
+        return None;
+    }
+    exports.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+    Some(fallow_output::SearchGapFacts {
+        total: exports.iter().map(|export| export.total).sum(),
+        exports,
+    })
+}
+
+/// Build the test reach facts: how tests reach each value export whose
+/// declaration statement overlaps an added diff line. Returns `None` when no
+/// diff is known or the diff changes no value export.
+fn build_test_reach_facts(
+    result: &AuditResult,
+    diff_index: Option<&fallow_output::DiffIndex>,
+) -> Option<fallow_output::TestReachFacts> {
+    use fallow_engine::module_graph::{ExportTestReach, TestMaskingState};
+    use fallow_output::{
+        ExportTestReachFact, TEST_REACH_EXPORT_CAP, TEST_REACH_FILE_CAP, TestReachClass,
+        TestReachCounts, TestReachFacts, TestReachMasking, TestReachStatus,
+    };
+
+    let diff_index = diff_index?;
+    let check = result.check.as_ref()?;
+    let reach = check.test_reach.as_ref()?;
+    let mut counts = TestReachCounts::default();
+    let mut rows: Vec<ExportTestReachFact> = Vec::new();
+    let mut total = 0usize;
+    for export in &reach.exports {
+        let key = diff_index.key_for_root_relative(&export.file);
+        let (start, end) = export.declaration_lines;
+        if !diff_index.range_overlaps_added(&key, u64::from(start), u64::from(end)) {
+            continue;
+        }
+        total += 1;
+        let class = if !reach.has_tests {
+            TestReachClass::NoneFile
+        } else if export.literal_value
+            && check
+                .trace_provenance
+                .is_config_export(std::path::Path::new(&export.file), &export.export_name)
+        {
+            TestReachClass::Framework
+        } else {
+            match export.reach {
+                ExportTestReach::Direct => TestReachClass::Direct,
+                ExportTestReach::Transitive => TestReachClass::Transitive,
+                ExportTestReach::MockedOnly => TestReachClass::MockedOnly,
+                ExportTestReach::None => TestReachClass::None,
+                ExportTestReach::NoneFile => TestReachClass::NoneFile,
+            }
+        };
+        counts.add(class);
+        if !reach.has_tests || matches!(class, TestReachClass::Direct | TestReachClass::Framework) {
+            continue;
+        }
+        let change = export_change(
+            check.test_reach_base_exports.as_ref(),
+            diff_index,
+            &key,
+            export,
+        );
+        let mocked = class == TestReachClass::MockedOnly;
+        let tests = (mocked && !export.tests.is_empty()).then_some(&export.tests);
+        rows.push(ExportTestReachFact {
+            file: export.file.clone(),
+            export_name: export.export_name.clone(),
+            line: export.line,
+            reach: class,
+            change,
+            tests: tests.map(|tests| tests.iter().take(TEST_REACH_FILE_CAP).cloned().collect()),
+            tests_total: tests.map(Vec::len),
+            test_changed: tests.map(|tests| {
+                tests
+                    .iter()
+                    .any(|test| diff_index.changes_path(&diff_index.key_for_root_relative(test)))
+            }),
+            mocked_targets: mocked.then(|| {
+                export
+                    .mocked_targets
+                    .iter()
+                    .take(TEST_REACH_FILE_CAP)
+                    .cloned()
+                    .collect()
+            }),
+        });
+    }
+    if total == 0 {
+        return None;
+    }
+    rows.sort_by(|a, b| {
+        a.reach
+            .cmp(&b.reach)
+            .then_with(|| a.change.cmp(&b.change))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.export_name.cmp(&b.export_name))
+    });
+    let exports_omitted = rows.len().saturating_sub(TEST_REACH_EXPORT_CAP);
+    rows.truncate(TEST_REACH_EXPORT_CAP);
+    Some(TestReachFacts {
+        status: if reach.has_tests {
+            TestReachStatus::Measured
+        } else {
+            TestReachStatus::NoTests
+        },
+        masking: match reach.masking {
+            TestMaskingState::Active => TestReachMasking::Active,
+            TestMaskingState::NoMocks => TestReachMasking::NoMocks,
+            TestMaskingState::Capped => TestReachMasking::Capped,
+        },
+        total,
+        counts,
+        exports: rows,
+        exports_omitted,
+        e2e_runner: reach.has_e2e_runner,
+    })
+}
+
+/// Label a changed export `new` or `modified`.
+///
+/// An export is `new` only when it did not exist before the change: the file
+/// did not export the name at the base of the diff. So a one-line edit, a
+/// full rewrite and a moved declaration are `modified`, while a new export, a
+/// renamed export and an export of a new file are `new`. A renamed file is
+/// compared with its path before the rename.
+///
+/// When git could not read the base version of the file, the label falls
+/// back to the diff lines: `new` when every line of the declaration is an
+/// added line. This fallback cannot tell a one-line edit from a new export.
+fn export_change(
+    base_exports: Option<&FxHashMap<String, FxHashSet<String>>>,
+    diff_index: &fallow_output::DiffIndex,
+    key: &str,
+    export: &fallow_engine::module_graph::ExportTestReachPaths,
+) -> fallow_output::ExportChange {
+    use fallow_output::ExportChange;
+    if let Some(names) = base_exports.and_then(|base| base.get(&export.file)) {
+        return if names.contains(&export.export_name) {
+            ExportChange::Modified
+        } else {
+            ExportChange::New
+        };
+    }
+    let (start, end) = export.declaration_lines;
+    if (start..=end).all(|line| diff_index.line_is_added(key, u64::from(line))) {
+        ExportChange::New
+    } else {
+        ExportChange::Modified
     }
 }
 
@@ -414,19 +622,14 @@ pub fn build_brief_output_with_diff(
     diff_index: Option<&fallow_output::DiffIndex>,
 ) -> ReviewBriefOutput {
     let triage = build_triage(result, diff_index);
-    let closure = result
-        .check
-        .as_ref()
-        .and_then(|c| c.impact_closure.as_ref());
     let deltas = result.review_deltas.clone().unwrap_or_default();
     let mut graph_facts = result.check.as_ref().map_or_else(
         || GraphFacts {
             exports_added: 0,
             api_width_delta: 0,
-            reachable_from: Vec::new(),
             boundaries_touched: Vec::new(),
         },
-        |check| derive_graph_facts(&check.results, closure),
+        |check| derive_graph_facts(&check.results),
     );
     // The exports-aware delta fills the previously-stubbed export facts:
     // `exports_added` / `api_width_delta` count the public-API surface the change
@@ -435,9 +638,11 @@ pub fn build_brief_output_with_diff(
     graph_facts.exports_added = added;
     graph_facts.api_width_delta = i64::try_from(added).unwrap_or(i64::MAX);
     let partition = build_partition_facts(result);
-    let impact_closure = build_impact_closure_facts(result);
+    let impact_closure = build_impact_closure_facts(result, diff_index);
     let focus = build_focus_map(result, &deltas);
     ReviewBriefOutput {
+        branching: build_branching_report(result),
+        test_reach: build_test_reach_facts(result, diff_index),
         schema_version: ReviewBriefSchemaVersion::default(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         command: "audit-brief".to_string(),
@@ -449,8 +654,40 @@ pub fn build_brief_output_with_diff(
         deltas,
         weakening: result.weakening_signals.clone(),
         routing: result.routing.clone().unwrap_or_default(),
+        ownership: result.ownership.clone(),
         decisions: result.decision_surface.clone().unwrap_or_default(),
     }
+}
+
+/// Compare branching across the accounting set, or `None` when there is no
+/// base to compare against.
+///
+/// Both sides are restricted to the changed files before comparing. The base
+/// pass analyzes the whole base worktree, so an unrestricted comparison would
+/// describe the repository rather than the changeset.
+fn build_branching_report(result: &AuditResult) -> Option<fallow_output::BranchingReport> {
+    let base = result.base_snapshot.as_ref()?;
+    let health = result.health.as_ref()?;
+    let root = health.config.root.as_path();
+    let accounting: rustc_hash::FxHashSet<String> = result
+        .changed_files
+        .iter()
+        .map(|path| crate::audit::keys::relative_key_path(path, root))
+        .collect();
+    let restrict = |source: &fallow_output::BranchingSnapshot| -> fallow_output::BranchingSnapshot {
+        source
+            .iter()
+            .filter(|(path, _)| accounting.contains(path.as_str()))
+            .map(|(path, totals)| (path.clone(), *totals))
+            .collect()
+    };
+    let head = crate::audit::branching_keys(&health.branching_by_file, root);
+    Some(fallow_output::BranchingReport::compare(
+        &restrict(&base.branching),
+        &restrict(&head),
+        fallow_output::DEFAULT_BRANCHING_TOLERANCE,
+        &|path| fallow_engine::test_paths::is_test_path_str(root, path),
+    ))
 }
 
 /// Build the reused "subtract" section (dead-code / duplication / complexity)
@@ -509,7 +746,6 @@ fn print_brief_json(
         Ok(output) => {
             let Ok(output) = fallow_output::serialize_review_brief_json_output(
                 output,
-                crate::output_runtime::current_root_envelope_mode(),
                 crate::output_runtime::telemetry_analysis_run_id().as_deref(),
             ) else {
                 return ExitCode::SUCCESS;
@@ -559,18 +795,88 @@ fn print_brief_human(
                 brief.graph_facts.boundaries_touched.join(", ")
             );
         }
+        print_branching_human(brief.branching.as_ref());
         print_partition_human(&brief.partition);
         print_impact_closure_human(&brief.impact_closure);
+        for line in test_reach_lines(brief.test_reach.as_ref()) {
+            eprintln!("{line}");
+        }
         print_focus_human(&brief.focus, show_deprioritized);
         print_deltas_human(&brief.deltas);
         print_weakening_human(&brief.weakening);
         print_routing_human(&brief.routing);
+        print_ownership_human(brief.ownership.as_ref());
     }
 
     // Always render the findings sections so the brief shows WHERE to look, even
     // when the underlying verdict is a fail. Headers stay off (the brief owns its
     // own header line above).
     crate::audit::print_audit_findings(result, quiet, explain, false);
+}
+
+/// The brief lines naming the files that split in place, or `None` when none
+/// did.
+///
+/// Split out from the printer so the wording and the width are testable: every
+/// line has to hold under 80 columns, and the brief has no other place where a
+/// reader meets the phrase "branch point".
+fn branching_human_lines(report: Option<&fallow_output::BranchingReport>) -> Option<Vec<String>> {
+    let report = report.filter(|report| report.is_reportable())?;
+    // States what was measured. Concluding "this was split" would overclaim:
+    // the peak is a file-level maximum, so it can also fall because the largest
+    // function left the file while other functions arrived.
+    let mut lines =
+        vec!["  branching: branching about level, more functions, smaller peak".to_string()];
+    for split in report.split_in_place.iter().take(2) {
+        lines.push(format!("         {}", elide_path(&split.path, 71)));
+        lines.push(format!(
+            "           {} to {} branch points, {} to {} functions, peak {} to {}",
+            split.branch_points_before,
+            split.branch_points_after,
+            split.functions_before,
+            split.functions_after,
+            split.peak_before,
+            split.peak_after,
+        ));
+    }
+    let remaining = report.split_in_place.len().saturating_sub(2);
+    if remaining > 0 {
+        lines.push(format!(
+            "         and {remaining} more file{}",
+            crate::report::plural(remaining)
+        ));
+    }
+    Some(lines)
+}
+
+/// Shorten a path from the left, keeping the file name, so a deep path cannot
+/// push a brief line past the terminal width.
+fn elide_path(path: &str, budget: usize) -> String {
+    if path.chars().count() <= budget {
+        return path.to_string();
+    }
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(budget.saturating_sub(4))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(".../{tail}")
+}
+
+/// Print branching conservation on the human brief. Caller has already gated on
+/// `!quiet`. Renders nothing unless a file demonstrably split in place: the set
+/// totals are context, and every sibling section is silent when it has nothing
+/// to say.
+fn print_branching_human(report: Option<&fallow_output::BranchingReport>) {
+    let Some(lines) = branching_human_lines(report) else {
+        return;
+    };
+    for line in lines {
+        eprintln!("{line}");
+    }
 }
 
 /// Print the Stage 2 partition + order on the human brief: the by-module units
@@ -617,77 +923,611 @@ fn unit_label(module_dir: &str) -> String {
     }
 }
 
-/// Print the Stage 3 impact-closure summary on the human brief: the count of
-/// affected-but-not-shown files and each coordination gap (the precise
+/// The impact-closure lines: the magnitude, then the single heaviest directory
+/// with its exact share and a pointer at the rest.
+///
+/// Split out from the printer so the wording and the width are testable, the
+/// way `branching_human_lines` is: every line has to hold under 80 columns.
+/// The heaviest directory carries a count because the names alone cannot say
+/// whether the reach is concentrated or diffuse, which is the only question
+/// this section exists to answer. One name plus its share beats two names
+/// without: it costs half the width, and the count is what makes the line
+/// readable at a glance ("88 of 326 in tests" is the answer; two bare names
+/// are not).
+///
+/// The line names the rollup's own top row, so it never disagrees with
+/// `affected_by_dir` in the JSON. That row is often a test directory, because
+/// tests import broadly; the count is what tells a reader that, which is why
+/// it is not omitted.
+fn affected_lines(closure: &ImpactClosureFacts) -> Vec<String> {
+    if closure.affected_count == 0 {
+        return Vec::new();
+    }
+    let dirs = closure.affected_by_dir.len() + closure.affected_by_dir_omitted;
+    let mut lines = vec![format!(
+        "  impact closure: {} file{} affected beyond the diff{}",
+        closure.affected_count,
+        crate::report::plural(closure.affected_count),
+        if dirs < 2 {
+            String::new()
+        } else {
+            format!(" across {dirs} directories")
+        },
+    )];
+    // One directory says nothing the count did not already say.
+    let Some(heaviest) = closure.affected_by_dir.first().filter(|_| dirs > 1) else {
+        return lines;
+    };
+    lines.push(format!(
+        "         heaviest {} ({} file{})",
+        elide_path(&unit_label(&heaviest.dir), 48),
+        heaviest.count,
+        crate::report::plural(heaviest.count),
+    ));
+    let remaining = dirs - 1;
+    // The rollup itself is capped, so the JSON holds the whole breakdown only
+    // when nothing was omitted from it. Promising a full list past that point
+    // would send a reader on a round-trip that cannot answer them.
+    let route = if closure.affected_by_dir_omitted == 0 {
+        "--format json for full list".to_string()
+    } else {
+        format!(
+            "{} of them in --format json",
+            closure.affected_by_dir.len() - 1
+        )
+    };
+    lines.push(format!(
+        "         and {remaining} more director{} ({route})",
+        if remaining == 1 { "y" } else { "ies" },
+    ));
+    lines
+}
+
+/// How many consumers the human brief spells out before it collapses the rest
+/// into a count. Each one costs at least two lines, as a branching split does,
+/// but a coordination gap is Stage 3's headline signal rather than a supporting
+/// metric, so it gets one item more than `branching_human_lines` shows. The JSON
+/// carries every gap; this is the reading order, not the record.
+const MAX_HUMAN_COORDINATION_CONSUMERS: usize = 3;
+
+/// How many changed files one spelled-out consumer names before the rest
+/// collapse into a count. One source is the common case and two already
+/// establish that the consumer spans the diff, so a consumer importing from a
+/// dozen changed files cannot take the section over.
+const MAX_HUMAN_GAP_SOURCES: usize = 2;
+
+/// Join symbol names until they no longer fit `budget`, returning the rendered
+/// text and how many names it left out. A gap on a barrel file can consume two
+/// dozen symbols, and the reader needs to recognise the contract, not enumerate
+/// it.
+fn summarize_symbols(symbols: &[String], budget: usize) -> (String, usize) {
+    let mut shown = 0usize;
+    let mut width = 0usize;
+    for symbol in symbols {
+        let separator = usize::from(shown > 0) * 2;
+        let remaining = symbols.len() - shown - 1;
+        // Keep room for the suffix the omitted symbols will need.
+        let suffix = if remaining == 0 {
+            0
+        } else {
+            format!(" +{remaining} more").chars().count()
+        };
+        let next = width + separator + symbol.chars().count();
+        if shown > 0 && next + suffix > budget {
+            break;
+        }
+        width = next;
+        shown += 1;
+    }
+    // The first symbol always renders, elided if it alone overruns the budget.
+    let shown = shown.max(1).min(symbols.len());
+    let joined = symbols[..shown].join(", ");
+    let omitted = symbols.len() - shown;
+    if omitted == 0 {
+        return (elide_symbol(&joined, budget), 0);
+    }
+    let suffix = format!(" +{omitted} more");
+    let head = elide_symbol(&joined, budget.saturating_sub(suffix.chars().count()));
+    (format!("{head}{suffix}"), omitted)
+}
+
+/// Shorten a symbol list from the right, unlike `elide_path`, which keeps the
+/// tail: a symbol's leading characters are what identifies it.
+fn elide_symbol(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(budget.saturating_sub(3)).collect();
+    format!("{head}...")
+}
+
+/// The coordination-gap lines: how many consumers sit outside the diff, then a
+/// capped walk through the widest of them, one consumer per group of lines.
+///
+/// Split out from the printer so the wording and the width are testable, the
+/// way `affected_lines` and `branching_human_lines` are: every line has to hold
+/// under 80 columns. Two paths and a symbol list cannot share one line at that
+/// width, so the consumer gets its own line and each contract it consumes gets
+/// a continuation, matching how a branching split renders.
+///
+/// `collect_coordination_gaps` emits one fact per (changed file, consumer) pair,
+/// so a consumer importing from two changed files arrives as two facts. The walk
+/// groups by consumer: the header then counts the people who have to be
+/// coordinated with, which is what it has always claimed to count, and no
+/// consumer path is printed twice underneath it.
+///
+/// The walk is ordered by how many symbols the consumer takes across the whole
+/// diff, not by path. Unlike `affected_by_dir`, the JSON gap list is path-sorted
+/// and carries no ranking of its own, so an alphabetical prefix would spell out
+/// whichever consumers sort first and collapse a barrel consumer taking two
+/// dozen symbols behind the remainder. The header states the total either way.
+///
+/// The changed files underneath one consumer are ranked the same way, and for
+/// the same reason: an alphabetical prefix there collapses an eight-symbol
+/// contract behind two one-symbol imports that happen to sort earlier.
+///
+/// The header claims only what `collect_coordination_gaps` establishes: the
+/// consumer uses an export of a file in the diff. It never verifies that the
+/// export itself changed, so the line must not say the contract changed.
+fn coordination_gap_lines(gaps: &[CoordinationGapFact]) -> Vec<String> {
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    let mut at: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut consumers: Vec<(&str, Vec<&CoordinationGapFact>)> = Vec::new();
+    for gap in gaps {
+        match at.get(gap.consumer_file.as_str()) {
+            Some(&index) => consumers[index].1.push(gap),
+            None => {
+                at.insert(&gap.consumer_file, consumers.len());
+                consumers.push((&gap.consumer_file, vec![gap]));
+            }
+        }
+    }
+    let mut lines = vec![format!(
+        "  coordination gap: {} consumer{} outside the diff use{} exports of changed files",
+        consumers.len(),
+        crate::report::plural(consumers.len()),
+        if consumers.len() == 1 { "s" } else { "" },
+    )];
+    // The changed file is unique per consumer after grouping, so the tie-break
+    // keeps this order total without leaning on `sort_by` stability.
+    for (_, sources) in &mut consumers {
+        sources.sort_by(|a, b| {
+            b.consumed_symbols
+                .len()
+                .cmp(&a.consumed_symbols.len())
+                .then_with(|| a.changed_file.cmp(&b.changed_file))
+        });
+    }
+    // The consumer path is unique after grouping, so it is a total tie-break
+    // rather than one that leans on `sort_by` stability plus an upstream sort.
+    consumers.sort_by(|a, b| {
+        symbols_taken(&b.1)
+            .cmp(&symbols_taken(&a.1))
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    let mut symbols_omitted = 0usize;
+    let mut sources_omitted = 0usize;
+    for (consumer, sources) in consumers.iter().take(MAX_HUMAN_COORDINATION_CONSUMERS) {
+        lines.push(format!("         {}", elide_path(consumer, 71)));
+        for gap in sources.iter().take(MAX_HUMAN_GAP_SOURCES) {
+            debug_assert!(
+                !gap.consumed_symbols.is_empty(),
+                "a gap exists because a symbol is consumed, so the list is never empty"
+            );
+            let (symbols, omitted) = summarize_symbols(&gap.consumed_symbols, 24);
+            symbols_omitted += omitted;
+            lines.push(format!(
+                "           consumes {symbols} from {}",
+                elide_path(&gap.changed_file, 28),
+            ));
+        }
+        let hidden = sources.len().saturating_sub(MAX_HUMAN_GAP_SOURCES);
+        if hidden > 0 {
+            sources_omitted += hidden;
+            lines.push(format!(
+                "           and {hidden} more changed file{}",
+                crate::report::plural(hidden),
+            ));
+        }
+    }
+
+    let remaining = consumers
+        .len()
+        .saturating_sub(MAX_HUMAN_COORDINATION_CONSUMERS);
+    if remaining > 0 {
+        lines.push(format!(
+            "         and {remaining} more consumer{} (--format json for full list)",
+            crate::report::plural(remaining),
+        ));
+    } else if symbols_omitted > 0 || sources_omitted > 0 {
+        // A `+N more` with no route on screen leaves the reader nowhere to go.
+        let dropped = match (symbols_omitted > 0, sources_omitted > 0) {
+            (true, true) => "every consumed symbol and changed file",
+            (false, true) => "every changed file",
+            _ => "every consumed symbol",
+        };
+        lines.push(format!("         (--format json for {dropped})"));
+    }
+    lines
+}
+
+/// How many symbol references one consumer takes across the whole diff, the key
+/// the walk ranks by.
+fn symbols_taken(sources: &[&CoordinationGapFact]) -> usize {
+    sources.iter().map(|g| g.consumed_symbols.len()).sum()
+}
+
+/// Human lines for the co-change gaps: one header, one line per listed gap,
+/// and a note for the gaps that the cap cut.
+fn co_change_gap_lines(closure: &ImpactClosureFacts) -> Vec<String> {
+    let gaps = &closure.co_change_gap;
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    let total = closure.co_change_gap_count.max(gaps.len());
+    let mut lines = vec![format!(
+        "  co-change gaps ({total}): files that usually change together, no import between them"
+    )];
+    for gap in gaps {
+        lines.push(format!(
+            "    {} -> {} ({} shared commits, {:.0}%)",
+            gap.changed_file,
+            gap.partner_file,
+            gap.shared_revisions,
+            gap.degree * 100.0
+        ));
+    }
+    let hidden = total - gaps.len();
+    if hidden > 0 {
+        lines.push(format!("    {hidden} more not shown"));
+    }
+    lines
+}
+
+/// Print the Stage 3 impact-closure summary on the human brief: the blast
+/// radius and its heaviest directory, then the coordination gaps (the precise
 /// inter-module attention pointer). Caller has already gated on `!quiet`.
 fn print_impact_closure_human(closure: &ImpactClosureFacts) {
-    if !closure.affected_not_shown.is_empty() {
-        eprintln!(
-            "  impact closure: {} file{} affected beyond the diff",
-            closure.affected_not_shown.len(),
-            crate::report::plural(closure.affected_not_shown.len()),
-        );
+    for line in affected_lines(closure) {
+        eprintln!("{line}");
     }
-    for gap in &closure.coordination_gap {
-        eprintln!(
-            "  coordination gap: {} consumes {} from {} (not in this diff)",
-            gap.consumer_file,
-            gap.consumed_symbols.join(", "),
-            gap.changed_file,
-        );
+    for line in coordination_gap_lines(&closure.coordination_gap) {
+        eprintln!("{line}");
+    }
+    for line in co_change_gap_lines(closure) {
+        eprintln!("{line}");
+    }
+    for line in search_gap_lines(closure.search_gap.as_ref()) {
+        eprintln!("{line}");
     }
 }
 
-/// Print the Stage 4 weighted focus map on the human brief: the ranked
-/// `review-here` units (with reason + any low-confidence flag), then the
-/// de-prioritized count as a collapsed escape hatch. `--show-deprioritized`
-/// re-expands the full de-prioritized list ("show me what you de-prioritized").
-/// Caller has already gated on `!quiet`. Renders nothing when no unit was scored.
-fn print_focus_human(focus: &crate::audit_focus::FocusMap, show_deprioritized: bool) {
-    if focus.total_units() == 0 {
-        return;
+/// Exports and consumers per export that the human search-gap section shows.
+const MAX_HUMAN_SEARCH_GAP_EXPORTS: usize = 3;
+const MAX_HUMAN_SEARCH_GAP_CONSUMERS: usize = 3;
+
+/// Human lines for the literal-search gap: the consumers of changed exports
+/// that a text search for the export name misses or finds under another name.
+fn search_gap_lines(facts: Option<&fallow_output::SearchGapFacts>) -> Vec<String> {
+    use fallow_types::trace::SearchVisibility;
+
+    let Some(facts) = facts else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!(
+        "  search gap: {} consumer use{} of changed exports hide{} from a name search",
+        facts.total,
+        crate::report::plural(facts.total),
+        if facts.total == 1 { "s" } else { "" },
+    )];
+    let mut truncated = facts.exports.len() > MAX_HUMAN_SEARCH_GAP_EXPORTS;
+    for export in facts.exports.iter().take(MAX_HUMAN_SEARCH_GAP_EXPORTS) {
+        lines.push(format!(
+            "         {} in {}:{}",
+            elide_symbol(&export.export_name, 30),
+            elide_path(&export.file, 34),
+            export.line,
+        ));
+        for consumer in export.consumers.iter().take(MAX_HUMAN_SEARCH_GAP_CONSUMERS) {
+            let level = if consumer.search_visibility == SearchVisibility::Missed {
+                "missed"
+            } else {
+                "renamed"
+            };
+            let hint = consumer
+                .search_as
+                .as_deref()
+                .map(|name| format!(", search {}", elide_symbol(name, 20)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "           {level} {}{hint}",
+                elide_path(&consumer.consumer_file, 40),
+            ));
+        }
+        truncated |= export.total > MAX_HUMAN_SEARCH_GAP_CONSUMERS;
     }
+    if truncated {
+        lines.push("         (--format json for the full list)".to_string());
+    }
+    lines
+}
+
+/// Rows that the human test reach section shows.
+const MAX_HUMAN_TEST_REACH_EXPORTS: usize = 3;
+
+/// Width that every human test reach line stays within.
+const TEST_REACH_LINE_WIDTH: usize = 80;
+
+/// Indent of a test reach row and of its continuation line.
+const TEST_REACH_ROW_INDENT: &str = "    ";
+const TEST_REACH_REASON_INDENT: &str = "                 ";
+
+/// The human label of a reach class. `none` and `none-file` both read as
+/// "no test"; the row reason tells them apart.
+const fn test_reach_label(class: fallow_output::TestReachClass) -> &'static str {
+    use fallow_output::TestReachClass;
+    match class {
+        TestReachClass::MockedOnly => "mocked only",
+        TestReachClass::None | TestReachClass::NoneFile => "no test",
+        TestReachClass::Transitive => "transitive",
+        TestReachClass::Direct => "direct",
+        TestReachClass::Framework => "framework",
+    }
+}
+
+/// The non-zero class counts, in the order of the JSON `counts` keys.
+fn test_reach_count_phrases(counts: &fallow_output::TestReachCounts) -> Vec<String> {
+    [
+        (counts.direct, "direct"),
+        (counts.transitive, "transitive"),
+        (counts.mocked_only, "mocked only"),
+        (counts.none + counts.none_file, "no test"),
+        (counts.framework, "framework"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect()
+}
+
+/// Why a row has no real test, or `None` when the label says it all.
+fn test_reach_reason(
+    row: &fallow_output::ExportTestReachFact,
+    has_e2e_runner: bool,
+) -> Option<String> {
+    use fallow_output::TestReachClass;
+    match row.reach {
+        TestReachClass::MockedOnly => {
+            let targets = row.mocked_targets.as_deref().unwrap_or_default();
+            let first = targets.first()?;
+            let more = targets.len() - 1;
+            let suffix = if more > 0 {
+                format!(" +{more}")
+            } else {
+                String::new()
+            };
+            Some(format!("tests mock {}{suffix}", elide_path(first, 40)))
+        }
+        TestReachClass::NoneFile if has_e2e_runner => {
+            Some("file not reached by tests; e2e tests do not import files".to_string())
+        }
+        TestReachClass::NoneFile => Some("file not reached by tests".to_string()),
+        _ => None,
+    }
+}
+
+/// The human lines for the test reach section.
+///
+/// Split out from the printer so the wording and the width are testable:
+/// every line holds within 80 columns. The section shows at most
+/// [`MAX_HUMAN_TEST_REACH_EXPORTS`] rows and points to the JSON for the rest.
+fn test_reach_lines(facts: Option<&fallow_output::TestReachFacts>) -> Vec<String> {
+    use fallow_output::{TestReachMasking, TestReachStatus};
+
+    let Some(facts) = facts else {
+        return Vec::new();
+    };
+    let exports = format!(
+        "{} changed export{}",
+        facts.total,
+        crate::report::plural(facts.total)
+    );
+    if facts.status == TestReachStatus::NoTests {
+        return vec![format!(
+            "  test reach: no test files in this project; {exports} {} no test",
+            if facts.total == 1 { "has" } else { "have" },
+        )];
+    }
+    let mut lines = Vec::new();
+    let phrases = test_reach_count_phrases(&facts.counts);
+    let mut current = format!("  test reach: {exports}: ");
+    let mut first = true;
+    for phrase in &phrases {
+        let piece = if first {
+            phrase.clone()
+        } else {
+            format!(", {phrase}")
+        };
+        if !first && current.chars().count() + piece.chars().count() > TEST_REACH_LINE_WIDTH {
+            lines.push(format!("{current},"));
+            current = format!("{TEST_REACH_ROW_INDENT}{phrase}");
+        } else {
+            current.push_str(&piece);
+        }
+        first = false;
+    }
+    lines.push(current);
+    if facts.masking == TestReachMasking::Capped {
+        lines.push(format!(
+            "{TEST_REACH_ROW_INDENT}mock detection is off: too many distinct mock sets"
+        ));
+    }
+    let shown = || facts.exports.iter().take(MAX_HUMAN_TEST_REACH_EXPORTS);
+    let name_width = shown()
+        .map(|row| elide_symbol(&row.export_name, 24).chars().count())
+        .max()
+        .unwrap_or(0);
+    for row in shown() {
+        let location = format!("{}:{}", elide_path(&row.file, 28), row.line);
+        let name = elide_symbol(&row.export_name, 24);
+        let main = format!(
+            "{TEST_REACH_ROW_INDENT}{:<12} {location:<20} {name:<name_width$}",
+            test_reach_label(row.reach),
+        );
+        let trimmed = main.trim_end().to_string();
+        let fits = |line: &str, reason: &str| {
+            line.chars().count() + 2 + reason.chars().count() <= TEST_REACH_LINE_WIDTH
+        };
+        // The reason column aligns when the padded row fits. A long name in
+        // another row must not push this reason to its own line.
+        match test_reach_reason(row, facts.e2e_runner) {
+            Some(reason) if fits(&main, &reason) => lines.push(format!("{main}  {reason}")),
+            Some(reason) if fits(&trimmed, &reason) => {
+                lines.push(format!("{trimmed}  {reason}"));
+            }
+            Some(reason) => {
+                lines.push(trimmed);
+                lines.push(format!("{TEST_REACH_REASON_INDENT}{reason}"));
+            }
+            None => lines.push(trimmed),
+        }
+    }
+    if facts.exports.len() > MAX_HUMAN_TEST_REACH_EXPORTS || facts.exports_omitted > 0 {
+        lines.push(format!(
+            "{TEST_REACH_ROW_INDENT}(--format json for the full list)"
+        ));
+    }
+    lines
+}
+
+/// Greedily wrap prose to `first` columns on the opening line and `rest`
+/// thereafter, returning the unprefixed chunks so the caller owns the indents.
+///
+/// Elision is wrong for these strings: a decision question is the judgment the
+/// brief exists to pose, and a focus reason is the evidence for a label, so
+/// cutting either destroys the signal rather than shortening it. Only a word
+/// that alone overruns its line is shortened, and `elide` decides from which
+/// end: a path keeps its tail (`elide_path`), while an owner identity keeps its
+/// head (`elide_symbol`), because an email or team name is identified by what it
+/// starts with.
+fn wrap_prose(
+    text: &str,
+    first: usize,
+    rest: usize,
+    elide: fn(&str, usize) -> String,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let budget = if lines.is_empty() { first } else { rest };
+        if current.is_empty() {
+            current = elide(word, budget);
+            continue;
+        }
+        if current.chars().count() + 1 + word.chars().count() <= budget {
+            current.push(' ');
+            current.push_str(word);
+            continue;
+        }
+        lines.push(std::mem::take(&mut current));
+        current = elide(word, rest);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Render one focus unit: the label and its file, then the reason wrapped
+/// underneath, then any confidence flags.
+///
+/// The reason used to share the file's line, which put an un-elided path and an
+/// unbounded sentence on one row; on a real project that reached 103 columns.
+fn focus_unit_lines(unit: &crate::audit_focus::FocusUnit) -> Vec<String> {
+    let mut lines = vec![format!(
+        "    [{}] {}",
+        unit.label.token(),
+        elide_path(&unit.file, 56),
+    )];
+    for (n, chunk) in wrap_prose(&unit.reason, 72, 70, elide_path)
+        .into_iter()
+        .enumerate()
+    {
+        // Continuations sit past the key column so `confidence` below stays the
+        // only thing that starts a new fact.
+        lines.push(if n == 0 {
+            format!("      {chunk}")
+        } else {
+            format!("        {chunk}")
+        });
+    }
+    for flag in &unit.confidence {
+        lines.extend(
+            wrap_prose(flag.message(), 60, 60, elide_path)
+                .into_iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    if i == 0 {
+                        format!("      confidence {chunk}")
+                    } else {
+                        format!("        {chunk}")
+                    }
+                }),
+        );
+    }
+    lines
+}
+
+/// The Stage 4 weighted focus map lines: the ranked `review-here` units (with
+/// reason and any low-confidence flag), then the de-prioritized count as a
+/// collapsed escape hatch. `--show-deprioritized` re-expands the full
+/// de-prioritized list ("show me what you de-prioritized").
+///
+/// Split out from the printer so the wording and the width are testable, the
+/// way `affected_lines` and `branching_human_lines` are: every line has to hold
+/// under 80 columns. Empty when no unit was scored.
+fn focus_lines(focus: &crate::audit_focus::FocusMap, show_deprioritized: bool) -> Vec<String> {
+    if focus.total_units() == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
     if !focus.review_here.is_empty() {
-        eprintln!(
+        lines.push(format!(
             "  focus: {} unit{} to review here (of {} changed)",
             focus.review_here.len(),
             crate::report::plural(focus.review_here.len()),
             focus.total_units(),
-        );
+        ));
         for unit in &focus.review_here {
-            eprintln!(
-                "    [{}] {}: {}",
-                unit.label.token(),
-                unit.file,
-                unit.reason
-            );
-            for flag in &unit.confidence {
-                eprintln!("      confidence {}", flag.message());
-            }
+            lines.extend(focus_unit_lines(unit));
         }
     }
     if focus.deprioritized.is_empty() {
-        return;
+        return lines;
     }
     if show_deprioritized {
-        eprintln!("  de-prioritized ({}):", focus.deprioritized.len());
+        lines.push(format!("  de-prioritized ({}):", focus.deprioritized.len()));
         for unit in &focus.deprioritized {
-            eprintln!(
-                "    [{}] {}: {}",
-                unit.label.token(),
-                unit.file,
-                unit.reason
-            );
-            for flag in &unit.confidence {
-                eprintln!("      confidence {}", flag.message());
-            }
+            lines.extend(focus_unit_lines(unit));
         }
     } else {
-        eprintln!(
+        lines.push(format!(
             "  de-prioritized: {} unit{} (run with --show-deprioritized to list)",
             focus.deprioritized.len(),
             crate::report::plural(focus.deprioritized.len()),
-        );
+        ));
+    }
+    lines
+}
+
+/// Print the Stage 4 weighted focus map on the human brief. Caller has already
+/// gated on `!quiet`. Renders nothing when no unit was scored.
+fn print_focus_human(focus: &crate::audit_focus::FocusMap, show_deprioritized: bool) {
+    for line in focus_lines(focus, show_deprioritized) {
+        eprintln!("{line}");
     }
 }
 
@@ -734,9 +1574,14 @@ fn dependency_key_names(keys: &[String]) -> String {
     keys.iter()
         .map(|key| {
             let (manifest, rest) = key.split_once("::").unwrap_or(("", key));
+            // A leading @ belongs to the scope; later @ signs may also occur
+            // inside npm alias ranges, so only split at the first non-leading one.
             let (name, range) = rest
-                .split_once('@')
-                .map_or((rest, None), |(name, range)| (name, range.split_once("->")));
+                .match_indices('@')
+                .find(|(index, _)| *index > 0)
+                .map_or((rest, None), |(index, _)| {
+                    (&rest[..index], rest[index + 1..].split_once("->"))
+                });
             let range_text = range
                 .map(|(from, to)| format!(" {from} to {to}"))
                 .unwrap_or_default();
@@ -789,28 +1634,215 @@ fn print_routing_human(routing: &crate::audit::routing::RoutingFacts) {
     }
 }
 
-/// Print the decision surface (the apex, 6.G): the ranked, capped set of
-/// consequential structural decisions, each as a framed judgment question with
-/// its routed expert. Caller has already gated on `!quiet`. Leads the brief.
-fn print_decision_surface_human(surface: &crate::audit_decision_surface::DecisionSurface) {
-    if surface.decisions.is_empty() {
-        eprintln!("Decisions: none (no consequential structural decision in this change)");
-        eprintln!();
-        return;
+/// Width of the owner column in the human ownership rollup.
+const OWNER_COLUMN_WIDTH: usize = 24;
+
+/// Width budget for the module directories of a slice on its human line.
+const SLICE_DIRS_BUDGET: usize = 27;
+
+/// The ownership lines: the owner-group count, the capped owner rollup, and
+/// the slices that have one owner.
+///
+/// Split out from the printer so the wording and the width are testable: every
+/// line has to hold under 80 columns. The slice numbers are 1-based positions
+/// in `partition.independent_slices`, the same order the partition line
+/// prints. Fallow reports the slices with one owner; the reviewer decides if
+/// a split is useful.
+fn ownership_lines(ownership: Option<&fallow_output::OwnershipFacts>) -> Vec<String> {
+    let Some(ownership) = ownership else {
+        return Vec::new();
+    };
+    if ownership.group_count == 0 {
+        return Vec::new();
     }
-    eprintln!("Decisions to make ({}):", surface.decisions.len());
+    let mut notes: Vec<String> = Vec::new();
+    if ownership.transitive_only_count > 0 {
+        notes.push(format!(
+            "{} transitive only",
+            ownership.transitive_only_count
+        ));
+    }
+    if ownership.unowned_direct_count > 0 {
+        notes.push(format!(
+            "{} unowned file{}",
+            ownership.unowned_direct_count,
+            crate::report::plural(ownership.unowned_direct_count),
+        ));
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
+    let mut lines = vec![format!(
+        "  ownership: {} owner group{}{notes}",
+        ownership.group_count,
+        crate::report::plural(ownership.group_count),
+    )];
+    for group in &ownership.groups {
+        let owner = elide_symbol(&group.owner, OWNER_COLUMN_WIDTH);
+        let affected = if group.affected_count > 0 {
+            format!(", {} affected", group.affected_count)
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "    {owner:<OWNER_COLUMN_WIDTH$} {} changed{affected}",
+            group.direct_count
+        ));
+    }
+    if ownership.groups_omitted > 0 {
+        lines.push(format!(
+            "    +{} more group{}",
+            ownership.groups_omitted,
+            crate::report::plural(ownership.groups_omitted),
+        ));
+    }
+    for (index, slice) in ownership.slices.iter().enumerate() {
+        if !slice.separable {
+            continue;
+        }
+        lines.push(format!(
+            "  slice {} ({}) {}",
+            index + 1,
+            slice_dirs_label(&slice.module_dirs),
+            slice_owner_phrase(&slice.owners),
+        ));
+    }
+    lines
+}
+
+/// Label the module directories of a slice: the first directory, shortened
+/// by whole leading segments so the distinct tail stays visible, plus the
+/// count of the other directories. The partition line lists every directory in full.
+fn slice_dirs_label(module_dirs: &[String]) -> String {
+    let Some(first) = module_dirs.first() else {
+        return String::new();
+    };
+    let more = module_dirs.len() - 1;
+    let suffix = if more > 0 {
+        format!(" +{more} more")
+    } else {
+        String::new()
+    };
+    let budget = SLICE_DIRS_BUDGET.saturating_sub(suffix.chars().count());
+    format!(
+        "{}{suffix}",
+        elide_leading_segments(&unit_label(first), budget)
+    )
+}
+
+/// Shorten a path by removing whole leading segments, so the label never
+/// cuts inside a folder name. Falls back to a character cut only when the
+/// last segment alone is wider than the budget.
+fn elide_leading_segments(path: &str, budget: usize) -> String {
+    if path.chars().count() <= budget {
+        return path.to_string();
+    }
+    let mut rest = path;
+    while let Some((_, tail)) = rest.split_once('/') {
+        rest = tail;
+        if rest.chars().count() + 4 <= budget {
+            return format!(".../{rest}");
+        }
+    }
+    elide_path(rest, budget)
+}
+
+/// The owner part of a separable slice line.
+fn slice_owner_phrase(owners: &[String]) -> String {
+    match owners {
+        [owner] if owner == crate::codeowners::UNOWNED_LABEL => "is unowned".to_string(),
+        _ => format!(
+            "has one owner: {}",
+            elide_symbol(&owners.join(", "), OWNER_COLUMN_WIDTH)
+        ),
+    }
+}
+
+/// Print the ownership section. Silent when the brief has no ownership
+/// section.
+fn print_ownership_human(ownership: Option<&fallow_output::OwnershipFacts>) {
+    for line in ownership_lines(ownership) {
+        eprintln!("{line}");
+    }
+}
+
+/// How many contract members a decision question names inline on the human
+/// brief before the rest collapse into "+N more".
+///
+/// Lower than [`fallow_output::MAX_CONTRACT_MEMBERS`], which the walkthrough
+/// tour uses, because the two lines do not carry the same load: the tour drops
+/// the anchor path and the trailing question, while the brief keeps both (the
+/// path appears nowhere else, and the question IS the judgment the brief
+/// poses). Three names are what fits beside them: a widened export question
+/// then reads in three lines, or four once the anchor path is deep enough to
+/// take a line of its own, instead of a screenful, and three names are enough
+/// to recognise the shape of a contract. The count carries the list's size and
+/// the JSON carries every name.
+const MAX_BRIEF_DECISION_MEMBERS: usize = 3;
+
+/// Where a reader goes when a member list collapsed. Named so the printer and
+/// the tests that locate it in the rendered block cannot drift apart; one test
+/// still pins the wording itself.
+const JSON_NAME_ROUTE: &str = "  (--format json for every collapsed name)";
+
+/// The decision-surface lines (the apex, 6.G): the ranked, capped set of
+/// consequential structural decisions, each as a framed judgment question with
+/// its routed expert. Leads the brief.
+///
+/// Split out from the printer so the wording and the width are testable, the
+/// way `affected_lines` and `branching_human_lines` are: every line has to hold
+/// under 80 columns. A question naming a widened export list runs to several
+/// hundred characters, so a member list longer than
+/// [`MAX_BRIEF_DECISION_MEMBERS`] collapses to that many names and the prose
+/// around it wraps under a hanging indent rather than being cut. The question IS
+/// the judgment the brief exists to pose, so the ask at the end of the sentence
+/// always survives.
+fn decision_surface_lines(surface: &crate::audit_decision_surface::DecisionSurface) -> Vec<String> {
+    if surface.decisions.is_empty() {
+        return vec![
+            "Decisions: none (no consequential structural decision in this change)".to_string(),
+            String::new(),
+        ];
+    }
+    let mut lines = vec![format!("Decisions to make ({}):", surface.decisions.len())];
+    let mut names_collapsed = false;
     for (i, decision) in surface.decisions.iter().enumerate() {
         // Taste ownership: the question first (never an answer), then the honest
         // graph fact, then the named trade-off. The human reads reversibility from
         // the count; the tool never labels the door or recommends a choice.
-        eprintln!(
-            "  {}. [{}] {}",
-            i + 1,
-            decision.category.tag(),
-            decision.question
-        );
+        let head = format!("  {}. [{}] ", i + 1, decision.category.tag());
+        let head_width = head.chars().count();
+        // Continuations sit past column 5 so that column stays the key column
+        // `trade-off:` and `ask:` own, giving the block a 2 / 5 / 7 hierarchy.
+        // A widened export list spends most of the question's lines on names, which
+        // pushes the ask itself off the first screenful; the members identify the
+        // contract, they are not the thing being asked about.
+        let asked = fallow_output::cap_member_list(&decision.question, MAX_BRIEF_DECISION_MEMBERS);
+        names_collapsed |= asked != decision.question;
+        let question = wrap_prose(&asked, 80 - head_width, 73, elide_path);
+        if question.is_empty() {
+            lines.push(head.trim_end().to_string());
+        }
+        for (n, chunk) in question.into_iter().enumerate() {
+            if n == 0 {
+                lines.push(format!("{head}{chunk}"));
+            } else {
+                lines.push(format!("       {chunk}"));
+            }
+        }
         if !decision.tradeoff.is_empty() {
-            eprintln!("     trade-off: {}", decision.tradeoff);
+            for (n, chunk) in wrap_prose(&decision.tradeoff, 64, 71, elide_path)
+                .into_iter()
+                .enumerate()
+            {
+                if n == 0 {
+                    lines.push(format!("     trade-off: {chunk}"));
+                } else {
+                    lines.push(format!("       {chunk}"));
+                }
+            }
         }
         if !decision.expert.is_empty() {
             let bus = if decision.bus_factor_one {
@@ -818,13 +1850,68 @@ fn print_decision_surface_human(surface: &crate::audit_decision_surface::Decisio
             } else {
                 ""
             };
-            eprintln!("     ask: {}{bus}", decision.expert.join(", "));
+            // The suffix lands on the LAST wrapped line, so its width has to come
+            // out of every line's budget, not just the first.
+            let reserved = bus.chars().count();
+            // `     ask: ` is 10 columns and the continuation indent is 7, so the
+            // budgets are 70 and 73 before the suffix, which lands on whichever
+            // line ends up last and therefore comes out of every line.
+            let experts = wrap_prose(
+                &decision.expert.join(", "),
+                70 - reserved,
+                73 - reserved,
+                elide_symbol,
+            );
+            for (n, chunk) in experts.iter().enumerate() {
+                if n == 0 {
+                    lines.push(format!("     ask: {chunk}"));
+                } else {
+                    lines.push(format!("       {chunk}"));
+                }
+            }
+            if !bus.is_empty()
+                && !experts.is_empty()
+                && let Some(last) = lines.last_mut()
+            {
+                last.push_str(bus);
+            }
         }
     }
-    if let Some(note) = &surface.truncated {
-        eprintln!("  ... {}", note.reason);
+    if names_collapsed {
+        // A `+N more` with no route on screen leaves the reader nowhere to go. The
+        // route holds for the names: a decision that renders here carries its full,
+        // uncapped question in the brief JSON.
+        //
+        // It stays with the questions it routes, ahead of the truncation note.
+        // Below the note it reads as routing the collapsed DECISIONS, and that
+        // claim is false: `build_decision_surface` truncates the ranked list
+        // before serialization, so the JSON carries the collapsed decisions only
+        // as ids in `emitted_signal_ids`, never their questions.
+        lines.push(JSON_NAME_ROUTE.to_string());
     }
-    eprintln!();
+    if let Some(note) = &surface.truncated {
+        for (n, chunk) in wrap_prose(&note.reason, 72, 72, elide_path)
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(if n == 0 {
+                format!("  ... {chunk}")
+            } else {
+                format!("      {chunk}")
+            });
+        }
+    }
+    // The apex section closes with a blank line in BOTH states, or it runs
+    // straight into the drill-down header it is supposed to lead.
+    lines.push(String::new());
+    lines
+}
+
+/// Print the decision surface. Caller has already gated on `!quiet`.
+fn print_decision_surface_human(surface: &crate::audit_decision_surface::DecisionSurface) {
+    for line in decision_surface_lines(surface) {
+        eprintln!("{line}");
+    }
 }
 
 fn weakening_label(kind: crate::audit::weakening::WeakeningKind) -> &'static str {
@@ -910,7 +1997,6 @@ pub fn print_decision_surface_result(
             let output = crate::audit_decision_surface::build_decision_surface_output(&surface);
             match fallow_output::serialize_decision_surface_json_output(
                 output,
-                crate::output_runtime::current_root_envelope_mode(),
                 crate::output_runtime::telemetry_analysis_run_id().as_deref(),
             ) {
                 Ok(value) => {
@@ -943,7 +2029,6 @@ pub fn print_walkthrough_guide_result(
     let guide = crate::audit_walkthrough::build_guide_from_result(result);
     if let Ok(value) = fallow_output::serialize_walkthrough_guide_json_output(
         guide,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) {
         let _ = crate::report::emit_report_json(&value, "review-walkthrough-guide", json_style);
@@ -988,7 +2073,6 @@ pub fn print_walkthrough_file_result(
     );
     if let Ok(value) = fallow_output::serialize_walkthrough_validation_json_output(
         validation,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) {
         let _ =
@@ -1106,6 +2190,37 @@ mod tests {
 
     use crate::audit::{AuditAttribution, AuditResult, AuditSummary, AuditVerdict};
 
+    #[test]
+    fn dependency_names_preserve_scopes_and_manifest_labels() {
+        let keys = [
+            "package.json::@scope/one",
+            "package.json::@scope/two",
+            "package.json::other",
+            "package.json::plain",
+            "packages/app/package.json::@scope/workspace",
+            "@scope/unqualified",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            dependency_key_names(&keys),
+            "@scope/one, @scope/two, other, plain, @scope/workspace (packages/app/package.json), @scope/unqualified"
+        );
+    }
+
+    #[test]
+    fn dependency_names_preserve_scoped_bumps_and_alias_ranges() {
+        let keys = [
+            "package.json::@scope/bumped@^1.0.0->^2.0.0",
+            "packages/app/package.json::plain@^1.0.0->^2.0.0",
+            "package.json::@scope/alias@npm:@other/pkg@^1.0.0->npm:@other/pkg@^2.0.0",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            dependency_key_names(&keys),
+            "@scope/bumped ^1.0.0 to ^2.0.0, plain ^1.0.0 to ^2.0.0 (packages/app/package.json), @scope/alias npm:@other/pkg@^1.0.0 to npm:@other/pkg@^2.0.0"
+        );
+    }
+
     fn str_set(files: &[&str]) -> FxHashSet<String> {
         files.iter().map(|file| (*file).to_string()).collect()
     }
@@ -1152,6 +2267,9 @@ mod tests {
             summary: AuditSummary {
                 dead_code_issues: 0,
                 dead_code_has_errors: false,
+                dead_code_skipped: false,
+                complexity_skipped: false,
+                duplication_skipped: false,
                 complexity_findings: 0,
                 max_cyclomatic: None,
                 duplication_clone_groups: 0,
@@ -1177,7 +2295,9 @@ mod tests {
             elapsed: Duration::ZERO,
             review_deltas: None,
             weakening_signals: Vec::new(),
+            diff_risk: fallow_output::DiffRiskReport::default(),
             routing: None,
+            ownership: None,
             decision_surface: None,
             graph_snapshot_hash: None,
             change_anchors: Vec::new(),
@@ -1221,7 +2341,6 @@ mod tests {
         let result = audit_result(AuditVerdict::Fail, OutputFormat::Json);
         let value = fallow_output::serialize_review_brief_json_output(
             build_brief_json(&result, None).expect("brief json must build"),
-            crate::output_runtime::current_root_envelope_mode(),
             crate::output_runtime::telemetry_analysis_run_id().as_deref(),
         )
         .expect("brief json must serialize");
@@ -1294,6 +2413,62 @@ mod tests {
         assert_eq!(triage.review_effort, ReviewEffort::Review);
     }
 
+    fn reach_export(
+        name: &str,
+        lines: (u32, u32),
+    ) -> fallow_engine::module_graph::ExportTestReachPaths {
+        fallow_engine::module_graph::ExportTestReachPaths {
+            file: "src/a.ts".to_owned(),
+            export_name: name.to_owned(),
+            line: lines.0,
+            declaration_lines: lines,
+            literal_value: false,
+            reach: fallow_engine::module_graph::ExportTestReach::None,
+            tests: Vec::new(),
+            mocked_targets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn export_change_falls_back_to_added_lines_without_base_exports() {
+        use fallow_output::ExportChange;
+        // Line 2 is the only added line: a one-line edit of a three-line
+        // declaration, and a one-line declaration that is all added.
+        let index = fallow_output::DiffIndex::from_unified_diff(
+            "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,3 +1,3 @@\n line one\n-old\n+new\n line three\n",
+        );
+        let edited = reach_export("edited", (1, 3));
+        let one_line = reach_export("oneLine", (2, 2));
+        let other_file: rustc_hash::FxHashMap<String, FxHashSet<String>> =
+            std::iter::once(("src/b.ts".to_owned(), FxHashSet::default())).collect();
+
+        for base in [None, Some(&other_file)] {
+            assert_eq!(
+                super::export_change(base, &index, "src/a.ts", &edited),
+                ExportChange::Modified
+            );
+            // The fallback cannot tell a one-line edit from a new export.
+            assert_eq!(
+                super::export_change(base, &index, "src/a.ts", &one_line),
+                ExportChange::New
+            );
+        }
+
+        let with_base: rustc_hash::FxHashMap<String, FxHashSet<String>> = std::iter::once((
+            "src/a.ts".to_owned(),
+            std::iter::once("oneLine".to_owned()).collect(),
+        ))
+        .collect();
+        assert_eq!(
+            super::export_change(Some(&with_base), &index, "src/a.ts", &one_line),
+            ExportChange::Modified
+        );
+        assert_eq!(
+            super::export_change(Some(&with_base), &index, "src/a.ts", &edited),
+            ExportChange::New
+        );
+    }
+
     #[test]
     fn no_diff_brief_keeps_optional_triage_fields_absent() {
         let result = audit_result(AuditVerdict::Warn, OutputFormat::Json);
@@ -1322,23 +2497,1176 @@ mod tests {
     }
 
     #[test]
-    fn derive_graph_facts_populates_reachable_from_from_closure() {
-        use fallow_engine::module_graph::{CoordinationGapPaths, ImpactClosurePaths};
-        let results = AnalysisResults::default();
-        let closure = ImpactClosurePaths {
-            in_diff: vec!["src/core.ts".to_string()],
-            affected_not_shown: vec!["src/app.ts".to_string(), "src/mid.ts".to_string()],
-            coordination_gap: vec![CoordinationGapPaths {
-                changed_file: "src/core.ts".to_string(),
-                consumer_file: "src/mid.ts".to_string(),
-                consumed_symbols: vec!["compute".to_string()],
+    fn graph_facts_carry_no_file_list() {
+        // The blast radius is Stage 3's alone. Stage 1 used to clone it verbatim,
+        // which put the same list on the wire twice and made half the envelope a
+        // duplicate.
+        let facts = derive_graph_facts(&AnalysisResults::default());
+        let value = serde_json::to_value(&facts).expect("graph facts serialize");
+        let keys: Vec<&str> = value
+            .as_object()
+            .expect("graph facts are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["exports_added", "api_width_delta", "boundaries_touched"]
+        );
+    }
+
+    fn spread_closure(affected: &[&str]) -> ImpactClosureFacts {
+        let mut paths: Vec<String> = affected.iter().map(|p| (*p).to_string()).collect();
+        paths.sort();
+        ImpactClosureFacts::new(&paths, Vec::new())
+    }
+
+    #[test]
+    fn human_impact_lines_report_the_full_count_not_the_sample() {
+        // Distinct file and directory totals, so a line that printed one where
+        // the other belongs cannot pass.
+        let mut affected: Vec<String> = (0..40).map(|i| format!("src/zone{i:03}/a.ts")).collect();
+        affected.extend((0..40).map(|i| format!("src/zone{i:03}/b.ts")));
+        affected.sort();
+        let closure = ImpactClosureFacts::new(&affected, Vec::new());
+        assert!(
+            closure.affected_not_shown.len() < closure.affected_count,
+            "the fixture must exercise the sample cap"
+        );
+        assert!(
+            closure.affected_by_dir.len() < 40,
+            "the fixture must exercise the rollup cap too"
+        );
+        let lines = affected_lines(&closure);
+        assert!(
+            lines[0].contains("80 files affected") && lines[0].contains("across 40 directories"),
+            "both totals survive capping, and neither stands in for the other: {lines:?}"
+        );
+        assert!(
+            lines[2].contains("and 39 more directories"),
+            "the remainder counts every directory, not just the kept rollup rows: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_json_route_is_only_promised_when_the_json_holds_the_breakdown() {
+        let complete: Vec<String> = (0..3).map(|i| format!("src/z{i}/file.ts")).collect();
+        let lines = affected_lines(&ImpactClosureFacts::new(&complete, Vec::new()));
+        assert!(
+            lines[2].ends_with("(--format json for full list)"),
+            "an uncapped rollup really is the full list: {lines:?}"
+        );
+
+        let mut capped: Vec<String> = (0..40).map(|i| format!("src/z{i:03}/file.ts")).collect();
+        capped.sort();
+        let closure = ImpactClosureFacts::new(&capped, Vec::new());
+        assert!(closure.affected_by_dir_omitted > 0, "fixture must cap");
+        let lines = affected_lines(&closure);
+        assert!(
+            lines[2].ends_with("(24 of them in --format json)"),
+            "past the rollup cap the JSON has no full list either, so do not promise one: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_repository_root_is_never_a_blank_token() {
+        let closure = spread_closure(&["setup.ts", "playground.ts", "src/app.ts"]);
+        let lines = affected_lines(&closure);
+        assert!(
+            lines[1].contains("heaviest <root> (2 files)"),
+            "a root-level directory must render as `<root>`, not as nothing: {lines:?}"
+        );
+        assert!(
+            lines[2].contains("and 1 more directory ("),
+            "a single remaining directory is not plural: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn impact_closure_lines_fit_eighty_columns() {
+        let deep = "packages/platform/features/checkout/pricing/discounts/rules/seasonal";
+        let mut affected: Vec<String> = (0..40).map(|i| format!("{deep}/rule{i:03}.ts")).collect();
+        affected.extend((0..999).map(|i| format!("src/z{i:04}/file.ts")));
+        affected.sort();
+        for line in affected_lines(&ImpactClosureFacts::new(&affected, Vec::new())) {
+            assert!(
+                line.chars().count() <= 80,
+                "brief lines hold under 80 columns: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_directory_reach_says_only_the_count() {
+        let lines = affected_lines(&spread_closure(&["src/a.ts", "src/b.ts"]));
+        assert_eq!(
+            lines,
+            vec!["  impact closure: 2 files affected beyond the diff".to_string()],
+            "naming the one directory would repeat what the count said"
+        );
+    }
+
+    fn gap(consumer: &str, changed: &str, symbols: &[&str]) -> CoordinationGapFact {
+        CoordinationGapFact {
+            changed_file: changed.to_string(),
+            consumer_file: consumer.to_string(),
+            consumed_symbols: symbols.iter().map(|s| (*s).to_string()).collect(),
+            note: COORDINATION_GAP_NOTE.to_string(),
+        }
+    }
+
+    #[test]
+    fn search_gap_lines_name_the_hidden_consumers_and_fit_eighty_columns() {
+        use fallow_types::trace::{SearchGapReason, SearchVisibility};
+
+        assert!(search_gap_lines(None).is_empty());
+        let consumer =
+            |file: &str, visibility, search_as: &str| fallow_output::SearchGapConsumerFact {
+                consumer_file: file.to_string(),
+                line: Some(3),
+                search_visibility: visibility,
+                reason: Some(SearchGapReason::ReExportAlias),
+                search_as: Some(search_as.to_string()),
+            };
+        let long_dir = "packages/very-long-workspace-name/src/features/deeply/nested";
+        let facts = fallow_output::SearchGapFacts {
+            total: 5,
+            exports: vec![fallow_output::ExportSearchGapFact {
+                file: format!("{long_dir}/lib.ts"),
+                export_name: "formatDateForTheCurrentLocaleAndTimezone".to_string(),
+                line: 12,
+                total: 5,
+                consumers: vec![
+                    consumer(&format!("{long_dir}/a.ts"), SearchVisibility::Missed, "fd"),
+                    consumer("src/b.ts", SearchVisibility::Renamed, "fmt"),
+                    consumer("src/c.ts", SearchVisibility::Missed, "lib"),
+                    consumer("src/d.ts", SearchVisibility::Missed, "lib2"),
+                ],
             }],
         };
-        let facts = derive_graph_facts(&results, Some(&closure));
+        let lines = search_gap_lines(Some(&facts));
         assert_eq!(
-            facts.reachable_from,
-            vec!["src/app.ts".to_string(), "src/mid.ts".to_string()]
+            lines[0],
+            "  search gap: 5 consumer uses of changed exports hide from a name search"
         );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("renamed src/b.ts, search fmt"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("src/d.ts")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("         (--format json for the full list)")
+        );
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 80,
+                "line overruns 80 columns: {line}"
+            );
+        }
+    }
+
+    fn reach_row(
+        file: &str,
+        name: &str,
+        reach: fallow_output::TestReachClass,
+    ) -> fallow_output::ExportTestReachFact {
+        let mocked = reach == fallow_output::TestReachClass::MockedOnly;
+        fallow_output::ExportTestReachFact {
+            file: file.to_string(),
+            export_name: name.to_string(),
+            line: 120,
+            reach,
+            change: fallow_output::ExportChange::Modified,
+            tests: None,
+            tests_total: None,
+            test_changed: None,
+            mocked_targets: mocked.then(|| vec![file.to_string(), "src/other.ts".to_string()]),
+        }
+    }
+
+    fn reach_facts(
+        counts: fallow_output::TestReachCounts,
+        exports: Vec<fallow_output::ExportTestReachFact>,
+    ) -> fallow_output::TestReachFacts {
+        fallow_output::TestReachFacts {
+            status: fallow_output::TestReachStatus::Measured,
+            masking: fallow_output::TestReachMasking::Active,
+            total: counts.direct
+                + counts.transitive
+                + counts.mocked_only
+                + counts.none
+                + counts.none_file
+                + counts.framework,
+            counts,
+            exports,
+            exports_omitted: 0,
+            e2e_runner: false,
+        }
+    }
+
+    #[test]
+    fn test_reach_lines_fit_eighty_columns_and_cap_the_rows() {
+        use fallow_output::TestReachClass;
+
+        assert!(test_reach_lines(None).is_empty());
+        let long_dir = "packages/very-long-workspace-name/src/features/deeply/nested";
+        let counts = fallow_output::TestReachCounts {
+            direct: 1200,
+            transitive: 3400,
+            mocked_only: 5600,
+            none: 7800,
+            none_file: 1000,
+            framework: 9000,
+        };
+        let mut facts = reach_facts(
+            counts,
+            vec![
+                reach_row(
+                    &format!("{long_dir}/queue.ts"),
+                    "enqueueTheJobWithAVeryLongNameIndeed",
+                    TestReachClass::MockedOnly,
+                ),
+                reach_row(&format!("{long_dir}/lib.ts"), "none", TestReachClass::None),
+                reach_row(&format!("{long_dir}/ui.ts"), "ui", TestReachClass::NoneFile),
+                reach_row("src/t.ts", "transitive", TestReachClass::Transitive),
+            ],
+        );
+        facts.e2e_runner = true;
+        let lines = test_reach_lines(Some(&facts));
+
+        assert!(lines[0].starts_with("  test reach: 28000 changed exports: 1200 direct,"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("tests mock .../") && line.ends_with(" +1"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    .contains("file not reached by tests; e2e tests do not import files"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("src/t.ts")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("    (--format json for the full list)")
+        );
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 80,
+                "line overruns 80 columns: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reach_lines_align_the_reason_column() {
+        use fallow_output::TestReachClass;
+
+        let facts = reach_facts(
+            fallow_output::TestReachCounts {
+                mocked_only: 1,
+                none_file: 1,
+                ..fallow_output::TestReachCounts::default()
+            },
+            vec![
+                reach_row("src/queue.ts", "enqueue", TestReachClass::MockedOnly),
+                reach_row("src/ui.ts", "renderPanel", TestReachClass::NoneFile),
+            ],
+        );
+
+        assert_eq!(
+            test_reach_lines(Some(&facts)),
+            [
+                "  test reach: 2 changed exports: 1 mocked only, 1 no test",
+                "    mocked only  src/queue.ts:120     enqueue      tests mock src/queue.ts +1",
+                "    no test      src/ui.ts:120        renderPanel  file not reached by tests",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reach_lines_render_the_short_states() {
+        let direct_only = reach_facts(
+            fallow_output::TestReachCounts {
+                direct: 2,
+                framework: 1,
+                ..fallow_output::TestReachCounts::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            test_reach_lines(Some(&direct_only)),
+            ["  test reach: 3 changed exports: 2 direct, 1 framework"]
+        );
+
+        let mut capped = reach_facts(
+            fallow_output::TestReachCounts {
+                transitive: 1,
+                ..fallow_output::TestReachCounts::default()
+            },
+            vec![reach_row(
+                "src/a.ts",
+                "a",
+                fallow_output::TestReachClass::Transitive,
+            )],
+        );
+        capped.masking = fallow_output::TestReachMasking::Capped;
+        assert_eq!(
+            test_reach_lines(Some(&capped)),
+            [
+                "  test reach: 1 changed export: 1 transitive",
+                "    mock detection is off: too many distinct mock sets",
+                "    transitive   src/a.ts:120         a",
+            ]
+        );
+
+        let mut no_tests = reach_facts(
+            fallow_output::TestReachCounts {
+                none_file: 7,
+                ..fallow_output::TestReachCounts::default()
+            },
+            Vec::new(),
+        );
+        no_tests.status = fallow_output::TestReachStatus::NoTests;
+        assert_eq!(
+            test_reach_lines(Some(&no_tests)),
+            ["  test reach: no test files in this project; 7 changed exports have no test"]
+        );
+    }
+
+    #[test]
+    fn coordination_gap_lines_fit_eighty_columns() {
+        // The widest line in the section is the consumer path, so the fixture
+        // has to overrun its budget or the assertion proves nothing.
+        let symbols: Vec<String> = (0..26)
+            .map(|i| format!("safeParseAsyncVariant{i:02}"))
+            .collect();
+        let symbol_refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
+        let gaps: Vec<CoordinationGapFact> = (0..1234)
+            .map(|i| {
+                gap(
+                    &format!(
+                        "packages/platform/features/checkout/pricing/discounts/seasonal/regional/tiers/consumer{i:04}.ts"
+                    ),
+                    "packages/platform/features/checkout/pricing/discounts/parse.ts",
+                    &symbol_refs,
+                )
+            })
+            .collect();
+        let lines = coordination_gap_lines(&gaps);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(".../") && line.chars().count() == 80),
+            "the fixture must drive the consumer line to the 80-column ceiling: {lines:?}"
+        );
+        assert_eq!(
+            lines[0].chars().count(),
+            80,
+            "a four-digit count drives the header to the ceiling too: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("1234 consumers") && lines.last().is_some_and(|l| l.contains("1231")),
+            "four-digit counts must render on both the header and the remainder: {lines:?}"
+        );
+        for line in lines {
+            assert!(
+                line.chars().count() <= 80,
+                "brief lines hold under 80 columns: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn one_consumer_of_two_changed_files_is_counted_and_printed_once() {
+        // `collect_coordination_gaps` emits one fact per (changed file, consumer)
+        // pair, so this is ONE consumer arriving as two gaps. The header counts
+        // consumers, so it must say one, and the path must not repeat.
+        let forward = coordination_gap_lines(&[
+            gap("src/app.ts", "src/z-core.ts", &["parse"]),
+            gap("src/app.ts", "src/a-core.ts", &["render"]),
+        ]);
+        assert_eq!(
+            forward,
+            vec![
+                "  coordination gap: 1 consumer outside the diff uses exports of changed files"
+                    .to_string(),
+                "         src/app.ts".to_string(),
+                "           consumes render from src/a-core.ts".to_string(),
+                "           consumes parse from src/z-core.ts".to_string(),
+            ],
+            "the header counts consumers and the rows below it agree"
+        );
+        let reversed = coordination_gap_lines(&[
+            gap("src/app.ts", "src/a-core.ts", &["render"]),
+            gap("src/app.ts", "src/z-core.ts", &["parse"]),
+        ]);
+        assert_eq!(
+            forward, reversed,
+            "the order must not depend on the order the gaps arrived in"
+        );
+    }
+
+    #[test]
+    fn a_consumer_spanning_more_changed_files_than_fit_says_how_many_are_left() {
+        // The consumer path is the widest line this block renders, so a deep one
+        // is what gives the width loop below something that can actually fail.
+        let consumer = "packages/platform/features/checkout/pricing/discounts/\
+                        seasonal/regional/tiers/consumer0001.ts";
+        let sources: Vec<CoordinationGapFact> = (0..5)
+            .map(|i| gap(consumer, &format!("src/core{i}.ts"), &["parse"]))
+            .collect();
+        let lines = coordination_gap_lines(&sources);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(" consumes ")).count(),
+            2,
+            "one consumer cannot take the section over: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("         (--format json for every changed file)"),
+            "the collapsed sources get a route that holds: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "           and 3 more changed files"),
+            "the collapsed sources are counted, not dropped: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.chars().count() == 80),
+            "the fixture must drive the consumer line to the ceiling: {lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 80,
+                "brief lines hold under 80 columns: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn the_widest_changed_files_are_the_ones_spelled_out_under_a_consumer() {
+        // The same principle one level down from `the_widest_consumers_...`: an
+        // alphabetical prefix spells out two one-symbol imports and collapses the
+        // eight-symbol contract, which is the thing that needs coordinating.
+        let gaps = vec![
+            gap("src/consumer.ts", "src/a-logger.ts", &["log"]),
+            gap("src/consumer.ts", "src/b-const.ts", &["VERSION"]),
+            gap(
+                "src/consumer.ts",
+                "src/z-contract.ts",
+                &[
+                    "createOrder",
+                    "cancelOrder",
+                    "priceCart",
+                    "applyTax",
+                    "quoteShipping",
+                    "capturePayment",
+                    "refund",
+                    "voidAuth",
+                ],
+            ),
+        ];
+        let lines = coordination_gap_lines(&gaps);
+        assert!(
+            lines[2].ends_with(" from src/z-contract.ts"),
+            "the changed file the consumer takes the most from leads: {lines:?}"
+        );
+        assert_eq!(
+            lines[3], "           consumes log from src/a-logger.ts",
+            "two one-symbol files tie, and the tie breaks on path: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("b-const")),
+            "the file that loses the tie is the one that collapses: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "           and 1 more changed file"),
+            "the collapsed file is counted, not dropped: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_widest_consumers_are_the_ones_spelled_out() {
+        // The JSON gap list is path-sorted with no ranking, so an alphabetical
+        // prefix would collapse the barrel consumer behind the remainder.
+        let mut gaps: Vec<CoordinationGapFact> = (0..5)
+            .map(|i| gap(&format!("src/a{i}.ts"), "src/core.ts", &["parse"]))
+            .collect();
+        gaps.push(gap(
+            "src/zz-barrel.ts",
+            "src/core.ts",
+            &["parse", "decode", "encode"],
+        ));
+        let lines = coordination_gap_lines(&gaps);
+        assert!(
+            lines[1].contains("src/zz-barrel.ts"),
+            "the consumer taking the most symbols leads: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn coordination_gaps_beyond_the_cap_are_counted_not_dropped_silently() {
+        let gaps: Vec<CoordinationGapFact> = (0..7)
+            .map(|i| gap(&format!("src/c{i}.ts"), "src/core.ts", &["parse"]))
+            .collect();
+        let lines = coordination_gap_lines(&gaps);
+        assert!(
+            lines[0].starts_with(
+                "  coordination gap: 7 consumers outside the diff use exports of changed files"
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            8,
+            "a header, two lines per shown consumer, then the remainder: {lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .expect("a remainder line")
+                .contains("and 4 more consumers (--format json for full list)"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_coordination_gap_reads_as_singular_and_needs_no_remainder() {
+        let lines = coordination_gap_lines(&[gap("src/app.ts", "src/core.ts", &["parse"])]);
+        assert_eq!(
+            lines,
+            vec![
+                "  coordination gap: 1 consumer outside the diff uses exports of changed files"
+                    .to_string(),
+                "         src/app.ts".to_string(),
+                "           consumes parse from src/core.ts".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_over_budget_first_symbol_does_not_swallow_the_more_suffix() {
+        let long = "aVeryLongExportedSymbolNameIndeed";
+        let (text, omitted) = summarize_symbols(&[long.to_string(), "parse".to_string()], 24);
+        assert_eq!(omitted, 1);
+        assert!(text.ends_with(" +1 more"), "{text:?}");
+        assert!(
+            text.chars().count() <= 24,
+            "{} chars in {text:?}",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_elided_symbol_list_still_gets_a_route_without_a_remainder_line() {
+        let symbols: Vec<String> = (0..30).map(|i| format!("symbolNumber{i:02}")).collect();
+        let symbol_refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
+        let lines = coordination_gap_lines(&[gap("src/app.ts", "src/core.ts", &symbol_refs)]);
+        assert!(
+            lines[2].contains('+'),
+            "the fixture must elide symbols: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("         (--format json for every consumed symbol)"),
+            "a `+N more` with no remainder line still needs somewhere to go: {lines:?}"
+        );
+    }
+
+    fn focus_unit(
+        file: &str,
+        reason: &str,
+        label: crate::audit_focus::FocusLabel,
+    ) -> crate::audit_focus::FocusUnit {
+        use crate::audit_focus::{ConfidenceFlag, FocusScore, FocusUnit};
+        FocusUnit {
+            file: file.to_string(),
+            score: FocusScore {
+                fan_io: 1,
+                security_taint: 0,
+                risk_zone: 0,
+                change_shape: 0,
+                runtime: 0,
+                total: 1,
+            },
+            label,
+            reason: reason.to_string(),
+            confidence: vec![ConfidenceFlag::ReExportIndirection],
+        }
+    }
+
+    /// The widest real inputs: a deep monorepo path and an unbounded reason.
+    fn wide_focus() -> crate::audit_focus::FocusMap {
+        let deep = "packages/platform/features/checkout/pricing/discounts/seasonal/regional/tiers/rules.ts";
+        let reason = "fan-in (312 importers), fan-out 47, changes a contract consumed \
+             outside the diff, sits in a risk zone, and carries a security-tainted \
+             argument reachable from an untrusted source";
+        use crate::audit_focus::FocusLabel;
+        crate::audit_focus::FocusMap {
+            review_here: vec![focus_unit(deep, reason, FocusLabel::ReviewHere)],
+            // `[not-prioritized]` is the widest label, so it renders the widest
+            // row; labelling this `ReviewHere` would leave that row untested.
+            deprioritized: vec![focus_unit(deep, reason, FocusLabel::NotPrioritized)],
+        }
+    }
+
+    #[test]
+    fn focus_lines_fit_eighty_columns() {
+        for show_deprioritized in [false, true] {
+            let lines = focus_lines(&wide_focus(), show_deprioritized);
+            assert!(
+                lines.iter().any(|line| line.contains(".../")),
+                "the fixture must exercise path elision: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("        ") && !l.contains("confidence"))
+                    .count()
+                    >= 1,
+                "the fixture must wrap a reason onto a continuation line, and the \
+                 `confidence` row must not stand in for one: {lines:?}"
+            );
+            if show_deprioritized {
+                // `[not-prioritized]` is four columns wider than `[review-here]`,
+                // so only the expanded branch renders the widest row this section
+                // can produce. Pinning it means raising the path budget fails here.
+                let widest = lines
+                    .iter()
+                    .find(|l| l.starts_with("    [not-prioritized] "))
+                    .expect("the expanded branch renders the de-prioritized unit");
+                assert_eq!(
+                    widest.chars().count(),
+                    78,
+                    "the widest focus row sits at its budget: {widest:?}"
+                );
+            }
+            for line in lines {
+                assert!(
+                    line.chars().count() <= 80,
+                    "brief lines hold under 80 columns: {} chars in {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_focus_reason_keeps_every_word() {
+        let reason =
+            "fan-in (2 importers), fan-out 4, changes a contract consumed outside the diff";
+        let lines = focus_lines(
+            &crate::audit_focus::FocusMap {
+                review_here: vec![focus_unit(
+                    "src/a.ts",
+                    reason,
+                    crate::audit_focus::FocusLabel::ReviewHere,
+                )],
+                deprioritized: Vec::new(),
+            },
+            false,
+        );
+        let rejoined: String = lines
+            .iter()
+            .filter(|l| l.starts_with("      ") && !l.contains("confidence"))
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            rejoined, reason,
+            "wrapping re-flows the reason, it never drops a word"
+        );
+    }
+
+    fn decision(
+        question: &str,
+        tradeoff: &str,
+        experts: &[&str],
+    ) -> crate::audit_decision_surface::Decision {
+        use crate::audit_decision_surface::{Decision, DecisionCategory};
+        Decision {
+            signal_id: "sig".to_string(),
+            category: DecisionCategory::PublicApiContract,
+            question: question.to_string(),
+            anchor_file: "src/core.ts".to_string(),
+            anchor_line: 1,
+            signal_key: "key".to_string(),
+            previous_signal_id: None,
+            blast: 1,
+            consequence: 1,
+            expert: experts.iter().map(|e| (*e).to_string()).collect(),
+            bus_factor_one: true,
+            internal_consumer_count: 1,
+            tradeoff: tradeoff.to_string(),
+        }
+    }
+
+    #[test]
+    fn decision_surface_lines_fit_eighty_columns() {
+        // The real shape that overran: a question naming every widened export.
+        let exports = (0..26)
+            .map(|i| format!("safeParseAsyncVariant{i:02}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let question = format!(
+            "`packages/platform/features/checkout/pricing/parse.ts` changes exports \
+             ({exports}) imported by 312 files outside this PR. Does this change break \
+             or alter what those callers expect?"
+        );
+        let surface = crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision(
+                &question,
+                "312 modules outside the diff consume this contract; changing its shape \
+                 requires coordinating them.",
+                &[
+                    "a-very-long-github-handle",
+                    "another-long-handle",
+                    "third-handle",
+                ],
+            )],
+            truncated: Some(crate::audit_decision_surface::TruncationNote {
+                collapsed: 9,
+                reason: "9 more structural decisions collapsed below the cap of 4".to_string(),
+            }),
+            emitted_signal_ids: vec!["sig".to_string()],
+        };
+        let lines = decision_surface_lines(&surface);
+        assert!(
+            lines.iter().filter(|l| l.starts_with("     ")).count() > 3,
+            "the fixture must exercise wrapping: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.chars().count() == 80),
+            "the fixture must drive a line to the ceiling: {lines:?}"
+        );
+        let ask = lines
+            .iter()
+            .find(|l| l.starts_with("     ask: "))
+            .expect("an ask line");
+        assert!(
+            ask.ends_with("(bus-factor 1)") || lines.iter().any(|l| l.ends_with("(bus-factor 1)")),
+            "the bus-factor suffix still lands: {lines:?}"
+        );
+        assert!(
+            !ask.contains("..."),
+            "an owner identity that fits must not be shortened: {ask:?}"
+        );
+        let route_at = lines
+            .iter()
+            .position(|l| l == JSON_NAME_ROUTE)
+            .unwrap_or_else(|| panic!("the collapsed names need a route: {lines:?}"));
+        let note_at = lines
+            .iter()
+            .position(|l| l.starts_with("  ... "))
+            .unwrap_or_else(|| panic!("the collapsed decisions need a note: {lines:?}"));
+        assert!(
+            route_at < note_at,
+            "the name route stays with the questions it routes: under the note it \
+             reads as routing the collapsed DECISIONS, and the JSON carries those \
+             only as ids: {lines:?}"
+        );
+        for line in lines {
+            assert!(
+                line.chars().count() <= 80,
+                "brief lines hold under 80 columns: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    /// The public-API question a real monorepo entry point produces: one changed
+    /// file, two dozen re-exported names, and the ask at the very end.
+    fn zod_shaped_question() -> String {
+        let exports = [
+            "_decode",
+            "_decodeAsync",
+            "_encode",
+            "_encodeAsync",
+            "_parse",
+            "_parseAsync",
+            "_safeDecode",
+            "_safeDecodeAsync",
+            "_safeEncode",
+            "_safeEncodeAsync",
+            "_safeParse",
+            "_safeParseAsync",
+            "decode",
+            "decodeAsync",
+            "encode",
+            "encodeAsync",
+            "parse",
+            "parseAsync",
+            "safeDecode",
+            "safeDecodeAsync",
+            "safeEncode",
+            "safeEncodeAsync",
+            "validate",
+            "validateAsync",
+        ]
+        .join(", ");
+        format!(
+            "`packages/zod/src/v4/core/parse.ts` changes exports ({exports}) imported by 6 \
+             files outside this PR. Does this change break or alter what those callers \
+             expect?"
+        )
+    }
+
+    #[test]
+    fn a_capped_member_list_keeps_the_path_and_the_ask() {
+        let question = zod_shaped_question();
+        let lines = decision_surface_lines(&crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision(&question, "", &[])],
+            truncated: None,
+            emitted_signal_ids: vec!["sig".to_string()],
+        });
+        let rendered = lines.join(" ");
+        assert!(
+            rendered.contains("+21 more"),
+            "the collapsed names are counted, not dropped: {lines:?}"
+        );
+        assert!(
+            !rendered.contains("safeEncodeAsync"),
+            "a name past the cap must not still render: {lines:?}"
+        );
+        assert!(
+            rendered.contains("`packages/zod/src/v4/core/parse.ts`"),
+            "the anchor path appears nowhere else on the brief: {lines:?}"
+        );
+        assert!(
+            rendered.contains("Does this change break or alter what those callers expect?"),
+            "the ask is the judgment the brief poses and survives the cap: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  (--format json for every collapsed name)"),
+            "collapsed names get a route that holds: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_zod_shaped_question_reads_in_three_lines() {
+        let question = zod_shaped_question();
+        // Without the cap this same question wraps past a first screenful, so the
+        // count below measures the cap rather than a short fixture.
+        let head = format!(
+            "  1. [{}] ",
+            crate::audit_decision_surface::DecisionCategory::PublicApiContract.tag()
+        );
+        assert!(
+            wrap_prose(&question, 80 - head.chars().count(), 73, elide_path).len() > 5,
+            "the fixture must be one the cap actually shortens: {question}"
+        );
+        let lines = decision_surface_lines(&crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision(&question, "", &[])],
+            truncated: None,
+            emitted_signal_ids: vec!["sig".to_string()],
+        });
+        // The tail is asserted, not encoded in an index: a new closing line then
+        // fails here instead of silently shifting the slice below.
+        let route_at = lines
+            .iter()
+            .position(|l| l == JSON_NAME_ROUTE)
+            .unwrap_or_else(|| panic!("the collapsed names need a route: {lines:?}"));
+        assert_eq!(
+            &lines[route_at + 1..],
+            [String::new()],
+            "the route closes the section, ahead of its blank line: {lines:?}"
+        );
+        let question_lines = &lines[1..route_at];
+        assert_eq!(
+            question_lines.len(),
+            3,
+            "a widened export list costs three lines, not a screenful: {lines:?}"
+        );
+        assert!(question_lines[0].starts_with(&head), "{lines:?}");
+        // The only test covering the question CONTINUATION budget. The fit-eighty
+        // fixture's word boundaries leave it four columns of slack, so widening
+        // that budget overruns 80 columns here first: this fixture's widest
+        // continuation is 77 of 73, and one word more puts it at 82.
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 80,
+                "brief lines hold under 80 columns: {} chars in {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_group_anchor_still_collapses_its_export_list() {
+        // Next.js and SvelteKit route groups are parenthesized directory segments.
+        // The brief caps the question WITHOUT stripping the anchor path first, so
+        // `(marketing)` is the first parenthetical the cap meets; treating it as
+        // the member list would leave two dozen export names rendering in full.
+        let question = zod_shaped_question().replace(
+            "packages/zod/src/v4/core/parse.ts",
+            "app/(marketing)/lib/api.ts",
+        );
+        let lines = decision_surface_lines(&crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision(&question, "", &[])],
+            truncated: None,
+            emitted_signal_ids: vec!["sig".to_string()],
+        });
+        let rendered = lines.join(" ");
+        assert!(
+            rendered.contains("`app/(marketing)/lib/api.ts`"),
+            "the route group survives verbatim: {lines:?}"
+        );
+        assert!(
+            rendered.contains("+21 more") && !rendered.contains("safeEncodeAsync"),
+            "the export list is the parenthetical that collapses: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == JSON_NAME_ROUTE),
+            "a collapsed list routes to the full one: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_uncapped_question_is_promised_no_route_it_does_not_need() {
+        let lines = decision_surface_lines(&crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision(
+                "`src/core.ts` changes exports (parse, decode) imported by 3 files outside \
+                 this PR. Does this change break or alter what those callers expect?",
+                "",
+                &[],
+            )],
+            truncated: None,
+            emitted_signal_ids: vec!["sig".to_string()],
+        });
+        assert!(
+            !lines.iter().any(|l| l.contains("collapsed name")),
+            "nothing collapsed, so nothing to route to: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_decision_with_no_experts_omits_the_ask_line() {
+        let lines = decision_surface_lines(&crate::audit_decision_surface::DecisionSurface {
+            decisions: vec![decision("Widens the public surface. Intended?", "", &[])],
+            truncated: None,
+            emitted_signal_ids: vec!["sig".to_string()],
+        });
+        assert!(!lines.iter().any(|l| l.contains("ask:")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("trade-off:")), "{lines:?}");
+    }
+
+    #[test]
+    fn an_empty_decision_surface_still_says_so() {
+        let lines =
+            decision_surface_lines(&crate::audit_decision_surface::DecisionSurface::default());
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("Decisions: none (no consequential structural decision in this change)")
+        );
+    }
+
+    #[test]
+    fn an_unscored_focus_map_renders_nothing() {
+        assert!(focus_lines(&crate::audit_focus::FocusMap::default(), false).is_empty());
+        assert!(focus_lines(&crate::audit_focus::FocusMap::default(), true).is_empty());
+    }
+
+    #[test]
+    fn a_word_wider_than_its_line_is_shortened_not_overflowed() {
+        let deep =
+            "packages/platform/features/checkout/pricing/discounts/seasonal/regional/rules.ts";
+        let lines = wrap_prose(&format!("touches {deep} directly"), 40, 40, elide_path);
+        for line in &lines {
+            assert!(line.chars().count() <= 40, "{line:?}");
+        }
+        assert!(
+            lines.iter().any(|l| l.contains(".../")),
+            "a path keeps its tail: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_owner_identity_is_shortened_from_the_head_not_the_tail() {
+        // The routing line exists to name who to ask, and an email or team name
+        // is identified by what it starts with, not by its domain.
+        let owner = "very.long.firstname.lastname@engineering.example.com";
+        let lines = wrap_prose(owner, 30, 30, elide_symbol);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("very.long.first") && lines[0].ends_with("..."),
+            "{lines:?}"
+        );
+    }
+
+    fn ownership_fixture(
+        groups: usize,
+        slices: Vec<fallow_output::OwnershipSliceFact>,
+    ) -> fallow_output::OwnershipFacts {
+        let kept = groups.min(fallow_output::OWNER_GROUP_CAP);
+        fallow_output::OwnershipFacts {
+            group_count: groups,
+            transitive_only_count: 12,
+            unowned_direct_count: 123,
+            groups: (0..kept)
+                .map(|i| fallow_output::OwnerGroupFact {
+                    owner: format!("@a-very-long-organization-name/team-{i:02}"),
+                    direct_count: 100 + i,
+                    affected_count: 10_000 + i,
+                })
+                .collect(),
+            groups_omitted: groups - kept,
+            slices,
+        }
+    }
+
+    fn slice(dirs: &[&str], owners: &[&str]) -> fallow_output::OwnershipSliceFact {
+        fallow_output::OwnershipSliceFact {
+            module_dirs: dirs.iter().map(|d| (*d).to_string()).collect(),
+            owners: owners.iter().map(|o| (*o).to_string()).collect(),
+            separable: owners.len() == 1,
+        }
+    }
+
+    #[test]
+    fn ownership_lines_fit_eighty_columns() {
+        let slices = (0..12)
+            .map(|i| {
+                slice(
+                    &[
+                        "packages/some-deeply-nested/module-directory",
+                        "packages/other",
+                    ],
+                    &[if i % 2 == 0 {
+                        "@a-very-long-organization-name/design-system-team"
+                    } else {
+                        "@x"
+                    }],
+                )
+            })
+            .collect();
+        let lines = ownership_lines(Some(&ownership_fixture(40, slices)));
+        assert!(lines.len() > 10, "{lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= 80,
+                "{} columns: {line}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_lines_count_the_groups_beyond_the_cap() {
+        let lines = ownership_lines(Some(&ownership_fixture(
+            fallow_output::OWNER_GROUP_CAP + 3,
+            Vec::new(),
+        )));
+        assert_eq!(lines.last().map(String::as_str), Some("    +3 more groups"));
+        assert_eq!(lines.len(), 1 + fallow_output::OWNER_GROUP_CAP + 1);
+    }
+
+    #[test]
+    fn ownership_lines_name_only_the_slices_with_one_owner() {
+        let lines = ownership_lines(Some(&ownership_fixture(
+            2,
+            vec![
+                slice(&["src/app", "src/core"], &["@team/app", "@team/core"]),
+                slice(&["src/tools"], &["@team/tools"]),
+            ],
+        )));
+        assert!(!lines.iter().any(|l| l.contains("slice 1 ")), "{lines:?}");
+        assert!(
+            lines.contains(&"  slice 2 (src/tools) has one owner: @team/tools".to_string()),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn ownership_slice_lines_keep_the_distinct_tail_of_long_directories() {
+        let lines = ownership_lines(Some(&ownership_fixture(
+            2,
+            vec![
+                slice(
+                    &["packages/hoppscotch-selfhost-web/src/api/queries"],
+                    &["@a"],
+                ),
+                slice(
+                    &[
+                        "packages/hoppscotch-selfhost-web/src/platform/infra",
+                        "packages/other",
+                    ],
+                    &[crate::codeowners::UNOWNED_LABEL],
+                ),
+            ],
+        )));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  slice 1 (") && l.contains("api/queries)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("platform/infra +1 more) is unowned")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_slice_label_removes_whole_leading_segments() {
+        assert_eq!(
+            elide_leading_segments("packages/hoppscotch-backend/src/infra-config", 27),
+            ".../src/infra-config"
+        );
+        assert_eq!(elide_leading_segments("src/short", 27), "src/short");
+        let label = elide_leading_segments("a/an-extremely-long-single-folder-name-here", 20);
+        assert_eq!(label.chars().count(), 20, "{label}");
+    }
+
+    #[test]
+    fn ownership_lines_are_silent_without_codeowners_or_slices() {
+        assert!(ownership_lines(None).is_empty());
+        let lines = ownership_lines(Some(&ownership_fixture(1, Vec::new())));
+        assert!(!lines.iter().any(|l| l.contains("slice")), "{lines:?}");
+    }
+
+    #[test]
+    fn no_gaps_prints_nothing() {
+        assert!(coordination_gap_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_symbol_list_that_fits_is_printed_whole() {
+        assert_eq!(
+            summarize_symbols(&["a".into(), "b".into()], 24),
+            ("a, b".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn a_single_symbol_wider_than_the_budget_is_elided_not_dropped() {
+        let (one, omitted) = summarize_symbols(&["aRidiculouslyLongExportedSymbolName".into()], 24);
+        assert_eq!(omitted, 0);
+        assert_eq!(one.chars().count(), 24, "{one:?}");
+        assert!(
+            one.starts_with("aRidiculously") && one.ends_with("..."),
+            "{one:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_closure_prints_nothing() {
+        assert!(affected_lines(&ImpactClosureFacts::new(&[], Vec::new())).is_empty());
+        assert!(affected_lines(&ImpactClosureFacts::default()).is_empty());
     }
 
     #[test]
@@ -1351,5 +3679,97 @@ mod tests {
         };
         assert!(gap.note.contains("attention pointer"));
         assert!(gap.note.contains("not a correctness proof"));
+    }
+
+    fn branching_fixture(
+        previous: (u32, u32, u16),
+        current: (u32, u32, u16),
+    ) -> fallow_output::BranchingReport {
+        let unit = |(branch_points, functions, peak): (u32, u32, u16)| {
+            std::iter::once((
+                "src/checkout/pricing.ts".to_string(),
+                fallow_types::extract::FileBranching {
+                    branch_points,
+                    functions,
+                    peak_cyclomatic: peak,
+                    cognitive: branch_points,
+                    cognitive_nesting_weight: 0,
+                    has_module_unit: false,
+                    has_synthetic_units: false,
+                },
+            ))
+            .collect::<fallow_output::BranchingSnapshot>()
+        };
+        fallow_output::BranchingReport::compare(
+            &unit(previous),
+            &unit(current),
+            fallow_output::DEFAULT_BRANCHING_TOLERANCE,
+            &|_| false,
+        )
+    }
+
+    #[test]
+    fn branching_lines_are_silent_without_a_split() {
+        assert!(branching_human_lines(None).is_none());
+        let flat = branching_fixture((12, 3, 5), (12, 3, 5));
+        assert!(
+            branching_human_lines(Some(&flat)).is_none(),
+            "set totals alone are context, matching every sibling section"
+        );
+    }
+
+    #[test]
+    fn branching_lines_name_the_file_that_split() {
+        let report = branching_fixture((39, 1, 40), (39, 8, 6));
+        let lines = branching_human_lines(Some(&report)).expect("a split renders");
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("branching about level, more functions, smaller peak"));
+        assert!(
+            lines[1].ends_with("src/checkout/pricing.ts"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("39 to 39 branch points, 1 to 8 functions, peak 40 to 6"),
+            "{}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn branching_lines_fit_eighty_columns() {
+        // A long path with four-digit counts, which is the widest realistic
+        // shape.
+        let long = "src/features/checkout/pricing/discounts/calculate-line-totals.ts";
+        let unit = |branch_points: u32, functions: u32, peak: u16| {
+            std::iter::once((
+                long.to_string(),
+                fallow_types::extract::FileBranching {
+                    branch_points,
+                    functions,
+                    peak_cyclomatic: peak,
+                    cognitive: branch_points,
+                    cognitive_nesting_weight: 0,
+                    has_module_unit: false,
+                    has_synthetic_units: false,
+                },
+            ))
+            .collect::<fallow_output::BranchingSnapshot>()
+        };
+        let report = fallow_output::BranchingReport::compare(
+            &unit(9999, 1000, 9999),
+            &unit(9999, 4000, 12),
+            fallow_output::DEFAULT_BRANCHING_TOLERANCE,
+            &|_| false,
+        );
+
+        for line in branching_human_lines(Some(&report)).expect("a split renders") {
+            assert!(
+                line.chars().count() <= 80,
+                "{} columns: {line}",
+                line.chars().count()
+            );
+        }
     }
 }

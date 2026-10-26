@@ -3,7 +3,9 @@ use oxc_ast::ast::{
 };
 
 use crate::{
-    DynamicImportInfo, SemanticFact, VitestModuleMockAction, VitestModuleMockOperationFact,
+    DynamicImportInfo, ImportedName, PlaywrightConditionalFixtureDefinitionFact,
+    PlaywrightFixtureAliasFact, PlaywrightFixtureTypeFact, SemanticFact, VitestModuleMockAction,
+    VitestModuleMockOperationFact,
 };
 
 use super::super::{
@@ -13,12 +15,40 @@ use super::super::{
 use super::visit_helpers::{
     collect_fixture_type_bindings_from_members, collect_fixture_type_bindings_from_type,
     mock_method_object_span, mock_object_is_literal_global, mock_replacement_candidate,
-    mock_static_target_source, playwright_extend_base_name, root_manual_mock_source,
+    mock_static_target_source, playwright_extend_chain, root_manual_mock_source,
     vi_mock_has_factory, vitest_auto_mock_source,
 };
 use crate::parse::MockApiReferenceSpans;
 
+/// The import sources of the Playwright test runner. The `playwright` package
+/// exports the same runner at `playwright/test` that `@playwright/test`
+/// re-exports.
+const PLAYWRIGHT_TEST_SOURCES: [&str; 2] = ["@playwright/test", "playwright/test"];
+
+/// What the innermost call of an `.extend(...)` chain extends.
+enum PlaywrightExtendRoot {
+    /// An identifier, for example `base` in `base.extend({})`.
+    Name(String),
+    /// The base test names of an imported `mergeTests(...)` call.
+    Merge(Vec<String>),
+}
+
+/// An `.extend(...)` chain such as `base.extend<A>({}).extend<B>({})`.
+struct PlaywrightExtendChain<'b, 'a> {
+    /// The `.extend(...)` calls, outermost first.
+    calls: Vec<&'b CallExpression<'a>>,
+    root: PlaywrightExtendRoot,
+}
+
 impl ModuleInfoExtractor {
+    /// True when `local_name` is the named import `imported_name` from a
+    /// Playwright test runner source.
+    fn is_playwright_test_import(&self, local_name: &str, imported_name: &str) -> bool {
+        PLAYWRIGHT_TEST_SOURCES
+            .iter()
+            .any(|source| self.is_named_import_from(local_name, source, imported_name))
+    }
+
     fn collect_playwright_fixture_type_bindings(&self, ty: &TSType<'_>) -> Vec<(String, String)> {
         let mut bindings = Vec::new();
         collect_fixture_type_bindings_from_type(
@@ -75,12 +105,113 @@ impl ModuleInfoExtractor {
         self.playwright_fixture_types
             .insert(type_name.to_string(), bindings.clone());
         for (fixture_name, fixture_type) in bindings {
-            self.record_playwright_fixture_type_fact(
-                type_name.to_string(),
-                fixture_name.clone(),
-                fixture_type,
-            );
+            self.semantic_facts
+                .push(SemanticFact::PlaywrightFixtureType(
+                    PlaywrightFixtureTypeFact {
+                        alias_name: type_name.to_string(),
+                        fixture_name,
+                        type_name: fixture_type,
+                    },
+                ));
         }
+    }
+
+    /// True when `name` holds a Playwright test: the Playwright runner `test`
+    /// import or a local const recorded in `playwright_local_tests`.
+    pub(crate) fn is_playwright_test_name(&self, name: &str) -> bool {
+        self.is_playwright_test_import(name, "test") || self.playwright_local_tests.contains(name)
+    }
+
+    /// True when only analysis can prove that `name` holds a Playwright test:
+    /// a named or default import, which another file can define, or a local
+    /// const that extends such a name.
+    pub(crate) fn is_conditional_playwright_base(&self, name: &str) -> bool {
+        self.playwright_conditional_tests.contains(name)
+            || self.imports.iter().any(|import| {
+                import.local_name == name
+                    && matches!(
+                        import.imported_name,
+                        ImportedName::Named(_) | ImportedName::Default
+                    )
+            })
+    }
+
+    /// Record a fixture definition that analysis applies only when the
+    /// imported `base_name` resolves to a Playwright test.
+    pub(crate) fn record_playwright_conditional_fixture_definition_fact(
+        &mut self,
+        test_name: String,
+        base_name: String,
+        fixture_name: String,
+        type_name: String,
+    ) {
+        self.semantic_facts
+            .push(SemanticFact::PlaywrightConditionalFixtureDefinition(
+                Box::new(PlaywrightConditionalFixtureDefinitionFact {
+                    test_name,
+                    base_name,
+                    fixture_name,
+                    type_name,
+                }),
+            ));
+    }
+
+    /// The base test names of a call to the imported `mergeTests`, or `None`
+    /// when the call is not one. The import gate (it also accepts
+    /// `mergeTests as merge`) keeps a user-local `mergeTests` function inert.
+    fn playwright_merge_call_base_names(&self, call: &CallExpression<'_>) -> Option<Vec<String>> {
+        let Expression::Identifier(callee) = &call.callee else {
+            return None;
+        };
+        if !self.is_playwright_test_import(callee.name.as_str(), "mergeTests") {
+            return None;
+        }
+        let mut base_names: Vec<String> = call
+            .arguments
+            .iter()
+            .filter_map(playwright_merge_argument_base_name)
+            .collect();
+        base_names.sort();
+        base_names.dedup();
+        Some(base_names)
+    }
+
+    /// The `.extend(...)` calls of `call` and the root that they extend, or
+    /// `None` when `call` is not an `.extend(...)` chain on an identifier or on
+    /// an imported `mergeTests(...)` call.
+    fn playwright_extend_chain_of<'b, 'a>(
+        &self,
+        call: &'b CallExpression<'a>,
+    ) -> Option<PlaywrightExtendChain<'b, 'a>> {
+        let (calls, receiver) = playwright_extend_chain(call)?;
+        let root = match receiver {
+            Expression::Identifier(ident) => PlaywrightExtendRoot::Name(ident.name.to_string()),
+            Expression::CallExpression(inner) => {
+                PlaywrightExtendRoot::Merge(self.playwright_merge_call_base_names(inner)?)
+            }
+            _ => return None,
+        };
+        Some(PlaywrightExtendChain { calls, root })
+    }
+
+    /// The fixture bindings that the type arguments of each `.extend<T>(...)`
+    /// call in a chain declare, sorted and without duplicates.
+    fn collect_playwright_extend_type_bindings(
+        &self,
+        calls: &[&CallExpression<'_>],
+    ) -> Vec<(String, String)> {
+        let mut bindings = Vec::new();
+        for call in calls {
+            let Some(type_arguments) = call.type_arguments.as_deref() else {
+                continue;
+            };
+            for type_arg in &type_arguments.params {
+                bindings.extend(self.collect_playwright_fixture_type_bindings(type_arg));
+            }
+        }
+        bindings.sort_unstable();
+        bindings.dedup();
+        bindings
     }
 
     pub(super) fn record_playwright_fixture_definitions(
@@ -88,21 +219,37 @@ impl ModuleInfoExtractor {
         test_name: &str,
         call: &CallExpression<'_>,
     ) {
-        let Some(base_name) = playwright_extend_base_name(call) else {
+        let Some(chain) = self.playwright_extend_chain_of(call) else {
             return;
         };
-        if !self.is_named_import_from(base_name.as_str(), "@playwright/test", "test") {
-            return;
-        }
-        let Some(type_arguments) = call.type_arguments.as_deref() else {
-            return;
+        let receiver_is_test = match &chain.root {
+            PlaywrightExtendRoot::Name(base_name) => self.is_playwright_test_name(base_name),
+            PlaywrightExtendRoot::Merge(_) => true,
         };
-        let mut bindings = Vec::new();
-        for type_arg in &type_arguments.params {
-            bindings.extend(self.collect_playwright_fixture_type_bindings(type_arg));
+        if !receiver_is_test {
+            // `appTest.extend<T>()` on an imported `appTest` defines the
+            // fixtures of `T` only when analysis resolves `appTest` to a
+            // Playwright test. An unrelated imported `extend` stays inert.
+            if let PlaywrightExtendRoot::Name(base_name) = &chain.root
+                && self.is_conditional_playwright_base(base_name)
+            {
+                self.playwright_conditional_tests
+                    .insert(test_name.to_string());
+                for (fixture_name, type_name) in
+                    self.collect_playwright_extend_type_bindings(&chain.calls)
+                {
+                    self.record_playwright_conditional_fixture_definition_fact(
+                        test_name.to_string(),
+                        base_name.clone(),
+                        fixture_name,
+                        type_name,
+                    );
+                }
+            }
+            return;
         }
-        bindings.sort_unstable();
-        bindings.dedup();
+        self.playwright_local_tests.insert(test_name.to_string());
+        let bindings = self.collect_playwright_extend_type_bindings(&chain.calls);
         // Remember this local `const X = base.extend<T>({...})` fixture definition
         // so a helper wrapping `<X>.extend(...)` can inherit the bindings under its
         // own name (issue #1791). Stored whether or not the const is exported.
@@ -120,7 +267,13 @@ impl ModuleInfoExtractor {
     }
 
     fn record_playwright_fixture_alias(&mut self, test_name: &str, base_name: &str) {
-        self.record_playwright_fixture_alias_fact(test_name.to_string(), base_name.to_string());
+        self.semantic_facts
+            .push(SemanticFact::PlaywrightFixtureAlias(
+                PlaywrightFixtureAliasFact {
+                    test_name: test_name.to_string(),
+                    base_name: base_name.to_string(),
+                },
+            ));
     }
 
     pub(super) fn record_playwright_wrapper_aliases(
@@ -128,30 +281,60 @@ impl ModuleInfoExtractor {
         test_name: &str,
         call: &CallExpression<'_>,
     ) {
-        if let Some(base_name) = playwright_extend_base_name(call) {
-            if !self.is_named_import_from(base_name.as_str(), "@playwright/test", "test") {
-                self.record_playwright_fixture_alias(test_name, &base_name);
+        // `mergeTests(a, b)` and the chained `mergeTests(a, b).extend(...)`
+        // (issue #3462) both inherit the fixtures of each merged test.
+        let base_names = match self
+            .playwright_extend_chain_of(call)
+            .map(|chain| chain.root)
+        {
+            Some(PlaywrightExtendRoot::Name(base_name)) => {
+                if !self.is_playwright_test_import(base_name.as_str(), "test") {
+                    self.record_playwright_fixture_alias(test_name, &base_name);
+                }
+                return;
             }
-            return;
-        }
-
-        let Expression::Identifier(callee) = &call.callee else {
-            return;
+            Some(PlaywrightExtendRoot::Merge(base_names)) => base_names,
+            None => match self.playwright_merge_call_base_names(call) {
+                Some(base_names) => base_names,
+                None => return,
+            },
         };
-        if !self.is_named_import_from(callee.name.as_str(), "@playwright/test", "mergeTests") {
-            return;
-        }
-
-        let mut base_names: Vec<String> = call
-            .arguments
-            .iter()
-            .filter_map(playwright_merge_argument_base_name)
-            .collect();
-        base_names.sort();
-        base_names.dedup();
+        self.playwright_local_tests.insert(test_name.to_string());
         for base_name in base_names {
             self.record_playwright_fixture_alias(test_name, &base_name);
         }
+    }
+
+    /// Alias a helper to each test that its returned `mergeTests(...)` call
+    /// merges (issue #1795). The analyze-time alias fact lets each merged
+    /// fixture resolve cross-file through the #1210 expansion. The pending pair
+    /// serves same-file helper inheritance.
+    fn record_playwright_merge_helper_aliases(&mut self, test_name: &str, base_names: Vec<String>) {
+        for base_name in base_names {
+            self.record_playwright_fixture_alias(test_name, &base_name);
+            self.pending_playwright_factory_aliases
+                .push((test_name.to_string(), base_name));
+        }
+    }
+
+    /// Queue the fixture bindings of a helper that returns `<base>.extend<T>(...)`.
+    /// `base_name` is `None` when the root of the chain is a `mergeTests(...)` call.
+    fn push_playwright_factory_type_bindings(
+        &mut self,
+        test_name: &str,
+        base_name: Option<String>,
+        calls: &[&CallExpression<'_>],
+    ) {
+        let type_bindings = self.collect_playwright_extend_type_bindings(calls);
+        if type_bindings.is_empty() {
+            return;
+        }
+        self.pending_playwright_factory_calls
+            .push(PendingPlaywrightFactory {
+                test_name: test_name.to_string(),
+                base_name,
+                type_bindings,
+            });
     }
 
     /// Capture helper-function Playwright fixtures or aliases from returns.
@@ -160,7 +343,12 @@ impl ModuleInfoExtractor {
         test_name: &str,
         call: &CallExpression<'_>,
     ) {
-        if let Some(base_name) = playwright_extend_base_name(call) {
+        let chain = self.playwright_extend_chain_of(call);
+        if let Some(PlaywrightExtendChain {
+            calls,
+            root: PlaywrightExtendRoot::Name(base_name),
+        }) = chain
+        {
             // A helper returning `<base>.extend(...)`. `<base>` is either the
             // `@playwright/test` `test` import (its own fixtures come from the
             // type argument via the PendingPlaywrightFactory below) OR a local
@@ -184,49 +372,23 @@ impl ModuleInfoExtractor {
             // `record_playwright_wrapper_aliases`); the #1210 cross-file
             // expansion then resolves the imported base to its fixture
             // definitions. The raw `test` base no-ops. Issue #1795.
-            if !self.is_named_import_from(base_name.as_str(), "@playwright/test", "test") {
+            if !self.is_playwright_test_import(base_name.as_str(), "test") {
                 self.record_playwright_fixture_alias(test_name, &base_name);
             }
-
-            let Some(type_arguments) = call.type_arguments.as_deref() else {
-                return;
-            };
-            let mut bindings = Vec::new();
-            for type_arg in &type_arguments.params {
-                bindings.extend(self.collect_playwright_fixture_type_bindings(type_arg));
-            }
-            bindings.sort_unstable();
-            bindings.dedup();
-            if bindings.is_empty() {
-                return;
-            }
-            self.pending_playwright_factory_calls
-                .push(PendingPlaywrightFactory {
-                    test_name: test_name.to_string(),
-                    base_name,
-                    type_bindings: bindings,
-                });
-        } else if let Expression::Identifier(callee) = &call.callee
-            && self.is_named_import_from(callee.name.as_str(), "@playwright/test", "mergeTests")
+            self.push_playwright_factory_type_bindings(test_name, Some(base_name), &calls);
+        } else if let Some(PlaywrightExtendChain {
+            calls,
+            root: PlaywrightExtendRoot::Merge(base_names),
+        }) = chain
         {
+            // A helper returning `mergeTests(a, b).extend<T>(...)` (issue #3462)
+            // inherits the merged tests and defines the fixtures of `T`.
+            self.record_playwright_merge_helper_aliases(test_name, base_names);
+            self.push_playwright_factory_type_bindings(test_name, None, &calls);
+        } else if let Some(base_names) = self.playwright_merge_call_base_names(call) {
             // A helper returning `mergeTests(billingTest(), ordersUiTest())`
-            // (issue #1795): emit an analyze-time alias fact per argument base so
-            // each wrapped fixture's definitions are inherited cross-file via the
-            // #1210 expansion, and push the same pairs for same-file helper
-            // inheritance. The import gate (handles `mergeTests as merge`) keeps a
-            // user-local `mergeTests` function inert.
-            let mut base_names: Vec<String> = call
-                .arguments
-                .iter()
-                .filter_map(playwright_merge_argument_base_name)
-                .collect();
-            base_names.sort();
-            base_names.dedup();
-            for base_name in base_names {
-                self.record_playwright_fixture_alias(test_name, &base_name);
-                self.pending_playwright_factory_aliases
-                    .push((test_name.to_string(), base_name));
-            }
+            // (issue #1795).
+            self.record_playwright_merge_helper_aliases(test_name, base_names);
         } else if let Expression::Identifier(ident) = &call.callee {
             self.pending_playwright_factory_aliases
                 .push((test_name.to_string(), ident.name.to_string()));
@@ -322,6 +484,7 @@ impl ModuleInfoExtractor {
             destructured_names: Vec::new(),
             local_name: None,
             is_speculative: false,
+            value_escapes: false,
         });
 
         if has_factory {
@@ -347,6 +510,7 @@ impl ModuleInfoExtractor {
                 destructured_names: Vec::new(),
                 local_name: Some(String::new()),
                 is_speculative: true,
+                value_escapes: false,
             });
         }
     }

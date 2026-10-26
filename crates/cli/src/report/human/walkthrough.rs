@@ -493,11 +493,11 @@ fn focus_subline(guide: &StandardWalkthroughGuide) -> Option<String> {
             plural(facts.boundaries_touched.len())
         ));
     }
-    if !closure.affected_not_shown.is_empty() {
+    if closure.affected_count > 0 {
         parts.push(format!(
             "{} file{} affected beyond the diff",
-            closure.affected_not_shown.len(),
-            plural(closure.affected_not_shown.len())
+            closure.affected_count,
+            plural(closure.affected_count)
         ));
     }
     if parts.is_empty() {
@@ -606,6 +606,8 @@ mod tests {
             .collect();
         let total_files = review_here.len() + deprioritized.len();
         let digest = StandardReviewBriefOutput {
+            branching: None,
+            test_reach: None,
             schema_version: ReviewBriefSchemaVersion::default(),
             version: "test".to_string(),
             command: "audit-brief".to_string(),
@@ -619,7 +621,6 @@ mod tests {
             graph_facts: fallow_output::GraphFacts {
                 exports_added: 0,
                 api_width_delta: 0,
-                reachable_from: Vec::new(),
                 boundaries_touched: Vec::new(),
             },
             partition: PartitionFacts::default(),
@@ -631,6 +632,7 @@ mod tests {
             deltas: ReviewDeltas::default(),
             weakening,
             routing,
+            ownership: None,
             decisions: DecisionSurface {
                 decisions,
                 truncated: None,

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fallow_config::{CatalogPrecedingCommentPolicy, OutputFormat};
+use fallow_types::output_dead_code::{MutationEvidence, ReachabilityCaveat};
 
 mod catalog;
 mod class_members;
@@ -18,6 +19,22 @@ mod plan;
 pub use fallow_config::is_config_fixable;
 
 use plan::{CapturedHashes, CommitOutcome, FixPlan, SkippedFile};
+
+/// Compose the hard error for a `fix` run whose type-aware pass could not run.
+///
+/// `fix` is the one surface that still stops here, so it is also the one place
+/// a user can get stuck. The failure alone does not say that: it names neither
+/// the ceiling that most often causes it nor the flag that continues without
+/// semantic evidence. Both belong in the message, the way the transport error
+/// carries its own install line.
+fn type_aware_failure_message(error: &str) -> String {
+    format!(
+        "Type-aware analysis failed: {error}. Raise the per-request ceiling with \
+         FALLOW_TYPE_AWARE_TIMEOUT_SECS (seconds, default 120) when the pass ran out of time, \
+         or rerun with --no-type-aware to fix without semantic evidence, which removes more \
+         because nothing confirmed the extra findings are unused."
+    )
+}
 
 fn run_analyze(
     config: &fallow_config::ResolvedConfig,
@@ -37,7 +54,7 @@ fn run_analyze(
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        let outcome = fallow_api::refine_type_aware_results_with_config(
+        let outcome = match fallow_api::refine_type_aware_results_with_config(
             config,
             &mut results,
             &projects,
@@ -45,10 +62,25 @@ fn run_analyze(
             true,
             false,
             false,
-        )
-        .map_err(|error| {
-            crate::error::emit_error(&format!("Type-aware analysis failed: {error}"), 2, output)
-        })?;
+        ) {
+            Ok(outcome) => outcome,
+            // `fix` deletes code, so it fails closed where the reporting
+            // commands degrade. Degrading a report is conservative: the
+            // syntactic set is a superset, so a gate only gets stricter. The
+            // same superset applied by a mutating command is the opposite,
+            // because the extra entries are exactly the ones a working
+            // type-aware pass would have proven live and removed. Asking for
+            // `--type-aware` on a command that removes code is asking for that
+            // verification, so its absence must stop the run rather than widen
+            // the deletion.
+            Err(error) => {
+                return Err(crate::error::emit_error(
+                    &type_aware_failure_message(&error.to_string()),
+                    2,
+                    output,
+                ));
+            }
+        };
         if let Some(outcome) = outcome {
             if !quiet {
                 for warning in &outcome.type_aware.warnings {
@@ -97,6 +129,14 @@ pub struct FixOptions<'a> {
     pub type_aware: Option<bool>,
     pub type_aware_projects: &'a [PathBuf],
     pub type_aware_require: Option<fallow_config::TypeAwareRequire>,
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Only fixes touching scoped files are planned and applied;
+    /// the analysis itself still runs whole-project so fixability stays sound.
+    /// `None` means whole-project scope.
+    pub scope: Option<PathBuf>,
+    /// `--show-cascade`: also fix the export and member findings of unused
+    /// files. By default `fix` skips them, as the report hides them.
+    pub show_cascade: bool,
 }
 
 pub fn run_fix(opts: &FixOptions<'_>) -> ExitCode {
@@ -142,10 +182,21 @@ fn run_fix_impl(opts: &FixOptions<'_>, fix_count: &mut usize) -> ExitCode {
         return code;
     }
 
+    if opts.show_cascade {
+        config.show_cascade = true;
+    }
+
     let (results, file_hashes) = match run_analyze(&config, opts.output, opts.quiet) {
         Ok(r) => r,
         Err(code) => return code,
     };
+
+    let mut results = results;
+    // The report hides these findings, so `fix` offers no fix for them.
+    fallow_engine::dead_code::hide_cascade_findings(&mut results, &config);
+    if let Some(scope) = opts.scope.as_ref() {
+        fallow_engine::dead_code::filter_to_workspaces(&mut results, std::slice::from_ref(scope));
+    }
 
     if results.total_issues() == 0 {
         return if opts.emit_output {
@@ -189,7 +240,7 @@ fn finalize_fix_run(
     mut had_write_error: bool,
     catalog_totals: &CatalogFixTotals,
 ) -> ExitCode {
-    let plan_skip_records = build_skipped_records(opts.root, plan.skipped(), opts.quiet);
+    let plan_skip_records = build_skipped_records(opts.root, plan.skipped(), opts.output);
     fixes.extend(plan_skip_records.iter().cloned());
 
     let has_recoverable_skip = plan
@@ -222,6 +273,8 @@ fn finalize_fix_run(
             content_changed_count: skip_counts.content_changed,
             mixed_line_endings_count: skip_counts.mixed_line_endings,
             low_confidence_count: skip_counts.low_confidence,
+            low_confidence_dependency_count: count_withheld_dependency_fixes(fixes),
+            low_confidence_member_count: count_withheld_member_fixes(fixes),
         })
     {
         return code;
@@ -331,12 +384,14 @@ fn emit_empty_fix_output(opts: &FixOptions<'_>) -> ExitCode {
             skipped_content_changed: 0,
             skipped_mixed_line_endings: 0,
             skipped_low_confidence_exports: 0,
+            skipped_low_confidence_dependencies: 0,
+            skipped_low_confidence_members: 0,
         }) {
             Ok(envelope) if matches!(opts.output, OutputFormat::GithubSummary) => {
                 return crate::report::github_summary::print_fix_summary(&envelope);
             }
             Ok(envelope) => match opts.json_style.serialize(&envelope) {
-                Ok(json) => println!("{json}"),
+                Ok(json) => crate::report::sink::stdoutln!("{json}"),
                 Err(e) => {
                     eprintln!("Error: failed to serialize fix output: {e}");
                     return ExitCode::from(2);
@@ -381,11 +436,24 @@ fn apply_unused_export_fixes(input: &mut FixApplicationInput<'_>) {
         .iter()
         .map(|finding| finding.import.path.clone())
         .collect();
+    let caveats_by_file: FxHashMap<PathBuf, Vec<ReachabilityCaveat>> = input
+        .results
+        .unused_exports
+        .iter()
+        .filter(|finding| !finding.may_auto_apply_mutation())
+        .map(|finding| {
+            (
+                finding.export.path.clone(),
+                finding.reachability_caveats.clone(),
+            )
+        })
+        .collect();
     exports::apply_export_fixes(&mut exports::ExportFixInput {
         root: input.root,
         exports_by_file: &exports_by_file,
         hashes: input.file_hashes,
         unresolved_import_files: &unresolved_import_files,
+        caveats_by_file: &caveats_by_file,
         plan: input.plan,
         output: input.output,
         dry_run: input.dry_run,
@@ -393,6 +461,14 @@ fn apply_unused_export_fixes(input: &mut FixApplicationInput<'_>) {
     });
 }
 
+/// Plan the enum-member removals this run has the evidence to perform.
+///
+/// A member is reported unused when no module the run PARSED accesses it, so
+/// a member whose only reference sits in a file the run never read reads as
+/// unused exactly like an export does. The gate is asked once per finding via
+/// [`MutationEvidence::may_auto_apply_mutation`]; a finding that fails it never
+/// reaches the file grouping, and is reported as a withheld entry instead so
+/// the JSON stream says what was not done and why.
 fn apply_unused_enum_member_fixes(input: &mut FixApplicationInput<'_>) {
     if input.results.unused_enum_members.is_empty() {
         return;
@@ -400,10 +476,17 @@ fn apply_unused_enum_member_fixes(input: &mut FixApplicationInput<'_>) {
     let mut enum_members_by_file: FxHashMap<PathBuf, Vec<&fallow_types::results::UnusedMember>> =
         FxHashMap::default();
     for finding in &input.results.unused_enum_members {
+        if !finding.may_auto_apply_mutation() {
+            push_withheld_enum_member_entry(input, finding);
+            continue;
+        }
         enum_members_by_file
             .entry(finding.member.path.clone())
             .or_default()
             .push(&finding.member);
+    }
+    if enum_members_by_file.is_empty() {
+        return;
     }
     enum_members::apply_enum_member_fixes(enum_members::EnumMemberFixInput {
         root: input.root,
@@ -414,6 +497,38 @@ fn apply_unused_enum_member_fixes(input: &mut FixApplicationInput<'_>) {
         dry_run: input.dry_run,
         fixes: input.fixes,
     });
+}
+
+/// Emit the skip entry for an enum member the gate withheld. Mirrors the
+/// dependency entry: the shared `skip_reason` an agent already branches on,
+/// plus the caveat tokens, so a caller gates on the marker rather than parsing
+/// prose. Withholding is per member, not per file rewrite, so this never
+/// reaches the plan's per-file skip list.
+fn push_withheld_enum_member_entry(
+    input: &mut FixApplicationInput<'_>,
+    finding: &fallow_types::output_dead_code::UnusedEnumMemberFinding,
+) {
+    let relative = finding
+        .member
+        .path
+        .strip_prefix(input.root)
+        .unwrap_or(&finding.member.path);
+    let tokens: Vec<&str> = finding
+        .reachability_caveats
+        .iter()
+        .map(|caveat| ReachabilityCaveat::token(*caveat))
+        .collect();
+    input.fixes.push(serde_json::json!({
+        "type": "remove_enum_member",
+        "path": relative.to_string_lossy().replace('\\', "/"),
+        "line": finding.member.line,
+        "parent": finding.member.parent_name,
+        "name": finding.member.member_name,
+        "applied": false,
+        "skipped": true,
+        "skip_reason": plan::SkipReason::LowConfidenceIncompleteAnalysis.as_wire_str(),
+        "reachability_caveats": tokens,
+    }));
 }
 
 impl CommitOutcome {
@@ -443,6 +558,8 @@ struct FixOutputInput<'a> {
     content_changed_count: usize,
     mixed_line_endings_count: usize,
     low_confidence_count: usize,
+    low_confidence_dependency_count: usize,
+    low_confidence_member_count: usize,
 }
 
 struct CatalogFixTotals {
@@ -488,7 +605,11 @@ fn count_fix_skips(records: &[serde_json::Value]) -> FixSkipCounts {
                 record
                     .get("skip_reason")
                     .and_then(serde_json::Value::as_str),
-                Some("low_confidence_off_graph" | "low_confidence_unresolved_imports")
+                Some(
+                    "low_confidence_off_graph"
+                        | "low_confidence_unresolved_imports"
+                        | "low_confidence_incomplete_analysis"
+                )
             )
         })
         .count();
@@ -497,6 +618,43 @@ fn count_fix_skips(records: &[serde_json::Value]) -> FixSkipCounts {
         mixed_line_endings: count_reason("mixed_line_endings"),
         low_confidence,
     }
+}
+
+/// Count the `remove-dependency` writes withheld because the finding carried a
+/// reachability caveat. These never reach the plan (the withholding is per
+/// package, not per file), so they are counted off the emitted entries.
+fn count_withheld_dependency_fixes(fixes: &[serde_json::Value]) -> usize {
+    fixes
+        .iter()
+        .filter(|fix| {
+            fix.get("type").and_then(serde_json::Value::as_str) == Some("remove_dependency")
+                && fix.get("skip_reason").and_then(serde_json::Value::as_str)
+                    == Some("low_confidence_incomplete_analysis")
+        })
+        .count()
+}
+
+/// Count the member writes withheld because the finding carried a reachability
+/// caveat. Withheld per member rather than per file rewrite, so like the
+/// dependency counter these are read off the emitted entries instead of the
+/// plan's skip list.
+///
+/// Both member removals count here. `skipped_low_confidence_members` is named
+/// for the shape, not for one kind, and a class member whose removal the
+/// sidecar had approved is withheld for exactly the reason an enum member is:
+/// a member access is credited from any module the run parsed, so any file it
+/// did not read can hide one.
+fn count_withheld_member_fixes(fixes: &[serde_json::Value]) -> usize {
+    fixes
+        .iter()
+        .filter(|fix| {
+            matches!(
+                fix.get("type").and_then(serde_json::Value::as_str),
+                Some("remove_enum_member" | "remove_class_member")
+            ) && fix.get("skip_reason").and_then(serde_json::Value::as_str)
+                == Some("low_confidence_incomplete_analysis")
+        })
+        .count()
 }
 
 fn apply_catalog_fixes(request: &mut CatalogFixRequest<'_>) -> CatalogFixTotals {
@@ -555,12 +713,14 @@ fn emit_fix_output(input: &FixOutputInput<'_>) -> Result<(), ExitCode> {
             skipped_content_changed: input.content_changed_count,
             skipped_mixed_line_endings: input.mixed_line_endings_count,
             skipped_low_confidence_exports: input.low_confidence_count,
+            skipped_low_confidence_dependencies: input.low_confidence_dependency_count,
+            skipped_low_confidence_members: input.low_confidence_member_count,
         }) {
             Ok(envelope) if matches!(input.output, OutputFormat::GithubSummary) => {
                 let _ = crate::report::github_summary::print_fix_summary(&envelope);
             }
             Ok(envelope) => match input.json_style.serialize(&envelope) {
-                Ok(json) => println!("{json}"),
+                Ok(json) => crate::report::sink::stdoutln!("{json}"),
                 Err(e) => {
                     eprintln!("Error: failed to serialize fix output: {e}");
                     return Err(ExitCode::from(2));
@@ -574,8 +734,9 @@ fn emit_fix_output(input: &FixOutputInput<'_>) -> Result<(), ExitCode> {
     } else if matches!(input.output, OutputFormat::GithubAnnotations) {
         // The jq layer emits no annotations for `fix` (annotate.sh's `fix)`
         // case is empty); keep the annotation stream empty.
-    } else if !input.quiet {
+    } else {
         emit_human_summary(&HumanSummaryInput {
+            quiet: input.quiet,
             dry_run: input.dry_run,
             fixes: input.fixes,
             catalog_applied: input.catalog_applied,
@@ -584,6 +745,8 @@ fn emit_fix_output(input: &FixOutputInput<'_>) -> Result<(), ExitCode> {
             content_changed_count: input.content_changed_count,
             mixed_line_endings_count: input.mixed_line_endings_count,
             low_confidence_count: input.low_confidence_count,
+            low_confidence_dependency_count: input.low_confidence_dependency_count,
+            low_confidence_member_count: input.low_confidence_member_count,
         });
     }
     Ok(())
@@ -595,28 +758,37 @@ fn emit_fix_output(input: &FixOutputInput<'_>) -> Result<(), ExitCode> {
 /// downstream consumers (JSON renderer, human summary, jq scripts) see
 /// the diagnostic in one stream.
 ///
-/// `quiet` suppresses the per-file stderr diagnostic, matching how
-/// `opts.quiet` gates the rest of the human summary. JSON consumers
-/// always see the skip records via the returned vec; only the streaming
-/// stderr line is gated.
+/// The per-file stderr diagnostic is gated on format, never on `--quiet`: a
+/// JSON consumer reads the same records off the returned vec, and a human
+/// caller must see every mutation fallow refused even when it asked for quiet
+/// output. The `Would remove` lines it sits beside are gated the same way.
 fn build_skipped_records(
     root: &Path,
     skipped: &[SkippedFile],
-    quiet: bool,
+    output: OutputFormat,
 ) -> Vec<serde_json::Value> {
     skipped
         .iter()
         .map(|skip| {
             let relative = skip.path.strip_prefix(root).unwrap_or(&skip.path);
-            if !quiet {
+            if !matches!(output, OutputFormat::Json) {
                 eprintln!("{}", skip.reason.human_message(relative));
             }
-            serde_json::json!({
+            let mut record = serde_json::json!({
                 "type": "skipped",
-                "path": relative.display().to_string(),
+                "path": relative.to_string_lossy().replace('\\', "/"),
                 "skipped": true,
                 "skip_reason": skip.reason.as_wire_str(),
-            })
+            });
+            if !skip.caveats.is_empty() {
+                let tokens: Vec<&str> = skip
+                    .caveats
+                    .iter()
+                    .map(|caveat| ReachabilityCaveat::token(*caveat))
+                    .collect();
+                record["reachability_caveats"] = serde_json::json!(tokens);
+            }
+            record
         })
         .collect()
 }
@@ -638,7 +810,10 @@ fn patch_applied_field_on_failure(
         failed.iter().map(|(p, _)| p.clone()).collect();
     for (path, err) in failed {
         let relative = path.strip_prefix(root).unwrap_or(path);
-        eprintln!("Error: failed to write {}: {err}", relative.display());
+        eprintln!(
+            "Error: failed to write {}: {err}",
+            relative.to_string_lossy().replace('\\', "/")
+        );
     }
     for entry in fixes.iter_mut() {
         let target = entry.get("__target").and_then(|v| v.as_str());
@@ -668,6 +843,9 @@ fn strip_target_sidechannel(fixes: &mut [serde_json::Value]) {
 /// describe work the user opted out of rather than work they need to
 /// do right now.
 struct HumanSummaryInput<'a> {
+    /// Suppresses the progress half of the summary only. What fallow REFUSED
+    /// to change is never suppressed; see [`emit_human_summary`].
+    quiet: bool,
     dry_run: bool,
     fixes: &'a [serde_json::Value],
     catalog_applied: usize,
@@ -676,19 +854,30 @@ struct HumanSummaryInput<'a> {
     content_changed_count: usize,
     mixed_line_endings_count: usize,
     low_confidence_count: usize,
+    low_confidence_dependency_count: usize,
+    low_confidence_member_count: usize,
 }
 
+/// Emit the human fix summary, split by what `--quiet` may drop.
+///
+/// `--quiet` drops progress: the created-config notices, the `Fixed N issue(s)`
+/// / `Dry run complete` line, and the post-fix `pnpm install` reminder. It does
+/// NOT drop what fallow refused to change. `Would remove` lines are gated on
+/// format alone, so suppressing only the withheld half turned a quiet plan that
+/// is partial into one that reads as complete.
 fn emit_human_summary(input: &HumanSummaryInput<'_>) {
-    emit_created_config_messages(input.fixes);
-    emit_fix_count_line(
-        input.dry_run,
-        input.fixes,
-        input.catalog_comment_lines_removed,
-    );
-    if !input.dry_run && input.catalog_applied > 0 {
-        eprintln!(
-            "Catalog entries were removed from pnpm-workspace.yaml. Run `pnpm install` to refresh pnpm-lock.yaml.",
+    if !input.quiet {
+        emit_created_config_messages(input.fixes);
+        emit_fix_count_line(
+            input.dry_run,
+            input.fixes,
+            input.catalog_comment_lines_removed,
         );
+        if !input.dry_run && input.catalog_applied > 0 {
+            eprintln!(
+                "Catalog entries were removed from pnpm-workspace.yaml. Run `pnpm install` to refresh pnpm-lock.yaml.",
+            );
+        }
     }
     emit_residual_skip_warnings(input);
 }
@@ -745,6 +934,9 @@ fn emit_fix_count_line(
 
 /// Print the trailing skipped-entry warning lines (catalog guards, hash
 /// mismatch, mixed line endings, low-confidence exports).
+///
+/// Every line here names a mutation fallow declined to make, so none of them
+/// honour `--quiet`. See [`emit_human_summary`].
 fn emit_residual_skip_warnings(input: &HumanSummaryInput<'_>) {
     if input.catalog_skipped > 0 {
         let entries_word = if input.catalog_skipped == 1 {
@@ -786,8 +978,30 @@ fn emit_residual_skip_warnings(input: &HumanSummaryInput<'_>) {
             "files"
         };
         eprintln!(
-            "Kept unused exports in {} {files_word} where consumers may be invisible to fallow (test, mock, and fixture directories, or files with unresolved imports). Still listed by `fallow dead-code`; remove by hand if you have confirmed they are unused.",
+            "Kept unused exports in {} {files_word} where consumers may be invisible to fallow (test, mock, and fixture directories, files with unresolved imports, or files whose verdict rests on a source the run did not fully analyze). Still listed by `fallow dead-code`; remove by hand if you have confirmed they are unused.",
             input.low_confidence_count,
+        );
+    }
+    if input.low_confidence_dependency_count > 0 {
+        let package_word = if input.low_confidence_dependency_count == 1 {
+            "package"
+        } else {
+            "packages"
+        };
+        eprintln!(
+            "Kept {} declared {package_word} whose only import may sit in a file this run did not fully read. Resolve the files named in the workspace diagnostics above, then re-run `fallow fix`.",
+            input.low_confidence_dependency_count,
+        );
+    }
+    if input.low_confidence_member_count > 0 {
+        let member_word = if input.low_confidence_member_count == 1 {
+            "enum member"
+        } else {
+            "enum members"
+        };
+        eprintln!(
+            "Kept {} unused {member_word} whose only reference may sit in a file this run did not fully analyze. Resolve the files reported above, then re-run `fallow fix`.",
+            input.low_confidence_member_count,
         );
     }
 }
@@ -820,5 +1034,23 @@ mod tests {
 
         assert_eq!(fixes[0]["applied"], false);
         assert_eq!(fixes[1]["applied"], false);
+    }
+
+    #[test]
+    fn type_aware_failure_names_both_ways_forward() {
+        let message = type_aware_failure_message("sidecar timed out after 120s");
+
+        assert!(
+            message.starts_with("Type-aware analysis failed: sidecar timed out after 120s"),
+            "the original failure must stay first: {message}"
+        );
+        assert!(
+            message.contains("FALLOW_TYPE_AWARE_TIMEOUT_SECS"),
+            "the ceiling is the usual cause, so name the knob: {message}"
+        );
+        assert!(
+            message.contains("--no-type-aware"),
+            "the user must know fix can run without semantic evidence: {message}"
+        );
     }
 }

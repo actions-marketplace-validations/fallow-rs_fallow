@@ -1,13 +1,146 @@
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
+use colored::Colorize as _;
 use fallow_config::{FallowConfig, OutputFormat, ProductionAnalysis, ResolvedConfig};
 use fallow_engine::changed_files::clear_ambient_git_env;
 
-use crate::api::api_url;
+use crate::api::{
+    NETWORK_EXIT_CODE, ParsedErrorEnvelope, actionable_error_hint, api_url, response_message_suffix,
+};
+use crate::coverage::{
+    COVERAGE_UPLOAD_AUTH_REJECTED_EXIT_CODE as EXIT_AUTH_REJECTED,
+    COVERAGE_UPLOAD_PAYLOAD_TOO_LARGE_EXIT_CODE as EXIT_PAYLOAD_TOO_LARGE,
+    COVERAGE_UPLOAD_SERVER_ERROR_EXIT_CODE as EXIT_SERVER_ERROR,
+    COVERAGE_UPLOAD_VALIDATION_EXIT_CODE as EXIT_VALIDATION,
+};
 
 pub(super) const GIT_SHA_MAX_LEN: usize = 64;
+
+/// Outcome of a git-SHA keyed upload (`upload-inventory` and
+/// `upload-static-findings`). Each variant carries its exit code class, and
+/// the CLI dispatch changes transient errors to a warning when the user
+/// opts in.
+#[derive(Debug)]
+pub(super) enum UploadError {
+    /// User-fixable input error (missing key, unresolvable project-id,
+    /// analysis/config failure, ...).
+    Validation(String),
+    /// The payload exceeds the server cap; the user must scope the upload.
+    PayloadTooLarge(String),
+    /// 401 / 403: auth rejected, the user needs to rotate or scope the key.
+    AuthRejected(String),
+    /// 5xx, timeout, transport failure; transient.
+    ServerError(String),
+    /// Transport-level failure before response (DNS, TLS, connect).
+    Network(String),
+}
+
+impl UploadError {
+    pub(super) fn into_exit(self, log_prefix: &str, ignore_upload_errors: bool) -> ExitCode {
+        let soft_fail =
+            ignore_upload_errors && matches!(&self, Self::ServerError(_) | Self::Network(_));
+        let (code, body) = match self {
+            Self::Validation(m) => (EXIT_VALIDATION, m),
+            Self::PayloadTooLarge(m) => (EXIT_PAYLOAD_TOO_LARGE, m),
+            Self::AuthRejected(m) => (EXIT_AUTH_REJECTED, m),
+            Self::ServerError(m) => (EXIT_SERVER_ERROR, m),
+            Self::Network(m) => (NETWORK_EXIT_CODE, m),
+        };
+        let severity = if soft_fail {
+            "warning".yellow().bold()
+        } else {
+            "error".red().bold()
+        };
+        eprintln!("{log_prefix}: {severity}: {body}");
+        if soft_fail {
+            eprintln!("  -> --ignore-upload-errors set, continuing with exit 0");
+            return ExitCode::SUCCESS;
+        }
+        ExitCode::from(code)
+    }
+}
+
+/// Reject a dirty working tree for a git-SHA keyed upload, unless the run is
+/// a dry run or the user passed `--allow-dirty`.
+///
+/// `working_copy_subject` completes the warning sentence, for example
+/// `"the inventory comes"`.
+pub(super) fn enforce_clean_worktree(
+    log_prefix: &str,
+    command: &str,
+    working_copy_subject: &str,
+    dry_run: bool,
+    allow_dirty: bool,
+    root: &Path,
+) -> Result<(), UploadError> {
+    if dry_run || !dirty_worktree(root) {
+        return Ok(());
+    }
+    if allow_dirty {
+        eprintln!(
+            "{log_prefix}: {}: working tree has uncommitted changes. Proceeding because --allow-dirty was set, but {working_copy_subject} from the working copy and may not match the uploaded git SHA.",
+            "warning".yellow().bold(),
+        );
+        return Ok(());
+    }
+    Err(UploadError::Validation(format!(
+        "working tree has uncommitted changes. `{command}` is keyed to a git SHA, so uploading the working copy would drift from that commit. Commit or stash first, or pass --allow-dirty to intentionally upload the working copy."
+    )))
+}
+
+pub(super) fn format_upload_error_message(
+    command: &str,
+    status: u16,
+    body: &str,
+    code: Option<&str>,
+    envelope: &ParsedErrorEnvelope,
+) -> String {
+    if let Some(code) = code
+        && let Some(hint) = actionable_error_hint(command, code)
+    {
+        return format!("{hint} (HTTP {status}, code {code})");
+    }
+    let body_suffix = response_message_suffix(body, envelope);
+    format!("{command} request failed with HTTP {status}{body_suffix}")
+}
+
+pub(super) fn format_count(n: usize) -> String {
+    let mut s = n.to_string();
+    let mut i = s.len();
+    while i > 3 {
+        i -= 3;
+        s.insert(i, ',');
+    }
+    s
+}
+
+/// Endpoint URL for dry-run output. The project id stays unencoded so the
+/// user reads it as typed.
+pub(super) fn display_endpoint_url(
+    override_endpoint: Option<&str>,
+    project_id: &str,
+    path_suffix: &str,
+) -> String {
+    let base = override_endpoint.map_or_else(
+        || {
+            std::env::var("FALLOW_API_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map_or_else(
+                    || "https://api.fallow.cloud".to_owned(),
+                    |v| v.trim().trim_end_matches('/').to_owned(),
+                )
+        },
+        |v| v.trim().trim_end_matches('/').to_owned(),
+    );
+    format!("{base}/v1/coverage/{project_id}/{path_suffix}")
+}
+
+pub(super) fn to_posix_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
 
 pub(super) fn resolve_project_id(
     explicit_project_id: Option<&str>,
@@ -44,13 +177,16 @@ pub(super) fn resolve_project_id(
 /// The server accepts any non-empty string without path-traversal, whether
 /// bare (`fallow-cloud-api`) or slash-scoped (`acme/widgets`). Keep validation
 /// minimal: reject only what the server or filesystem would reject (empty,
-/// `..`).
+/// `..`, and a lone `.`, which URL normalization collapses to another route).
 pub(super) fn validate_project_id(id: &str) -> Result<&str, String> {
     if id.is_empty() {
         return Err("project id is empty".to_owned());
     }
     if id.contains("..") {
         return Err("project id must not contain '..' path segments".to_owned());
+    }
+    if id == "." {
+        return Err("project id must not be '.', which addresses a different URL route".to_owned());
     }
     Ok(id)
 }
@@ -161,6 +297,18 @@ pub fn url_encode_path_segment(value: &str) -> String {
     out
 }
 
+/// Build the dashboard URL for a repository page.
+///
+/// The dashboard serves a repository at `/repo/{repo}`, and the project id is a
+/// single route segment, so a slash-scoped id such as `owner/my-service` must be
+/// percent-encoded (`owner%2Fmy-service`) or the link resolves to a 404.
+pub(super) fn dashboard_repo_url(project_id: &str) -> String {
+    format!(
+        "https://fallow.cloud/repo/{}",
+        url_encode_path_segment(project_id)
+    )
+}
+
 pub(super) fn resolve_git_sha(
     explicit_git_sha: Option<&str>,
     root: &Path,
@@ -168,16 +316,13 @@ pub(super) fn resolve_git_sha(
     let sha = if let Some(explicit) = explicit_git_sha {
         explicit.trim().to_owned()
     } else {
-        let mut command = Command::new("git");
-        command.args(["rev-parse", "HEAD"]).current_dir(root);
-        clear_ambient_git_env(&mut command);
-        let output = command.output().map_err(|err| {
-            format!("could not resolve git SHA: {err}. Pass --git-sha <sha> explicitly.")
-        })?;
-        if !output.status.success() {
-            return Err("`git rev-parse HEAD` failed. Pass --git-sha <sha> explicitly.".to_owned());
-        }
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        fallow_engine::repo_refs::head_sha(root)
+            .map_err(|err| {
+                format!("could not resolve git SHA: {err}. Pass --git-sha <sha> explicitly.")
+            })?
+            .ok_or_else(|| {
+                "`git rev-parse HEAD` failed. Pass --git-sha <sha> explicitly.".to_owned()
+            })?
     };
 
     if sha.is_empty() {
@@ -255,6 +400,151 @@ pub(super) fn load_resolved_config_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn into_exit_maps_variants_and_soft_fails_transient_when_opted_in() {
+        let exit = |err: UploadError, ignore: bool| err.into_exit("fallow coverage test", ignore);
+        assert_eq!(
+            exit(UploadError::Validation("v".to_owned()), false),
+            ExitCode::from(EXIT_VALIDATION)
+        );
+        assert_eq!(
+            exit(UploadError::PayloadTooLarge("p".to_owned()), false),
+            ExitCode::from(EXIT_PAYLOAD_TOO_LARGE)
+        );
+        assert_eq!(
+            exit(UploadError::AuthRejected("a".to_owned()), false),
+            ExitCode::from(EXIT_AUTH_REJECTED)
+        );
+        assert_eq!(
+            exit(UploadError::ServerError("s".to_owned()), false),
+            ExitCode::from(EXIT_SERVER_ERROR)
+        );
+        assert_eq!(
+            exit(UploadError::Network("n".to_owned()), false),
+            ExitCode::from(NETWORK_EXIT_CODE)
+        );
+
+        // With --ignore-upload-errors, only transient (server/network) failures
+        // change to exit 0; auth rejection and payload size stay fatal.
+        assert_eq!(
+            exit(UploadError::ServerError("s".to_owned()), true),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit(UploadError::Network("n".to_owned()), true),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit(UploadError::AuthRejected("a".to_owned()), true),
+            ExitCode::from(EXIT_AUTH_REJECTED)
+        );
+        assert_eq!(
+            exit(UploadError::PayloadTooLarge("p".to_owned()), true),
+            ExitCode::from(EXIT_PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    fn enforce(dry_run: bool, allow_dirty: bool, root: &Path) -> Result<(), UploadError> {
+        enforce_clean_worktree(
+            "fallow coverage upload-inventory",
+            "upload-inventory",
+            "the inventory comes",
+            dry_run,
+            allow_dirty,
+            root,
+        )
+    }
+
+    #[test]
+    fn dirty_worktree_is_rejected_by_default() {
+        let repo = create_dirty_git_repo();
+        let err = enforce(false, false, repo.path())
+            .expect_err("dirty repo should fail without --allow-dirty");
+        let UploadError::Validation(message) = err else {
+            panic!("expected validation error, got {err:?}");
+        };
+        assert!(message.contains("working tree has uncommitted changes"));
+        assert!(message.contains("`upload-inventory` is keyed to a git SHA"));
+        assert!(message.contains("--allow-dirty"));
+    }
+
+    #[test]
+    fn dirty_worktree_is_allowed_with_explicit_opt_in() {
+        let repo = create_dirty_git_repo();
+        assert!(enforce(false, true, repo.path()).is_ok());
+    }
+
+    #[test]
+    fn dry_run_skips_dirty_worktree_validation() {
+        let repo = create_dirty_git_repo();
+        assert!(enforce(true, false, repo.path()).is_ok());
+    }
+
+    fn create_dirty_git_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("create temp repo");
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        run_git(dir.path(), &["config", "user.email", "review@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Reviewer"]);
+        std::fs::write(dir.path().join("a.js"), "function committed() {}\n")
+            .expect("write committed file");
+        run_git(dir.path(), &["add", "a.js"]);
+        run_git(dir.path(), &["commit", "-qm", "init"]);
+        std::fs::write(
+            dir.path().join("a.js"),
+            "function committed() {}\nfunction dirty() {}\n",
+        )
+        .expect("write dirty file");
+        dir
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn resolve_git_sha_validates_explicit_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        assert_eq!(resolve_git_sha(Some("abcdef1"), root).unwrap(), "abcdef1");
+        assert!(resolve_git_sha(Some(""), root).is_err(), "empty sha");
+        assert!(
+            resolve_git_sha(Some(&"a".repeat(GIT_SHA_MAX_LEN + 1)), root).is_err(),
+            "over-length sha"
+        );
+        assert!(
+            resolve_git_sha(Some("bad sha!"), root).is_err(),
+            "illegal characters"
+        );
+    }
+
+    #[test]
+    fn format_count_groups_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(14_280), "14,280");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn display_endpoint_url_uses_override_unencoded() {
+        let url = display_endpoint_url(Some("http://127.0.0.1:3000/"), "a/b", "static-findings");
+        assert_eq!(url, "http://127.0.0.1:3000/v1/coverage/a/b/static-findings");
+    }
+
+    #[test]
+    fn to_posix_string_normalizes_windows_separators() {
+        let p = Path::new("src\\foo\\bar.ts");
+        assert_eq!(to_posix_string(p), "src/foo/bar.ts");
+    }
 
     #[test]
     fn load_resolved_config_flattens_per_analysis_production() {
@@ -351,6 +641,24 @@ mod tests {
         assert!(validate_project_id("../etc/passwd").is_err());
         assert!(validate_project_id("acme/../secret").is_err());
         assert!(validate_project_id("").is_err());
+        assert!(validate_project_id(".").is_err());
+        assert!(validate_project_id("acme/.github").is_ok());
+    }
+
+    #[test]
+    fn dashboard_repo_url_targets_the_repo_route() {
+        assert_eq!(
+            dashboard_repo_url("my-service"),
+            "https://fallow.cloud/repo/my-service"
+        );
+    }
+
+    #[test]
+    fn dashboard_repo_url_encodes_a_slash_scoped_project_id() {
+        assert_eq!(
+            dashboard_repo_url("owner/my-service"),
+            "https://fallow.cloud/repo/owner%2Fmy-service"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use fallow_types::output_dead_code::ReachabilityCaveat;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tempfile::NamedTempFile;
 
@@ -35,6 +36,14 @@ pub(super) enum SkipReason {
     LowConfidenceOffGraph,
     /// Conservative skip for files with unresolved imports.
     LowConfidenceUnresolvedImports,
+    /// Conservative skip for findings whose verdict carries a
+    /// `reachability_caveats` entry: the run already knows some file's imports
+    /// went unseen (a degraded parse, an unreadable file, or a file discovery
+    /// skipped before reading it), so the removal would rest on evidence
+    /// fallow itself flagged. The reason names the consequence rather than any
+    /// one cause, and the skip follows the caveat, so a new cause needs no
+    /// wiring here.
+    LowConfidenceIncompleteAnalysis,
 }
 
 impl SkipReason {
@@ -44,6 +53,7 @@ impl SkipReason {
             Self::MixedLineEndings => "mixed_line_endings",
             Self::LowConfidenceOffGraph => "low_confidence_off_graph",
             Self::LowConfidenceUnresolvedImports => "low_confidence_unresolved_imports",
+            Self::LowConfidenceIncompleteAnalysis => "low_confidence_incomplete_analysis",
         }
     }
 
@@ -51,27 +61,29 @@ impl SkipReason {
     pub(super) fn is_intentional(self) -> bool {
         matches!(
             self,
-            Self::LowConfidenceOffGraph | Self::LowConfidenceUnresolvedImports
+            Self::LowConfidenceOffGraph
+                | Self::LowConfidenceUnresolvedImports
+                | Self::LowConfidenceIncompleteAnalysis
         )
     }
 
     pub(super) fn human_message(self, path: &Path) -> String {
+        let display = path.to_string_lossy().replace('\\', "/");
         match self {
             Self::ContentChanged => format!(
-                "Skipping {}: file content changed since `fallow dead-code` ran. Re-run `fallow fix` to refresh the analysis first.",
-                path.display(),
+                "Skipping {display}: file content changed since `fallow dead-code` ran. Re-run `fallow fix` to refresh the analysis first.",
             ),
             Self::MixedLineEndings => format!(
-                "Skipping {}: file has mixed CRLF/LF line endings. Normalize it, then re-run `fallow fix`.",
-                path.display(),
+                "Skipping {display}: file has mixed CRLF/LF line endings. Normalize it, then re-run `fallow fix`.",
             ),
             Self::LowConfidenceOffGraph => format!(
-                "Kept unused export(s) in {}: consumer coverage is incomplete, so the export was preserved.",
-                path.display(),
+                "Kept unused export(s) in {display}: consumer coverage is incomplete, so the export was preserved.",
             ),
             Self::LowConfidenceUnresolvedImports => format!(
-                "Kept unused export(s) in {}: unresolved imports make the usage graph incomplete.",
-                path.display(),
+                "Kept unused export(s) in {display}: unresolved imports make the usage graph incomplete.",
+            ),
+            Self::LowConfidenceIncompleteAnalysis => format!(
+                "Kept unused export(s) in {display}: a source file was not fully analyzed, so this run flagged the verdict itself as resting on an incomplete import graph.",
             ),
         }
     }
@@ -81,6 +93,9 @@ impl SkipReason {
 pub(super) struct SkippedFile {
     pub path: PathBuf,
     pub reason: SkipReason,
+    /// The caveats the withheld findings carried, surfaced on the fix entry so
+    /// a caller can gate on the marker instead of inferring it from the reason.
+    pub caveats: Vec<ReachabilityCaveat>,
 }
 
 /// Outcome of [`FixPlan::commit`].
@@ -106,7 +121,7 @@ impl CommitOutcome {
 
 /// Accumulator for batched writes during a `fallow fix` run.
 pub(super) struct FixPlan {
-    canonical_root: Option<PathBuf>,
+    canonical_root: PathBuf,
     entries: Vec<PlannedWrite>,
     skipped: Vec<SkippedFile>,
 }
@@ -114,19 +129,10 @@ pub(super) struct FixPlan {
 impl FixPlan {
     pub(super) fn for_root(root: &Path) -> std::io::Result<Self> {
         Ok(Self {
-            canonical_root: Some(std::fs::canonicalize(root)?),
+            canonical_root: std::fs::canonicalize(root)?,
             entries: Vec::new(),
             skipped: Vec::new(),
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn new() -> Self {
-        Self {
-            canonical_root: None,
-            entries: Vec::new(),
-            skipped: Vec::new(),
-        }
     }
 
     /// Queue a replacement for an existing target. The last replacement wins,
@@ -170,9 +176,6 @@ impl FixPlan {
     fn stage(&mut self, path: PathBuf, content: Vec<u8>) {
         match std::fs::read(&path) {
             Ok(original) => self.stage_existing(path, &original, content),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.stage_creation(path, content);
-            }
             Err(_) => self.stage_creation(path, content),
         }
     }
@@ -187,6 +190,16 @@ impl FixPlan {
 
     /// Record that a file was skipped. Deduped on `(path, reason)`.
     pub(super) fn skip(&mut self, path: PathBuf, reason: SkipReason) {
+        self.skip_with_caveats(path, reason, Vec::new());
+    }
+
+    /// Record a skip that carries the reachability caveats behind it.
+    pub(super) fn skip_with_caveats(
+        &mut self,
+        path: PathBuf,
+        reason: SkipReason,
+        caveats: Vec<ReachabilityCaveat>,
+    ) {
         if self
             .skipped
             .iter()
@@ -194,19 +207,15 @@ impl FixPlan {
         {
             return;
         }
-        self.skipped.push(SkippedFile { path, reason });
+        self.skipped.push(SkippedFile {
+            path,
+            reason,
+            caveats,
+        });
     }
 
     pub(super) fn skipped(&self) -> &[SkippedFile] {
         &self.skipped
-    }
-
-    #[allow(
-        dead_code,
-        reason = "test-only consumer; same reason as `written` above"
-    )]
-    pub(super) fn entries_paths(&self) -> impl Iterator<Item = &Path> {
-        self.entries.iter().map(|e| e.path.as_path())
     }
 
     /// Stage every entry to a sibling `NamedTempFile`, then promote each to
@@ -218,7 +227,7 @@ impl FixPlan {
 
         let mut staged: Vec<StagedEntry> = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
-            match stage_one(self.canonical_root.as_deref(), entry) {
+            match stage_one(&self.canonical_root, entry) {
                 Ok(stage) => staged.push(stage),
                 Err(e) => {
                     return CommitOutcome {
@@ -231,14 +240,12 @@ impl FixPlan {
 
         staged.sort_by(|a, b| a.requested.cmp(&b.requested));
 
-        if let Some(root) = self.canonical_root.as_deref() {
-            for stage in &staged {
-                if let Err(error) = revalidate_staged_target(root, stage) {
-                    return CommitOutcome {
-                        written: FxHashSet::default(),
-                        failed: vec![(stage.requested.clone(), error)],
-                    };
-                }
+        for stage in &staged {
+            if let Err(error) = revalidate_staged_target(&self.canonical_root, stage) {
+                return CommitOutcome {
+                    written: FxHashSet::default(),
+                    failed: vec![(stage.requested.clone(), error)],
+                };
             }
         }
         for stage in &staged {
@@ -281,14 +288,12 @@ struct StagedEntry {
 }
 
 fn stage_one(
-    canonical_root: Option<&Path>,
+    canonical_root: &Path,
     entry: PlannedWrite,
 ) -> Result<StagedEntry, (PathBuf, std::io::Error)> {
     let target = entry.path;
     let resolved = resolve_target_for_staging(&target).map_err(|error| (target.clone(), error))?;
-    if let Some(root) = canonical_root {
-        ensure_within_root(root, &resolved).map_err(|error| (target.clone(), error))?;
-    }
+    ensure_within_root(canonical_root, &resolved).map_err(|error| (target.clone(), error))?;
     let dir = resolved.parent().ok_or_else(|| {
         (
             target.clone(),
@@ -401,8 +406,8 @@ fn ensure_within_root(canonical_root: &Path, target: &Path) -> std::io::Result<(
         std::io::ErrorKind::PermissionDenied,
         format!(
             "fix plan target {} resolves outside project root {}",
-            target.display(),
-            canonical_root.display()
+            target.to_string_lossy().replace('\\', "/"),
+            canonical_root.to_string_lossy().replace('\\', "/")
         ),
     ))
 }
@@ -439,8 +444,8 @@ pub(super) fn read_source_with_hash_check(
     plan: &mut FixPlan,
 ) -> Option<(String, super::io::EncodingMetadata)> {
     if let Some(staged) = plan.staged_content(path) {
-        let raw = String::from_utf8(staged.to_vec()).ok()?;
-        return match super::io::classify_source(&raw) {
+        let raw = std::str::from_utf8(staged).ok()?;
+        return match super::io::classify_source(raw) {
             Ok((content, meta)) => Some((content, meta)),
             Err(super::io::EncodingError::MixedLineEndings { .. }) => {
                 plan.skip(path.to_path_buf(), SkipReason::MixedLineEndings);
@@ -511,7 +516,7 @@ mod tests {
         std::fs::write(&a, "original_a").unwrap();
         std::fs::write(&b, "original_b").unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(a.clone(), b"new_a".to_vec());
         plan.stage(b.clone(), b"new_b".to_vec());
 
@@ -529,7 +534,7 @@ mod tests {
         let bad = dir.path().join("nonexistent").join("bad.txt");
         std::fs::write(&good, "original_good").unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(good.clone(), b"new_good".to_vec());
         plan.stage(bad, b"new_bad".to_vec());
 
@@ -551,7 +556,7 @@ mod tests {
         std::fs::write(&source, "original source").unwrap();
         std::fs::write(&other, "original other").unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(source.clone(), b"fixed source".to_vec());
         plan.stage(other.clone(), b"fixed other".to_vec());
         std::fs::write(&source, "external source edit").unwrap();
@@ -575,7 +580,7 @@ mod tests {
         let manifest = dir.path().join("package.json");
         std::fs::write(&manifest, r#"{"dependencies":{"a":"1"}}"#).unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(manifest.clone(), b"{}\n".to_vec());
         std::fs::write(&manifest, r#"{"dependencies":{"b":"2"}}"#).unwrap();
 
@@ -595,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join(".fallowrc.json");
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(config.clone(), b"{\"rules\":{}}\n".to_vec());
         std::fs::write(&config, "external config").unwrap();
 
@@ -634,7 +639,8 @@ mod tests {
 
     #[test]
     fn commit_empty_plan_is_noop() {
-        let plan = FixPlan::new();
+        let dir = tempfile::tempdir().unwrap();
+        let plan = FixPlan::for_root(dir.path()).unwrap();
         let outcome = plan.commit();
         assert!(outcome.written.is_empty());
         assert!(outcome.failed.is_empty());
@@ -663,7 +669,8 @@ mod tests {
 
     #[test]
     fn skip_records_reach_skipped_list() {
-        let mut plan = FixPlan::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.skip(PathBuf::from("a.ts"), SkipReason::ContentChanged);
         assert_eq!(plan.skipped().len(), 1);
         assert_eq!(plan.skipped()[0].reason, SkipReason::ContentChanged);
@@ -675,7 +682,7 @@ mod tests {
         let p = dir.path().join("dup.txt");
         std::fs::write(&p, "orig").unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(p.clone(), b"first".to_vec());
         plan.stage(p.clone(), b"second".to_vec());
 
@@ -693,7 +700,7 @@ mod tests {
         let mut hashes = CapturedHashes::default();
         hashes.insert(file.clone(), stale_hash);
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let result = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan);
         assert!(result.is_none(), "mismatch must skip");
         assert_eq!(plan.skipped().len(), 1);
@@ -708,7 +715,7 @@ mod tests {
         std::fs::write(&file, "{}").unwrap();
         let hashes = CapturedHashes::default();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let result = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan);
         assert!(result.is_some(), "missing hash must proceed, not skip");
         assert!(plan.skipped().is_empty());
@@ -724,7 +731,7 @@ mod tests {
         let mut hashes = CapturedHashes::default();
         hashes.insert(file.clone(), correct_hash);
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let result = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan);
         let (content, _) = result.expect("match must proceed");
         assert_eq!(content, body);
@@ -743,7 +750,7 @@ mod tests {
             xxhash_rust::xxh3::xxh3_64(original.as_bytes()),
         );
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
 
         let first_view = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan)
             .expect("first read succeeds");
@@ -776,7 +783,7 @@ mod tests {
         std::fs::write(&file, "original\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         plan.stage(file.clone(), b"rewritten\n".to_vec());
         let outcome = plan.commit();
         assert!(outcome.failed.is_empty());
@@ -843,24 +850,9 @@ mod tests {
     }
 
     #[test]
-    fn entries_paths_yields_every_staged_path() {
-        let mut plan = FixPlan::new();
-        plan.stage(PathBuf::from("/tmp/a"), b"x".to_vec());
-        plan.stage(PathBuf::from("/tmp/b"), b"y".to_vec());
-        assert_eq!(plan.entries_paths().count(), 2);
-    }
-
-    #[test]
-    fn _atomic_write_still_works_for_callers_not_routed_through_the_plan() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        fallow_config::atomic_write(&path, b"{}").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
-    }
-
-    #[test]
     fn skip_deduplicates_repeat_entries_for_same_path_and_reason() {
-        let mut plan = FixPlan::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let path = PathBuf::from("/tmp/mixed.ts");
         plan.skip(path.clone(), SkipReason::MixedLineEndings);
         plan.skip(path.clone(), SkipReason::MixedLineEndings);
@@ -888,7 +880,7 @@ mod tests {
         let mut hashes = CapturedHashes::default();
         hashes.insert(file.clone(), 0xDEAD_BEEF);
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let result = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan);
         assert!(result.is_none(), "mixed-EOL file must be skipped");
         assert_eq!(plan.skipped().len(), 1);
@@ -903,7 +895,7 @@ mod tests {
         std::fs::write(&file, "a\r\nb\nc\r\n").unwrap();
         let hashes = CapturedHashes::default();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
 
         let first = read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan);
         assert!(first.is_none(), "first fixer call must skip");
@@ -928,13 +920,24 @@ mod tests {
     }
 
     #[test]
+    fn human_message_normalizes_backslash_separators() {
+        let path = Path::new("src\\util.ts");
+        let message = SkipReason::ContentChanged.human_message(path);
+        assert!(
+            !message.contains('\\'),
+            "the human-facing skip message must use forward slashes: {message}"
+        );
+        assert!(message.contains("src/util.ts"), "{message}");
+    }
+
+    #[test]
     fn stage_fixed_content_preserves_bom_on_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("bom.ts");
         let body = "export const a = 1;\nexport const b = 2;\n";
         std::fs::write(&file, format!("\u{FEFF}{body}")).unwrap();
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let (content, meta) = crate::fix::io::read_source(dir.path(), &file)
             .unwrap()
             .unwrap();
@@ -971,7 +974,7 @@ mod tests {
         let mut hashes = CapturedHashes::default();
         hashes.insert(file.clone(), xxhash_rust::xxh3::xxh3_64(body.as_bytes()));
 
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
 
         let (first_content, first_meta) =
             read_source_with_hash_check(dir.path(), &file, &hashes, &mut plan).unwrap();

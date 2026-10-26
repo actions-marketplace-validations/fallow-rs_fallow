@@ -2,9 +2,9 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use super::{plural, relative_path, split_dir_filename};
-
-const DOCS_HEALTH: &str = "https://docs.fallow.tools/explanations/health";
+use super::health::DOCS_HEALTH;
+use super::{plural, push_docs_footer, split_dir_filename};
+use crate::report::format_display_path;
 
 fn render_ownership_summary(report: &fallow_output::HealthReport) -> Option<String> {
     if report.hotspots.len() < 2 {
@@ -38,7 +38,9 @@ fn render_ownership_summary(report: &fallow_output::HealthReport) -> Option<Stri
 
     let mut segments: Vec<String> = Vec::new();
     if bus1_count > 0 {
-        let label = if bus1_count == total {
+        let label = if total == 1 {
+            "1 hotspot depends on a single recent contributor".to_owned()
+        } else if bus1_count == total {
             format!("all {total} hotspots depend on a single recent contributor")
         } else {
             format!("{bus1_count}/{total} hotspots depend on a single recent contributor")
@@ -160,13 +162,85 @@ pub(super) fn render_hotspots(
     push_hotspots_footer(lines, report);
 }
 
+/// Render the hidden change-coupling pairs. Silent when the section is absent
+/// or lists no pair.
+pub(super) fn render_change_coupling(
+    lines: &mut Vec<String>,
+    report: &fallow_output::HealthReport,
+    root: &Path,
+) {
+    let Some(coupling) = report.change_coupling.as_ref() else {
+        return;
+    };
+    if coupling.pairs.is_empty() {
+        return;
+    }
+    let count = coupling.total_pairs;
+    lines.push(format!(
+        "{} {}",
+        "\u{25cf}".yellow(),
+        format!(
+            "Hidden change coupling ({count} pair{}, since {})",
+            plural(count),
+            coupling.since
+        )
+        .yellow()
+        .bold()
+    ));
+    lines.push(String::new());
+    for pair in &coupling.pairs {
+        let strong = if pair.strong {
+            format!(" {}", "[strong]".yellow())
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "  {:>3.0}%  {}  {}{}",
+            pair.degree * 100.0,
+            format_display_path(&pair.path_a, root),
+            format_display_path(&pair.path_b, root),
+            strong,
+        ));
+        lines.push(format!(
+            "         {}",
+            format!(
+                "{} shared commits ({} and {} in total), no import between them",
+                pair.shared_revisions, pair.revisions_a, pair.revisions_b
+            )
+            .dimmed()
+        ));
+    }
+    if coupling.pairs.len() < count {
+        lines.push(format!(
+            "  {}",
+            format!(
+                "{} more pair{} not shown",
+                count - coupling.pairs.len(),
+                plural(count - coupling.pairs.len())
+            )
+            .dimmed()
+        ));
+    }
+    lines.push(String::new());
+    push_docs_footer(
+        lines,
+        "Files that change together without an import",
+        &format!("{DOCS_HEALTH}#change-coupling"),
+    );
+    lines.push(String::new());
+}
+
 fn push_hotspots_header(lines: &mut Vec<String>, report: &fallow_output::HealthReport) {
     let header = report.hotspot_summary.as_ref().map_or_else(
-        || format!("Hotspots ({} files)", report.hotspots.len()),
+        || {
+            let count = report.hotspots.len();
+            format!("Hotspots ({count} file{})", plural(count))
+        },
         |summary| {
+            let count = report.hotspots.len();
             format!(
-                "Hotspots ({} files, since {})",
-                report.hotspots.len(),
+                "Hotspots ({count} file{}, since {})",
+                plural(count),
                 summary.since,
             )
         },
@@ -176,7 +250,7 @@ fn push_hotspots_header(lines: &mut Vec<String>, report: &fallow_output::HealthR
 }
 
 fn push_hotspot_row(lines: &mut Vec<String>, entry: &fallow_output::HotspotEntry, root: &Path) {
-    let file_str = relative_path(&entry.path, root).display().to_string();
+    let file_str = format_display_path(&entry.path, root);
     let (dir, filename) = split_dir_filename(&file_str);
     lines.push(format!(
         "  {} {}  {}{}{}",
@@ -186,13 +260,21 @@ fn push_hotspot_row(lines: &mut Vec<String>, entry: &fallow_output::HotspotEntry
         filename,
         hotspot_test_tag(entry.is_test_path),
     ));
+    // The dispersion goes after the trend, so the columns before it keep their
+    // place whether or not the history has commit ids.
+    let dispersion = entry
+        .median_files_per_commit
+        .map_or_else(String::new, |median| {
+            format!("  {}", format!("{median:.1} files/commit").dimmed())
+        });
     lines.push(format!(
-        "         {} commits  {} churn  {} density  {} fan-in  {}",
+        "         {} commits  {} churn  {} density  {} fan-in  {}{}",
         format!("{:>3}", entry.commits).dimmed(),
         format!("{:>5}", entry.lines_added + entry.lines_deleted).dimmed(),
         format!("{:.2}", entry.complexity_density).dimmed(),
         format!("{:>2}", entry.fan_in).dimmed(),
         hotspot_trend_label(entry.trend),
+        dispersion,
     ));
     if let Some(ownership) = &entry.ownership {
         lines.push(format!(
@@ -246,11 +328,11 @@ fn push_hotspots_footer(lines: &mut Vec<String>, report: &fallow_output::HealthR
             "No CODEOWNERS file discovered, ownership signals limited to change history.".dimmed()
         ));
     }
-    lines.push(format!(
-        "  {}",
-        format!("Files with high churn and high complexity: {DOCS_HEALTH}#hotspot-metrics")
-            .dimmed()
-    ));
+    push_docs_footer(
+        lines,
+        "Files with high churn and high complexity",
+        &format!("{DOCS_HEALTH}#hotspot-metrics"),
+    );
     lines.push(String::new());
 }
 
@@ -339,6 +421,8 @@ mod tests {
             complexity_density: 0.42,
             fan_in: 7,
             trend,
+            median_files_per_commit: None,
+            median_lines_per_commit: None,
             ownership: None,
             is_test_path: false,
         }
@@ -413,6 +497,7 @@ mod tests {
                 files_analyzed: 10,
                 files_excluded: 1,
                 shallow_clone: false,
+                clock: None,
             }),
             ..HealthReport::default()
         };
@@ -428,5 +513,30 @@ mod tests {
         assert!(text.contains("tests/api.test.ts [test]"));
         assert!(text.contains("1 file excluded (< 3 commits)"));
         assert!(text.contains("No CODEOWNERS file discovered"));
+    }
+
+    #[test]
+    fn ownership_summary_uses_singular_for_one_owned_hotspot() {
+        let root = PathBuf::from("/repo");
+        let mut owned = hotspot(root.join("src/api.ts"), 75.0, ChurnTrend::Accelerating);
+        owned.ownership = Some(ownership(
+            "alice@example.com",
+            0.91,
+            1,
+            None,
+            OwnershipState::Unowned,
+        ));
+        let unowned = hotspot(root.join("src/db.ts"), 40.0, ChurnTrend::Stable);
+        let report = HealthReport {
+            hotspots: vec![HotspotFinding::from(owned), HotspotFinding::from(unowned)],
+            ..HealthReport::default()
+        };
+
+        let summary = plain(&[render_ownership_summary(&report).expect("summary line")]);
+
+        assert!(
+            summary.contains("1 hotspot depends on a single recent contributor"),
+            "{summary}"
+        );
     }
 }

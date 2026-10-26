@@ -7,7 +7,8 @@ use std::sync::OnceLock;
 use fallow_types::{
     output_dead_code::{
         CircularDependencyFinding, DuplicateExportFinding, DuplicatePropShapeFinding,
-        PropDrillingChainFinding, ReExportCycleFinding, UnlistedDependencyFinding,
+        PackageCycleFinding, PropDrillingChainFinding, ReExportCycleFinding,
+        UnlistedDependencyFinding,
     },
     results::{AnalysisResults, SecurityFinding},
 };
@@ -45,6 +46,63 @@ impl ChangedFilesError {
             Self::GitMissing(err) => format!("failed to run git: {err}"),
             Self::NotARepository => "not a git repository".to_owned(),
             Self::GitFailed(stderr) => augment_git_failed(stderr),
+        }
+    }
+
+    /// Stable kebab-case token naming this failure, for machine consumers.
+    ///
+    /// One token per variant, so a consumer can branch on the cause without
+    /// matching prose. Published on the wire as
+    /// `request_outcomes["changed-since"].reason`.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::InvalidRef(_) => "invalid-ref",
+            Self::GitMissing(_) => "git-missing",
+            Self::NotARepository => "not-a-repository",
+            Self::GitFailed(_) => "git-failed",
+        }
+    }
+
+    /// The full sentence for a run whose `--changed-since` request could not be
+    /// applied: what was asked, what happened instead, and the next step.
+    ///
+    /// The one prose source for this fact. The CLI writes it to stderr and
+    /// publishes the same string on the envelope, so a log a human read and a
+    /// report a script read cannot say different things.
+    ///
+    /// Git's own stderr is folded onto one line: the sentence travels into a
+    /// jq-rendered CI annotation and into a rendered pull-request comment, and
+    /// a multi-line value there splits one fact across two log records.
+    #[must_use]
+    pub fn changed_since_message(&self, git_ref: &str) -> String {
+        let cause = self
+            .describe()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "--changed-since '{git_ref}' was ignored because {cause}, so this report covers \
+             the whole project instead of the changed files. {}",
+            self.changed_since_remedy()
+        )
+    }
+
+    /// The next step for [`Self::changed_since_message`], one per cause.
+    const fn changed_since_remedy(&self) -> &'static str {
+        match self {
+            Self::InvalidRef(_) => {
+                "Pass a ref git can resolve, such as a branch name or a commit sha."
+            }
+            Self::GitMissing(_) => {
+                "Install git and make it available on PATH, or drop --changed-since."
+            }
+            Self::NotARepository => {
+                "Run fallow from inside the repository, or drop --changed-since."
+            }
+            Self::GitFailed(_) => {
+                "Verify the ref exists in this repository, and check out with full history."
+            }
         }
     }
 }
@@ -148,6 +206,61 @@ pub fn resolve_git_common_dir(cwd: &Path) -> Result<PathBuf, ChangedFilesError> 
     Ok(dunce::canonicalize(&path).unwrap_or(path))
 }
 
+/// Resolve the canonical git common directory and toplevel for `cwd` with
+/// one `git rev-parse` call.
+///
+/// The result equals [`resolve_git_common_dir`] and [`resolve_git_toplevel`],
+/// at the cost of one subprocess instead of two. It fails where either single
+/// probe fails, for example in a bare repository, which has no toplevel, and
+/// when git prints anything other than two paths. A caller that needs one of
+/// the two paths in that case calls the single probe.
+///
+/// # Errors
+///
+/// Returns the reason when git is missing, `cwd` is not in a work tree, or the
+/// output is not two paths.
+pub fn resolve_git_common_dir_and_toplevel(
+    cwd: &Path,
+) -> Result<(PathBuf, PathBuf), ChangedFilesError> {
+    let output = spawn_output(&mut git_command(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--show-toplevel",
+        ],
+    ))
+    .map_err(|e| ChangedFilesError::GitMissing(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(if stderr.contains("not a git repository") {
+            ChangedFilesError::NotARepository
+        } else {
+            ChangedFilesError::GitFailed(stderr.trim().to_owned())
+        });
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut lines = raw.lines();
+    let (Some(common), Some(toplevel), None) = (lines.next(), lines.next(), lines.next()) else {
+        return Err(ChangedFilesError::GitFailed(
+            "git rev-parse did not print one common dir and one toplevel".to_owned(),
+        ));
+    };
+    let canonical = |line: &str| {
+        let path = PathBuf::from(line.trim());
+        dunce::canonicalize(&path).unwrap_or(path)
+    };
+    if common.trim().is_empty() || toplevel.trim().is_empty() {
+        return Err(ChangedFilesError::GitFailed(
+            "git rev-parse returned an empty path".to_owned(),
+        ));
+    }
+    Ok((canonical(common), canonical(toplevel)))
+}
+
 /// Get files changed since a git ref.
 fn try_get_changed_files(
     root: &Path,
@@ -167,15 +280,58 @@ pub fn changed_files(root: &Path, git_ref: &str) -> Result<FxHashSet<PathBuf>, C
     try_get_changed_files(root, git_ref)
 }
 
+/// Resolve several refs against one working tree. The HEAD diff and untracked
+/// inventory do not depend on the ref, so a package-baseline run reads them
+/// once while still resolving each ref's committed diff independently.
+pub(crate) struct ChangedFilesBatch<'a> {
+    cwd: &'a Path,
+    toplevel: PathBuf,
+    working_tree: Option<FxHashSet<PathBuf>>,
+}
+
+impl<'a> ChangedFilesBatch<'a> {
+    pub(crate) fn new(cwd: &'a Path, first_ref: &str) -> Result<Self, ChangedFilesError> {
+        validate_git_ref(first_ref).map_err(ChangedFilesError::InvalidRef)?;
+        Ok(Self {
+            cwd,
+            toplevel: resolve_git_toplevel(cwd)?,
+            working_tree: None,
+        })
+    }
+
+    pub(crate) fn changed_files(
+        &mut self,
+        git_ref: &str,
+    ) -> Result<FxHashSet<PathBuf>, ChangedFilesError> {
+        let mut files = committed_changed_files(self.cwd, &self.toplevel, git_ref)?;
+        if self.working_tree.is_none() {
+            self.working_tree = Some(working_tree_changed_files(self.cwd, &self.toplevel)?);
+        }
+        if let Some(working_tree) = &self.working_tree {
+            files.extend(working_tree.iter().cloned());
+        }
+        Ok(files)
+    }
+}
+
 /// Get changed files and the git toplevel used to resolve them.
 pub fn try_get_changed_files_with_toplevel(
     cwd: &Path,
     toplevel: &Path,
     git_ref: &str,
 ) -> Result<FxHashSet<PathBuf>, ChangedFilesError> {
-    validate_git_ref(git_ref).map_err(ChangedFilesError::InvalidRef)?;
+    let mut files = committed_changed_files(cwd, toplevel, git_ref)?;
+    files.extend(working_tree_changed_files(cwd, toplevel)?);
+    Ok(files)
+}
 
-    let mut files = collect_git_paths(
+fn committed_changed_files(
+    cwd: &Path,
+    toplevel: &Path,
+    git_ref: &str,
+) -> Result<FxHashSet<PathBuf>, ChangedFilesError> {
+    validate_git_ref(git_ref).map_err(ChangedFilesError::InvalidRef)?;
+    collect_git_paths(
         cwd,
         toplevel,
         &[
@@ -185,12 +341,14 @@ pub fn try_get_changed_files_with_toplevel(
             "--end-of-options",
             &format!("{git_ref}...HEAD"),
         ],
-    )?;
-    files.extend(collect_git_paths(
-        cwd,
-        toplevel,
-        &["diff", "--name-only", "-z", "HEAD"],
-    )?);
+    )
+}
+
+fn working_tree_changed_files(
+    cwd: &Path,
+    toplevel: &Path,
+) -> Result<FxHashSet<PathBuf>, ChangedFilesError> {
+    let mut files = collect_git_paths(cwd, toplevel, &["diff", "--name-only", "-z", "HEAD"])?;
     files.extend(collect_git_paths(
         cwd,
         toplevel,
@@ -421,20 +579,8 @@ fn changed_files_error_from_output(output: &Output) -> ChangedFilesError {
 pub fn get_changed_files(root: &Path, git_ref: &str) -> Option<FxHashSet<PathBuf>> {
     match try_get_changed_files(root, git_ref) {
         Ok(files) => Some(files),
-        Err(ChangedFilesError::InvalidRef(e)) => {
-            eprintln!("Warning: --changed-since ignored: invalid git ref: {e}");
-            None
-        }
-        Err(ChangedFilesError::GitMissing(e)) => {
-            eprintln!("Warning: --changed-since ignored: failed to run git: {e}");
-            None
-        }
-        Err(ChangedFilesError::NotARepository) => {
-            eprintln!("Warning: --changed-since ignored: not a git repository");
-            None
-        }
-        Err(ChangedFilesError::GitFailed(stderr)) => {
-            eprintln!("Warning: --changed-since failed for ref '{git_ref}': {stderr}");
+        Err(err) => {
+            eprintln!("Warning: {}", err.changed_since_message(git_ref));
             None
         }
     }
@@ -476,16 +622,23 @@ fn collect_git_paths(
     Ok(files)
 }
 
+/// Decode one NUL-separated `git` output path into a `PathBuf`.
+///
+/// Unix keeps the raw bytes, so a non-UTF-8 tree path survives intact.
+/// Shared with `crate::churn`, which decodes the same `git` byte output under
+/// the same semantics.
 #[cfg(unix)]
-fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+pub(crate) fn git_path_from_bytes(path: &[u8]) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     PathBuf::from(OsString::from_vec(path.to_vec()))
 }
 
+/// Windows counterpart: there is no byte-oriented `OsString`, so decode
+/// lossily and rewrite to backslash separators.
 #[cfg(windows)]
-fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+pub(crate) fn git_path_from_bytes(path: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(path).replace('/', "\\"))
 }
 
@@ -513,13 +666,48 @@ pub fn filter_results_by_changed_files(
     results: &mut AnalysisResults,
     changed_files: &FxHashSet<PathBuf>,
 ) {
-    let cf = normalize_changed_files_set(changed_files);
+    filter_results_by_path_scope(results, &NormalizedChangedFiles::new(changed_files));
+}
+
+/// Path membership for one resolved result scope. Implementations own path
+/// normalization so source and manifest findings use the same policy.
+pub(crate) trait ChangedPathScope {
+    fn contains(&self, path: &Path) -> bool;
+    fn contains_workspace(&self, path: &Path) -> bool {
+        self.contains(path)
+    }
+}
+
+/// A changed-file set normalized the way every changed-file filter reads it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NormalizedChangedFiles(FxHashSet<PathBuf>);
+
+impl NormalizedChangedFiles {
+    pub(crate) fn new(changed_files: &FxHashSet<PathBuf>) -> Self {
+        Self(normalize_changed_files_set(changed_files))
+    }
+}
+
+impl ChangedPathScope for NormalizedChangedFiles {
+    fn contains(&self, path: &Path) -> bool {
+        contains_normalized(&self.0, path)
+    }
+
+    fn contains_workspace(&self, path: &Path) -> bool {
+        normalized_set_contains_path(&self.0, path)
+    }
+}
+
+pub(crate) fn filter_results_by_path_scope(
+    results: &mut AnalysisResults,
+    scope: &impl ChangedPathScope,
+) {
     classify_changed_file_filter_fields(results);
-    retain_basic_issue_findings_by_changed_path(results, &cf);
-    retain_graph_findings_by_changed_files(results, &cf);
-    retain_boundary_policy_and_suppression_findings(results, &cf);
-    retain_security_and_workspace_findings(results, &cf);
-    retain_framework_findings_by_changed_files(results, &cf);
+    retain_basic_issue_findings_by_changed_path(results, scope);
+    retain_graph_findings_by_changed_files(results, scope);
+    retain_boundary_policy_and_suppression_findings(results, scope);
+    retain_security_and_workspace_findings(results, scope);
+    retain_framework_findings_by_changed_files(results, scope);
 }
 
 fn classify_changed_file_filter_fields(results: &AnalysisResults) {
@@ -528,6 +716,7 @@ fn classify_changed_file_filter_fields(results: &AnalysisResults) {
         unused_exports: _unused_exports,
         unused_types: _unused_types,
         private_type_leaks: _private_type_leaks,
+        deprecated_exports_in_use: _deprecated_exports_in_use,
         unused_dependencies: _unused_dependencies,
         unused_dev_dependencies: _unused_dev_dependencies,
         unused_optional_dependencies: _unused_optional_dependencies,
@@ -542,6 +731,7 @@ fn classify_changed_file_filter_fields(results: &AnalysisResults) {
         dev_dependencies_in_production: _dev_dependencies_in_production,
         circular_dependencies: _circular_dependencies,
         re_export_cycles: _re_export_cycles,
+        package_cycles: _package_cycles,
         boundary_violations: _boundary_violations,
         boundary_coverage_violations: _boundary_coverage_violations,
         boundary_call_violations: _boundary_call_violations,
@@ -560,16 +750,22 @@ fn classify_changed_file_filter_fields(results: &AnalysisResults) {
         route_collisions: _route_collisions,
         dynamic_segment_name_conflicts: _dynamic_segment_name_conflicts,
         unused_component_props: _unused_component_props,
+        absent_component_props: _absent_component_props,
         unused_component_emits: _unused_component_emits,
         unused_component_inputs: _unused_component_inputs,
         unused_component_outputs: _unused_component_outputs,
         unused_svelte_events: _unused_svelte_events,
+        unused_effect_layers: _unused_effect_layers,
+        unused_tagged_errors: _unused_tagged_errors,
+        unproduced_catch_tags: _unproduced_catch_tags,
         unused_server_actions: _unused_server_actions,
         unused_load_data_keys: _unused_load_data_keys,
         unused_load_data_keys_global_abstain: _unused_load_data_keys_global_abstain,
         prop_drilling_chains: _prop_drilling_chains,
         thin_wrappers: _thin_wrappers,
         duplicate_prop_shapes: _duplicate_prop_shapes,
+        cascade_hidden: _cascade_hidden,
+        cascade: _cascade,
         suppression_count: _suppression_count,
         unused_component_props_exempted: _unused_component_props_exempted,
         active_suppressions: _active_suppressions,
@@ -588,104 +784,88 @@ fn classify_changed_file_filter_fields(results: &AnalysisResults) {
 
 fn retain_basic_issue_findings_by_changed_path(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_by_changed_path(&mut results.unused_files, changed_files, |f| &f.file.path);
-    retain_by_changed_path(&mut results.unused_exports, changed_files, |e| {
+    retain_by_changed_path(&mut results.unused_files, scope, |f| &f.file.path);
+    retain_by_changed_path(&mut results.unused_exports, scope, |e| &e.export.path);
+    retain_by_changed_path(&mut results.unused_types, scope, |e| &e.export.path);
+    retain_by_changed_path(&mut results.private_type_leaks, scope, |e| &e.leak.path);
+    retain_by_changed_path(&mut results.deprecated_exports_in_use, scope, |e| {
         &e.export.path
     });
-    retain_by_changed_path(&mut results.unused_types, changed_files, |e| &e.export.path);
-    retain_by_changed_path(&mut results.private_type_leaks, changed_files, |e| {
-        &e.leak.path
-    });
-    retain_by_changed_path(&mut results.unused_enum_members, changed_files, |m| {
-        &m.member.path
-    });
-    retain_by_changed_path(&mut results.unused_class_members, changed_files, |m| {
-        &m.member.path
-    });
-    retain_by_changed_path(&mut results.unused_store_members, changed_files, |m| {
-        &m.member.path
-    });
-    retain_by_changed_path(&mut results.unresolved_imports, changed_files, |i| {
-        &i.import.path
-    });
+    retain_by_changed_path(&mut results.unused_enum_members, scope, |m| &m.member.path);
+    retain_by_changed_path(&mut results.unused_class_members, scope, |m| &m.member.path);
+    retain_by_changed_path(&mut results.unused_store_members, scope, |m| &m.member.path);
+    retain_by_changed_path(&mut results.unresolved_imports, scope, |i| &i.import.path);
 }
 
 fn retain_graph_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_unlisted_dependencies_by_import_site(&mut results.unlisted_dependencies, changed_files);
-    retain_duplicate_exports_by_changed_locations(&mut results.duplicate_exports, changed_files);
-    retain_circular_dependencies_by_changed_file(&mut results.circular_dependencies, changed_files);
-    retain_re_export_cycles_by_changed_file(&mut results.re_export_cycles, changed_files);
+    retain_unlisted_dependencies_by_import_site(&mut results.unlisted_dependencies, scope);
+    retain_duplicate_exports_by_changed_locations(&mut results.duplicate_exports, scope);
+    retain_circular_dependencies_by_changed_file(&mut results.circular_dependencies, scope);
+    retain_re_export_cycles_by_changed_file(&mut results.re_export_cycles, scope);
+    retain_package_cycles_by_changed_file(&mut results.package_cycles, scope);
 }
 
 fn retain_boundary_policy_and_suppression_findings(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_by_changed_path(&mut results.boundary_violations, changed_files, |v| {
+    retain_by_changed_path(&mut results.boundary_violations, scope, |v| {
         &v.violation.from_path
     });
-    retain_by_changed_path(
-        &mut results.boundary_coverage_violations,
-        changed_files,
-        |v| &v.violation.path,
-    );
-    retain_by_changed_path(&mut results.boundary_call_violations, changed_files, |v| {
+    retain_by_changed_path(&mut results.boundary_coverage_violations, scope, |v| {
         &v.violation.path
     });
-    retain_by_changed_path(&mut results.policy_violations, changed_files, |v| {
+    retain_by_changed_path(&mut results.boundary_call_violations, scope, |v| {
         &v.violation.path
     });
-    retain_by_changed_path(&mut results.stale_suppressions, changed_files, |s| &s.path);
+    retain_by_changed_path(&mut results.policy_violations, scope, |v| &v.violation.path);
+    retain_by_changed_path(&mut results.stale_suppressions, scope, |s| &s.path);
 }
 
 fn retain_security_and_workspace_findings(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_security_findings_by_changed_path(&mut results.security_findings, changed_files);
+    retain_security_findings_by_changed_path(&mut results.security_findings, scope);
     retain_by_changed_path(
         &mut results.security_unresolved_callee_diagnostics,
-        changed_files,
+        scope,
         |d| &d.path,
     );
-    retain_by_changed_path(
-        &mut results.unresolved_catalog_references,
-        changed_files,
-        |r| &r.reference.path,
-    );
+    retain_by_changed_path(&mut results.unresolved_catalog_references, scope, |r| {
+        &r.reference.path
+    });
     results
         .empty_catalog_groups
-        .retain(|g| normalized_set_contains_path(changed_files, &g.group.path));
-    retain_by_changed_path(
-        &mut results.unused_dependency_overrides,
-        changed_files,
-        |o| &o.entry.path,
-    );
+        .retain(|g| scope.contains_workspace(&g.group.path));
+    retain_by_changed_path(&mut results.unused_dependency_overrides, scope, |o| {
+        &o.entry.path
+    });
     retain_by_changed_path(
         &mut results.misconfigured_dependency_overrides,
-        changed_files,
+        scope,
         |o| &o.entry.path,
     );
 }
 
 fn retain_framework_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_client_boundary_findings_by_changed_files(results, changed_files);
-    retain_component_contract_findings_by_changed_files(results, changed_files);
-    retain_react_health_findings_by_changed_files(results, changed_files);
-    retain_nextjs_findings_by_changed_files(results, changed_files);
+    retain_client_boundary_findings_by_changed_files(results, scope);
+    retain_component_contract_findings_by_changed_files(results, scope);
+    retain_react_health_findings_by_changed_files(results, scope);
+    retain_nextjs_findings_by_changed_files(results, scope);
 }
 
 fn retain_client_boundary_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     let AnalysisResults {
         invalid_client_exports,
@@ -694,46 +874,50 @@ fn retain_client_boundary_findings_by_changed_files(
         ..
     } = results;
 
-    retain_by_changed_path(invalid_client_exports, changed_files, |e| &e.export.path);
-    retain_by_changed_path(mixed_client_server_barrels, changed_files, |b| {
-        &b.barrel.path
-    });
-    retain_by_changed_path(misplaced_directives, changed_files, |d| {
-        &d.directive_site.path
-    });
+    retain_by_changed_path(invalid_client_exports, scope, |e| &e.export.path);
+    retain_by_changed_path(mixed_client_server_barrels, scope, |b| &b.barrel.path);
+    retain_by_changed_path(misplaced_directives, scope, |d| &d.directive_site.path);
 }
 
 fn retain_component_contract_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     let AnalysisResults {
         unprovided_injects,
         unrendered_components,
         unused_component_props,
+        absent_component_props,
         unused_component_emits,
         unused_component_inputs,
         unused_component_outputs,
         unused_svelte_events,
+        unused_effect_layers,
+        unused_tagged_errors,
+        unproduced_catch_tags,
         unused_server_actions,
         unused_load_data_keys,
         ..
     } = results;
 
-    retain_by_changed_path(unprovided_injects, changed_files, |i| &i.inject.path);
-    retain_by_changed_path(unrendered_components, changed_files, |c| &c.component.path);
-    retain_by_changed_path(unused_component_props, changed_files, |p| &p.prop.path);
-    retain_by_changed_path(unused_component_emits, changed_files, |e| &e.emit.path);
-    retain_by_changed_path(unused_component_inputs, changed_files, |i| &i.input.path);
-    retain_by_changed_path(unused_component_outputs, changed_files, |o| &o.output.path);
-    retain_by_changed_path(unused_svelte_events, changed_files, |e| &e.event.path);
-    retain_by_changed_path(unused_server_actions, changed_files, |a| &a.action.path);
-    retain_by_changed_path(unused_load_data_keys, changed_files, |k| &k.key.path);
+    retain_by_changed_path(unprovided_injects, scope, |i| &i.inject.path);
+    retain_by_changed_path(unrendered_components, scope, |c| &c.component.path);
+    retain_by_changed_path(unused_component_props, scope, |p| &p.prop.path);
+    retain_by_changed_path(absent_component_props, scope, |p| &p.prop.path);
+    retain_by_changed_path(unused_component_emits, scope, |e| &e.emit.path);
+    retain_by_changed_path(unused_component_inputs, scope, |i| &i.input.path);
+    retain_by_changed_path(unused_component_outputs, scope, |o| &o.output.path);
+    retain_by_changed_path(unused_svelte_events, scope, |e| &e.event.path);
+    retain_by_changed_path(unused_effect_layers, scope, |e| &e.layer.path);
+    retain_by_changed_path(unused_tagged_errors, scope, |e| &e.error.path);
+    retain_by_changed_path(unproduced_catch_tags, scope, |e| &e.catch_tag.path);
+    retain_by_changed_path(unused_server_actions, scope, |a| &a.action.path);
+    retain_by_changed_path(unused_load_data_keys, scope, |k| &k.key.path);
 }
 
 fn retain_react_health_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     let AnalysisResults {
         prop_drilling_chains,
@@ -742,14 +926,14 @@ fn retain_react_health_findings_by_changed_files(
         ..
     } = results;
 
-    retain_prop_drilling_chains_by_anchor(prop_drilling_chains, changed_files);
-    retain_by_changed_path(thin_wrappers, changed_files, |w| &w.wrapper.file);
-    retain_duplicate_prop_shapes_by_anchor(duplicate_prop_shapes, changed_files);
+    retain_prop_drilling_chains_by_anchor(prop_drilling_chains, scope);
+    retain_by_changed_path(thin_wrappers, scope, |w| &w.wrapper.file);
+    retain_duplicate_prop_shapes_by_anchor(duplicate_prop_shapes, scope);
 }
 
 fn retain_nextjs_findings_by_changed_files(
     results: &mut AnalysisResults,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     let AnalysisResults {
         route_collisions,
@@ -757,113 +941,115 @@ fn retain_nextjs_findings_by_changed_files(
         ..
     } = results;
 
-    retain_by_changed_path(route_collisions, changed_files, |c| &c.collision.path);
-    retain_by_changed_path(dynamic_segment_name_conflicts, changed_files, |c| {
-        &c.conflict.path
-    });
+    retain_by_changed_path(route_collisions, scope, |c| &c.collision.path);
+    retain_by_changed_path(dynamic_segment_name_conflicts, scope, |c| &c.conflict.path);
 }
 
 fn retain_unlisted_dependencies_by_import_site(
     dependencies: &mut Vec<UnlistedDependencyFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     dependencies.retain(|dependency| {
         dependency
             .dep
             .imported_from
             .iter()
-            .any(|site| contains_normalized(changed_files, &site.path))
+            .any(|site| scope.contains(&site.path))
     });
 }
 
 fn retain_duplicate_exports_by_changed_locations(
     duplicate_exports: &mut Vec<DuplicateExportFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     for duplicate in &mut *duplicate_exports {
         duplicate
             .export
             .locations
-            .retain(|location| contains_normalized(changed_files, &location.path));
+            .retain(|location| scope.contains(&location.path));
     }
     duplicate_exports.retain(|duplicate| duplicate.export.locations.len() >= 2);
 }
 
 fn retain_circular_dependencies_by_changed_file(
     cycles: &mut Vec<CircularDependencyFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    cycles.retain(|cycle| {
-        cycle
-            .cycle
-            .files
-            .iter()
-            .any(|file| contains_normalized(changed_files, file))
-    });
+    cycles.retain(|cycle| cycle.cycle.files.iter().any(|file| scope.contains(file)));
 }
 
 fn retain_re_export_cycles_by_changed_file(
     cycles: &mut Vec<ReExportCycleFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
+) {
+    cycles.retain(|cycle| cycle.cycle.files.iter().any(|file| scope.contains(file)));
+}
+
+fn retain_package_cycles_by_changed_file(
+    cycles: &mut Vec<PackageCycleFinding>,
+    scope: &impl ChangedPathScope,
 ) {
     cycles.retain(|cycle| {
         cycle
             .cycle
-            .files
+            .edges
             .iter()
-            .any(|file| contains_normalized(changed_files, file))
+            .any(|edge| scope.contains(&edge.path))
     });
 }
 
 fn retain_security_findings_by_changed_path(
     findings: &mut Vec<SecurityFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    findings.retain(|finding| security_finding_touches_changed_path(finding, changed_files));
+    findings.retain(|finding| security_finding_touches_changed_path(finding, scope));
 }
 
 fn retain_prop_drilling_chains_by_anchor(
     chains: &mut Vec<PropDrillingChainFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
     chains.retain(|chain| {
+        if chain.effective_severity
+            == Some(fallow_types::output_dead_code::EffectiveSeverity::Error)
+        {
+            return chain.chain.hops.is_empty()
+                || chain.chain.hops.iter().any(|hop| scope.contains(&hop.file));
+        }
         chain
             .chain
             .hops
             .first()
-            .is_some_and(|hop| contains_normalized(changed_files, &hop.file))
+            .is_some_and(|hop| scope.contains(&hop.file))
     });
 }
 
 fn retain_duplicate_prop_shapes_by_anchor(
     shapes: &mut Vec<DuplicatePropShapeFinding>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) {
-    retain_by_changed_path(shapes, changed_files, |shape| &shape.shape.file);
+    retain_by_changed_path(shapes, scope, |shape| &shape.shape.file);
 }
 
 fn retain_by_changed_path<T>(
     items: &mut Vec<T>,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
     path: impl Fn(&T) -> &Path,
 ) {
-    items.retain(|item| contains_normalized(changed_files, path(item)));
+    items.retain(|item| scope.contains(path(item)));
 }
 
 fn security_finding_touches_changed_path(
     finding: &SecurityFinding,
-    changed_files: &FxHashSet<PathBuf>,
+    scope: &impl ChangedPathScope,
 ) -> bool {
-    contains_normalized(changed_files, &finding.path)
-        || finding
-            .trace
-            .iter()
-            .any(|hop| contains_normalized(changed_files, &hop.path))
+    scope.contains(&finding.path)
+        || finding.trace.iter().any(|hop| scope.contains(&hop.path))
         || finding.reachability.as_ref().is_some_and(|reachability| {
             reachability
                 .untrusted_source_trace
                 .iter()
-                .any(|hop| contains_normalized(changed_files, &hop.path))
+                .any(|hop| scope.contains(&hop.path))
         })
 }
 
@@ -893,15 +1079,21 @@ pub fn filter_duplication_by_changed_files(
     changed_files: &FxHashSet<PathBuf>,
     root: &Path,
 ) {
-    let cf = normalize_changed_files_set(changed_files);
+    filter_duplication_by_path_scope(report, &NormalizedChangedFiles::new(changed_files), root);
+}
+
+pub(crate) fn filter_duplication_by_path_scope(
+    report: &mut DuplicationReport,
+    scope: &impl ChangedPathScope,
+    root: &Path,
+) {
     report.clone_groups.retain(|group| {
         group
             .instances
             .iter()
-            .any(|instance| contains_normalized(&cf, &instance.file))
+            .any(|instance| scope.contains(&instance.file))
     });
-    duplicates::refresh_clone_families(report, root);
-    report.stats = duplicates::recompute_stats(report);
+    duplicates::refresh_scoped_report(report, root);
 }
 
 #[cfg(test)]
@@ -918,15 +1110,62 @@ mod tests {
         },
     };
 
+    /// One reason token per cause, because each carries a different remedy and
+    /// a consumer branches on the token rather than on the prose.
     #[test]
-    fn validate_git_ref_rejects_option_like_ref() {
-        assert!(validate_git_ref("--upload-pack=evil").is_err());
-        assert!(validate_git_ref("-flag").is_err());
+    fn every_changed_files_cause_reports_its_own_reason() {
+        let reasons = [
+            ChangedFilesError::InvalidRef("unclosed brace".to_owned()).reason(),
+            ChangedFilesError::GitMissing("no such file".to_owned()).reason(),
+            ChangedFilesError::NotARepository.reason(),
+            ChangedFilesError::GitFailed("unknown revision".to_owned()).reason(),
+        ];
+        assert_eq!(
+            reasons,
+            [
+                "invalid-ref",
+                "git-missing",
+                "not-a-repository",
+                "git-failed"
+            ]
+        );
+        let unique: std::collections::BTreeSet<&str> = reasons.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two causes must not share a token"
+        );
     }
 
+    /// The published sentence and the stderr line are the same string, so the
+    /// remedy cannot drift between a log a human read and a report a script
+    /// read. It names the ref, says the report widened, and ends with a next
+    /// step.
     #[test]
-    fn validate_git_ref_allows_reflog_relative_date() {
-        assert!(validate_git_ref("HEAD@{1 week ago}").is_ok());
+    fn the_changed_since_message_names_the_ref_the_widening_and_the_next_step() {
+        let message = ChangedFilesError::NotARepository.changed_since_message("origin/main");
+        assert!(
+            message.contains("--changed-since 'origin/main'"),
+            "{message}"
+        );
+        assert!(message.contains("covers the whole project"), "{message}");
+        assert!(message.ends_with("or drop --changed-since."), "{message}");
+    }
+
+    /// Git writes multi-line stderr, and the sentence travels into a CI
+    /// annotation and a rendered comment where a newline splits one fact
+    /// across two records.
+    #[test]
+    fn the_changed_since_message_folds_git_stderr_onto_one_line() {
+        let message = ChangedFilesError::GitFailed(
+            "fatal: ambiguous argument 'x'\nUse '--' to separate paths".to_owned(),
+        )
+        .changed_since_message("x");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(
+            message.contains("ambiguous argument 'x' Use '--'"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -950,6 +1189,40 @@ mod tests {
         assert!(matches!(result, Err(ChangedFilesError::NotARepository)));
     }
 
+    #[test]
+    fn batched_refs_match_independent_changed_file_scopes() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "Test User"][..],
+            &["config", "commit.gpgsign", "false"][..],
+        ] {
+            run_git(repo.path(), args);
+        }
+        for name in ["committed.ts", "staged.ts", "unstaged.ts"] {
+            std::fs::write(repo.path().join(name), "old\n").expect("initial file");
+        }
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "base"]);
+        run_git(repo.path(), &["branch", "base"]);
+
+        std::fs::write(repo.path().join("committed.ts"), "new\n").expect("committed change");
+        run_git(repo.path(), &["add", "committed.ts"]);
+        run_git(repo.path(), &["commit", "--quiet", "-m", "change"]);
+        std::fs::write(repo.path().join("staged.ts"), "new\n").expect("staged change");
+        run_git(repo.path(), &["add", "staged.ts"]);
+        std::fs::write(repo.path().join("unstaged.ts"), "new\n").expect("unstaged change");
+        std::fs::write(repo.path().join("untracked.ts"), "new\n").expect("untracked file");
+
+        let mut batch = ChangedFilesBatch::new(repo.path(), "base").expect("batch");
+        for reference in ["base", "HEAD"] {
+            let batched = batch.changed_files(reference).expect("batched changes");
+            let independent = changed_files(repo.path(), reference).expect("independent changes");
+            assert_eq!(batched, independent, "{reference} scope changed");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn changed_files_preserve_special_filenames() {
@@ -959,6 +1232,7 @@ mod tests {
             &["config", "user.email", "test@example.com"][..],
             &["config", "user.name", "Test User"][..],
             &["config", "commit.gpgsign", "false"][..],
+            &["config", "tag.gpgsign", "false"][..],
         ] {
             run_git(repo.path(), args);
         }
@@ -1007,6 +1281,7 @@ mod tests {
             &["config", "user.email", "test@example.com"][..],
             &["config", "user.name", "Test User"][..],
             &["config", "commit.gpgsign", "false"][..],
+            &["config", "tag.gpgsign", "false"][..],
         ] {
             run_git(repo.path(), args);
         }
@@ -1101,6 +1376,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let mut changed = FxHashSet::default();
@@ -1127,12 +1404,60 @@ mod tests {
                 path: PathBuf::from("/repo/package.json"),
                 line: 3,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let changed = FxHashSet::default();
         filter_results_by_changed_files(&mut results, &changed);
 
         assert_eq!(results.unused_dependencies.len(), 1);
+    }
+
+    /// Retention for `deprecated-export-in-use` keys on the file that declares
+    /// the export. A change that only adds a consumer does not surface an old
+    /// deprecated export (documented v1 behavior).
+    #[test]
+    fn filter_results_keeps_deprecated_export_only_when_its_declaring_file_changed() {
+        let finding = |path: &str| {
+            fallow_types::output_dead_code::DeprecatedExportInUseFinding::with_actions(
+                fallow_types::results::DeprecatedExportInUse {
+                    path: PathBuf::from(path),
+                    export_name: "old".to_owned(),
+                    is_type_only: false,
+                    line: 2,
+                    col: 0,
+                    span_start: 0,
+                    deprecated_reason: None,
+                    consumer_count: 1,
+                    consumers: vec![fallow_types::results::DeprecatedExportConsumer {
+                        path: PathBuf::from("/repo/consumer.ts"),
+                        line: 1,
+                        col: 0,
+                        kind: fallow_types::results::DeprecatedConsumerKind::NamedImport,
+                    }],
+                    public_api: false,
+                },
+            )
+        };
+        let mut results = AnalysisResults::default();
+        results
+            .deprecated_exports_in_use
+            .push(finding("/repo/a.ts"));
+        results
+            .deprecated_exports_in_use
+            .push(finding("/repo/b.ts"));
+
+        let mut changed = FxHashSet::default();
+        changed.insert(PathBuf::from("/repo/a.ts"));
+        changed.insert(PathBuf::from("/repo/consumer.ts"));
+        filter_results_by_changed_files(&mut results, &changed);
+
+        let kept: Vec<_> = results
+            .deprecated_exports_in_use
+            .iter()
+            .map(|f| f.export.path.clone())
+            .collect();
+        assert_eq!(kept, vec![PathBuf::from("/repo/a.ts")]);
     }
 
     #[test]
@@ -1161,6 +1486,7 @@ mod tests {
                 CloneGroup {
                     instances: vec![
                         CloneInstance {
+                            is_symlink: false,
                             file: PathBuf::from("/repo/a.ts"),
                             start_line: 1,
                             end_line: 5,
@@ -1169,6 +1495,7 @@ mod tests {
                             fragment: "code".to_owned(),
                         },
                         CloneInstance {
+                            is_symlink: false,
                             file: PathBuf::from("/repo/b.ts"),
                             start_line: 1,
                             end_line: 5,
@@ -1184,6 +1511,7 @@ mod tests {
                 CloneGroup {
                     instances: vec![
                         CloneInstance {
+                            is_symlink: false,
                             file: PathBuf::from("/repo/c.ts"),
                             start_line: 1,
                             end_line: 5,
@@ -1192,6 +1520,7 @@ mod tests {
                             fragment: "other".to_owned(),
                         },
                         CloneInstance {
+                            is_symlink: false,
                             file: PathBuf::from("/repo/d.ts"),
                             start_line: 1,
                             end_line: 5,
@@ -1215,6 +1544,7 @@ mod tests {
                 total_tokens: 200,
                 duplicated_tokens: 80,
                 clone_groups: 2,
+                clone_families: 0,
                 clone_instances: 4,
                 duplication_percentage: 20.0,
                 clone_groups_below_min_occurrences: 0,
@@ -1231,5 +1561,80 @@ mod tests {
         assert_eq!(report.clone_groups.len(), 1);
         assert_eq!(report.stats.clone_groups, 1);
         assert_eq!(report.stats.clone_instances, 2);
+    }
+
+    /// A changed-file scope keeps the family order of every other path: the
+    /// file set. The larger family has the later file set, so an order by
+    /// duplicated lines puts it first.
+    #[test]
+    fn changed_file_scope_orders_families_by_file_set() {
+        let group = |files: [&str; 2], line_count: usize| CloneGroup {
+            instances: files
+                .iter()
+                .map(|file| CloneInstance {
+                    is_symlink: false,
+                    file: PathBuf::from(file),
+                    start_line: 1,
+                    end_line: line_count,
+                    start_col: 0,
+                    end_col: 10,
+                    fragment: String::new(),
+                })
+                .collect(),
+            token_count: line_count * 10,
+            line_count,
+            similarity: None,
+        };
+        let mut report = DuplicationReport {
+            clone_groups: vec![
+                group(["/repo/y.ts", "/repo/z.ts"], 46),
+                group(["/repo/a.ts", "/repo/b.ts"], 7),
+            ],
+            clone_families: Vec::new(),
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats::default(),
+        };
+        let changed: FxHashSet<PathBuf> = ["/repo/a.ts", "/repo/y.ts"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
+        filter_duplication_by_changed_files(&mut report, &changed, Path::new("/repo"));
+
+        let order: Vec<&PathBuf> = report
+            .clone_families
+            .iter()
+            .map(|family| &family.files[0])
+            .collect();
+        assert_eq!(
+            order,
+            [&PathBuf::from("/repo/a.ts"), &PathBuf::from("/repo/y.ts")]
+        );
+    }
+
+    /// The combined probe gives the same two paths as the two single probes,
+    /// from the repository root and from a subdirectory.
+    #[test]
+    fn one_probe_resolves_the_common_dir_and_the_toplevel() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        run_git(repo.path(), &["init", "--quiet"]);
+        let nested = repo.path().join("packages/app");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        for cwd in [repo.path(), nested.as_path()] {
+            let (common, toplevel) =
+                resolve_git_common_dir_and_toplevel(cwd).expect("combined probe");
+            assert_eq!(common, resolve_git_common_dir(cwd).expect("common dir"));
+            assert_eq!(toplevel, resolve_git_toplevel(cwd).expect("toplevel"));
+        }
+    }
+
+    /// A bare repository has a common dir but no work tree, so the combined
+    /// probe fails and a caller falls back to the single probes.
+    #[test]
+    fn the_combined_probe_fails_without_a_work_tree() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        run_git(repo.path(), &["init", "--quiet", "--bare"]);
+        assert!(resolve_git_common_dir_and_toplevel(repo.path()).is_err());
+        assert!(resolve_git_common_dir(repo.path()).is_ok());
     }
 }

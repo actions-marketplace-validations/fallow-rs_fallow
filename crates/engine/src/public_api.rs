@@ -2,11 +2,13 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use fallow_config::{PackageJson, ResolvedConfig, WorkspaceInfo};
+use fallow_config::{
+    PackageJson, ResolvedConfig, TsconfigOutputMap, TsconfigOutputResolution, WorkspaceInfo,
+};
 use fallow_types::discover::FileId;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use fallow_graph::resolve::OUTPUT_DIRS;
+use fallow_graph::resolve::{OUTPUT_DIRS, directory_index_entry, output_entry_to_source_path};
 
 use crate::{
     discover::{EntryPoint, EntryPointSource, SOURCE_EXTENSIONS},
@@ -160,42 +162,72 @@ fn add_package_public_api_entry_points(
         return;
     }
 
+    let output_map = TsconfigOutputMap::from_project(package_root);
+    let resolver = graph.package_entry_resolver(package_root);
+    let file_id_for =
+        |path: &Path| resolver.file_id(path, |candidate| path_to_file_id.get(candidate).copied());
     for entry in package_json.entry_points() {
         let Some(entry_point) = resolve_public_api_entry_path(
             package_root,
             &entry,
             canonical_project_root,
             EntryPointSource::PackageJsonExports,
+            &output_map,
+            &|path| file_id_for(path).is_some(),
         ) else {
             continue;
         };
 
-        if let Some(file_id) = path_to_file_id.get(&entry_point.path).copied().or_else(|| {
-            resolve_entry_via_canonical(graph, path_to_file_id, package_root, &entry_point.path)
-        }) {
+        if let Some(file_id) = file_id_for(&entry_point.path) {
             public_api_entry_points.insert(file_id);
         }
     }
 }
 
+/// Resolve a package entry to a source path.
+///
+/// `is_discovered` returns `true` for a path in the graph. A `lib/` entry
+/// outside the graph maps to `src/`, the same as a missing `lib/` entry.
 fn resolve_public_api_entry_path(
     base: &Path,
     entry: &str,
     canonical_root: &Path,
     source: EntryPointSource,
+    output_map: &TsconfigOutputMap,
+    is_discovered: &dyn Fn(&Path) -> bool,
 ) -> Option<EntryPoint> {
     if entry.contains('*') || entry_has_parent_dir(entry) {
         return None;
     }
 
-    if let Some(source_path) = try_output_to_source_path(base, entry) {
-        return validated_entry_point(&source_path, canonical_root, source);
-    }
+    match output_map.resolve_source_for_entry(entry, SOURCE_EXTENSIONS) {
+        TsconfigOutputResolution::Resolved(source_path) => {
+            return validated_entry_point(&source_path, canonical_root, source);
+        }
+        TsconfigOutputResolution::ConfiguredButUnresolved => {}
+        TsconfigOutputResolution::ConfiguredWithoutSource => {
+            // The tsconfig claims the output but names no file, so a bundler
+            // can own it. Only an analyzed source file under `src/` counts.
+            if let Some(source_path) =
+                output_entry_to_source_path(base, entry, SOURCE_EXTENSIONS, is_discovered)
+                    .filter(|source_path| is_discovered(source_path))
+            {
+                return validated_entry_point(&source_path, canonical_root, source);
+            }
+        }
+        TsconfigOutputResolution::Unconfigured => {
+            if let Some(source_path) =
+                output_entry_to_source_path(base, entry, SOURCE_EXTENSIONS, is_discovered)
+            {
+                return validated_entry_point(&source_path, canonical_root, source);
+            }
 
-    if is_entry_in_output_dir(entry)
-        && let Some(source_path) = try_source_index_fallback(base)
-    {
-        return validated_entry_point(&source_path, canonical_root, source);
+            if is_entry_in_output_dir(entry)
+                && let Some(source_path) = try_source_index_fallback(base)
+            {
+                return validated_entry_point(&source_path, canonical_root, source);
+            }
+        }
     }
 
     resolve_entry_via_filesystem_probe(base, entry, canonical_root, source)
@@ -220,7 +252,7 @@ fn resolve_entry_via_filesystem_probe(
         }
     }
 
-    if let Some(index_entry) = try_directory_index_entry(&resolved) {
+    if let Some(index_entry) = directory_index_entry(&resolved, SOURCE_EXTENSIONS) {
         return validated_entry_point(&index_entry, canonical_root, source);
     }
 
@@ -253,16 +285,6 @@ fn validated_entry_point(
         })
 }
 
-fn try_directory_index_entry(resolved: &Path) -> Option<PathBuf> {
-    for ext in SOURCE_EXTENSIONS {
-        let candidate = resolved.join(format!("index.{ext}"));
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn is_package_root_index_entry(entry: &str) -> bool {
     let mut components = Path::new(entry)
         .components()
@@ -278,38 +300,6 @@ fn is_package_root_index_entry(entry: &str) -> bool {
     file_name
         .to_str()
         .is_some_and(|name| name == "index" || name.starts_with("index."))
-}
-
-fn try_output_to_source_path(base: &Path, entry: &str) -> Option<PathBuf> {
-    let entry_path = Path::new(entry);
-    let components: Vec<_> = entry_path.components().collect();
-
-    let output_pos = components.iter().rposition(|component| {
-        if let Component::Normal(name) = component
-            && let Some(name) = name.to_str()
-        {
-            return OUTPUT_DIRS.contains(&name);
-        }
-        false
-    })?;
-
-    let prefix: PathBuf = components[..output_pos]
-        .iter()
-        .filter(|component| !matches!(component, Component::CurDir))
-        .collect();
-    let suffix: PathBuf = components[output_pos + 1..].iter().collect();
-
-    for ext in SOURCE_EXTENSIONS {
-        let source_candidate = base
-            .join(&prefix)
-            .join("src")
-            .join(suffix.with_extension(ext));
-        if source_candidate.exists() {
-            return Some(source_candidate);
-        }
-    }
-
-    None
 }
 
 fn is_entry_in_output_dir(entry: &str) -> bool {
@@ -331,35 +321,6 @@ fn try_source_index_fallback(base: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn resolve_entry_via_canonical(
-    graph: &fallow_graph::graph::ModuleGraph,
-    path_to_file_id: &FxHashMap<PathBuf, FileId>,
-    package_root: &Path,
-    entry_path: &Path,
-) -> Option<FileId> {
-    dunce::canonicalize(entry_path).ok().and_then(|canonical| {
-        path_to_file_id
-            .get(&canonical)
-            .copied()
-            .or_else(|| resolve_entry_via_scoped_canonical(graph, package_root, &canonical))
-    })
-}
-
-fn resolve_entry_via_scoped_canonical(
-    graph: &fallow_graph::graph::ModuleGraph,
-    package_root: &Path,
-    canonical_entry: &Path,
-) -> Option<FileId> {
-    graph
-        .modules
-        .iter()
-        .filter(|module| module.path.starts_with(package_root))
-        .find_map(|module| {
-            (dunce::canonicalize(&module.path).ok().as_deref() == Some(canonical_entry))
-                .then_some(module.file_id)
-        })
 }
 
 fn add_exportless_package_source_indexes(
@@ -410,8 +371,10 @@ mod tests {
     use crate::session::AnalysisSession;
 
     fn fixture_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/public-package-members")
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../tests/fixtures/public-package-members")
     }
 
     fn public_entry_paths(session: &AnalysisSession) -> Vec<PathBuf> {
@@ -440,5 +403,348 @@ mod tests {
 
         assert_eq!(selected_paths.len(), 1);
         assert!(selected_paths[0].ends_with("packages/public-lib/src/index.ts"));
+    }
+
+    #[test]
+    fn package_output_entries_resolve_through_tsconfig_with_outputs_present_or_absent() {
+        let directory = tempfile::tempdir().expect("temporary project directory");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("source")).expect("source directory");
+        std::fs::create_dir_all(root.join("distribution")).expect("output directory");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "configured-output-package",
+                "exports": {
+                    ".": {
+                        "types": "./distribution/index.d.ts",
+                        "import": "./distribution/index.js"
+                    }
+                }
+            }"#,
+        )
+        .expect("package manifest");
+        std::fs::write(
+            root.join("tsconfig.build.json"),
+            r#"{
+                "compilerOptions": {
+                    "rootDir": "./source",
+                    "outDir": "./distribution"
+                },
+                "include": ["source"]
+            }"#,
+        )
+        .expect("TypeScript config");
+        std::fs::write(
+            root.join("source/index.ts"),
+            "export const publicValue = 1;\n",
+        )
+        .expect("source entry");
+        std::fs::write(
+            root.join("source/internal.ts"),
+            "export const internalValue = 1;\n",
+        )
+        .expect("unrelated source file");
+        std::fs::write(
+            root.join("distribution/index.js"),
+            "export const publicValue = 1;\n",
+        )
+        .expect("generated JavaScript entry");
+        std::fs::write(
+            root.join("distribution/index.d.ts"),
+            "export declare const publicValue: 1;\n",
+        )
+        .expect("generated declaration entry");
+
+        let with_outputs = AnalysisSession::load_with_config(root, None, |_| {})
+            .expect("project with outputs loads");
+        let expected = root.join("source/index.ts");
+        assert_eq!(
+            public_entry_paths(&with_outputs),
+            vec![expected.clone()],
+            "configured output entries should resolve to their source entry, without exposing unrelated source files"
+        );
+
+        std::fs::remove_dir_all(root.join("distribution")).expect("remove generated outputs");
+        let without_outputs = AnalysisSession::load_with_config(root, None, |_| {})
+            .expect("project without outputs loads");
+        assert_eq!(
+            public_entry_paths(&without_outputs),
+            vec![expected],
+            "configured output entries should still resolve when build artifacts are absent"
+        );
+    }
+
+    #[test]
+    fn out_dir_without_root_dir_resolves_public_subpaths_and_bin() {
+        let directory = tempfile::tempdir().expect("temporary project directory");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "out-dir-only-package",
+                "main": "./dist/index.js",
+                "bin": "./dist/cli.js",
+                "exports": {
+                    ".": "./dist/index.js",
+                    "./browser": "./dist/browser.js"
+                }
+            }"#,
+        )
+        .expect("package manifest");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"outDir":"./dist"},"include":["src"]}"#,
+        )
+        .expect("TypeScript config");
+        for name in ["index.ts", "browser.ts", "cli.ts", "internal.ts"] {
+            std::fs::write(
+                root.join("src").join(name),
+                format!("export const {} = 1;\n", name.trim_end_matches(".ts")),
+            )
+            .expect("source module");
+        }
+
+        let session = AnalysisSession::load_with_config(root, None, |_| {})
+            .expect("outDir-only package loads");
+        let entries = public_entry_paths(&session);
+        for entry in ["src/index.ts", "src/browser.ts", "src/cli.ts"] {
+            assert!(
+                entries.iter().any(|path| path.ends_with(entry)),
+                "public output entry {entry} should map to its source, public entries: {entries:?}"
+            );
+        }
+        assert!(
+            !entries.iter().any(|path| path.ends_with("src/internal.ts")),
+            "mapping public outputs must not expose unrelated source files, public entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_dir_without_out_dir_resolves_package_types_entries() {
+        for with_output in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary project directory");
+            let root = directory.path();
+            std::fs::create_dir_all(root.join("source")).expect("source directory");
+            std::fs::write(
+                root.join("package.json"),
+                r#"{
+                    "name":"declaration-only-package",
+                    "types":"./types/index.d.ts",
+                    "exports":{".":{"types":"./types/index.d.ts"}}
+                }"#,
+            )
+            .expect("package manifest");
+            std::fs::write(
+                root.join("tsconfig.build.json"),
+                r#"{
+                    "compilerOptions": {
+                        "rootDir":"./source",
+                        "declarationDir":"./types"
+                    }
+                }"#,
+            )
+            .expect("TypeScript config");
+            std::fs::write(
+                root.join("source/index.ts"),
+                "export const publicValue = 1;\n",
+            )
+            .expect("source entry");
+            std::fs::write(
+                root.join("source/internal.ts"),
+                "export const internalValue = 1;\n",
+            )
+            .expect("unrelated source file");
+            if with_output {
+                std::fs::create_dir_all(root.join("types")).expect("types directory");
+                std::fs::write(
+                    root.join("types/index.d.ts"),
+                    "export declare const publicValue: 1;\n",
+                )
+                .expect("generated declaration entry");
+            }
+
+            let session = AnalysisSession::load_with_config(root, None, |_| {})
+                .expect("declaration-only project loads");
+            assert_eq!(
+                public_entry_paths(&session),
+                vec![root.join("source/index.ts")],
+                "declarationDir should resolve with output present={with_output}"
+            );
+        }
+    }
+
+    #[test]
+    fn lib_public_entry_maps_to_source_only_when_lib_is_missing() {
+        for with_lib in [false, true] {
+            let directory = tempfile::tempdir().expect("temporary project directory");
+            let root = directory.path();
+            std::fs::create_dir_all(root.join("src")).expect("source directory");
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"name":"lib-output-package","exports":{".":"./lib/index.mjs","./package.json":"./package.json"}}"#,
+            )
+            .expect("package manifest");
+            std::fs::write(root.join("src/index.ts"), "export const value = 1;\n")
+                .expect("source entry");
+            if with_lib {
+                std::fs::create_dir_all(root.join("lib")).expect("lib directory");
+                std::fs::write(root.join("lib/index.mjs"), "export const value = 1;\n")
+                    .expect("hand-written lib entry");
+            }
+
+            let session =
+                AnalysisSession::load_with_config(root, None, |_| {}).expect("project loads");
+            let entries = public_entry_paths(&session);
+            assert_eq!(
+                entries.iter().any(|path| path.ends_with("src/index.ts")),
+                !with_lib,
+                "src/index.ts is a public entry only when lib/ is missing (with_lib={with_lib}), entries: {entries:?}"
+            );
+            assert_eq!(
+                entries.iter().any(|path| path.ends_with("lib/index.mjs")),
+                with_lib,
+                "a lib/ file on disk stays the public entry (with_lib={with_lib}), entries: {entries:?}"
+            );
+        }
+    }
+
+    /// A `noEmit` tsconfig claims `dist/` but maps no file. A bundler emits
+    /// `dist/core.mjs` from `src/core/index.ts`.
+    #[test]
+    fn configured_output_without_source_maps_public_entry_to_src() {
+        let directory = tempfile::tempdir().expect("temporary project directory");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("src/core")).expect("source directory");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"bundled-package","exports":{"./core":{"types":"./dist/core/index.d.ts","import":"./dist/core.mjs"}}}"#,
+        )
+        .expect("package manifest");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"rootDir":"./src","outDir":"./dist","noEmit":true}}"#,
+        )
+        .expect("TypeScript config");
+        std::fs::write(root.join("src/core/index.ts"), "export const value = 1;\n")
+            .expect("source entry");
+        std::fs::write(root.join("src/internal.ts"), "export const value = 1;\n")
+            .expect("unrelated source file");
+
+        let session = AnalysisSession::load_with_config(root, None, |_| {}).expect("project loads");
+        let entries = public_entry_paths(&session);
+        assert!(
+            entries
+                .iter()
+                .any(|path| path.ends_with("src/core/index.ts")),
+            "the bundled output maps to its source directory index, entries: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|path| path.ends_with("src/internal.ts")),
+            "an unrelated source file must not become a public entry, entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_lib_public_entry_on_disk_maps_to_source() {
+        let directory = tempfile::tempdir().expect("temporary project directory");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::create_dir_all(root.join("lib")).expect("lib directory");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"lib-output-package","exports":{".":"./lib/index.mjs"}}"#,
+        )
+        .expect("package manifest");
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            r#"{"ignorePatterns":["lib/**"]}"#,
+        )
+        .expect("fallow config");
+        std::fs::write(root.join("src/index.ts"), "export const value = 1;\n")
+            .expect("source entry");
+        std::fs::write(root.join("lib/index.mjs"), "export const value = 1;\n")
+            .expect("ignored build output");
+
+        let session = AnalysisSession::load_with_config(root, None, |_| {}).expect("project loads");
+        let entries = public_entry_paths(&session);
+        assert!(
+            entries.iter().any(|path| path.ends_with("src/index.ts")),
+            "a lib/ entry outside the discovered file set maps to src/, entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_configured_output_does_not_use_legacy_public_entry_guess() {
+        for with_output in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary project directory");
+            let root = directory.path();
+            for source_dir in ["source", "src"] {
+                std::fs::create_dir_all(root.join(source_dir)).expect("source directory");
+                std::fs::write(
+                    root.join(source_dir).join("index.ts"),
+                    "export const value = 1;\n",
+                )
+                .expect("source entry");
+            }
+            std::fs::write(
+                root.join("package.json"),
+                r#"{"name":"ambiguous-output-package","exports":{".":"./dist/index.js","./runtime":"./runtime.ts"}}"#,
+            )
+            .expect("package manifest");
+            std::fs::write(root.join("runtime.ts"), "export const runtime = 1;\n")
+                .expect("independent runtime export");
+            for (config_name, source_dir) in [
+                ("tsconfig.source.json", "source"),
+                ("tsconfig.src.json", "src"),
+            ] {
+                std::fs::write(
+                    root.join(config_name),
+                    format!(
+                        r#"{{"compilerOptions":{{"rootDir":"./{source_dir}","outDir":"./dist"}}}}"#
+                    ),
+                )
+                .expect("TypeScript config");
+            }
+            if with_output {
+                std::fs::create_dir_all(root.join("dist")).expect("output directory");
+                std::fs::write(root.join("dist/index.js"), "export const value = 1;\n")
+                    .expect("generated output");
+            }
+
+            let session = AnalysisSession::load_with_config(root, None, |_| {})
+                .expect("ambiguous project loads");
+            let entries = public_entry_paths(&session);
+            assert!(
+                !entries.iter().any(|path| path.ends_with("src/index.ts")),
+                "an ambiguous configured map must not expose the legacy src guess with output present={with_output}, entries: {entries:?}"
+            );
+            assert!(
+                !entries.iter().any(|path| path.ends_with("source/index.ts")),
+                "an ambiguous configured map must not expose either source candidate, entries: {entries:?}"
+            );
+        }
+
+        let legacy = tempfile::tempdir().expect("legacy project directory");
+        std::fs::create_dir_all(legacy.path().join("src")).expect("legacy source directory");
+        std::fs::write(
+            legacy.path().join("package.json"),
+            r#"{"name":"legacy-output-package","main":"./dist/index.js"}"#,
+        )
+        .expect("package manifest");
+        std::fs::write(
+            legacy.path().join("src/index.ts"),
+            "export const value = 1;\n",
+        )
+        .expect("legacy source entry");
+        let session = AnalysisSession::load_with_config(legacy.path(), None, |_| {})
+            .expect("legacy project loads");
+        assert!(
+            public_entry_paths(&session)
+                .iter()
+                .any(|path| path.ends_with("src/index.ts")),
+            "the legacy dist/src convention should still resolve without a matching config"
+        );
     }
 }

@@ -41,7 +41,7 @@ pub struct HealthActionContext {
 }
 
 /// Wire envelope for a single complexity finding.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthFinding {
     /// Inner complexity-violation payload.
@@ -50,9 +50,31 @@ pub struct HealthFinding {
     /// Machine-actionable fix and suppress hints.
     pub actions: Vec<HealthFindingAction>,
     /// Audit-mode flag indicating whether the finding is new versus the base
-    /// snapshot.
+    /// snapshot. A complexity finding is new when no base finding has the same
+    /// path and function name, when a grown metric exceeds a threshold that
+    /// the base finding did not exceed, or when the growth of an exceeded
+    /// metric moves it to a higher severity tier. A CRAP score from estimated
+    /// coverage, or a CRAP score that the base finding does not have, is not
+    /// growth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<bool>,
+    /// Audit-mode class of the finding against the base snapshot:
+    /// `introduced`, `worsened` or `inherited`. A worsened finding matches a
+    /// base finding, is not introduced, and has a higher value in at least one
+    /// measured metric. Absent outside an audit with a base snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<crate::AuditFindingAttribution>,
+    /// Audit-mode list of the measured metrics that are higher than in the
+    /// matched base finding, with the base value and the head value. Present
+    /// on a worsened finding, and on an introduced finding that matches a base
+    /// finding. Absent when no metric grew.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worsened_metrics: Vec<crate::WorsenedMetric>,
+    /// Audit-mode reason why the finding does not gate the verdict. With
+    /// `test-file`, the finding is in a test file and `effective_severity` is
+    /// `warn`. Absent outside `audit`, and on a finding that gates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_exemption: Option<crate::AuditGateExemption>,
 }
 
 impl Deref for HealthFinding {
@@ -70,6 +92,9 @@ impl From<ComplexityViolation> for HealthFinding {
             violation,
             actions: Vec::new(),
             introduced: None,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 }
@@ -90,6 +115,9 @@ impl HealthFinding {
             violation,
             actions,
             introduced,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 
@@ -102,6 +130,9 @@ impl HealthFinding {
             violation,
             actions,
             introduced: None,
+            attribution: None,
+            worsened_metrics: Vec::new(),
+            gate_exemption: None,
         }
     }
 }
@@ -232,7 +263,7 @@ fn build_refactor_action(
             format!(
                 "Refactor `{name}` to reduce complexity (extract helper functions, simplify branching)"
             ),
-            "Consider splitting into smaller functions with single responsibilities",
+            "Split into smaller functions with single responsibilities. Splitting relocates branching, so it lowers this function's score without lowering the total",
         )
     };
     HealthFindingAction {
@@ -423,7 +454,7 @@ fn build_crap_coverage_action(
 /// pipeline (the typed action builder operates on the inner
 /// [`HotspotEntry`]) or via [`HotspotFinding::from`] for fixture and
 /// test code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HotspotFinding {
     /// Inner hotspot payload. Flattened on the wire.
@@ -644,7 +675,7 @@ fn suggest_codeowners_pattern(path: &str) -> String {
 /// Construct via [`RefactoringTargetFinding::with_actions`] in the
 /// typical health pipeline or via [`RefactoringTargetFinding::from`] for
 /// fixture and test code.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RefactoringTargetFinding {
     /// Inner refactoring target payload. Flattened on the wire.
@@ -711,7 +742,13 @@ fn build_refactoring_target_actions(target: &RefactoringTarget) -> Vec<Refactori
         comment: None,
     }];
 
-    if target.evidence.is_some() {
+    // A hidden-coupling target has no complexity finding to suppress.
+    if target.evidence.is_some()
+        && !matches!(
+            target.category,
+            RecommendationCategory::ResolveHiddenCoupling
+        )
+    {
         actions.push(RefactoringTargetAction {
             kind: RefactoringTargetActionType::SuppressLine,
             auto_fixable: false,
@@ -746,6 +783,7 @@ const fn category_snake_case(cat: &RecommendationCategory) -> &'static str {
         RecommendationCategory::ExtractComplexFunctions => "extract_complex_functions",
         RecommendationCategory::ExtractDependencies => "extract_dependencies",
         RecommendationCategory::AddTestCoverage => "add_test_coverage",
+        RecommendationCategory::ResolveHiddenCoupling => "resolve_hidden_coupling",
     }
 }
 
@@ -770,6 +808,8 @@ mod hotspot_target_tests {
             complexity_density: 1.5,
             fan_in: 3,
             trend: ChurnTrend::Stable,
+            median_files_per_commit: None,
+            median_lines_per_commit: None,
             ownership: None,
             is_test_path: false,
         }
@@ -1093,6 +1133,7 @@ mod hotspot_target_tests {
             RecommendationCategory::ExtractComplexFunctions,
             RecommendationCategory::ExtractDependencies,
             RecommendationCategory::AddTestCoverage,
+            RecommendationCategory::ResolveHiddenCoupling,
         ];
         for cat in &variants {
             let via_serde = serde_json::to_value(cat).expect("category should serialize");
@@ -1139,6 +1180,7 @@ mod crap_action_tests {
             line: 12,
             col: 2,
             cyclomatic: 16,
+            standard_cyclomatic: None,
             cognitive: 13,
             line_count: 20,
             param_count: 0,
@@ -1148,7 +1190,9 @@ mod crap_action_tests {
             react_hook_profile: None,
             exceeded: ExceededThreshold::Cognitive,
             severity: crate::FindingSeverity::Moderate,
+            effective_severity: None,
             crap: None,
+            mutation: None,
             coverage_pct: None,
             coverage_tier: None,
             coverage_source: None,

@@ -4,6 +4,7 @@ description: Reviews SARIF, CodeClimate, Compact, Markdown, and Badge output for
 tools: Glob, Grep, Read, Bash
 model: sonnet
 ---
+<!-- Generated from .agents/agents. Do not edit. -->
 
 Review changes to fallow's CI-oriented output formats. Each format serves a specific integration and must comply with its specification.
 
@@ -50,11 +51,15 @@ Review changes to fallow's CI-oriented output formats. Each format serves a spec
 2. **Determinism**: Same input produces identical output across runs
 3. **Severity mapping**: Consistent translation from fallow severity to format-specific severity
 4. **Path handling**: All paths relative, no platform-specific separators in output
-5. **Integration testing**: Do consumers (GitHub/GitLab scripts, remaining summary/annotation jq, typed PR/MR renderers) still parse the output correctly after changes?
+5. **Integration testing**: Do consumers (GitHub/GitLab scripts, the summary/annotation jq filters, typed PR/MR renderers) still parse the output correctly after changes?
 
-## Surface-specific checks (Phase 3 audits)
+## Surface-specific checks
 
 For each CI-format diff, run the format-specific audit alongside the generic checks above.
+
+The real-world corpus is intentionally untracked. Before its first use, follow
+the [benchmark setup](../../BENCHMARKS.md#comparative-benchmarks) and run
+`npm --prefix benchmarks run download-fixtures`.
 
 ### Compact format audit (Phase 3c)
 
@@ -85,7 +90,7 @@ FALLOW_QUIET=1 fallow <command> --format sarif --root benchmarks/fixtures/real-w
 
 Check:
 - [ ] Valid SARIF 2.1.0
-- [ ] If feature doesn't apply to SARIF (e.g., metric scores), verify it's intentionally omitted with a code comment
+- [ ] If a feature does not apply to SARIF (e.g., metric scores), verify it is intentionally omitted with a code comment
 
 ### CodeClimate format audit (Phase 3f)
 

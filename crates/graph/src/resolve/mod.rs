@@ -15,8 +15,14 @@
 //! React Native platform extensions, and package.json `exports` subpath resolution with
 //! output-to-source directory fallback.
 
+mod auto_imports;
 mod dynamic_imports;
 pub(crate) mod fallbacks;
+pub(crate) mod inline_loaders;
+mod jsx_runtime;
+mod memo;
+mod output_entry;
+mod package_credit;
 mod path_info;
 mod re_exports;
 mod react_native;
@@ -27,16 +33,24 @@ mod static_imports;
 mod tests;
 mod types;
 mod upgrades;
+mod work;
+mod workspace_alias;
 
+pub use auto_imports::{UnreadableAutoImportRead, unreadable_auto_import_reads};
 pub use fallbacks::extract_package_name_from_node_modules_path;
+pub use inline_loaders::InlineLoaderRequest;
+pub use output_entry::{directory_index_entry, output_entry_to_source_path};
 pub use path_info::{
     extract_package_name, is_bare_specifier, is_path_alias, is_valid_package_name,
+    normalize_npm_specifier,
 };
 pub use react_native::{PlatformFamilyKey, has_react_native_plugin, platform_family_key};
 pub use types::{
-    OUTPUT_DIRS, ResolveResult, ResolvedImport, ResolvedModule, ResolvedProject, ResolvedReExport,
-    ResolvedReplacedModuleTarget, ResolvedSourceEdge,
+    MISSING_ONLY_OUTPUT_DIRS, MissingExportTarget, OUTPUT_DIRS, ResolveResult, ResolvedImport,
+    ResolvedModule, ResolvedProject, ResolvedReExport, ResolvedReplacedModuleTarget,
+    ResolvedSourceEdge,
 };
+pub use work::ResolveWork;
 
 use std::sync::Arc;
 
@@ -46,12 +60,15 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use fallow_config::{AutoImportKind, AutoImportRule};
+use fallow_config::{AutoImportKind, AutoImportRule, JsxImportSourceRule};
 use fallow_types::discover::{DiscoveredFile, FileId};
 use fallow_types::extract::{ImportInfo, ImportedName, ModuleInfo, SemanticFact};
 use oxc_span::Span;
 
+use auto_imports::synthesize_auto_import_edges;
 use dynamic_imports::{GlobMatcherCache, resolve_dynamic_imports, resolve_dynamic_patterns};
+use jsx_runtime::resolve_config_jsx_runtime_imports;
+pub use jsx_runtime::{CompiledJsxRule, compile_jsx_rules};
 use re_exports::resolve_re_exports;
 use react_native::{build_condition_names, build_extensions, synthesize_platform_family_edges};
 use require_imports::resolve_require_imports;
@@ -74,10 +91,15 @@ pub struct ResolveAllImportsInput<'a> {
     pub path_aliases: &'a [(String, String)],
     /// Auto-import rules that synthesize implicit graph edges.
     pub auto_imports: &'a [AutoImportRule],
+    /// JSX import sources from bundler and test configs. Each adds a runtime
+    /// edge to the matching modules that have JSX and no runtime pragma.
+    pub jsx_import_sources: &'a [JsxImportSourceRule],
     /// Additional Sass and SCSS include directories.
     pub scss_include_paths: &'a [PathBuf],
     /// Static directory mappings for framework-specific asset resolution.
     pub static_dir_mappings: &'a [(PathBuf, String)],
+    /// Mounts a framework serves for the whole project; see `ResolveContext`.
+    pub framework_static_dir_mappings: &'a [(PathBuf, String)],
     /// Project root used for package manifest and relative-path resolution.
     pub root: &'a Path,
     /// Extra resolver conditions supplied by configuration.
@@ -96,6 +118,7 @@ pub struct ResolveAllImportsInput<'a> {
 /// every resolution instead of rebuilding this state per call.
 pub struct ResolverSession {
     resolver: oxc_resolver::Resolver,
+    script_resolver: oxc_resolver::Resolver,
     style_resolver: oxc_resolver::Resolver,
     extensions: Vec<String>,
     condition_names: Vec<String>,
@@ -129,6 +152,7 @@ impl ResolverSession {
         let extensions = build_extensions(input.active_plugins);
         let condition_names = build_condition_names(input.active_plugins, input.extra_conditions);
         let resolver = create_resolver(input.root, input.active_plugins, input.extra_conditions);
+        let script_resolver = specifier::create_script_resolver(&resolver);
         let mut style_conditions = input.extra_conditions.to_vec();
         style_conditions.push("sass".to_string());
         style_conditions.push("style".to_string());
@@ -142,6 +166,7 @@ impl ResolverSession {
 
         Self {
             resolver,
+            script_resolver,
             style_resolver,
             extensions,
             condition_names,
@@ -175,6 +200,10 @@ pub fn resolve_all_imports_with_session(
     let root_is_canonical = session.root_is_canonical;
     let workspace_roots = build_workspace_roots(input.workspaces, &session.canonical_ws_roots);
     let canonical_paths = build_canonical_file_paths(input.files, root_is_canonical);
+    let mut work = ResolveWork {
+        canonicalize_calls: canonical_paths.len() as u64,
+        ..ResolveWork::default()
+    };
     let path_to_id = build_path_to_id(input.files, &canonical_paths, root_is_canonical);
     let raw_path_to_id: FxHashMap<&Path, FileId> = input
         .files
@@ -194,9 +223,19 @@ pub fn resolve_all_imports_with_session(
     let tsconfig_cache = types::TsconfigCache::default();
     let canonicalize_cache = types::CanonicalizeCache::default();
     let glob_matcher_cache = GlobMatcherCache::default();
+    // Dynamic import patterns match against canonical file paths when the
+    // root is not canonical, so their root containment check needs the
+    // canonical root too.
+    let pattern_root = if canonical_paths.is_empty() {
+        input.root.to_path_buf()
+    } else {
+        dunce::canonicalize(input.root).unwrap_or_else(|_| input.root.to_path_buf())
+    };
+    let jsx_rules = compile_jsx_rules(input.jsx_import_sources);
 
     let ctx = ResolveContext {
         resolver: &session.resolver,
+        script_resolver: &session.script_resolver,
         style_resolver: &session.style_resolver,
         extensions: &session.extensions,
         path_to_id: &path_to_id,
@@ -208,6 +247,7 @@ pub fn resolve_all_imports_with_session(
         path_aliases: input.path_aliases,
         scss_include_paths: input.scss_include_paths,
         static_dir_mappings: input.static_dir_mappings,
+        framework_static_dir_mappings: input.framework_static_dir_mappings,
         root: input.root,
         canonical_fallback: canonical_fallback.as_ref(),
         tsconfig_warned: &tsconfig_warned,
@@ -222,7 +262,11 @@ pub fn resolve_all_imports_with_session(
             resolve_module_imports(
                 module,
                 &ctx,
-                &glob_matcher_cache,
+                &ProjectResolveRules {
+                    glob_matcher_cache: &glob_matcher_cache,
+                    pattern_root: &pattern_root,
+                    jsx_rules: &jsx_rules,
+                },
                 &file_paths,
                 &canonical_paths,
                 input.files,
@@ -234,7 +278,9 @@ pub fn resolve_all_imports_with_session(
     for output in resolved_outputs {
         resolved.push(output.module);
         vitest_mock_operations.extend(output.vitest_mock_operations);
+        work += output.work;
     }
+    work.canonicalize_calls += canonicalize_cache.distinct_paths() as u64;
 
     apply_specifier_upgrades(&mut resolved, &mut vitest_mock_operations);
 
@@ -253,6 +299,7 @@ pub fn resolve_all_imports_with_session(
     ResolvedProject {
         modules: resolved,
         replaced_module_targets,
+        work,
     }
 }
 
@@ -374,10 +421,17 @@ fn build_path_to_id<'a>(
     }
 }
 
+/// Per-run state that every module resolution reads.
+struct ProjectResolveRules<'a> {
+    glob_matcher_cache: &'a GlobMatcherCache,
+    pattern_root: &'a Path,
+    jsx_rules: &'a [CompiledJsxRule<'a>],
+}
+
 fn resolve_module_imports(
     module: &ModuleInfo,
     ctx: &ResolveContext<'_>,
-    glob_matcher_cache: &GlobMatcherCache,
+    rules: &ProjectResolveRules<'_>,
     file_paths: &[&Path],
     canonical_paths: &[PathBuf],
     files: &[DiscoveredFile],
@@ -390,44 +444,58 @@ fn resolve_module_imports(
         return None;
     };
 
-    let mut all_imports = resolve_static_imports(ctx, file_path, &module.imports);
-    all_imports.extend(resolve_require_imports(
-        ctx,
-        file_path,
-        &module.require_calls,
-    ));
+    let resolve = || {
+        let mut all_imports = resolve_static_imports(ctx, file_path, &module.imports);
+        all_imports.extend(resolve_config_jsx_runtime_imports(
+            ctx,
+            file_path,
+            module,
+            rules.jsx_rules,
+        ));
+        all_imports.extend(resolve_require_imports(
+            ctx,
+            file_path,
+            &module.require_calls,
+        ));
 
-    let from_dir = if canonical_paths.is_empty() {
-        file_path.parent().unwrap_or(file_path)
-    } else {
-        canonical_paths
-            .get(module.file_id.0 as usize)
-            .and_then(|p| p.parent())
-            .unwrap_or(file_path)
+        let from_dir = if canonical_paths.is_empty() {
+            file_path.parent().unwrap_or(file_path)
+        } else {
+            canonical_paths
+                .get(module.file_id.0 as usize)
+                .and_then(|p| p.parent())
+                .unwrap_or(file_path)
+        };
+
+        let vitest_mock_operations =
+            resolve_vitest_mock_operations(module.file_id, &module.semantic_facts, ctx, file_path);
+        let module = build_resolved_module(ResolvedModuleBuildInput {
+            module,
+            ctx,
+            glob_matcher_cache: rules.glob_matcher_cache,
+            pattern_root: rules.pattern_root,
+            file_path,
+            from_dir,
+            canonical_paths,
+            files,
+            all_imports,
+        });
+        (module, vitest_mock_operations)
     };
-
-    let vitest_mock_operations =
-        resolve_vitest_mock_operations(module.file_id, &module.semantic_facts, ctx, file_path);
-    let module = build_resolved_module(ResolvedModuleBuildInput {
-        module,
-        ctx,
-        glob_matcher_cache,
-        file_path,
-        from_dir,
-        canonical_paths,
-        files,
-        all_imports,
-    });
+    let ((module, vitest_mock_operations), work) =
+        memo::in_file_scope(file_path, || work::in_module_scope(resolve));
 
     Some(ResolvedModuleOutput {
         module,
         vitest_mock_operations,
+        work,
     })
 }
 
 struct ResolvedModuleOutput {
     module: ResolvedModule,
     vitest_mock_operations: Vec<ResolvedVitestMockOperation>,
+    work: ResolveWork,
 }
 
 fn resolve_vitest_mock_operations(
@@ -447,7 +515,12 @@ fn resolve_vitest_mock_operations(
                 source_specifier: operation.source.clone(),
                 call_start: operation.call_start,
                 action: operation.action,
-                target: specifier::resolve_specifier(ctx, file_path, &operation.source, false),
+                target: specifier::resolve_import_specifier(
+                    ctx,
+                    file_path,
+                    &operation.source,
+                    false,
+                ),
             })
         })
         .collect();
@@ -497,6 +570,7 @@ struct ResolvedModuleBuildInput<'a> {
     module: &'a ModuleInfo,
     ctx: &'a ResolveContext<'a>,
     glob_matcher_cache: &'a GlobMatcherCache,
+    pattern_root: &'a Path,
     file_path: &'a Path,
     from_dir: &'a Path,
     canonical_paths: &'a [PathBuf],
@@ -505,6 +579,39 @@ struct ResolvedModuleBuildInput<'a> {
 }
 
 fn build_resolved_module(input: ResolvedModuleBuildInput<'_>) -> ResolvedModule {
+    let ctx = input.ctx;
+    let mut module = resolved_module_without_export_hints(input);
+    module.missing_export_targets = collect_missing_export_targets(ctx, &module);
+    module
+}
+
+/// Record the missing `exports` paths of each unresolved bare specifier once.
+fn collect_missing_export_targets(
+    ctx: &ResolveContext<'_>,
+    module: &ResolvedModule,
+) -> Vec<MissingExportTarget> {
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut targets: Vec<MissingExportTarget> = module
+        .all_resolved_source_edges()
+        .filter_map(|edge| match edge.target() {
+            ResolveResult::Unresolvable(specifier) => Some(specifier.as_str()),
+            _ => None,
+        })
+        .filter(|specifier| seen.insert(specifier))
+        .filter_map(|specifier| {
+            let aliased = workspace_alias::aliased_specifier(ctx, &module.path, specifier);
+            fallbacks::missing_package_export_paths(ctx, aliased.as_deref().unwrap_or(specifier))
+                .map(|paths| MissingExportTarget {
+                    specifier: specifier.to_string(),
+                    paths,
+                })
+        })
+        .collect();
+    targets.sort_unstable_by(|left, right| left.specifier.cmp(&right.specifier));
+    targets
+}
+
+fn resolved_module_without_export_hints(input: ResolvedModuleBuildInput<'_>) -> ResolvedModule {
     ResolvedModule {
         file_id: input.module.file_id,
         path: input.file_path.to_path_buf(),
@@ -518,6 +625,7 @@ fn build_resolved_module(input: ResolvedModuleBuildInput<'_>) -> ResolvedModule 
         ),
         resolved_dynamic_patterns: resolve_dynamic_patterns(
             input.glob_matcher_cache,
+            input.pattern_root,
             input.from_dir,
             &input.module.dynamic_import_patterns,
             input.canonical_paths,
@@ -542,76 +650,7 @@ fn build_resolved_module(input: ResolvedModuleBuildInput<'_>) -> ResolvedModule 
             &input.module.exported_factory_return_object_shapes,
         ),
         type_member_types: Arc::clone(&input.module.type_member_types),
-    }
-}
-
-/// Synthesize module-graph edges for convention auto-imports.
-///
-/// For each module, every captured `auto_import_candidates` name is matched
-/// against the active plugins' auto-import table; on a hit a synthetic
-/// [`ResolvedImport`] is added so the existing graph builder credits the edge.
-/// Name collisions across files over-credit every match, keeping each provider
-/// reachable. Resolution is recomputed from the live file index each run.
-fn synthesize_auto_import_edges(
-    resolved: &mut [ResolvedModule],
-    modules: &[ModuleInfo],
-    auto_imports: &[AutoImportRule],
-    path_to_id: &FxHashMap<&Path, FileId>,
-    raw_path_to_id: &FxHashMap<&Path, FileId>,
-) {
-    if auto_imports.is_empty() {
-        return;
-    }
-
-    let mut table: FxHashMap<&str, Vec<(FileId, AutoImportKind)>> = FxHashMap::default();
-    for rule in auto_imports {
-        let source = rule.source.as_path();
-        let Some(file_id) = raw_path_to_id
-            .get(source)
-            .or_else(|| path_to_id.get(source))
-            .copied()
-        else {
-            continue;
-        };
-        table
-            .entry(rule.name.as_str())
-            .or_default()
-            .push((file_id, rule.kind));
-    }
-    if table.is_empty() {
-        return;
-    }
-
-    let candidates: FxHashMap<FileId, &[String]> = modules
-        .iter()
-        .filter(|module| !module.auto_import_candidates.is_empty())
-        .map(|module| (module.file_id, module.auto_import_candidates.as_slice()))
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-
-    for module in resolved.iter_mut() {
-        let Some(names) = candidates.get(&module.file_id) else {
-            continue;
-        };
-        for name in *names {
-            if is_auto_import_builtin(name) {
-                continue;
-            }
-            let Some(targets) = table.get(name.as_str()) else {
-                continue;
-            };
-            for (target_id, kind) in targets {
-                if *target_id == module.file_id {
-                    continue;
-                }
-                module.resolved_imports.push(ResolvedImport {
-                    info: synthetic_auto_import_info(name, *kind),
-                    target: ResolveResult::SyntheticAutoImport(*target_id),
-                });
-            }
-        }
+        missing_export_targets: Vec::new(),
     }
 }
 

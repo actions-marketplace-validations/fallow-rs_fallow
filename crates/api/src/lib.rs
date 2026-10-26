@@ -1,8 +1,8 @@
 //! Programmatic API contract types for fallow.
 //!
-//! Runtime execution for dead-code and duplication lives here. Health output
-//! assembly is also API-owned, with the concrete runner injected while the
-//! remaining health pipeline moves out of the CLI crate. This crate owns the
+//! Runtime execution for dead-code, duplication and health lives here. The
+//! default health runner, `EngineHealthRunner`, runs the engine pipeline.
+//! Tests and hosts can inject a different runner. This crate owns the
 //! CLI-independent option, error, and output contracts so NAPI, future Rust
 //! embedders, and the engine facade can share them without depending on the
 //! CLI crate.
@@ -16,17 +16,21 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use fallow_config::EmailMode;
 use fallow_output::EffortEstimate;
 use serde::Serialize;
 
 mod analysis_context;
+mod audit_complexity;
 /// Stable per-finding keys and audit ledgers that compare head results against
 /// a base snapshot, plus helpers that annotate output JSON with
 /// introduced-vs-pre-existing attribution.
 pub mod audit_keys;
 pub mod audit_output;
+pub mod audit_run;
 pub mod combined_output;
 /// One-line-per-finding compact text builders for dead-code, grouped, health,
 /// and duplication output.
@@ -36,20 +40,24 @@ pub mod dead_code_codeclimate;
 pub mod dead_code_sarif;
 pub mod decision_surface;
 pub mod dependency_deltas;
+pub mod diff_risk;
+pub mod doctor;
 pub mod dupes_output;
-mod duplication_filters;
 pub mod editor;
 pub mod explain;
 pub mod grouped_output;
 pub mod health_codeclimate;
+mod health_groups_markdown;
 pub mod json_output;
 pub mod list_output;
 mod list_runtime;
 /// Markdown report builders for dead-code, grouped, duplication, health, and
 /// walkthrough output.
 pub mod markdown_output;
+pub mod mutation;
 mod next_steps;
 pub mod output_contracts;
+pub mod ownership;
 pub mod review_deltas;
 pub mod routing;
 pub mod runtime;
@@ -63,57 +71,33 @@ pub mod security_output;
 /// Local-only advisory similar-code discovery and provider status.
 pub mod similar_code;
 mod type_aware;
-pub mod ci_output {
-    //! Compatibility re-exports for CI output builders now owned by
-    //! `fallow-output`.
-
-    pub use fallow_output::{
-        CiIssue, CiProvider, GroupedReviewIssues, MARKER_PREFIX_V2, MARKER_SUFFIX_V2,
-        MAX_COMMENT_BODY_BYTES, PROJECT_LEVEL_RULE_IDS, PrCommentRenderInput,
-        ReviewCommentRenderInput, ReviewEnvelopeRenderInput, ReviewEnvelopeRenderResult,
-        ReviewEnvelopeTruncation, ReviewGitlabDiffRefs, cap_body_with_marker, command_title,
-        composite_fingerprint, escape_md, github_check_conclusion,
-        group_review_issues_by_path_line, is_project_level_rule, issues_from_codeclimate,
-        issues_from_codeclimate_issues, render_pr_comment, render_review_comment_for_group,
-        render_review_envelope, review_label_from_codeclimate, summary_fingerprint, summary_label,
-    };
-}
 pub use analysis_context::{ProgrammaticAnalysisContext, resolve_programmatic_analysis_context};
 pub use audit_output::{
     AuditAttribution, AuditCodeClimateOutputInput, AuditJsonHeaderInput, AuditJsonOutputInput,
-    AuditSarifOutputInput, AuditSummary, AuditVerdict,
+    AuditSarifOutputInput, AuditSummary, AuditVerdict, attach_audit_diff_risk_attribution,
     attach_audit_duplication_demotion_attribution, attach_audit_styling_attribution,
     attach_audit_wire_attribution, build_audit_codeclimate, build_audit_codeclimate_issues,
-    build_audit_header_json, build_audit_header_map, build_audit_sarif, build_review_brief_header,
-    serialize_audit_json,
-};
-pub use ci_output::{
-    CiIssue, CiProvider, GroupedReviewIssues, MARKER_PREFIX_V2, MARKER_SUFFIX_V2,
-    MAX_COMMENT_BODY_BYTES, PROJECT_LEVEL_RULE_IDS, PrCommentRenderInput, ReviewCommentRenderInput,
-    ReviewEnvelopeRenderInput, ReviewEnvelopeRenderResult, ReviewEnvelopeTruncation,
-    ReviewGitlabDiffRefs, cap_body_with_marker, command_title, composite_fingerprint, escape_md,
-    github_check_conclusion, group_review_issues_by_path_line, is_project_level_rule,
-    issues_from_codeclimate, issues_from_codeclimate_issues, render_pr_comment,
-    render_review_comment_for_group, render_review_envelope, review_label_from_codeclimate,
-    summary_fingerprint, summary_label,
+    build_audit_header_json, build_audit_header_map, build_audit_sarif,
+    build_diff_risk_codeclimate, build_review_brief_header, serialize_audit_json,
 };
 pub use combined_output::{
     CombinedCheckJsonSection, CombinedJsonOutputInput, serialize_combined_dupes_json,
     serialize_combined_health_json, serialize_combined_json,
 };
 pub use compact_output::{
-    build_compact_lines, build_duplication_compact_lines, build_grouped_compact_lines,
-    build_health_compact_lines,
+    build_compact_lines, build_diff_risk_compact_lines, build_duplication_compact_lines,
+    build_grouped_compact_lines, build_health_compact_lines,
 };
 pub use coverage::{
     CoverageInputError, CoverageInputSource, CoverageInputs, resolve_coverage_inputs,
 };
 pub use dead_code_codeclimate::build_codeclimate;
 pub use dead_code_sarif::build_sarif;
+pub use doctor::{DoctorOptions, run_doctor, run_doctor_with_cache_dir};
 pub use dupes_output::{
     AttributedCloneGroup, AttributedCloneGroupFinding, AttributedInstance, CloneDemotionReason,
-    CloneFamilyFinding, CloneGroupFinding, DupesReportPayload, DuplicationGroup,
-    DuplicationGrouping, build_duplication_codeclimate,
+    CloneFamilyFinding, CloneGroupFinding, CombinedDupesSection, DupesReportPayload,
+    DuplicationGroup, DuplicationGrouping, build_duplication_codeclimate,
 };
 pub use editor::{
     ChangedFilesError, EditorAnalysisOutput, EditorAnalysisResults, EditorAnalysisSession,
@@ -121,27 +105,56 @@ pub use editor::{
     EditorDeadCodeAnalysisOutput, EditorDuplicationReport, EditorDuplicationStats,
     EditorInlineComplexityExceeded, EditorInlineComplexityFinding, EditorMirroredDirectory,
     EditorProjectAnalysisOutput, EditorRefactoringKind, EditorRefactoringSuggestion,
-    collect_inline_complexity, editor_duplicates, editor_extract, editor_results, editor_security,
-    editor_suppress, filter_inline_complexity_by_changed_files, resolve_git_toplevel,
+    EditorSessionParseCounts, collect_inline_complexity, editor_duplicates, editor_extract,
+    editor_results, editor_security, editor_suppress, filter_inline_complexity_by_change_scope,
+    filter_inline_complexity_by_changed_files, resolve_git_toplevel,
     try_get_changed_files_with_toplevel,
 };
 pub use explain::{
-    CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, RuleDef, RuleGuide, SECURITY_RULES,
-    all_rules, bare_rule_id, coverage_analyze_meta, coverage_setup_meta, explain_issue_type,
-    rule_by_id, rule_by_token, rule_command, rule_docs_url, rule_guide, rule_severity_key,
-    security_meta, serialize_explain_programmatic_json, unknown_explain_error,
+    AUDIT_RULES, CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, RuleDef, RuleGuide,
+    SECURITY_RULES, all_rules, bare_rule_id, coverage_analyze_meta, coverage_setup_meta,
+    explain_issue_type, rule_by_id, rule_by_token, rule_command, rule_docs_url, rule_guide,
+    rule_severity_key, security_meta, serialize_explain_programmatic_json, unknown_explain_error,
 };
-pub use fallow_config::{AuditGate, HealthConfig, TypeAwareRequire};
-pub use fallow_output::{RootEnvelopeMode, serialize_similar_code_json_output};
+pub use fallow_config::levenshtein::closest_match;
+pub use fallow_config::{AuditGate, AuditWorsened, HealthConfig, TypeAwareRequire};
+/// Engine-owned change scope of one run: a global changed-file set or the
+/// per-workspace Git baselines of `workspaces.changedSince`.
+pub use fallow_engine::change_scope::{
+    ChangeScope, ChangeScopeOwner, ChangeScopeRequest, first_package_baselines,
+    package_baseline_statuses,
+};
+/// Engine-owned per-workspace Git baseline state used by analysis surfaces.
+pub use fallow_engine::package_baselines::{PackageBaselineError, PackageChangeScope};
+/// Stack size for threads that run analysis, and the registration that lets a
+/// bounded parse stay on such a thread.
+///
+/// A process that runs analysis outside
+/// [`ProgrammaticAnalysisContext::install`], such as the LSP server, gives its
+/// own threads this stack size and registers it at thread start.
+pub use fallow_engine::thread_pool::{WORKER_STACK_SIZE, register_thread_stack};
+/// Parsed modules that a long-lived process keeps across analysis calls.
+///
+/// A process that runs many calls on the same project, such as the MCP
+/// server, installs a store once. Each later analysis session then takes the
+/// modules of an unchanged file list from memory and does no parse work.
+pub use fallow_engine::warm_parse;
+/// Shared JSON and editor notification row for an applied package Git ref.
+pub use fallow_output::PackageBaselineStatus;
+pub use fallow_output::serialize_similar_code_json_output;
 pub use fallow_types::trace::{
     CloneTrace, DependencyTrace, ExportReference, ExportTrace, FileTrace, ReExportChain,
     TracedCloneGroup, TracedExport, TracedReExport,
 };
+pub use fallow_types::trace_usage::{
+    DependencyUsage, DependencyUsageQuery, SitePageRequest, UsageQueryError,
+};
 pub use grouped_output::{
     ResultGroup, UNOWNED_GROUP_LABEL, build_duplication_grouping_with, group_analysis_results_with,
-    largest_clone_group_owner_with,
+    health_signal_header_part, largest_clone_group_owner_with,
 };
 pub use health_codeclimate::build_health_codeclimate;
+pub use health_groups_markdown::build_health_groups_markdown;
 pub use json_output::{
     CheckJsonExtraOutputs, CheckJsonOutputInput, CheckJsonPayloadInput, DuplicationJsonOutputInput,
     GroupedCheckJsonOutputInput, GroupedDuplicationJsonOutputInput, serialize_check_json,
@@ -158,8 +171,12 @@ pub use list_runtime::{
     serialize_list_boundaries_programmatic_json, serialize_project_info_programmatic_json,
 };
 pub use markdown_output::{
-    build_duplication_markdown, build_grouped_markdown, build_health_markdown, build_markdown,
-    build_walkthrough_markdown,
+    ComplexityListing, build_diff_risk_markdown, build_duplication_markdown,
+    build_grouped_markdown, build_health_markdown, build_markdown, build_walkthrough_markdown,
+};
+pub use mutation::{
+    MutationProgress, MutationProgressSink, MutationRunOptions, MutationRunScope,
+    apply_mutation_verdicts, validate_mutation_verdicts,
 };
 pub use output_contracts::{
     AuditOutput, BoundariesListLogicalGroup, BoundariesListRule, BoundariesListZone,
@@ -168,7 +185,9 @@ pub use output_contracts::{
     SecurityOutput, SecurityOutputConfig, SecuritySummaryOutput, SimilarCodeCandidateSnapshot,
     SimilarCodeOutput, TraceOutput, WorkspacesOutput,
 };
+pub use runtime::TYPE_AWARE_CONFIG_UNSUPPORTED;
 pub use runtime::{
+    AUDIT_CONFIG_BASELINE_UNSUPPORTED, ArchitectureOutput, ArchitectureProgrammaticOutput,
     AuditProgrammaticKeySnapshot, AuditProgrammaticOutput, BoundaryViolationsOutput,
     BoundaryViolationsProgrammaticOutput, CircularDependenciesOutput,
     CircularDependenciesProgrammaticOutput, CombinedProgrammaticOutput, DeadCodeOutput,
@@ -178,23 +197,28 @@ pub use runtime::{
     ProgrammaticHealthAnalysis, ProgrammaticHealthNextStepFacts, ProgrammaticHealthRun,
     ProgrammaticHealthRunner, TraceClassMemberOutput, TraceCloneBenchmarkResult, TraceCloneOutput,
     TraceCloneProgrammaticOutput, TraceDependencyOutput, TraceDependencyProgrammaticOutput,
-    TraceExportOutput, TraceExportProgrammaticOutput, TraceExportTargetOutput, TraceFileOutput,
-    TraceFileProgrammaticOutput, benchmark_trace_clone_compact_json,
-    benchmark_trace_graph_family_compact_json, inspect_similar_code, load_health_config,
-    parse_similar_code_candidate_snapshot, review_similar_code, run_audit, run_boundary_violations,
+    TraceErrorOutput, TraceErrorProgrammaticOutput, TraceExportOutput,
+    TraceExportProgrammaticOutput, TraceExportTargetOutput, TraceFileOutput,
+    TraceFileProgrammaticOutput, TraceImportPathOutput, TraceImportPathProgrammaticOutput,
+    benchmark_trace_clone_compact_json, benchmark_trace_graph_family_compact_json,
+    inspect_similar_code, load_health_config, parse_similar_code_candidate_snapshot, plan_mutation,
+    review_similar_code, run_architecture, run_audit, run_boundary_violations,
     run_circular_dependencies, run_combined, run_complexity_with_runner, run_dead_code,
-    run_decision_surface, run_duplication, run_feature_flags, run_health, run_health_with_runner,
-    run_similar_code, run_trace_clone, run_trace_dependency, run_trace_export, run_trace_file,
-    select_similar_code_candidate_snapshot, serialize_health_report_json,
+    run_dead_code_with_baseline, run_decision_surface, run_duplication, run_feature_flags,
+    run_health, run_health_with_runner, run_mutation, run_mutation_with_progress, run_similar_code,
+    run_trace_clone, run_trace_dependency, run_trace_error, run_trace_export, run_trace_file,
+    run_trace_import_path, select_similar_code_candidate_snapshot, serialize_health_report_json,
 };
 pub use runtime_json::{
-    serialize_audit_programmatic_json, serialize_boundary_violations_programmatic_json,
+    serialize_architecture_programmatic_json, serialize_audit_programmatic_json,
+    serialize_boundary_violations_programmatic_json,
     serialize_circular_dependencies_programmatic_json, serialize_combined_programmatic_json,
     serialize_dead_code_programmatic_json, serialize_decision_surface_programmatic_json,
     serialize_duplication_programmatic_json, serialize_feature_flags_programmatic_json,
     serialize_health_programmatic_json, serialize_trace_clone_programmatic_json,
-    serialize_trace_dependency_programmatic_json, serialize_trace_export_programmatic_json,
-    serialize_trace_file_programmatic_json,
+    serialize_trace_dependency_programmatic_json, serialize_trace_error_programmatic_json,
+    serialize_trace_export_programmatic_json, serialize_trace_file_programmatic_json,
+    serialize_trace_import_path_programmatic_json,
 };
 pub use sarif_output::{
     annotate_sarif_results, build_duplication_sarif, build_grouped_duplication_sarif,
@@ -207,14 +231,10 @@ pub use type_aware::{
     discard_unverified_semantic_candidates, inspect_symbol as inspect_type_aware_symbol,
     merge_type_aware_meta,
     refine_configured_dead_code_results as refine_type_aware_results_with_config,
-    refine_configured_dead_code_results_in_session as refine_type_aware_results_in_session_with_config,
-    refine_dead_code_results as refine_type_aware_results,
-    refine_dead_code_results_in_session as refine_type_aware_results_in_session,
-    refine_programmatic_dead_code as refine_type_aware_dead_code, shutdown_type_aware_sidecars,
-    status as type_aware_status, symbol_impact as run_type_aware_symbol_impact,
-    symbol_impact as type_aware_symbol_impact, terminate_active_type_aware_sidecars,
-    trace_symbol as run_type_aware_symbol_trace, trace_symbol as trace_type_aware_symbol,
-    type_coupling as analyze_type_coupling,
+    shutdown_type_aware_sidecars, status as type_aware_status,
+    symbol_impact as run_type_aware_symbol_impact, symbol_impact as type_aware_symbol_impact,
+    terminate_active_type_aware_sidecars, trace_symbol as run_type_aware_symbol_trace,
+    trace_symbol as trace_type_aware_symbol, type_coupling as analyze_type_coupling,
 };
 
 /// Long names of the analysis-affecting global CLI flags that
@@ -313,7 +333,25 @@ pub struct AnalysisOptions {
     /// Worker thread count. `None` picks the default; `Some(0)` is rejected.
     pub threads: Option<usize>,
     /// Explicit unified diff file that scopes changed-code analysis.
+    ///
+    /// Relative file paths resolve against the analysis root. Patch headers
+    /// are placed relative to that root or its Git repository toplevel.
+    /// A readable patch with foreign or ambiguous paths leaves the analysis
+    /// at full scope and records a `not-applied` diff-filter request outcome.
+    /// Empty and deletion-only patches apply an empty scope.
+    ///
+    /// A file that cannot be read fails the call with
+    /// `FALLOW_INVALID_DIFF_FILE`: the caller named it and can fix it.
+    /// An explicit file never falls back to `ambient_diff_file`.
     pub diff_file: Option<PathBuf>,
+    /// Unified diff file inherited from the environment (`FALLOW_DIFF_FILE`)
+    /// rather than named by the caller. Read only when `diff_file` is unset.
+    ///
+    /// A file that cannot be read or placed does not fail the call. The
+    /// analysis runs at full scope and `request_outcomes["diff-filter"]` states
+    /// the reason, exactly as the CLI does for the same variable: a caller
+    /// cannot fix a CI environment it inherited (issue #2799).
+    pub ambient_diff_file: Option<PathBuf>,
     /// Legacy convenience override. `true` forces production mode; `false`
     /// defers to config unless `production_override` is set.
     pub production: bool,
@@ -321,7 +359,22 @@ pub struct AnalysisOptions {
     /// use the project config for the current analysis.
     pub production_override: Option<bool>,
     /// Git base reference that scopes analysis to files changed since it.
+    ///
+    /// A ref that does not resolve fails the call with
+    /// `FALLOW_CHANGED_FILES_FAILED`: the caller named it and can fix it.
     pub changed_since: Option<String>,
+    /// Git base reference inherited from the environment
+    /// (`FALLOW_CHANGED_SINCE`) rather than named by the caller. Read only when
+    /// `changed_since` is unset.
+    ///
+    /// A ref that does not resolve does not fail the call. The analysis runs at
+    /// full scope and `request_outcomes["changed-since"]` states the reason,
+    /// exactly as the CLI does for `--changed-since`.
+    pub ambient_changed_since: Option<String>,
+    /// Ignore the per-package refs of `workspaces.changedSince` for this call,
+    /// as `--no-package-baselines` does on the CLI. Every workspace package is
+    /// then analyzed in full scope.
+    pub no_package_baselines: bool,
     /// Restrict analysis to the named workspace packages.
     pub workspace: Option<Vec<String>>,
     /// Restrict analysis to workspaces changed since the given git reference.
@@ -331,18 +384,61 @@ pub struct AnalysisOptions {
     /// Optional project-wide TypeScript semantic analysis. Disabled by default
     /// and never changes compiler or typed-lint ownership.
     pub type_aware: TypeAwareOptions,
+    /// Caller-owned cooperative cancellation for this analysis.
+    ///
+    /// Setting the flag asks the analysis to stop at its next stage boundary
+    /// and return a `FALLOW_CANCELLED` error. `None`, the default, is an
+    /// analysis that always runs to completion.
+    ///
+    /// The field is on the shared options struct, but the entry points do not
+    /// all honor it, so read the one being called before relying on it:
+    ///
+    /// - Cancelled at the entry, on both sides of the per-file parse loop, and
+    ///   at each pipeline stage boundary: [`run_dead_code`],
+    ///   [`run_circular_dependencies`], [`run_boundary_violations`],
+    ///   [`run_architecture`],
+    ///   [`run_combined`], [`run_duplication`], [`run_feature_flags`], and the
+    ///   four trace routes.
+    /// - Cancelled only at the boundaries around config load and file
+    ///   discovery, because they are the whole run: [`run_project_info`] and
+    ///   [`run_list_boundaries`].
+    /// - Cancelled only at the entry, then run to completion:
+    ///   [`run_health`], which hands off to a runner that builds its own
+    ///   session below these options.
+    /// - Not cancellable at all: [`run_decision_surface`] and
+    ///   [`run_similar_code`].
+    ///
+    /// The stop is cooperative everywhere it exists, so it has no upper bound:
+    /// it is only as prompt as the longest stage holding no check, and
+    /// duplication detection and the dead-code detectors are each seconds of
+    /// uninterruptible work on a large repository. A caller that needs a
+    /// bounded stop has to run Fallow as a child process and kill it.
+    pub cancellation: Option<Arc<AtomicBool>>,
 }
 
 /// Typed options for Fallow's optional TypeScript semantic companion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TypeAwareOptions {
-    /// Turn on TypeScript semantic refinement for this call.
-    pub enabled: bool,
+    /// `Some(true)` turns on TypeScript semantic refinement for this call, as
+    /// `--type-aware` does. `Some(false)` keeps the call syntactic, as
+    /// `--no-type-aware` does, also when `FALLOW_TYPE_AWARE` or the config
+    /// turns it on. `None` follows `FALLOW_TYPE_AWARE` and the config. The
+    /// typed runners cannot run type-aware analysis from those layers, so they
+    /// return [`TYPE_AWARE_CONFIG_UNSUPPORTED`] when a layer turns it on.
+    pub enabled: Option<bool>,
     /// Explicit TypeScript project paths handed to the semantic sidecar.
     /// Empty defers to project discovery.
     pub projects: Vec<PathBuf>,
     /// How strictly semantic completion is required before results are kept.
     pub require: fallow_config::TypeAwareRequire,
+}
+
+impl TypeAwareOptions {
+    /// The caller requested type-aware analysis for this call.
+    #[must_use]
+    pub const fn requested(&self) -> bool {
+        matches!(self.enabled, Some(true))
+    }
 }
 
 /// Issue-type filters for the dead-code analysis.
@@ -361,6 +457,8 @@ pub struct DeadCodeFilters {
     pub unused_types: bool,
     /// Exported APIs that expose non-exported types.
     pub private_type_leaks: bool,
+    /// Exports marked `@deprecated` that are still in use.
+    pub deprecated_exports_in_use: bool,
     /// Enum members never read.
     pub unused_enum_members: bool,
     /// Class members never used outside their declaration.
@@ -373,6 +471,8 @@ pub struct DeadCodeFilters {
     pub unrendered_components: bool,
     /// Declared component props never used.
     pub unused_component_props: bool,
+    /// Review optional props omitted by known reachable callers.
+    pub absent_component_props: bool,
     /// Declared component emits never used.
     pub unused_component_emits: bool,
     /// Declared component inputs never bound.
@@ -381,6 +481,12 @@ pub struct DeadCodeFilters {
     pub unused_component_outputs: bool,
     /// Svelte component events never listened to.
     pub unused_svelte_events: bool,
+    /// Effect layers composed only into unused layers.
+    pub unused_effect_layers: bool,
+    /// Effect tagged errors that no code produces.
+    pub unused_tagged_errors: bool,
+    /// `catchTag` handlers for a tag that no code produces.
+    pub unproduced_catch_tags: bool,
     /// Server actions never invoked.
     pub unused_server_actions: bool,
     /// `load` data keys never read by the consuming page.
@@ -395,6 +501,8 @@ pub struct DeadCodeFilters {
     pub circular_deps: bool,
     /// Cycles formed through re-export chains.
     pub re_export_cycles: bool,
+    /// Dependency cycles between workspace packages.
+    pub package_cycles: bool,
     /// Imports that cross configured architecture boundaries.
     pub boundary_violations: bool,
     /// Violations of configured dependency policy rules.
@@ -414,22 +522,34 @@ pub struct DeadCodeFilters {
 }
 
 impl DeadCodeFilters {
+    /// Whether the report keeps dependency findings: no filter is active, or
+    /// `unused_deps` or `unlisted_deps` is one of the active filters. The CLI
+    /// applies the same rule to its `--unused-deps` and `--unlisted-deps`.
+    pub(crate) fn reports_dependency_findings(&self) -> bool {
+        !self.any_active() || self.unused_deps || self.unlisted_deps
+    }
+
     fn any_active(&self) -> bool {
         self.unused_files
             || self.unused_exports
             || self.unused_deps
             || self.unused_types
             || self.private_type_leaks
+            || self.deprecated_exports_in_use
             || self.unused_enum_members
             || self.unused_class_members
             || self.unused_store_members
             || self.unprovided_injects
             || self.unrendered_components
             || self.unused_component_props
+            || self.absent_component_props
             || self.unused_component_emits
             || self.unused_component_inputs
             || self.unused_component_outputs
             || self.unused_svelte_events
+            || self.unused_effect_layers
+            || self.unused_tagged_errors
+            || self.unproduced_catch_tags
             || self.unused_server_actions
             || self.unused_load_data_keys
             || self.unresolved_imports
@@ -437,6 +557,7 @@ impl DeadCodeFilters {
             || self.duplicate_exports
             || self.circular_deps
             || self.re_export_cycles
+            || self.package_cycles
             || self.boundary_violations
             || self.policy_violations
             || self.stale_suppressions
@@ -469,6 +590,7 @@ impl DeadCodeFilters {
             "--unused-exports" => self.unused_exports = true,
             "--unused-types" => self.unused_types = true,
             "--private-type-leaks" => self.private_type_leaks = true,
+            "--deprecated-exports-in-use" => self.deprecated_exports_in_use = true,
             "--unused-deps" => self.unused_deps = true,
             "--unused-enum-members" => self.unused_enum_members = true,
             "--unused-class-members" => self.unused_class_members = true,
@@ -476,10 +598,14 @@ impl DeadCodeFilters {
             "--unprovided-injects" => self.unprovided_injects = true,
             "--unrendered-components" => self.unrendered_components = true,
             "--unused-component-props" => self.unused_component_props = true,
+            "--absent-component-props" => self.absent_component_props = true,
             "--unused-component-emits" => self.unused_component_emits = true,
             "--unused-component-inputs" => self.unused_component_inputs = true,
             "--unused-component-outputs" => self.unused_component_outputs = true,
             "--unused-svelte-events" => self.unused_svelte_events = true,
+            "--unused-effect-layers" => self.unused_effect_layers = true,
+            "--unused-tagged-errors" => self.unused_tagged_errors = true,
+            "--unproduced-catch-tags" => self.unproduced_catch_tags = true,
             "--unused-server-actions" => self.unused_server_actions = true,
             "--unused-load-data-keys" => self.unused_load_data_keys = true,
             "--unresolved-imports" => self.unresolved_imports = true,
@@ -487,6 +613,7 @@ impl DeadCodeFilters {
             "--duplicate-exports" => self.duplicate_exports = true,
             "--circular-deps" => self.circular_deps = true,
             "--re-export-cycles" => self.re_export_cycles = true,
+            "--package-cycles" => self.package_cycles = true,
             "--boundary-violations" => self.boundary_violations = true,
             "--policy-violations" => self.policy_violations = true,
             "--stale-suppressions" => self.stale_suppressions = true,
@@ -513,6 +640,62 @@ pub struct DeadCodeOptions {
     pub files: Vec<PathBuf>,
     /// Also report unused exports declared in entry-point files.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
+    /// Report only the findings with these `finding_id` values. The filter
+    /// runs last, after the baseline, and the output then carries
+    /// `finding_id_query`. Empty reports every finding. Only
+    /// [`run_dead_code`] and [`run_dead_code_with_baseline`] accept it.
+    pub finding_ids: Vec<String>,
+}
+
+/// Options for the analysis of `fallow architecture`: import cycles, boundary
+/// violations and rule-pack policy violations.
+///
+/// No selector reports every architecture issue type. Each selector keeps one
+/// kind, as `--cycles`, `--boundaries` and `--policy` do on the CLI.
+#[derive(Debug, Clone, Default)]
+pub struct ArchitectureOptions {
+    /// Shared analysis options.
+    pub analysis: AnalysisOptions,
+    /// Restrict findings to these files when non-empty.
+    pub files: Vec<PathBuf>,
+    /// Import cycles: circular dependencies, re-export cycles and workspace
+    /// package cycles.
+    pub cycles: bool,
+    /// Boundary violations, boundary coverage and forbidden calls.
+    pub boundaries: bool,
+    /// Rule-pack policy violations.
+    pub policy: bool,
+}
+
+impl ArchitectureOptions {
+    /// The dead-code issue-type filters that the selectors stand for.
+    #[must_use]
+    pub fn dead_code_filters(&self) -> DeadCodeFilters {
+        let all = !(self.cycles || self.boundaries || self.policy);
+        DeadCodeFilters {
+            circular_deps: self.cycles || all,
+            re_export_cycles: self.cycles || all,
+            package_cycles: self.cycles || all,
+            boundary_violations: self.boundaries || all,
+            policy_violations: self.policy || all,
+            ..DeadCodeFilters::default()
+        }
+    }
+
+    /// The dead-code options that run this analysis.
+    #[must_use]
+    pub fn dead_code_options(&self) -> DeadCodeOptions {
+        DeadCodeOptions {
+            analysis: self.analysis.clone(),
+            filters: self.dead_code_filters(),
+            files: self.files.clone(),
+            include_entry_exports: false,
+            show_cascade: false,
+            finding_ids: Vec::new(),
+        }
+    }
 }
 
 /// Options for changed-code audit analysis.
@@ -532,12 +715,28 @@ pub struct AuditOptions {
     /// Production override for the duplication domain; `None` defers to
     /// config.
     pub production_dupes: Option<bool>,
-    /// Enable CSS / styling analysis; `None` defers to config.
+    /// Run the dead-code domain; `None` defers to `audit.deadCode` in config,
+    /// which defaults to on. When off, the verdict comes from the domains that
+    /// run.
+    pub dead_code: Option<bool>,
+    /// Run the health domain; `None` defers to `audit.health` in config,
+    /// which defaults to on.
+    pub health: Option<bool>,
+    /// Run the duplication domain; `None` defers to `audit.dupes` in config,
+    /// which defaults to on.
+    pub duplication: Option<bool>,
+    /// `Some(false)` skips CSS / styling analysis, as `--no-css` does. `None`
+    /// and `Some(true)` defer to `audit.css` in config, which defaults to on.
     pub css: Option<bool>,
-    /// Enable deep cross-file CSS analysis; `None` defers to config.
+    /// Enable deep cross-file CSS analysis; `None` defers to `audit.cssDeep`
+    /// in config, which defaults to on. It runs only when CSS analysis runs.
     pub css_deep: Option<bool>,
-    /// Gate mode deciding which findings fail the audit.
-    pub gate: fallow_config::AuditGate,
+    /// Gate mode deciding which findings fail the audit; `None` defers to
+    /// `audit.gate` in config, which defaults to `new-only`.
+    pub gate: Option<fallow_config::AuditGate>,
+    /// How a worsened complexity finding affects the verdict; `None` defers
+    /// to `audit.worsened` in config, which defaults to `warn`.
+    pub worsened: Option<fallow_config::AuditWorsened>,
     /// Fail the gate when a changed function exceeds this CRAP score.
     pub max_crap: Option<f64>,
     /// Test coverage report path for coverage-aware findings.
@@ -546,6 +745,8 @@ pub struct AuditOptions {
     pub coverage_root: Option<PathBuf>,
     /// Also report unused exports declared in entry-point files.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
     /// Runtime coverage capture merged into the audit.
     pub runtime_coverage: Option<PathBuf>,
     /// Minimum recorded invocations for a code path to count as hot.
@@ -565,6 +766,8 @@ pub struct CombinedOptions {
     pub health: bool,
     /// Also report unused exports declared in entry-point files.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
     /// Options for the duplication domain.
     pub duplication_options: DuplicationOptions,
     /// Options for the health domain.
@@ -579,6 +782,7 @@ impl Default for CombinedOptions {
             duplication: true,
             health: true,
             include_entry_exports: false,
+            show_cascade: false,
             duplication_options: DuplicationOptions::default(),
             health_options: ComplexityOptions::default(),
         }
@@ -602,8 +806,29 @@ pub struct DecisionSurfaceOptions {
 pub struct FeatureFlagsOptions {
     /// Shared analysis options.
     pub analysis: AnalysisOptions,
-    /// Cap on the number of reported flags.
+    /// Cap on the number of reported flags. With `retirement`, it also caps
+    /// the retirement rows.
     pub top: Option<usize>,
+    /// Retirement report options. `None` leaves the `retirement` block out.
+    pub retirement: Option<FeatureFlagsRetirementOptions>,
+}
+
+/// Options of the flag retirement report, the `--retirement` mode of
+/// `fallow flags`.
+#[derive(Debug, Clone, Default)]
+pub struct FeatureFlagsRetirementOptions {
+    /// How to measure flag age.
+    pub flag_age: fallow_types::flag_retirement::FlagAgeMode,
+    /// Vendor flag export to read, like `--flag-state`.
+    pub flag_state: Option<std::path::PathBuf>,
+    /// Keep only rows with one of these reasons. Empty keeps all rows.
+    pub reasons: Vec<fallow_types::flag_retirement::RetirementReason>,
+    /// Row order.
+    pub sort: fallow_engine::flag_retirement::RetirementSort,
+    /// Keep only rows at least this many days old.
+    pub min_age_days: Option<u64>,
+    /// Report the flags older than this many days in `max_flag_age`.
+    pub max_flag_age: Option<u64>,
 }
 
 /// Programmatic duplication mode selection.
@@ -645,6 +870,9 @@ pub struct DuplicationOptions {
     /// Only report cross-directory duplicates. `None` defers to the project
     /// config.
     pub skip_local: Option<bool>,
+    /// Omit clone instances whose path is a symlink or lies under a symlinked
+    /// directory. `None` defers to the project config.
+    pub ignore_symlinks: Option<bool>,
     /// Match clones across languages. `None` defers to the project config.
     pub cross_language: Option<bool>,
     /// Exclude module wiring from clone detection. `None` defers to the project
@@ -652,6 +880,10 @@ pub struct DuplicationOptions {
     pub ignore_imports: Option<bool>,
     /// Cap on the number of reported clone groups.
     pub top: Option<usize>,
+    /// Emit the verbatim source text on each clone instance. `None` keeps the
+    /// text, matching `fallow dupes` without `--no-fragments`; `Some(false)`
+    /// yields a location-only payload.
+    pub include_fragments: Option<bool>,
 }
 
 /// Options for local advisory similar-code discovery.
@@ -708,6 +940,31 @@ pub struct TraceFileOptions {
     pub file: String,
 }
 
+/// Options for shortest-import-path trace analysis.
+#[derive(Debug, Clone, Default)]
+pub struct TraceImportPathOptions {
+    /// Shared analysis options.
+    pub analysis: AnalysisOptions,
+    /// Path of the module the walk starts from.
+    pub from: String,
+    /// Path of the module the walk is looking for.
+    pub to: String,
+    /// Follow only static imports that carry a runtime value, so the route
+    /// explains why `to` loads before `from` runs.
+    pub eager_only: bool,
+}
+
+/// Options for stack-trace frame resolution.
+#[derive(Debug, Clone, Default)]
+pub struct TraceErrorOptions {
+    /// Shared analysis options.
+    pub analysis: AnalysisOptions,
+    /// The runtime stack trace, verbatim.
+    pub trace: String,
+    /// Where the trace came from, reported back as the payload's `source`.
+    pub source: String,
+}
+
 /// Options for dependency trace analysis.
 #[derive(Debug, Clone, Default)]
 pub struct TraceDependencyOptions {
@@ -715,6 +972,9 @@ pub struct TraceDependencyOptions {
     pub analysis: AnalysisOptions,
     /// Package whose importers are traced.
     pub package_name: String,
+    /// The per-specifier usage to report. `None` keeps the output equal to
+    /// `fallow dead-code --trace-dependency`, with no `usage` object.
+    pub usage: Option<DependencyUsageQuery>,
 }
 
 /// Duplicate-code trace target.
@@ -982,6 +1242,20 @@ pub struct ComplexityRunOptions<'a> {
     pub min_commits: Option<u32>,
     /// Test coverage inputs.
     pub coverage_inputs: ComplexityCoverageInputs<'a>,
+}
+
+/// Build the process-global Rayon pool with the [`WORKER_STACK_SIZE`] stack
+/// and `threads` workers. Zero threads selects the Rayon default count, which
+/// honors `RAYON_NUM_THREADS`.
+///
+/// A process that runs analysis outside
+/// [`ProgrammaticAnalysisContext::install`] calls this once at startup, before
+/// any parallel work. Returns `false` when the global pool already exists or
+/// when a worker thread cannot start. Rayon then keeps its default pool.
+pub fn configure_global_analysis_pool(threads: usize) -> bool {
+    fallow_engine::thread_pool::worker_pool_builder(threads)
+        .build_global()
+        .is_ok()
 }
 
 /// Derive effective health section flags for API consumers.

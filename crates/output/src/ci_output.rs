@@ -3,12 +3,12 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+use crate::review_envelopes::{default_marker_regex, default_marker_regex_flags};
 use crate::{
     CodeClimateIssue, CodeClimateSeverity, DiffIndex, GitHubReviewComment, GitHubReviewSide,
     GitLabReviewComment, GitLabReviewPosition, GitLabReviewPositionType, ReviewCheckConclusion,
     ReviewComment, ReviewEnvelopeEvent, ReviewEnvelopeMeta, ReviewEnvelopeOutput,
-    ReviewEnvelopeSchema, ReviewEnvelopeSummary, ReviewId, ReviewProvider, default_marker_regex,
-    default_marker_regex_flags, review_id_marker,
+    ReviewEnvelopeSchema, ReviewEnvelopeSummary, ReviewId, ReviewProvider, review_id_marker,
 };
 use serde_json::Value;
 
@@ -60,8 +60,27 @@ pub struct CiIssue {
     pub path: String,
     /// 1-based line of the finding.
     pub line: u64,
+    /// Inclusive 1-based end line for range findings.
+    pub end_line: Option<u64>,
+    /// Other source ranges that provide evidence for this finding.
+    pub other_locations: Vec<CiLocation>,
     /// Stable finding fingerprint used for comment identity.
     pub fingerprint: String,
+    /// The fingerprint an older Fallow release gave this finding, when it is
+    /// different from `fingerprint`. Review comments carry it for one
+    /// release, so a thread with the older marker still matches.
+    pub legacy_fingerprint: Option<String>,
+}
+
+/// Source range attached to a normalized CI finding as supporting evidence.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CiLocation {
+    /// File path relative to the analysed root.
+    pub path: String,
+    /// Inclusive 1-based start line.
+    pub line: u64,
+    /// Inclusive 1-based end line.
+    pub end_line: u64,
 }
 
 /// Inputs for rendering a sticky PR/MR summary comment.
@@ -78,6 +97,9 @@ pub struct PrCommentRenderInput<'a> {
     pub max_comments: usize,
     /// Maps a rule id to its display category label.
     pub category_for_rule: &'a dyn Fn(&str) -> &'static str,
+    /// A Markdown section after the findings and before the footer. The CLI
+    /// uses it for the unmatched config patterns.
+    pub trailing_section: Option<&'a str>,
 }
 
 /// GitLab diff refs for a review-envelope position.
@@ -132,13 +154,19 @@ pub struct ReviewEnvelopeRenderInput<'a> {
     pub suggestion_block: &'a dyn Fn(CiProvider, &CiIssue) -> Option<String>,
     /// Produces a guidance block for a finding, when one applies.
     pub guidance_block: &'a dyn Fn(&CiIssue) -> Option<String>,
+    /// A Markdown section in the summary body, after the inline-comment line
+    /// and before the markers. The CLI uses it for the unmatched config
+    /// patterns, as the sticky comment does.
+    pub trailing_section: Option<&'a str>,
 }
 
-/// Marker prefix appended to every v2 review-comment body.
-pub const MARKER_PREFIX_V2: &str = "<!-- fallow-fingerprint:v2: ";
+/// Marker prefix appended to every review-comment body.
+///
+/// Version 3 carries the line-stable fingerprint of dead-code findings.
+pub const MARKER_PREFIX_V3: &str = "<!-- fallow-fingerprint:v3: ";
 
-/// Closing of the v2 marker, after the fingerprint string.
-pub const MARKER_SUFFIX_V2: &str = " -->";
+/// Closing of the v3 marker, after the fingerprint string.
+pub const MARKER_SUFFIX_V3: &str = " -->";
 
 /// Hard cap on a single review-comment body, matching GitHub's 65 536-char
 /// comment limit; bodies at or over it are truncated with a marker suffix.
@@ -177,6 +205,27 @@ fn issue_from_codeclimate(value: &Value) -> Option<CiIssue> {
         .pointer("/location/lines/begin")
         .and_then(Value::as_u64)
         .unwrap_or(1);
+    let end_line = value.pointer("/location/lines/end").and_then(Value::as_u64);
+    let mut other_locations = value
+        .get("other_locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|location| {
+            let line = location.pointer("/lines/begin")?.as_u64()?;
+            let end_line = location
+                .pointer("/lines/end")
+                .and_then(Value::as_u64)
+                .filter(|end| *end >= line)
+                .unwrap_or(line);
+            Some(CiLocation {
+                path: location.get("path")?.as_str()?.to_owned(),
+                line,
+                end_line,
+            })
+        })
+        .collect::<Vec<_>>();
+    other_locations.sort();
     Some(CiIssue {
         rule_id: value
             .get("check_name")
@@ -198,19 +247,41 @@ fn issue_from_codeclimate(value: &Value) -> Option<CiIssue> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        legacy_fingerprint: None,
         path,
         line,
+        end_line,
+        other_locations,
     })
 }
 
 fn issue_from_codeclimate_issue(issue: &CodeClimateIssue) -> CiIssue {
+    let mut other_locations = issue
+        .other_locations
+        .iter()
+        .map(|location| CiLocation {
+            path: location.path.clone(),
+            line: u64::from(location.lines.begin),
+            end_line: u64::from(
+                location
+                    .lines
+                    .end
+                    .filter(|end| *end >= location.lines.begin)
+                    .unwrap_or(location.lines.begin),
+            ),
+        })
+        .collect::<Vec<_>>();
+    other_locations.sort();
     CiIssue {
         rule_id: issue.check_name.clone(),
         description: issue.description.clone(),
         severity: codeclimate_severity_label(issue.severity).to_owned(),
         path: issue.location.path.clone(),
         line: u64::from(issue.location.lines.begin),
+        end_line: issue.location.lines.end.map(u64::from),
+        other_locations,
         fingerprint: issue.fingerprint.clone(),
+        legacy_fingerprint: issue.legacy_fingerprint.clone(),
     }
 }
 
@@ -233,41 +304,109 @@ fn fingerprint_hash(parts: &[&str]) -> String {
     crate::codeclimate_fingerprint_hash(parts)
 }
 
-/// Render the sticky PR/MR summary comment body: identity marker, headline
-/// count, and per-category findings tables.
+/// Render the sticky summary comment body: identity marker, run verdict,
+/// headline count, and per-category findings tables.
+///
+/// The verdict is derived from the findings' severities. Use
+/// [`render_pr_comment_with_verdict`] to fold in a gate conclusion the caller
+/// already computed, such as a saved audit verdict.
+#[must_use]
+pub fn render_pr_comment(input: &PrCommentRenderInput<'_>) -> String {
+    render_pr_comment_with_verdict(input, None)
+}
+
+/// Render the sticky summary comment body with an explicit gate conclusion.
+///
+/// The rendered verdict is the more severe of `gate` and the severity-derived
+/// [`github_check_conclusion`], so a gate that only knows about thresholds
+/// cannot mask an error-severity finding, and a failing gate cannot be masked
+/// by findings that are all advisory.
+///
+/// This body is the surface a rerun edits in place. A provider review body is
+/// a point-in-time record that no later run can rewrite, which is why the run
+/// verdict lives here and not there.
 #[must_use]
 #[expect(clippy::expect_used, reason = "formatting into String is infallible")]
-pub fn render_pr_comment(input: &PrCommentRenderInput<'_>) -> String {
+pub fn render_pr_comment_with_verdict(
+    input: &PrCommentRenderInput<'_>,
+    gate: Option<ReviewCheckConclusion>,
+) -> String {
     let marker = format!("<!-- fallow-id: {} -->", input.marker_id);
     let title = command_title(input.command);
     let count = input.issues.len();
     let noun = if count == 1 { "finding" } else { "findings" };
+    let verdict = most_severe_conclusion(github_check_conclusion(input.issues), gate);
 
     let mut out = String::new();
     out.push_str(&marker);
     out.push('\n');
     write!(&mut out, "### Fallow {title}\n\n").expect("write to string");
+    write!(&mut out, "**{}**\n\n", pr_comment_verdict(verdict)).expect("write to string");
     if count == 0 {
         writeln!(
             &mut out,
-            "No {provider} PR/MR findings.",
-            provider = input.provider.name()
+            "No findings for this {}.",
+            change_noun(input.provider)
         )
         .expect("write to string");
     } else {
-        write!(&mut out, "Found **{count}** {noun}.\n\n").expect("write to string");
         let groups = group_by_category(input.issues, input.category_for_rule);
-        if let [(_, group_issues)] = groups.as_slice() {
-            render_findings_table(&mut out, group_issues, input.max_comments, "Details");
+        if groups.len() > 1 {
+            write!(
+                &mut out,
+                "Found **{count}** {noun}: {}.\n\n",
+                category_breakdown(&groups)
+            )
+            .expect("write to string");
         } else {
-            for (category, group_issues) in &groups {
-                let summary_label = summary_label(category, group_issues.len(), input.max_comments);
-                render_findings_table(&mut out, group_issues, input.max_comments, &summary_label);
-            }
+            write!(&mut out, "Found **{count}** {noun}.\n\n").expect("write to string");
         }
+        for (category, group_issues) in &groups {
+            let summary_label = summary_label(category, group_issues.len(), input.max_comments);
+            render_findings_table(&mut out, group_issues, input.max_comments, &summary_label);
+        }
+    }
+    if let Some(section) = input
+        .trailing_section
+        .map(str::trim)
+        .filter(|section| !section.is_empty())
+    {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(section);
+        out.push('\n');
     }
     out.push_str("\nGenerated by fallow.");
     out
+}
+
+/// Verdict line rendered under the sticky comment heading.
+const fn pr_comment_verdict(conclusion: ReviewCheckConclusion) -> &'static str {
+    match conclusion {
+        ReviewCheckConclusion::Failure => "Quality gate failed",
+        ReviewCheckConclusion::Neutral => "Review needed",
+        ReviewCheckConclusion::Success => "Quality gate passed",
+    }
+}
+
+const fn conclusion_rank(conclusion: ReviewCheckConclusion) -> u8 {
+    match conclusion {
+        ReviewCheckConclusion::Success => 0,
+        ReviewCheckConclusion::Neutral => 1,
+        ReviewCheckConclusion::Failure => 2,
+    }
+}
+
+const fn most_severe_conclusion(
+    derived: ReviewCheckConclusion,
+    gate: Option<ReviewCheckConclusion>,
+) -> ReviewCheckConclusion {
+    match gate {
+        Some(gate) if conclusion_rank(gate) > conclusion_rank(derived) => gate,
+        _ => derived,
+    }
 }
 
 /// Rule ids whose findings describe project-wide config state rather than a
@@ -293,13 +432,21 @@ pub fn is_project_level_rule(rule_id: &str) -> bool {
     PROJECT_LEVEL_RULE_IDS.contains(&rule_id)
 }
 
-const CATEGORY_ORDER: [&str; 6] = [
+/// Section order for the sticky comment. Every category the rule registry
+/// carries is listed, so a new bucket does not sort alphabetically into the
+/// middle of the report. "Other" collects rules a downstream consumer added
+/// without registering, and sorts last by construction.
+const CATEGORY_ORDER: [&str; 10] = [
     "Dead code",
     "Dependencies",
     "Duplication",
     "Health",
     "Architecture",
+    "Policy",
+    "Security",
+    "Flags",
     "Suppressions",
+    "Other",
 ];
 
 fn group_by_category<'a>(
@@ -322,6 +469,17 @@ fn group_by_category<'a>(
         ordered.push((category, items));
     }
     ordered
+}
+
+/// Table of contents for the collapsed sections below: "Dead code 13,
+/// Dependencies 12". Section order, so the subtitle reads in the order a
+/// reader scrolls.
+fn category_breakdown(groups: &[(&'static str, Vec<&CiIssue>)]) -> String {
+    groups
+        .iter()
+        .map(|(category, issues)| format!("{category} {}", issues.len()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Collapsible-section label for a findings category: appends "showing N"
@@ -368,12 +526,31 @@ fn render_findings_table(out: &mut String, issues: &[&CiIssue], max: usize, summ
 #[must_use]
 pub fn command_title(command: &str) -> &'static str {
     match command {
-        "dead-code" | "check" => "dead-code report",
+        "dead-code" | "check" => "codebase report",
+        "architecture" => "architecture report",
         "dupes" => "duplication report",
         "health" => "health report",
         "audit" => "audit report",
+        "security" => "security report",
+        "fix" => "fix report",
         "" | "combined" => "combined report",
         _ => "report",
+    }
+}
+
+/// How the provider names a change proposal ("pull request" / "merge request").
+const fn change_noun(provider: CiProvider) -> &'static str {
+    match provider {
+        CiProvider::Github => "pull request",
+        CiProvider::Gitlab => "merge request",
+    }
+}
+
+/// The provider's diff tab, where inline review comments are read.
+const fn changes_tab(provider: CiProvider) -> &'static str {
+    match provider {
+        CiProvider::Github => "Files changed",
+        CiProvider::Gitlab => "Changes",
     }
 }
 
@@ -462,8 +639,11 @@ pub fn markdown_table_text(value: &str) -> String {
 
 /// Render a provider-specific review envelope from typed CI issues.
 #[must_use]
-pub fn render_review_envelope(input: &ReviewEnvelopeRenderInput<'_>) -> ReviewEnvelopeRenderResult {
-    render_review_envelope_with_id(input, None, None, None)
+pub fn render_review_envelope(
+    input: &ReviewEnvelopeRenderInput<'_>,
+    status_message: Option<&str>,
+) -> ReviewEnvelopeRenderResult {
+    render_review_envelope_with_id(input, None, None, status_message)
 }
 
 /// Render a review envelope with an explicit gate conclusion and status.
@@ -481,8 +661,9 @@ pub fn render_review_envelope_with_conclusion(
 pub fn render_scoped_review_envelope(
     input: &ReviewEnvelopeRenderInput<'_>,
     review_id: &ReviewId,
+    status_message: Option<&str>,
 ) -> ReviewEnvelopeRenderResult {
-    render_review_envelope_with_id(input, Some(review_id), None, None)
+    render_review_envelope_with_id(input, Some(review_id), None, status_message)
 }
 
 /// Render a scoped review envelope with an explicit gate conclusion and status.
@@ -529,8 +710,8 @@ fn render_review_envelope_with_id(
         input.command,
         input.provider,
         comments.len(),
-        conclusion,
         status_message,
+        input.trailing_section,
     );
     let summary_fp = summary_fingerprint(&summary_text);
     let summary_marker = review_markers(&summary_fp, review_id);
@@ -551,32 +732,45 @@ fn render_review_envelope_with_id(
     }
 }
 
+/// Review body: what this review carries and where to read it.
+///
+/// No run verdict. A provider review is a point-in-time record that a later
+/// run cannot rewrite, so a verdict rendered here keeps asserting a state the
+/// editable sticky comment has already moved on from. The machine-readable
+/// gate result still travels on `meta.check_conclusion`.
 fn review_summary_text(
     command: &str,
     provider: CiProvider,
     comment_count: usize,
-    conclusion: ReviewCheckConclusion,
     status_message: Option<&str>,
+    trailing_section: Option<&str>,
 ) -> String {
-    let verdict = review_summary_verdict(conclusion);
     let status = status_message.map_or_else(String::new, |message| format!("\n\n> {message}"));
+    let section = trailing_section
+        .map(str::trim)
+        .filter(|section| !section.is_empty())
+        .map_or_else(String::new, |section| format!("\n\n{section}"));
     format!(
-        "### Fallow {}\n\n**{}**{}\n\n{} inline finding{} selected for {} review.\n\n<!-- fallow-review -->",
+        "### Fallow {}{}\n\n{}{}\n\n<!-- fallow-review -->",
         command_title(command),
-        verdict,
         status,
-        comment_count,
-        if comment_count == 1 { "" } else { "s" },
-        provider.name(),
+        inline_comment_line(provider, comment_count),
+        section,
     )
 }
 
-fn review_summary_verdict(conclusion: ReviewCheckConclusion) -> &'static str {
-    match conclusion {
-        ReviewCheckConclusion::Failure => "Quality gate failed",
-        ReviewCheckConclusion::Neutral => "Review needed",
-        ReviewCheckConclusion::Success => "Quality gate passed",
+fn inline_comment_line(provider: CiProvider, count: usize) -> String {
+    if count == 0 {
+        return format!(
+            "No findings anchored to the changed lines in this {}.",
+            change_noun(provider)
+        );
     }
+    format!(
+        "{count} inline comment{} on the changed lines. Open the {} tab to review.",
+        if count == 1 { "" } else { "s" },
+        changes_tab(provider),
+    )
 }
 
 /// Review issues grouped per `(path, line)` for one-comment-per-location
@@ -679,6 +873,7 @@ fn render_review_comment_for_group_with_id(
         let constituents: Vec<&str> = input.group.iter().map(|i| i.fingerprint.as_str()).collect();
         composite_fingerprint(&constituents)
     };
+    let legacy_fingerprint = group_legacy_fingerprint(input.group);
 
     let content = build_merged_comment_content(input);
     let marker_line = review_markers(&fingerprint, review_id);
@@ -692,8 +887,34 @@ fn render_review_comment_for_group_with_id(
         path_prefix: input.path_prefix,
         body,
         fingerprint,
+        legacy_fingerprint,
         truncated,
     })
+}
+
+/// The fingerprint an older Fallow release gave a comment for `group`, or
+/// `None` when no issue in the group has a legacy fingerprint.
+///
+/// A merged comment hashes the legacy fingerprint of each constituent, or its
+/// fingerprint when the constituent has no legacy value. This is the value
+/// that the older release wrote into the merged marker.
+fn group_legacy_fingerprint(group: &[&CiIssue]) -> Option<String> {
+    if group.iter().all(|issue| issue.legacy_fingerprint.is_none()) {
+        return None;
+    }
+    if let [issue] = group {
+        return issue.legacy_fingerprint.clone();
+    }
+    let constituents: Vec<&str> = group
+        .iter()
+        .map(|issue| {
+            issue
+                .legacy_fingerprint
+                .as_deref()
+                .unwrap_or(issue.fingerprint.as_str())
+        })
+        .collect();
+    Some(composite_fingerprint(&constituents))
 }
 
 #[expect(clippy::expect_used, reason = "formatting into String is infallible")]
@@ -712,6 +933,23 @@ fn build_merged_comment_content(input: &ReviewCommentRenderInput<'_, '_>) -> Str
             escape_md(&issue.description)
         )
         .expect("write to String is infallible");
+        if !issue.other_locations.is_empty() {
+            content.push_str("\n\nOther locations: ");
+            let locations = issue
+                .other_locations
+                .iter()
+                .map(|location| {
+                    markdown_code_span(&format!(
+                        "{}:{}-{}",
+                        apply_path_prefix(input.path_prefix, &location.path),
+                        location.line,
+                        location.end_line
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            content.push_str(&locations);
+        }
         if let Some(suggestion) = (input.suggestion_block)(input.provider, issue) {
             content.push_str(&suggestion);
         }
@@ -732,6 +970,7 @@ struct ReviewCommentInput<'a> {
     path_prefix: &'a str,
     body: String,
     fingerprint: String,
+    legacy_fingerprint: Option<String>,
     truncated: bool,
 }
 
@@ -744,6 +983,7 @@ fn build_review_comment(input: ReviewCommentInput<'_>) -> ReviewComment {
         path_prefix,
         body,
         fingerprint,
+        legacy_fingerprint,
         truncated,
     } = input;
     match provider {
@@ -753,6 +993,7 @@ fn build_review_comment(input: ReviewCommentInput<'_>) -> ReviewComment {
             side: GitHubReviewSide::Right,
             body,
             fingerprint,
+            legacy_fingerprint,
             truncated,
         }),
         CiProvider::Gitlab => {
@@ -776,6 +1017,7 @@ fn build_review_comment(input: ReviewCommentInput<'_>) -> ReviewComment {
                 body,
                 position,
                 fingerprint,
+                legacy_fingerprint,
                 truncated,
             })
         }
@@ -871,7 +1113,7 @@ fn build_review_envelope_output(
 }
 
 fn review_markers(fingerprint: &str, review_id: Option<&ReviewId>) -> String {
-    let fingerprint = format!("\n\n{MARKER_PREFIX_V2}{fingerprint}{MARKER_SUFFIX_V2}");
+    let fingerprint = format!("\n\n{MARKER_PREFIX_V3}{fingerprint}{MARKER_SUFFIX_V3}");
     match review_id {
         Some(review_id) => format!("{fingerprint}\n{}", review_id_marker(review_id)),
         None => fingerprint,
@@ -900,34 +1142,6 @@ mod tests {
     use super::*;
     use crate::{CodeClimateIssueKind, CodeClimateLines, CodeClimateLocation};
 
-    fn escape_md_legacy(value: &str) -> String {
-        let collapsed = value.replace("\r\n", " ").replace(['\n', '\r'], " ");
-        let mut out = String::with_capacity(collapsed.len());
-        for ch in collapsed.chars() {
-            if matches!(
-                ch,
-                '\\' | '`'
-                    | '*'
-                    | '_'
-                    | '['
-                    | ']'
-                    | '('
-                    | ')'
-                    | '!'
-                    | '<'
-                    | '>'
-                    | '#'
-                    | '|'
-                    | '~'
-                    | '&'
-            ) {
-                out.push('\\');
-            }
-            out.push(ch);
-        }
-        out.trim().to_owned()
-    }
-
     fn category_for_rule(rule_id: &str) -> &'static str {
         match rule_id {
             "fallow/code-duplication" => "Duplication",
@@ -935,6 +1149,13 @@ mod tests {
             "fallow/unused-dependency" => "Dependencies",
             _ => "Dead code",
         }
+    }
+
+    #[test]
+    fn command_title_names_each_analysis_command() {
+        assert_eq!(command_title("dead-code"), "codebase report");
+        assert_eq!(command_title("architecture"), "architecture report");
+        assert_eq!(command_title("dupes"), "duplication report");
     }
 
     #[test]
@@ -975,10 +1196,19 @@ mod tests {
                     path: format!("src/{index}.ts"),
                     lines: CodeClimateLines {
                         begin: u32::try_from(index + 1).expect("small fixture index"),
+                        end: Some(u32::try_from(index + 3).expect("small fixture index")),
                     },
                 },
+                other_locations: vec![CodeClimateLocation {
+                    path: format!("src/peer-{index}.ts"),
+                    lines: CodeClimateLines {
+                        begin: 20,
+                        end: Some(24),
+                    },
+                }],
                 owner: None,
                 group: None,
+                legacy_fingerprint: None,
             })
             .collect::<Vec<_>>();
         let value = serde_json::to_value(&typed).expect("typed fixture serializes");
@@ -987,6 +1217,11 @@ mod tests {
             issues_from_codeclimate_issues(&typed),
             issues_from_codeclimate(&value)
         );
+        let normalized = issues_from_codeclimate_issues(&typed);
+        assert_eq!(normalized[0].end_line, Some(3));
+        assert_eq!(normalized[0].other_locations[0].path, "src/peer-0.ts");
+        assert_eq!(normalized[0].other_locations[0].line, 20);
+        assert_eq!(normalized[0].other_locations[0].end_line, 24);
         let typed_labels = issues_from_codeclimate_issues(&typed)
             .into_iter()
             .map(|issue| issue.severity)
@@ -999,6 +1234,45 @@ mod tests {
     }
 
     #[test]
+    fn review_comment_renders_repository_prefixed_peer_ranges() {
+        let issue = CiIssue {
+            rule_id: "fallow/code-duplication".to_owned(),
+            description: "Code clone dup:abcd1234 (11 lines, 2 instances)".to_owned(),
+            severity: "minor".to_owned(),
+            path: "src/a.ts".to_owned(),
+            line: 5,
+            end_line: Some(15),
+            other_locations: vec![CiLocation {
+                path: "src/b.ts".to_owned(),
+                line: 30,
+                end_line: 40,
+            }],
+            fingerprint: "instance-fingerprint".to_owned(),
+            legacy_fingerprint: None,
+        };
+        let comment = render_review_comment_for_group(&ReviewCommentRenderInput {
+            provider: CiProvider::Gitlab,
+            group: &[&issue],
+            gitlab_diff_refs: None,
+            diff_index: None,
+            path_prefix: "packages/app",
+            include_guidance: false,
+            suggestion_block: &|_, _| None,
+            guidance_block: &|_| None,
+        });
+        let ReviewComment::GitLab(comment) = comment else {
+            panic!("expected GitLab comment");
+        };
+
+        assert_eq!(comment.position.new_path, "packages/app/src/a.ts");
+        assert!(
+            comment
+                .body
+                .contains("Other locations: `packages/app/src/b.ts:30-40`")
+        );
+    }
+
+    #[test]
     fn renders_default_empty_comment() {
         let body = render_pr_comment(&PrCommentRenderInput {
             command: "check",
@@ -1007,9 +1281,214 @@ mod tests {
             marker_id: "fallow-results".to_owned(),
             max_comments: 50,
             category_for_rule: &category_for_rule,
+            trailing_section: None,
         });
         assert!(body.contains("<!-- fallow-id: fallow-results"));
-        assert!(body.contains("No GitHub PR/MR findings."));
+        assert!(body.contains("No findings for this pull request."));
+    }
+
+    fn pr_comment_issue(rule_id: &str, description: &str, severity: &str, path: &str) -> CiIssue {
+        CiIssue {
+            rule_id: rule_id.to_owned(),
+            description: description.to_owned(),
+            severity: severity.to_owned(),
+            path: path.to_owned(),
+            line: 3,
+            end_line: None,
+            other_locations: Vec::new(),
+            fingerprint: path.to_owned(),
+            legacy_fingerprint: None,
+        }
+    }
+
+    fn dead_code_issue(line: u64, fingerprint: &str, legacy: Option<&str>) -> CiIssue {
+        CiIssue {
+            rule_id: "fallow/unused-export".to_owned(),
+            description: "Export 'helper' is never imported by other modules".to_owned(),
+            severity: "major".to_owned(),
+            path: "src/lib.ts".to_owned(),
+            line,
+            end_line: None,
+            other_locations: Vec::new(),
+            fingerprint: fingerprint.to_owned(),
+            legacy_fingerprint: legacy.map(str::to_owned),
+        }
+    }
+
+    fn github_comment(group: &[&CiIssue]) -> GitHubReviewComment {
+        let comment = render_review_comment_for_group(&ReviewCommentRenderInput {
+            provider: CiProvider::Github,
+            group,
+            gitlab_diff_refs: None,
+            diff_index: None,
+            path_prefix: "",
+            include_guidance: false,
+            suggestion_block: &|_, _| None,
+            guidance_block: &|_| None,
+        });
+        let ReviewComment::GitHub(comment) = comment else {
+            panic!("expected GitHub comment");
+        };
+        comment
+    }
+
+    /// A comment carries the stable fingerprint in a v3 marker, and the
+    /// legacy fingerprint on the side, so a thread with the v2 marker of an
+    /// older release still matches.
+    #[test]
+    fn review_comment_writes_a_v3_marker_and_keeps_the_legacy_fingerprint() {
+        let issue = dead_code_issue(3, "0123456789abcdef", Some("fedcba9876543210"));
+
+        let comment = github_comment(&[&issue]);
+
+        assert!(
+            comment
+                .body
+                .ends_with("<!-- fallow-fingerprint:v3: 0123456789abcdef -->"),
+            "{}",
+            comment.body
+        );
+        assert!(!comment.body.contains("fallow-fingerprint:v2:"));
+        assert_eq!(comment.fingerprint, "0123456789abcdef");
+        assert_eq!(
+            comment.legacy_fingerprint.as_deref(),
+            Some("fedcba9876543210")
+        );
+        let value = serde_json::to_value(&comment).expect("comment serializes");
+        assert_eq!(value["legacy_fingerprint"], "fedcba9876543210");
+    }
+
+    /// A finding whose fingerprint did not change carries no legacy value,
+    /// and the wire shape has no `legacy_fingerprint` key.
+    #[test]
+    fn review_comment_omits_an_unchanged_legacy_fingerprint() {
+        let issue = dead_code_issue(3, "0123456789abcdef", None);
+
+        let comment = github_comment(&[&issue]);
+
+        assert_eq!(comment.legacy_fingerprint, None);
+        let value = serde_json::to_value(&comment).expect("comment serializes");
+        assert!(value.get("legacy_fingerprint").is_none());
+    }
+
+    /// A merged comment gets the composite that the older release computed:
+    /// the legacy value of each constituent, or its fingerprint when it has
+    /// no legacy value.
+    #[test]
+    fn merged_review_comment_rebuilds_the_legacy_composite() {
+        let moved = dead_code_issue(3, "0123456789abcdef", Some("fedcba9876543210"));
+        let kept = dead_code_issue(3, "1111111111111111", None);
+
+        let comment = github_comment(&[&moved, &kept]);
+
+        assert_eq!(
+            comment.fingerprint,
+            composite_fingerprint(&["0123456789abcdef", "1111111111111111"])
+        );
+        assert_eq!(
+            comment.legacy_fingerprint,
+            Some(composite_fingerprint(&[
+                "fedcba9876543210",
+                "1111111111111111"
+            ]))
+        );
+    }
+
+    #[test]
+    fn pr_comment_titles_by_content_and_names_its_only_category() {
+        let issues = vec![
+            pr_comment_issue(
+                "fallow/unresolved-import",
+                "Import './x' could not be resolved",
+                "major",
+                "src/a.ts",
+            ),
+            pr_comment_issue(
+                "fallow/unresolved-import",
+                "Import './y' could not be resolved",
+                "major",
+                "src/b.ts",
+            ),
+        ];
+        let body = render_pr_comment(&PrCommentRenderInput {
+            command: "dead-code",
+            provider: CiProvider::Github,
+            issues: &issues,
+            marker_id: "fallow-results".to_owned(),
+            max_comments: 50,
+            category_for_rule: &category_for_rule,
+            trailing_section: None,
+        });
+        assert!(body.contains("### Fallow codebase report"), "{body}");
+        assert!(body.contains("**Quality gate failed**"), "{body}");
+        assert!(body.contains("Found **2** findings."), "{body}");
+        assert!(body.contains("<summary>Dead code (2)</summary>"), "{body}");
+    }
+
+    #[test]
+    fn pr_comment_breakdown_indexes_several_categories() {
+        let issues = vec![
+            pr_comment_issue(
+                "fallow/unresolved-import",
+                "Import './x' could not be resolved",
+                "major",
+                "src/a.ts",
+            ),
+            pr_comment_issue(
+                "fallow/unused-dependency",
+                "Package 'lodash' is never imported",
+                "minor",
+                "package.json",
+            ),
+        ];
+        let body = render_pr_comment(&PrCommentRenderInput {
+            command: "check",
+            provider: CiProvider::Github,
+            issues: &issues,
+            marker_id: "fallow-results".to_owned(),
+            max_comments: 50,
+            category_for_rule: &category_for_rule,
+            trailing_section: None,
+        });
+        assert!(
+            body.contains("Found **2** findings: Dead code 1, Dependencies 1."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn pr_comment_empty_state_speaks_the_provider_language() {
+        let github = render_pr_comment(&PrCommentRenderInput {
+            command: "dead-code",
+            provider: CiProvider::Github,
+            issues: &[],
+            marker_id: "fallow-results".to_owned(),
+            max_comments: 50,
+            category_for_rule: &category_for_rule,
+            trailing_section: None,
+        });
+        let gitlab = render_pr_comment(&PrCommentRenderInput {
+            command: "dead-code",
+            provider: CiProvider::Gitlab,
+            issues: &[],
+            marker_id: "fallow-results".to_owned(),
+            max_comments: 50,
+            category_for_rule: &category_for_rule,
+            trailing_section: None,
+        });
+        assert!(
+            github.contains("No findings for this pull request."),
+            "{github}"
+        );
+        assert!(
+            gitlab.contains("No findings for this merge request."),
+            "{gitlab}"
+        );
+        assert!(
+            github.starts_with("<!-- fallow-id: fallow-results -->\n"),
+            "{github}"
+        );
+        assert!(github.contains("Generated by fallow."), "{github}");
     }
 
     #[test]
@@ -1068,26 +1547,27 @@ mod tests {
     }
 
     #[test]
-    fn escape_md_matches_legacy_contract_corpus() {
-        const ALPHABET: [char; 12] = [
-            'a', ' ', '\t', '\r', '\n', '\\', '|', '`', '&', '\u{2003}', 'é', '🦀',
-        ];
+    fn escape_md_trims_surrounding_whitespace() {
+        assert_eq!(escape_md("  a\u{2003}\r\n"), "a");
+        assert_eq!(escape_md(" \t\r\n\u{2003} "), "");
+    }
 
-        for length in 0..=4 {
-            let case_count = ALPHABET.len().pow(length);
-            for mut encoded in 0..case_count {
-                let mut value = String::new();
-                for _ in 0..length {
-                    value.push(ALPHABET[encoded % ALPHABET.len()]);
-                    encoded /= ALPHABET.len();
-                }
-                assert_eq!(
-                    escape_md(&value),
-                    escape_md_legacy(&value),
-                    "contract mismatch for {value:?}"
-                );
-            }
-        }
+    #[test]
+    fn escape_md_collapses_crlf_to_one_space() {
+        let collapsed = escape_md("a\r\nb\rc\nd");
+        assert_eq!(collapsed, "a b c d");
+        assert_eq!(collapsed.len(), 7, "CRLF must not expand to two spaces");
+    }
+
+    #[test]
+    fn escape_md_preserves_interior_tabs_and_wide_spaces() {
+        assert_eq!(escape_md("a\tb"), "a\tb");
+        assert_eq!(escape_md("a\u{2003}b"), "a\u{2003}b");
+    }
+
+    #[test]
+    fn escape_md_passes_non_ascii_through_unchanged() {
+        assert_eq!(escape_md("é🦀"), "é🦀");
     }
 
     #[test]
@@ -1143,6 +1623,7 @@ mod tests {
             "fallow/duplicate-export",
             "fallow/circular-dependency",
             "fallow/re-export-cycle",
+            "fallow/package-cycle",
             "fallow/boundary-violation",
             "fallow/stale-suppression",
             "fallow/private-type-leak",
@@ -1161,6 +1642,26 @@ mod tests {
         let raw = "code with `backticks` and *stars*";
         let once = escape_md(raw);
         let twice = escape_md(&once);
-        assert!(twice.contains(r"\\"));
+        assert_eq!(once, r"code with \`backticks\` and \*stars\*");
+        assert_eq!(twice, r"code with \\\`backticks\\\` and \\\*stars\\\*");
+    }
+
+    #[test]
+    fn pr_comment_trailing_section_renders_before_the_footer() {
+        let body = render_pr_comment(&PrCommentRenderInput {
+            command: "check",
+            provider: CiProvider::Github,
+            issues: &[],
+            marker_id: "fallow-results".to_owned(),
+            max_comments: 50,
+            category_for_rule: &category_for_rule,
+            trailing_section: Some("\n## Unmatched config patterns\n\n- `@typo/*`"),
+        });
+        assert!(
+            body.ends_with(
+                "\n\n## Unmatched config patterns\n\n- `@typo/*`\n\nGenerated by fallow."
+            ),
+            "{body}"
+        );
     }
 }

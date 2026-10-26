@@ -23,7 +23,6 @@ fallow-security = { workspace = true }
 fallow-types = { workspace = true }
 
 # Parsing & analysis
-oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_ast_visit = { workspace = true }
 oxc_parser = { workspace = true }
@@ -45,7 +44,6 @@ regex = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml_ng = { workspace = true }
 toml = { workspace = true }
 
 # Hashing
@@ -64,7 +62,6 @@ schema = ["fallow-types/schema"]
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
-dhat = { workspace = true }
 postcard = { workspace = true }
 tempfile = { workspace = true }
 
@@ -76,13 +73,13 @@ name = "analysis"
 harness = false
 
 [[bench]]
+name = "entry_point_discovery"
+harness = false
+
+[[bench]]
 name = "large_analysis"
 harness = false
 
 [[bench]]
 name = "scaling_analysis"
-harness = false
-
-[[bench]]
-name = "allocations"
 harness = false

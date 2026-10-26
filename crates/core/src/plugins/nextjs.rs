@@ -26,6 +26,9 @@ const PAGE_EXPORTS: &[&str] = &[
     "runtime",
     "preferredRegion",
     "maxDuration",
+    "instant",
+    "prefetch",
+    "unstable_dynamicStaleTime",
 ];
 const LAYOUT_EXPORTS: &[&str] = &[
     "default",
@@ -41,6 +44,8 @@ const LAYOUT_EXPORTS: &[&str] = &[
     "runtime",
     "preferredRegion",
     "maxDuration",
+    "instant",
+    "prefetch",
 ];
 const ROUTE_EXPORTS: &[&str] = &[
     "GET",
@@ -238,7 +243,7 @@ define_plugin!(
         ("src/app/**/sitemap.{ts,tsx,js,jsx}", SITEMAP_EXPORTS),
         ("src/app/**/robots.{ts,tsx,js,jsx}", ROBOTS_EXPORTS),
     ],
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
 
         let imports = config_parser::extract_imports(source, config_path);
@@ -306,6 +311,15 @@ define_plugin!(
                 .push(crate::resolve::extract_package_name(package));
         }
 
+        // Next.js loads each SWC plugin package named in this tuple list.
+        result
+            .referenced_dependencies
+            .extend(config_parser::extract_config_swc_plugin_dependencies(
+                source,
+                config_path,
+                &["experimental", "swcPlugins"],
+            ));
+
         if config_parser::extract_config_truthy_bool_or_object(
             source,
             config_path,
@@ -315,6 +329,18 @@ define_plugin!(
                 .referenced_dependencies
                 .push(REACT_COMPILER_BABEL_PLUGIN.to_string());
         }
+
+        // `@module-federation/nextjs-mf` registers the plugin inside the
+        // `webpack(config)` hook of this same file, so the Federation reader has
+        // to run over `next.config.*` as it runs over a bundler config.
+        super::module_federation::apply_bundler_plugin_options(
+            &mut result,
+            source,
+            config_path,
+            root,
+            super::module_federation::FederationBase::default(),
+            "nextjs",
+        );
 
         result
     },
@@ -432,6 +458,36 @@ mod tests {
             .find(|(pat, _)| *pat == "mdx-components.{ts,tsx,js,jsx}")
             .expect("should have mdx-components used exports");
         assert!(mdx_entry.1.contains(&"useMDXComponents"));
+    }
+
+    #[test]
+    fn page_and_layout_exports_include_instant_and_prefetch_segment_config() {
+        let plugin = NextJsPlugin;
+        let exports = plugin.used_exports();
+        let lookup = |pattern: &str| -> &[&str] {
+            exports
+                .iter()
+                .find(|(pat, _)| *pat == pattern)
+                .unwrap_or_else(|| panic!("should have used exports for {pattern}"))
+                .1
+        };
+
+        for prefix in ["app", "src/app"] {
+            let page = lookup(&format!("{prefix}/**/page.{{ts,tsx,js,jsx}}"));
+            assert!(page.contains(&"instant"));
+            assert!(page.contains(&"prefetch"));
+            assert!(page.contains(&"unstable_dynamicStaleTime"));
+
+            let layout = lookup(&format!("{prefix}/**/layout.{{ts,tsx,js,jsx}}"));
+            assert!(layout.contains(&"instant"));
+            assert!(layout.contains(&"prefetch"));
+            // Next.js rejects `unstable_dynamicStaleTime` in layout files.
+            assert!(!layout.contains(&"unstable_dynamicStaleTime"));
+
+            let route = lookup(&format!("{prefix}/**/route.{{ts,tsx,js,jsx}}"));
+            assert!(!route.contains(&"instant"));
+            assert!(!route.contains(&"prefetch"));
+        }
     }
 
     #[test]
@@ -632,6 +688,93 @@ mod tests {
         );
     }
 
+    /// `@module-federation/nextjs-mf` registers the plugin inside the
+    /// `webpack(config)` hook, and the Next.js plugin owns `next.config.*`, so
+    /// the exposed target reaches the report through this reader only.
+    #[test]
+    fn next_config_webpack_hook_exposes_become_entry_patterns() {
+        let source = r#"
+            const NextFederationPlugin = require("@module-federation/nextjs-mf");
+            module.exports = {
+                pageExtensions: ["tsx"],
+                webpack(config, options) {
+                    config.plugins.push(
+                        new NextFederationPlugin({
+                            name: "shop",
+                            filename: "static/chunks/remoteEntry.js",
+                            exposes: { "./pages-map": "./pages-map.js" },
+                            remotes: remotes(options.isServer),
+                        }),
+                    );
+                    return config;
+                },
+            };
+        "#;
+        let plugin = NextJsPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/next.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        let patterns: Vec<&str> = result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        assert!(
+            patterns.contains(&"pages-map.js"),
+            "the exposed target is an entry point, got {patterns:?}"
+        );
+        assert!(
+            patterns.iter().any(|pattern| pattern.contains("tsx")),
+            "the Next.js reader still contributes its own patterns, got {patterns:?}"
+        );
+        let recorded: Vec<(&str, &str, &str)> = result
+            .config_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.plugin.as_str(),
+                    diagnostic.key.as_str(),
+                    diagnostic.reason.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![("nextjs", "remotes", "not-object-literal")],
+            "the unreadable key names the config the user must edit"
+        );
+    }
+
+    /// A `next.config.*` without Federation options gains nothing, so the reader
+    /// cannot make a Next.js project report differently.
+    #[test]
+    fn next_config_without_federation_options_gains_nothing() {
+        let source = r"
+            export default {
+                reactStrictMode: true,
+                webpack(config) {
+                    config.plugins.push(new MyPlugin({ exposes: 1 }));
+                    return config;
+                },
+            };
+        ";
+        let plugin = NextJsPlugin;
+        let result = plugin.resolve_config(
+            Path::new("/project/next.config.ts"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            result.entry_patterns.is_empty(),
+            "{:?}",
+            result.entry_patterns
+        );
+        assert!(result.config_diagnostics.is_empty());
+        assert!(result.provided_dependencies.is_empty());
+    }
+
     #[test]
     fn resolve_config_extracts_import_deps() {
         let source = r#"
@@ -672,6 +815,31 @@ mod tests {
         assert!(
             result.entry_patterns.is_empty(),
             "no pageExtensions means no extra entry patterns"
+        );
+    }
+
+    #[test]
+    fn resolve_config_experimental_swc_plugins_are_referenced_dependencies() {
+        let source = r#"
+            const nextConfig = {
+                experimental: {
+                    swcPlugins: [
+                        ["@lingui/swc-plugin", { runtimeModules: {} }],
+                        ["@acme/swc-plugin/wasm", {}],
+                        ["./local-plugin.wasm", {}],
+                    ],
+                },
+            };
+            export default withSomething(nextConfig);
+        "#;
+        let deps = NextJsPlugin
+            .resolve_config(Path::new("next.config.ts"), source, Path::new("/project"))
+            .referenced_dependencies;
+        assert!(deps.contains(&"@lingui/swc-plugin".to_string()), "{deps:?}");
+        assert!(deps.contains(&"@acme/swc-plugin".to_string()), "{deps:?}");
+        assert!(
+            !deps.iter().any(|dep| dep.contains("local-plugin")),
+            "a relative SWC plugin path is not a package: {deps:?}"
         );
     }
 

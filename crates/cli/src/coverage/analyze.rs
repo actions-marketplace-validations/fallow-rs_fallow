@@ -8,6 +8,11 @@ use std::time::Instant;
 use fallow_config::OutputFormat;
 use fallow_cov_protocol::function_identity_id;
 use fallow_engine::changed_files::clear_ambient_git_env;
+use fallow_engine::source::inventory::{
+    InventoryComplexity, InventoryEntry, walk_source_with_complexity,
+};
+use fallow_types::cloud::{CloudCommand, cloud_api_key_missing_message};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::coverage::RunContext;
@@ -16,8 +21,10 @@ use crate::coverage::cloud_client::{
     CloudRuntimeProvenance, CloudRuntimeWarning, CloudTrackingState, fetch_runtime_context,
 };
 use crate::coverage::upload_common::parse_git_remote_to_project_id;
+use crate::coverage::upload_inventory::extension_supported;
 use crate::error::emit_error;
 use crate::health::HealthOptions;
+use crate::health::optimization_target::{StaticCost, optimization_target};
 use fallow_output::{
     RUNTIME_STALE_AFTER_DAYS, RuntimeCoverageAction, RuntimeCoverageCaptureQuality,
     RuntimeCoverageConfidence, RuntimeCoverageDataSource, RuntimeCoverageEvidence,
@@ -47,6 +54,10 @@ pub struct AnalyzeArgs {
     pub top: Option<usize>,
     pub blast_radius: bool,
     pub importance: bool,
+    /// List every cloud runtime function that found no local counterpart on
+    /// stderr, instead of only counting them in the `cloud_functions_unmatched`
+    /// warning.
+    pub debug_unmatched: bool,
 }
 
 impl fmt::Debug for AnalyzeArgs {
@@ -68,6 +79,7 @@ impl fmt::Debug for AnalyzeArgs {
             .field("top", &self.top)
             .field("blast_radius", &self.blast_radius)
             .field("importance", &self.importance)
+            .field("debug_unmatched", &self.debug_unmatched)
             .finish()
     }
 }
@@ -263,11 +275,14 @@ fn local_health_options<'a>(
         analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
         complexity_breakdown: false,
         group_by: None,
+        group_filter: None,
+        trend_from: None,
+        scope: None,
     }
 }
 
 fn run_cloud(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
-    let api_key = match resolve_api_key(args.api_key.as_deref()) {
+    let api_key = match resolve_api_key(args.api_key.as_deref(), CloudCommand::Analyze) {
         Ok(api_key) => api_key,
         Err(err) => return emit_cloud_error(&err, ctx.output),
     };
@@ -283,6 +298,7 @@ fn run_cloud(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
         period_days: args.coverage_period,
         environment: args.environment.clone(),
         commit_sha: args.commit_sha.clone(),
+        agent_source: crate::coverage::cloud_transport::detected_agent_source(),
     };
 
     let start = Instant::now();
@@ -294,9 +310,43 @@ fn run_cloud(args: &AnalyzeArgs, ctx: &RunContext<'_>) -> ExitCode {
         Ok(index) => index,
         Err(code) => return code,
     };
-    let mut report = merge_cloud_snapshot(&snapshot, &static_index, args.min_invocations_hot);
+    let CloudMergeOutput {
+        mut report,
+        unmatched,
+    } = merge_cloud_snapshot(&snapshot, &static_index, args.min_invocations_hot);
+    if args.debug_unmatched {
+        print_unmatched_cloud_functions(&unmatched);
+    }
     apply_top_limit(&mut report, args.top);
     print_runtime_report(&report, ctx, start.elapsed(), args)
+}
+
+/// Print the unmatched cloud runtime functions on stderr, highest traffic
+/// first, so the class of misses is visible without a debugger. Kept off
+/// stdout so `--format json` stays machine-readable.
+fn print_unmatched_cloud_functions(unmatched: &[UnmatchedCloudFunction]) {
+    if unmatched.is_empty() {
+        eprintln!("unmatched cloud functions: none");
+        return;
+    }
+    let mut sorted: Vec<&UnmatchedCloudFunction> = unmatched.iter().collect();
+    sorted.sort_by(|left, right| {
+        right
+            .invocations
+            .cmp(&left.invocations)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    eprintln!("unmatched cloud functions: {}", sorted.len());
+    for function in sorted {
+        let line = function
+            .line
+            .map_or_else(|| "?".to_owned(), |line| line.to_string());
+        eprintln!(
+            "  {}:{} {} ({} invocations)",
+            function.path, line, function.name, function.invocations
+        );
+    }
 }
 
 fn runtime_coverage_source_env_is_cloud() -> bool {
@@ -304,7 +354,10 @@ fn runtime_coverage_source_env_is_cloud() -> bool {
         .is_ok_and(|value| value.trim().eq_ignore_ascii_case("cloud"))
 }
 
-fn resolve_api_key(explicit: Option<&str>) -> Result<String, CloudError> {
+pub(super) fn resolve_api_key(
+    explicit: Option<&str>,
+    command: CloudCommand,
+) -> Result<String, CloudError> {
     if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
         return Ok(value.to_owned());
     }
@@ -314,19 +367,17 @@ fn resolve_api_key(explicit: Option<&str>) -> Result<String, CloudError> {
             return Ok(trimmed.to_owned());
         }
     }
-    Err(CloudError::Auth(
-        "Cloud runtime coverage requires an API key.\n\nSet FALLOW_API_KEY or pass --api-key:\n\n  FALLOW_API_KEY=fallow_live_... fallow coverage analyze --cloud --repo owner/repo".to_owned(),
-    ))
+    Err(CloudError::Auth(cloud_api_key_missing_message(command)))
 }
 
-fn resolve_repo(explicit: Option<&str>, root: &Path) -> Result<String, CloudError> {
+pub(super) fn resolve_repo(explicit: Option<&str>, root: &Path) -> Result<String, CloudError> {
     if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(value.to_owned());
+        return checked_repo(value, "--repo");
     }
     if let Ok(value) = std::env::var("FALLOW_REPO") {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            return Ok(trimmed.to_owned());
+            return checked_repo(trimmed, "FALLOW_REPO");
         }
     }
     if let Some(from_remote) = git_origin_project_id(root) {
@@ -335,6 +386,18 @@ fn resolve_repo(explicit: Option<&str>, root: &Path) -> Result<String, CloudErro
     Err(CloudError::Validation(
         "Could not infer repository for cloud runtime coverage.\n\nPass it explicitly:\n\n  fallow coverage analyze --cloud --repo owner/repo\n\nor set:\n\n  FALLOW_REPO=owner/repo".to_owned(),
     ))
+}
+
+/// Refuse a repository that is only dots. The value becomes one URL path
+/// segment, and `.` and `..` are not percent-encoded, so they would address
+/// a different route. The same rule guards commit SHAs.
+fn checked_repo(repo: &str, source: &str) -> Result<String, CloudError> {
+    if repo.chars().all(|c| c == '.') {
+        return Err(CloudError::Validation(format!(
+            "{source} must name a repository such as owner/repo (not only dots), got {repo}"
+        )));
+    }
+    Ok(repo.to_owned())
 }
 
 fn git_origin_project_id(root: &Path) -> Option<String> {
@@ -350,7 +413,7 @@ fn git_origin_project_id(root: &Path) -> Option<String> {
     parse_git_remote_to_project_id(String::from_utf8_lossy(&output.stdout).trim())
 }
 
-fn emit_cloud_error(err: &CloudError, output: OutputFormat) -> ExitCode {
+pub(super) fn emit_cloud_error(err: &CloudError, output: OutputFormat) -> ExitCode {
     match err {
         CloudError::Auth(_) | CloudError::TierRequired(_) => {
             crate::telemetry::note_failure_reason(crate::telemetry::FailureReason::Auth);
@@ -375,8 +438,17 @@ struct StaticFunctionInfo {
     start_line: u32,
     end_line: u32,
     static_used: bool,
+    /// `Some(true)` when production mode dropped the only files that reference
+    /// this function, so `static_used` reads `false` purely because the test,
+    /// story, or fixture side of the tree is missing from the graph.
+    /// `Some(false)` when both graphs were built and no such reference exists,
+    /// `None` when the run was not filtered and there is no second answer.
+    test_only_reference: Option<bool>,
     test_covered: bool,
     cyclomatic: u32,
+    /// Static cost inputs for the hot-path optimization target. `None` when
+    /// the source inventory carried no complexity for the function.
+    cost: Option<StaticCost>,
     caller_count: u32,
     owner_count: Option<u32>,
     /// Cross-surface join key (`fallow:fn:<hash>`) computed over the
@@ -389,22 +461,46 @@ struct StaticFunctionInfo {
     /// finding built from this function carries a line-move-immune key for
     /// baseline suppression.
     source_hash: Option<String>,
+    /// Whether `name` is the callee this function was passed to
+    /// (`arr.map(cb)` -> `map`) rather than a declared or bound name. The
+    /// runtime instrumenter names callbacks that way, so the join key reads
+    /// like a declaration while the source has no declaration to point at;
+    /// the verdict copy says "callback passed to X" instead.
+    is_callback: bool,
 }
 
 #[derive(Default)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the `by_<key>` prefix names the lookup dimension of each index map; it is the clearest convention for a multi-index struct"
-)]
 struct StaticIndex {
     by_key: FxHashMap<(String, String, u32), StaticFunctionInfo>,
     by_path_name: FxHashMap<(String, String), Vec<StaticFunctionInfo>>,
     /// Stable-id join tier: the strongest match, tried before
     /// `(path, name, line)` and the fuzzy line fallback.
     by_stable_id: FxHashMap<String, StaticFunctionInfo>,
+    /// Positional join tier, keyed by `(path, start_line)` and deliberately
+    /// name-free. Runtime instrumentation names a function from its
+    /// surroundings (an anonymous callback takes the callee's name, an
+    /// accessor keeps its `get`/`set` prefix), so a name comparison drops
+    /// exactly the callback-heavy, high-traffic functions. Position is the
+    /// part both sides agree on.
+    by_path_line: FxHashMap<(String, u32), Vec<StaticFunctionInfo>>,
+    /// File name to repo-relative paths, used to rebase a runtime path that
+    /// carries a container or bundle prefix onto the local tree.
+    paths_by_file_name: FxHashMap<String, Vec<String>>,
 }
 
-fn build_static_index(ctx: &RunContext<'_>, production: bool) -> Result<StaticIndex, ExitCode> {
+/// One dead-code analysis run, kept together with the session so callers can
+/// still read the resolved root and config after the artifacts are produced.
+struct StaticAnalysisRun {
+    session: fallow_engine::session::AnalysisSession,
+    artifacts: fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
+}
+
+/// Run dead-code analysis over the project, with or without the production
+/// file filter.
+fn run_static_analysis(
+    ctx: &RunContext<'_>,
+    production: bool,
+) -> Result<StaticAnalysisRun, ExitCode> {
     let config = crate::load_config_for_analysis(
         ctx.root,
         ctx.config_path,
@@ -420,9 +516,28 @@ fn build_static_index(ctx: &RunContext<'_>, production: bool) -> Result<StaticIn
     )?;
     let session = fallow_engine::session::AnalysisSession::from_resolved_config(config)
         .map_err(|err| emit_error(&format!("analysis failed: {err}"), 2, ctx.output))?;
-    let analysis_output = session
+    let artifacts = session
         .analyze_dead_code_with_artifacts(true, true)
         .map_err(|err| emit_error(&format!("analysis failed: {err}"), 2, ctx.output))?;
+    Ok(StaticAnalysisRun { session, artifacts })
+}
+
+fn build_static_index(ctx: &RunContext<'_>, production: bool) -> Result<StaticIndex, ExitCode> {
+    // Production mode drops test, spec, story, and fixture files from
+    // discovery, so an export that only a test references reads as statically
+    // unused and, with zero production invocations, as safe to delete. A
+    // second unfiltered run answers "is anything left referencing it", which
+    // separates a genuinely dead export from a test-only one. It runs only in
+    // production mode, where the first answer is the ambiguous one.
+    let full_tree = if production {
+        Some(UnusedStaticSets::from_analysis(
+            &run_static_analysis(ctx, false)?.artifacts,
+        ))
+    } else {
+        None
+    };
+    let run = run_static_analysis(ctx, production)?;
+    let analysis_output = &run.artifacts;
     let Some(modules) = analysis_output.modules.as_deref() else {
         return Err(emit_error(
             "analysis failed: engine did not retain parsed modules",
@@ -438,15 +553,18 @@ fn build_static_index(ctx: &RunContext<'_>, production: bool) -> Result<StaticIn
         ));
     };
     let file_paths: FxHashMap<_, _> = files.iter().map(|file| (file.id, &file.path)).collect();
-    let codeowners =
-        crate::codeowners::CodeOwners::load(session.root(), session.config().codeowners.as_deref())
-            .ok();
+    let codeowners = crate::codeowners::CodeOwners::load(
+        run.session.root(),
+        run.session.config().codeowners.as_deref(),
+    )
+    .ok();
     Ok(build_index_from_analysis(
-        session.root(),
+        run.session.root(),
         modules,
-        &analysis_output,
+        analysis_output,
         &file_paths,
         codeowners.as_ref(),
+        full_tree.as_ref(),
     ))
 }
 
@@ -456,10 +574,15 @@ fn build_index_from_analysis(
     analysis_output: &fallow_engine::dead_code::DeadCodeAnalysisArtifacts,
     file_paths: &FxHashMap<fallow_types::discover::FileId, &PathBuf>,
     codeowners: Option<&crate::codeowners::CodeOwners>,
+    full_tree: Option<&UnusedStaticSets>,
 ) -> StaticIndex {
-    let unused = UnusedStaticSets::from_analysis(analysis_output);
+    let reachability = Reachability {
+        analysed: UnusedStaticSets::from_analysis(analysis_output),
+        full_tree,
+    };
     let mut out = StaticIndex::default();
     let graph = analysis_output.graph.as_ref();
+    let mut walked = Vec::with_capacity(modules.len());
     for module in modules {
         let Some(path) = file_paths.get(&module.file_id) else {
             continue;
@@ -473,14 +596,127 @@ fn build_index_from_analysis(
                 function,
                 path.as_path(),
                 &rel,
-                &unused,
+                &reachability,
                 caller_count,
                 owner_count,
             );
             index_static_function(&mut out, &rel, info);
         }
+        walked.push(ModuleIndexContext {
+            path: (*path).clone(),
+            rel,
+            caller_count,
+            owner_count,
+        });
     }
+    index_instrumenter_functions(&mut out, &walked, &reachability);
     out
+}
+
+/// The per-file facts the instrumenter-name pass needs after the complexity
+/// pass has consumed the parsed module.
+struct ModuleIndexContext {
+    /// Absolute path of the file on disk, re-read by the inventory walker.
+    path: PathBuf,
+    /// Repo-relative posix path, the one the identity hash is taken over.
+    rel: String,
+    caller_count: u32,
+    owner_count: Option<u32>,
+}
+
+/// Index every function the runtime instrumenter would name, on top of the
+/// complexity pass.
+///
+/// The health/complexity pass enumerates declarations, so a callback passed to
+/// a call (`sqliteTable("t", {}, (table) => [...])`, `.references(() => ...)`,
+/// `rows.map(...)`), an object-literal method, and an accessor never enter the
+/// index. A cloud row for one of those carries the instrumenter's name, so it
+/// has nothing to join against and the hottest functions in a service are
+/// dropped from `findings` and `hot_paths`. The inventory walker already
+/// reproduces `oxc-coverage-instrument`'s naming for exactly this contract, so
+/// walking the same files with it closes the gap on the identity the cloud
+/// stores. Complexity-pass entries win every collision; only identities the
+/// first pass never produced are added.
+fn index_instrumenter_functions(
+    out: &mut StaticIndex,
+    contexts: &[ModuleIndexContext],
+    reachability: &Reachability<'_>,
+) {
+    let per_file: Vec<Vec<StaticFunctionInfo>> = contexts
+        .par_iter()
+        .map(|context| instrumenter_functions_for_file(context, reachability))
+        .collect();
+    for (context, functions) in contexts.iter().zip(per_file) {
+        for info in functions {
+            if out.by_stable_id.contains_key(&info.stable_id) {
+                continue;
+            }
+            index_static_function(out, &context.rel, info);
+        }
+    }
+}
+
+/// Walk one file with the inventory walker and build static info for every
+/// function it names. A file the walker cannot parse, or cannot read, yields
+/// nothing: the complexity-pass entries for it stay as they are.
+fn instrumenter_functions_for_file(
+    context: &ModuleIndexContext,
+    reachability: &Reachability<'_>,
+) -> Vec<StaticFunctionInfo> {
+    if !extension_supported(&context.path) {
+        return Vec::new();
+    }
+    let Ok(source) = std::fs::read_to_string(&context.path) else {
+        return Vec::new();
+    };
+    let (entries, complexity) = walk_source_with_complexity(&context.path, &source);
+    entries
+        .into_iter()
+        .map(|entry| {
+            // Complexity pairs by `source_hash`; an entry without one has no metrics.
+            let hash = entry.source_hash.as_deref();
+            let metrics = hash.and_then(|hash| complexity.get(hash)).copied();
+            instrumenter_function_info(entry, metrics, context, reachability)
+        })
+        .collect()
+}
+
+/// Build a `StaticFunctionInfo` for one inventory entry.
+fn instrumenter_function_info(
+    entry: InventoryEntry,
+    metrics: Option<InventoryComplexity>,
+    context: &ModuleIndexContext,
+    reachability: &Reachability<'_>,
+) -> StaticFunctionInfo {
+    let static_used =
+        reachability
+            .analysed
+            .function_is_used(&context.path, &entry.name, entry.line);
+    let stable_id = function_identity_id(&context.rel, &entry.name, entry.line);
+    let test_only_reference = reachability
+        .full_tree
+        .map(|full| !static_used && full.function_is_used(&context.path, &entry.name, entry.line));
+    StaticFunctionInfo {
+        path: PathBuf::from(&context.rel),
+        name: entry.name,
+        start_line: entry.line,
+        end_line: entry.end_line,
+        static_used,
+        test_only_reference,
+        test_covered: false,
+        cyclomatic: metrics.map_or(0, |metrics| u32::from(metrics.cyclomatic)),
+        cost: metrics.map(|metrics| StaticCost {
+            cognitive: metrics.cognitive,
+            cyclomatic: metrics.cyclomatic,
+            // `end_line` is inclusive, as in the complexity pass.
+            line_count: entry.end_line.saturating_sub(entry.line).saturating_add(1),
+        }),
+        caller_count: context.caller_count,
+        owner_count: context.owner_count,
+        stable_id,
+        source_hash: entry.source_hash,
+        is_callback: entry.is_callback,
+    }
 }
 
 /// Per-file sets of statically-unused files and exports, used to flag whether a
@@ -534,31 +770,54 @@ impl UnusedStaticSets {
     }
 }
 
+/// The reachability answers a function is scored against: the sets the run's
+/// own analysis produced, plus the unfiltered sets when that analysis applied
+/// the production file filter.
+struct Reachability<'a> {
+    analysed: UnusedStaticSets,
+    full_tree: Option<&'a UnusedStaticSets>,
+}
+
 /// Build a `StaticFunctionInfo` for one extracted function.
 fn static_function_info(
     function: &fallow_types::extract::FunctionComplexity,
     path: &Path,
     rel: &str,
-    unused: &UnusedStaticSets,
+    reachability: &Reachability<'_>,
     caller_count: u32,
     owner_count: Option<u32>,
 ) -> StaticFunctionInfo {
+    let static_used =
+        reachability
+            .analysed
+            .function_is_used(path, function.identity_name(), function.line);
     StaticFunctionInfo {
         path: PathBuf::from(rel),
-        name: function.name.clone(),
+        name: function.identity_name().to_owned(),
         start_line: function.line,
         end_line: function.line.saturating_add(function.line_count),
-        static_used: unused.function_is_used(path, function.name.as_str(), function.line),
+        static_used,
+        test_only_reference: reachability.full_tree.map(|full| {
+            !static_used && full.function_is_used(path, function.identity_name(), function.line)
+        }),
         test_covered: false,
         cyclomatic: u32::from(function.cyclomatic),
+        cost: Some(StaticCost {
+            cognitive: function.cognitive,
+            cyclomatic: function.cyclomatic,
+            line_count: function.line_count,
+        }),
         caller_count,
         owner_count,
-        stable_id: function_identity_id(rel, &function.name, function.line),
+        stable_id: function_identity_id(rel, function.identity_name(), function.line),
         source_hash: function.source_hash.clone(),
+        // The complexity pass only enumerates declarations and bindings, so
+        // nothing it produces is a callee-named callback.
+        is_callback: false,
     }
 }
 
-/// Insert a function's static info into all three lookup tiers of the index.
+/// Insert a function's static info into every lookup tier of the index.
 fn index_static_function(out: &mut StaticIndex, rel: &str, info: StaticFunctionInfo) {
     out.by_key.insert(
         (rel.to_string(), info.name.clone(), info.start_line),
@@ -566,17 +825,38 @@ fn index_static_function(out: &mut StaticIndex, rel: &str, info: StaticFunctionI
     );
     out.by_stable_id
         .insert(info.stable_id.clone(), info.clone());
+    out.by_path_line
+        .entry((rel.to_string(), info.start_line))
+        .or_default()
+        .push(info.clone());
+    let file_name = path_file_name(rel).to_owned();
+    let paths = out.paths_by_file_name.entry(file_name).or_default();
+    if !paths.iter().any(|path| path == rel) {
+        paths.push(rel.to_string());
+    }
     out.by_path_name
         .entry((rel.to_string(), info.name.clone()))
         .or_default()
         .push(info);
 }
 
+/// Last `/`-separated segment of an already normalized path.
+fn path_file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The merged report plus the runtime functions that found no local
+/// counterpart, kept alongside the report so `--debug-unmatched` can list them.
+struct CloudMergeOutput {
+    report: RuntimeCoverageReport,
+    unmatched: Vec<UnmatchedCloudFunction>,
+}
+
 fn merge_cloud_snapshot(
     snapshot: &CloudRuntimeContext,
     static_index: &StaticIndex,
     min_invocations_hot: u64,
-) -> RuntimeCoverageReport {
+) -> CloudMergeOutput {
     let CloudMergeEntries {
         mut findings,
         mut hot_paths,
@@ -589,10 +869,10 @@ fn merge_cloud_snapshot(
     let blast_radius = cloud_blast_radius_entries(snapshot, synthesized_blast_radius);
     let importance = cloud_importance_entries(snapshot, synthesized_importance);
 
-    let warnings = cloud_warnings(snapshot, unmatched_cloud_functions);
+    let warnings = cloud_warnings(snapshot, unmatched_cloud_functions.len());
     let trust_output = cloud_runtime_trust_output(snapshot);
 
-    RuntimeCoverageReport {
+    let report = RuntimeCoverageReport {
         schema_version: RuntimeCoverageSchemaVersion::V1,
         verdict: cloud_report_verdict(&findings),
         signals: Vec::new(),
@@ -607,6 +887,10 @@ fn merge_cloud_snapshot(
         actionability_reason: trust_output.actionability_reason,
         actionability_verdict: trust_output.actionability_verdict,
         provenance: trust_output.provenance,
+    };
+    CloudMergeOutput {
+        report,
+        unmatched: unmatched_cloud_functions,
     }
 }
 
@@ -742,7 +1026,17 @@ struct CloudMergeEntries {
     hot_paths: Vec<RuntimeCoverageHotPath>,
     synthesized_blast_radius: Vec<fallow_output::RuntimeCoverageBlastRadiusEntry>,
     synthesized_importance: Vec<(fallow_output::RuntimeCoverageImportanceEntry, Option<u32>)>,
-    unmatched_cloud_functions: usize,
+    unmatched_cloud_functions: Vec<UnmatchedCloudFunction>,
+}
+
+/// One cloud runtime function with no local counterpart, kept so the drop is
+/// inspectable instead of only counted.
+#[derive(Debug, Clone)]
+pub struct UnmatchedCloudFunction {
+    pub path: String,
+    pub name: String,
+    pub line: Option<u32>,
+    pub invocations: u64,
 }
 
 fn collect_cloud_merge_entries(
@@ -755,22 +1049,66 @@ fn collect_cloud_merge_entries(
         hot_paths: Vec::new(),
         synthesized_blast_radius: Vec::new(),
         synthesized_importance: Vec::new(),
-        unmatched_cloud_functions: 0,
+        unmatched_cloud_functions: Vec::new(),
     };
     for function in &snapshot.functions {
         let Some(local) = match_cloud_function(function, static_index) else {
-            entries.unmatched_cloud_functions = entries.unmatched_cloud_functions.saturating_add(1);
+            let line = function.start_line.or(function.line_number);
+            tracing::debug!(
+                path = %function.file_path,
+                function = %function.function_name,
+                line = ?line,
+                invocations = function.hit_count.unwrap_or(0),
+                "cloud runtime function has no local counterpart; omitted from findings"
+            );
+            entries
+                .unmatched_cloud_functions
+                .push(UnmatchedCloudFunction {
+                    path: function.file_path.clone(),
+                    name: function.function_name.clone(),
+                    line,
+                    invocations: function.hit_count.unwrap_or(0),
+                });
             continue;
         };
         if matches!(function.tracking_state, CloudTrackingState::Called) {
             collect_called_cloud_function(&mut entries, function, &local, min_invocations_hot);
         } else {
-            entries
-                .findings
-                .push(cloud_finding(function, &local, snapshot.window.period_days));
+            entries.findings.push(cloud_finding(
+                function,
+                &local,
+                cloud_observation_days(snapshot, function),
+            ));
         }
     }
     entries
+}
+
+/// Days of runtime evidence behind one cloud function state.
+///
+/// `tracking_state` covers only the current deployment. When the cloud sends
+/// `evidence_window`, that deployment ran for `observed_hours`, which can be a
+/// few hours inside a 30-day window. The nominal period applies only when the
+/// cloud states the period-wide state (`period_tracking_state`), or when it is
+/// an older cloud that sends no evidence window.
+fn cloud_observation_days(snapshot: &CloudRuntimeContext, function: &CloudRuntimeFunction) -> u32 {
+    if function.period_tracking_state.is_some() {
+        return snapshot.window.period_days;
+    }
+    snapshot
+        .evidence_window
+        .as_ref()
+        .map_or(snapshot.window.period_days, |window| {
+            let days = (window.observed_hours.max(0.0) / 24.0).ceil();
+            // Bounded by the period, so the cast cannot truncate.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "days is a non-negative whole number no larger than the period"
+            )]
+            let days = days.min(f64::from(snapshot.window.period_days)) as u32;
+            days
+        })
 }
 
 fn collect_called_cloud_function(
@@ -854,6 +1192,9 @@ fn cloud_hot_path(local: &StaticFunctionInfo, invocations: u64) -> RuntimeCovera
         invocations,
         percentile: 100,
         actions: Vec::new(),
+        optimization_target: local
+            .cost
+            .map(|cost| optimization_target(invocations, cost, None)),
     }
 }
 
@@ -922,12 +1263,17 @@ fn cloud_finding(
                 "not_covered"
             }
             .to_owned(),
+            test_only_reference: local.test_only_reference,
             v8_tracking: cloud_v8_tracking(function.tracking_state).to_owned(),
             untracked_reason: function.untracked_reason.clone(),
             observation_days,
             deployments_observed: function.deployments_observed,
         },
-        actions: runtime_actions(verdict),
+        actions: runtime_actions(
+            verdict,
+            local.test_only_reference == Some(true),
+            local.is_callback.then_some(local.name.as_str()),
+        ),
         // The cloud-join path (analyze --cloud) does not carry the window
         // trace_count + thresholds here, so it omits the #321 discriminator
         // block; that surface's discriminator contract is #328 territory.
@@ -1034,7 +1380,16 @@ fn cloud_finding_decision(
     match function.tracking_state {
         CloudTrackingState::NeverCalled => match function.never_called_source {
             CloudNeverCalledSource::RuntimeObserved => (
-                if local.static_used {
+                // A function that only a test file reaches is statically
+                // unused in the production graph, but deleting it breaks that
+                // test, so it is never safe to delete on runtime evidence
+                // alone. A function that ran in an earlier deployment of the
+                // period (boot code that a new deployment has not run yet) is
+                // not dead either.
+                if local.static_used
+                    || local.test_only_reference == Some(true)
+                    || function.period_tracking_state == Some(CloudTrackingState::Called)
+                {
                     RuntimeCoverageVerdict::ReviewRequired
                 } else {
                     RuntimeCoverageVerdict::SafeToDelete
@@ -1166,7 +1521,7 @@ fn match_cloud_function(
     {
         return Some(info.clone());
     }
-    let path = normalize_runtime_path(Path::new(&function.file_path));
+    let path = resolve_function_path(function, static_index)?.to_owned();
     let line = function.start_line.or(function.line_number)?;
     if let Some(info) =
         static_index
@@ -1186,10 +1541,130 @@ fn match_cloud_function(
         }
         return Some(info.clone());
     }
-    static_index
+    if let Some(info) = static_index
         .by_path_name
-        .get(&(path, function.function_name.clone()))
+        .get(&(path.clone(), function.function_name.clone()))
         .and_then(|candidates| nearest_cloud_candidate(candidates, line, function.end_line))
+    {
+        return Some(info);
+    }
+    static_index
+        .by_path_line
+        .get(&(path, line))
+        .and_then(|candidates| positional_cloud_candidate(candidates, function.end_line))
+}
+
+/// Find the repo-relative path of a cloud function in the static index.
+///
+/// A newer cloud sends `repo_path`: the runtime path with the proven runtime
+/// prefix removed. When the checkout has that exact path, it is the answer.
+/// Otherwise, and for an older cloud without the field, the suffix match on
+/// the runtime path is the fallback.
+fn resolve_function_path<'index>(
+    function: &CloudRuntimeFunction,
+    static_index: &'index StaticIndex,
+) -> Option<&'index str> {
+    if let Some(repo_path) = function
+        .repo_path
+        .as_deref()
+        .map(|path| normalize_runtime_path(Path::new(path)))
+        .filter(|path| !path.is_empty())
+        && let Some(found) = static_index
+            .paths_by_file_name
+            .get(path_file_name(&repo_path))
+            .and_then(|candidates| candidates.iter().find(|candidate| **candidate == repo_path))
+    {
+        return Some(found.as_str());
+    }
+    let runtime_path = normalize_runtime_path(Path::new(&function.file_path));
+    resolve_cloud_path(static_index, &runtime_path)
+}
+
+/// Rebase a runtime file path onto the repo-relative path the static index is
+/// keyed by.
+///
+/// A runtime path is whatever the process saw: a containerized service reports
+/// `/app/src/a.ts`, a bundled worker reports a path below its output root. None
+/// of those equal the repo-relative path, so comparing the full string drops
+/// every function in the file. Candidates are looked up by file name and
+/// accepted when one path is a segment-wise suffix of the other; the longest
+/// such overlap wins, and a tie between two different local files is left
+/// unmatched rather than guessed.
+fn resolve_cloud_path<'index>(
+    static_index: &'index StaticIndex,
+    runtime_path: &str,
+) -> Option<&'index str> {
+    let candidates = static_index
+        .paths_by_file_name
+        .get(path_file_name(runtime_path))?;
+    let runtime_segments: Vec<&str> = runtime_path.split('/').filter(|s| !s.is_empty()).collect();
+    let mut best: Option<(&str, usize)> = None;
+    let mut tied = false;
+    for candidate in candidates {
+        let candidate_segments: Vec<&str> =
+            candidate.split('/').filter(|s| !s.is_empty()).collect();
+        let overlap = candidate_segments.len().min(runtime_segments.len());
+        if runtime_segments[runtime_segments.len() - overlap..]
+            != candidate_segments[candidate_segments.len() - overlap..]
+        {
+            continue;
+        }
+        match best {
+            None => {
+                best = Some((candidate.as_str(), overlap));
+                tied = false;
+            }
+            Some((_, current)) if overlap > current => {
+                best = Some((candidate.as_str(), overlap));
+                tied = false;
+            }
+            Some((_, current)) if overlap == current => tied = true,
+            Some(_) => {}
+        }
+    }
+    if tied {
+        None
+    } else {
+        best.map(|(path, _)| path)
+    }
+}
+
+/// Pick the one static function that starts on the runtime function's line.
+///
+/// Reached only after the name tiers missed, so the name is known to disagree.
+/// A single candidate on the line is that function; several mean nested
+/// definitions opening on one line, and the end line breaks the tie when the
+/// runtime reported one. Anything still ambiguous stays unmatched.
+fn positional_cloud_candidate(
+    candidates: &[StaticFunctionInfo],
+    end_line: Option<u32>,
+) -> Option<StaticFunctionInfo> {
+    if let [only] = candidates {
+        return Some(only.clone());
+    }
+    let end_line = end_line?;
+    let mut best: Option<(&StaticFunctionInfo, u32)> = None;
+    let mut tied = false;
+    for candidate in candidates {
+        let distance = candidate.end_line.abs_diff(end_line);
+        match best {
+            None => {
+                best = Some((candidate, distance));
+                tied = false;
+            }
+            Some((_, current)) if distance < current => {
+                best = Some((candidate, distance));
+                tied = false;
+            }
+            Some((_, current)) if distance == current => tied = true,
+            Some(_) => {}
+        }
+    }
+    if tied {
+        None
+    } else {
+        best.map(|(candidate, _)| candidate.clone())
+    }
 }
 
 fn nearest_cloud_candidate(
@@ -1245,16 +1720,50 @@ fn normalize_runtime_path(path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn runtime_actions(verdict: RuntimeCoverageVerdict) -> Vec<RuntimeCoverageAction> {
+/// Follow-up actions for a finding. `test_only_reference` narrows the
+/// review-required advice to the case where the only remaining callers live in
+/// files production mode excluded, because there the reviewer has a concrete
+/// choice to make rather than a general "look at this".
+/// Build the action list for one runtime finding.
+///
+/// `callback_callee` is set when the function has no declared name of its own
+/// and is known only as the callee it was passed to, so the copy can point at
+/// the call site (`callback passed to map`) rather than tell the reader to go
+/// find a declaration that does not exist.
+fn runtime_actions(
+    verdict: RuntimeCoverageVerdict,
+    test_only_reference: bool,
+    callback_callee: Option<&str>,
+) -> Vec<RuntimeCoverageAction> {
     match verdict {
         RuntimeCoverageVerdict::SafeToDelete => vec![RuntimeCoverageAction {
             kind: "delete-cold-code".to_owned(),
-            description: "Remove cold code after confirming ownership.".to_owned(),
+            description: callback_callee.map_or_else(
+                || "Remove cold code after confirming ownership.".to_owned(),
+                |callee| {
+                    format!(
+                        "Callback passed to {callee}; remove the cold code after confirming ownership."
+                    )
+                },
+            ),
             auto_fixable: false,
         }],
+        RuntimeCoverageVerdict::ReviewRequired if test_only_reference => {
+            vec![RuntimeCoverageAction {
+                kind: "review-runtime".to_owned(),
+                description: "Only tests reference this export; delete the test usage together with the function or keep it."
+                    .to_owned(),
+                auto_fixable: false,
+            }]
+        }
         RuntimeCoverageVerdict::ReviewRequired => vec![RuntimeCoverageAction {
             kind: "review-runtime".to_owned(),
-            description: "Review runtime-cold code before changing it.".to_owned(),
+            description: callback_callee.map_or_else(
+                || "Review runtime-cold code before changing it.".to_owned(),
+                |callee| {
+                    format!("Callback passed to {callee}; review the runtime-cold code before changing it.")
+                },
+            ),
             auto_fixable: false,
         }],
         RuntimeCoverageVerdict::CoverageUnavailable
@@ -1337,7 +1846,6 @@ fn runtime_json_output(
         fallow_output::build_coverage_analyze_output(report, elapsed, env!("CARGO_PKG_VERSION"));
     fallow_output::serialize_coverage_analyze_json_output(
         envelope,
-        crate::output_runtime::current_root_envelope_mode(),
         explain.then(crate::explain::coverage_analyze_meta),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
@@ -1432,17 +1940,7 @@ fn print_runtime_human(
         report.summary.trace_count, report.summary.period_days, report.summary.deployments_seen
     );
     for finding in report.findings.iter().take(display_limit) {
-        println!(
-            "  {}:{} {} [{}, {}]",
-            finding.path.display(),
-            finding.line,
-            finding.function,
-            finding.invocations.map_or_else(
-                || "untracked".to_owned(),
-                |hits| format!("{hits} invocations")
-            ),
-            finding.verdict.human_label(),
-        );
+        println!("{}", human_finding_line(finding));
     }
     if args.blast_radius {
         print_runtime_blast_radius(report, display_limit);
@@ -1458,6 +1956,28 @@ fn print_runtime_human(
     }
     eprintln!("runtime coverage analyzed in {:.2}s", elapsed.as_secs_f64());
     ExitCode::SUCCESS
+}
+
+/// One human-output finding row. A test-only reference is called out inline
+/// because the verdict alone ("review required") does not say why the function
+/// looks dead, and that is exactly the case where deleting it breaks the suite.
+fn human_finding_line(finding: &RuntimeCoverageFinding) -> String {
+    format!(
+        "  {}:{} {} [{}, {}{}]",
+        finding.path.display(),
+        finding.line,
+        finding.function,
+        finding.invocations.map_or_else(
+            || "untracked".to_owned(),
+            |hits| format!("{hits} invocations")
+        ),
+        finding.verdict.human_label(),
+        if finding.evidence.test_only_reference == Some(true) {
+            ", referenced only from tests"
+        } else {
+            ""
+        },
+    )
 }
 
 /// Print the human-format blast-radius section, capped at `display_limit`.
@@ -1503,7 +2023,9 @@ fn print_runtime_importance(report: &RuntimeCoverageReport, display_limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fallow_output::{RuntimeCoverageBlastRadiusEntry, RuntimeCoverageImportanceEntry};
+    use fallow_output::{
+        RuntimeCoverageBlastRadiusEntry, RuntimeCoverageCostBasis, RuntimeCoverageImportanceEntry,
+    };
 
     #[test]
     fn api_key_alone_does_not_enable_cloud_source() {
@@ -1553,6 +2075,7 @@ mod tests {
             top: Some(5),
             blast_radius: true,
             importance: true,
+            debug_unmatched: true,
         };
 
         let formatted = format!("{args:?}");
@@ -1574,6 +2097,7 @@ mod tests {
             "top: Some(5)",
             "blast_radius: true",
             "importance: true",
+            "debug_unmatched: true",
         ] {
             assert!(
                 formatted.contains(expected),
@@ -1596,7 +2120,8 @@ mod tests {
     #[test]
     fn resolve_api_key_prefers_trimmed_explicit_value() {
         assert_eq!(
-            resolve_api_key(Some("  fallow_live_token  ")).expect("explicit key should resolve"),
+            resolve_api_key(Some("  fallow_live_token  "), CloudCommand::Analyze)
+                .expect("explicit key should resolve"),
             "fallow_live_token"
         );
     }
@@ -1613,15 +2138,33 @@ mod tests {
     }
 
     #[test]
+    fn resolve_repo_rejects_dot_only_values() {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+
+        for repo in [".", "..", " ... "] {
+            let error = resolve_repo(Some(repo), dir.path())
+                .expect_err("a dot-only repo must not reach the URL path");
+            assert!(
+                matches!(&error, CloudError::Validation(message) if message.contains("not only dots")),
+                "{repo:?}: {error:?}"
+            );
+        }
+        assert_eq!(
+            resolve_repo(Some("acme/.github"), dir.path()).expect("dots inside a name stay valid"),
+            "acme/.github"
+        );
+    }
+
+    #[test]
     fn resolve_repo_infers_origin_remote() {
         let dir = tempfile::TempDir::new().expect("temp dir should be created");
-        let init = Command::new("git")
+        let init = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
             .args(["init", "-b", "main"])
             .current_dir(dir.path())
             .output()
             .expect("git init should run");
         assert!(init.status.success());
-        let remote = Command::new("git")
+        let remote = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
             .args([
                 "remote",
                 "add",
@@ -1648,25 +2191,17 @@ mod tests {
             start_line: 10,
             end_line: 20,
             static_used: false,
+            test_only_reference: None,
             test_covered: false,
             cyclomatic: 4,
+            cost: None,
             caller_count: 0,
             owner_count: None,
             stable_id: function_identity_id("src/a.ts", "oldFlow", 10),
             source_hash: None,
+            is_callback: false,
         };
-        static_index.by_key.insert(
-            ("src/a.ts".to_owned(), "oldFlow".to_owned(), 10),
-            info.clone(),
-        );
-        static_index
-            .by_stable_id
-            .insert(info.stable_id.clone(), info.clone());
-        static_index
-            .by_path_name
-            .entry(("src/a.ts".to_owned(), "oldFlow".to_owned()))
-            .or_default()
-            .push(info);
+        index_static_function(&mut static_index, "src/a.ts", info);
         let mut snapshot = cloud_context(1, 0);
         snapshot.summary.trace_count = 100;
         snapshot.summary.deployments_seen = 2;
@@ -1681,7 +2216,7 @@ mod tests {
             cloud_function("src/missing.ts", "missingInAst", Some(1), Some(1), Some(3));
         unmatched.deployments_observed = 2;
         snapshot.functions = vec![matched, unmatched];
-        let report = merge_cloud_snapshot(&snapshot, &static_index, 100);
+        let report = merge_cloud_snapshot(&snapshot, &static_index, 100).report;
         assert_eq!(report.findings.len(), 1);
         assert_eq!(
             report.findings[0].verdict,
@@ -1717,6 +2252,11 @@ mod tests {
         let info = StaticFunctionInfo {
             caller_count: 8,
             cyclomatic: 12,
+            cost: Some(StaticCost {
+                cognitive: 9,
+                cyclomatic: 12,
+                line_count: 12,
+            }),
             owner_count: Some(1),
             ..static_info("src/api.ts", "handler", 10, 22)
         };
@@ -1732,6 +2272,7 @@ mod tests {
             verdict: None,
             provenance: None,
             window: crate::coverage::cloud_client::CloudRuntimeWindow { period_days: 14 },
+            evidence_window: None,
             summary: crate::coverage::cloud_client::CloudRuntimeSummary {
                 trace_count: 10,
                 deployments_seen: 4,
@@ -1748,12 +2289,19 @@ mod tests {
             warnings: vec![],
         };
 
-        let report = merge_cloud_snapshot(&snapshot, &static_index, 100);
+        let report = merge_cloud_snapshot(&snapshot, &static_index, 100).report;
 
         assert_eq!(report.verdict, RuntimeCoverageReportVerdict::Clean);
         assert!(report.findings.is_empty());
         assert_eq!(report.hot_paths[0].function, "handler");
         assert_eq!(report.hot_paths[0].invocations, 20_000);
+        let target = report.hot_paths[0]
+            .optimization_target
+            .as_ref()
+            .expect("cloud hot path carries an optimization target");
+        assert_eq!(target.cost_basis, RuntimeCoverageCostBasis::Cognitive);
+        assert_eq!(target.cost_score, 180_000);
+        assert_eq!(target.inner_iterations_per_call, None);
         assert_eq!(report.blast_radius[0].caller_count, 8);
         assert_eq!(
             report.blast_radius[0].risk_band,
@@ -1808,9 +2356,526 @@ mod tests {
         assert!(match_cloud_function(&function, &static_index).is_none());
     }
 
+    /// Fixture project mirroring the shapes a containerized service reports:
+    /// a top-level arrow, an object-literal method, an accessor, and two
+    /// anonymous callbacks that runtime instrumentation names after the callee
+    /// they were passed to.
+    const CLOUD_FIXTURE_SOURCE: &str = r"export const createClient = (url: string) => {
+  const rows = [1, 2, 3];
+  return {
+    execute: async (sql: string) => {
+      return rows.map((row) => row + sql.length);
+    },
+    get closed() {
+      return url.length === 0;
+    },
+  };
+};
+
+export const register = (app: { get: (path: string, handler: () => string) => void }) => {
+  app.get('/health', () => {
+    return 'ok';
+  });
+};
+";
+
+    fn fixture_static_index(source: &str) -> (tempfile::TempDir, StaticIndex) {
+        fixture_static_index_at("src/db/file-client.ts", source)
+    }
+
+    fn fixture_static_index_at(
+        relative_path: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, StaticIndex) {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        let file = dir.path().join(relative_path);
+        std::fs::create_dir_all(file.parent().expect("fixture path should have a parent"))
+            .expect("fixture directory should be created");
+        std::fs::write(&file, source).expect("fixture source should be written");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"fixture","version":"0.0.0","type":"module"}"#,
+        )
+        .expect("package.json should be written");
+        let config_path = None;
+        let ctx = RunContext {
+            root: dir.path(),
+            config_path: &config_path,
+            output: OutputFormat::Json,
+            json_style: crate::json_style::JsonStyle::Compact,
+            quiet: true,
+            no_cache: true,
+            threads: 1,
+            explain: false,
+            allow_remote_extends: false,
+        };
+        let index = build_static_index(&ctx, false).expect("static index should build");
+        (dir, index)
+    }
+
+    /// A module with three exports: one only a test file references, one the
+    /// production entry point references, and one nothing references at all.
+    const TEST_ONLY_EXPORT_SOURCE: &str = r"export const resetForTests = () => {
+  return 'reset';
+};
+
+export const handler = (input: string) => {
+  return input.trim();
+};
+
+export const orphan = () => {
+  return 'orphan';
+};
+";
+
+    /// Build a static index for a project whose only reference to
+    /// `resetForTests` comes from a `*.test.ts` file, analysed with the
+    /// production filter on (the mode that drops that test file).
+    fn test_only_export_index() -> (tempfile::TempDir, StaticIndex) {
+        let dir = tempfile::TempDir::new().expect("temp dir should be created");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src should be created");
+        std::fs::write(dir.path().join("src/helpers.ts"), TEST_ONLY_EXPORT_SOURCE)
+            .expect("helpers source should be written");
+        std::fs::write(
+            dir.path().join("src/helpers.test.ts"),
+            "import { resetForTests } from './helpers';\n\nresetForTests();\n",
+        )
+        .expect("test source should be written");
+        std::fs::write(
+            dir.path().join("src/index.ts"),
+            "import { handler } from './helpers';\n\nexport const main = (input: string) => handler(input);\n",
+        )
+        .expect("entry source should be written");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"fixture","version":"0.0.0","type":"module","main":"src/index.ts"}"#,
+        )
+        .expect("package.json should be written");
+        let config_path = None;
+        let ctx = RunContext {
+            root: dir.path(),
+            config_path: &config_path,
+            output: OutputFormat::Json,
+            json_style: crate::json_style::JsonStyle::Compact,
+            quiet: true,
+            no_cache: true,
+            threads: 1,
+            explain: false,
+            allow_remote_extends: false,
+        };
+        let index = build_static_index(&ctx, true).expect("static index should build");
+        (dir, index)
+    }
+
+    fn never_called_cloud_function(
+        name: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> CloudRuntimeFunction {
+        let mut function = cloud_function(
+            "src/helpers.ts",
+            name,
+            Some(start_line),
+            Some(start_line),
+            Some(end_line),
+        );
+        function.tracking_state = CloudTrackingState::NeverCalled;
+        function.never_called_source = CloudNeverCalledSource::RuntimeObserved;
+        function.hit_count = Some(0);
+        function
+    }
+
+    #[test]
+    fn production_test_only_export_never_reaches_safe_to_delete() {
+        let (_dir, static_index) = test_only_export_index();
+        let mut snapshot = cloud_context(2, 0);
+        snapshot.functions = vec![
+            never_called_cloud_function("resetForTests", 1, 3),
+            never_called_cloud_function("orphan", 9, 11),
+        ];
+
+        let CloudMergeOutput { report, .. } = merge_cloud_snapshot(&snapshot, &static_index, 100);
+
+        let reset = report
+            .findings
+            .iter()
+            .find(|finding| finding.function == "resetForTests")
+            .expect("the test-only export must produce a finding");
+        assert_eq!(
+            reset.verdict,
+            RuntimeCoverageVerdict::ReviewRequired,
+            "an export a test file references must never read as safe to delete"
+        );
+        assert_eq!(reset.evidence.test_only_reference, Some(true));
+        assert_eq!(reset.evidence.static_status, "unused");
+        assert_eq!(
+            reset
+                .actions
+                .first()
+                .map(|action| action.description.as_str()),
+            Some(
+                "Only tests reference this export; delete the test usage together with the function or keep it."
+            )
+        );
+
+        let orphan = report
+            .findings
+            .iter()
+            .find(|finding| finding.function == "orphan")
+            .expect("the unreferenced export must produce a finding");
+        assert_eq!(
+            orphan.verdict,
+            RuntimeCoverageVerdict::SafeToDelete,
+            "an export nothing references at all stays deletable"
+        );
+        assert_eq!(orphan.evidence.test_only_reference, Some(false));
+
+        let reset_line = human_finding_line(reset);
+        assert!(
+            reset_line.ends_with(", referenced only from tests]"),
+            "{reset_line}"
+        );
+        assert!(!human_finding_line(orphan).contains("referenced only from tests"));
+
+        let json = serde_json::to_value(&reset.evidence).expect("evidence should serialize");
+        assert_eq!(
+            json.get("test_only_reference"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    fn prefixed_cloud_function(
+        name: &str,
+        start_line: u32,
+        end_line: u32,
+        hits: u64,
+    ) -> CloudRuntimeFunction {
+        let mut function = cloud_function(
+            "/app/src/db/file-client.ts",
+            name,
+            Some(start_line),
+            Some(start_line),
+            Some(end_line),
+        );
+        function.tracking_state = CloudTrackingState::Called;
+        function.hit_count = Some(hits);
+        function
+    }
+
+    #[test]
+    fn cloud_functions_match_through_container_prefix_and_runtime_names() {
+        let (_dir, static_index) = fixture_static_index(CLOUD_FIXTURE_SOURCE);
+        let functions = vec![
+            prefixed_cloud_function("createClient", 1, 11, 611),
+            prefixed_cloud_function("execute", 4, 6, 100_000),
+            prefixed_cloud_function("map", 5, 5, 833_000_000),
+            prefixed_cloud_function("get closed", 7, 9, 2),
+            prefixed_cloud_function("register", 13, 17, 400),
+            prefixed_cloud_function("get", 14, 16, 379_000),
+        ];
+        let mut snapshot = cloud_context(functions.len(), 0);
+        snapshot.functions = functions;
+
+        let CloudMergeOutput { report, unmatched } =
+            merge_cloud_snapshot(&snapshot, &static_index, 100);
+
+        assert!(
+            unmatched.is_empty(),
+            "every fixture function has a local counterpart, got {unmatched:?}"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "cloud_functions_unmatched")
+        );
+        assert_eq!(
+            report.hot_paths.first().map(|hot| hot.invocations),
+            Some(833_000_000),
+            "the busiest runtime function must lead the hot paths"
+        );
+        for hot_path in &report.hot_paths {
+            assert_eq!(hot_path.path, PathBuf::from("src/db/file-client.ts"));
+        }
+        let mut hot_lines: Vec<u32> = report.hot_paths.iter().map(|hot| hot.line).collect();
+        hot_lines.sort_unstable();
+        assert_eq!(
+            hot_lines,
+            vec![1, 4, 5, 13, 14],
+            "the callback and object-method functions must reach the hot paths"
+        );
+    }
+
+    /// Fixture project carrying the shapes the health/complexity pass does not
+    /// enumerate: a Drizzle-style schema whose table and column callbacks are
+    /// anonymous arrows, an object returned from a factory with methods, a
+    /// getter, and a `.map(...)` chain. Runtime instrumentation names each of
+    /// them after the callee it was passed to or after the property key.
+    const SCHEMA_FIXTURE_SOURCE: &str = r"declare const sqliteTable: (
+  name: string,
+  columns: Record<string, unknown>,
+  extra?: (table: Record<string, unknown>) => unknown[],
+) => Record<string, unknown>;
+declare const text: (name: string) => {
+  primaryKey: () => unknown;
+  references: (target: () => unknown) => unknown;
+};
+declare const index: (name: string) => { on: (column: unknown) => unknown };
+
+export const orgs = sqliteTable('orgs', {
+  id: text('id').primaryKey(),
+});
+
+export const users = sqliteTable(
+  'users',
+  {
+    id: text('id').primaryKey(),
+    orgId: text('org_id').references(() => orgs.id),
+  },
+  (table) => [index('users_org_idx').on(table.orgId)],
+);
+
+export const createStore = (rows: string[]) => {
+  return {
+    execute: async (sql: string) => {
+      return rows.map((row) => row + sql.length);
+    },
+    rollback: () => rows.length,
+    get closed() {
+      return rows.length === 0;
+    },
+  };
+};
+";
+
+    /// A cloud row for `SCHEMA_FIXTURE_SOURCE`, carrying the container-prefixed
+    /// runtime path the service reports and the `stable_id` the cloud hashes
+    /// over the repo-relative path, so the join has to land on the stable-id
+    /// tier rather than on a positional fallback.
+    fn schema_cloud_function(
+        name: &str,
+        start_line: u32,
+        end_line: u32,
+        hits: u64,
+    ) -> CloudRuntimeFunction {
+        let mut function = cloud_function(
+            "/app/src/db/schema.ts",
+            name,
+            Some(start_line),
+            Some(start_line),
+            Some(end_line),
+        );
+        function.stable_id = Some(function_identity_id("src/db/schema.ts", name, start_line));
+        function.tracking_state = CloudTrackingState::Called;
+        function.hit_count = Some(hits);
+        function
+    }
+
+    #[test]
+    fn instrumenter_named_callbacks_and_members_match_on_stable_id() {
+        let (_dir, static_index) =
+            fixture_static_index_at("src/db/schema.ts", SCHEMA_FIXTURE_SOURCE);
+        let functions = vec![
+            schema_cloud_function("references", 20, 20, 27),
+            schema_cloud_function("sqliteTable", 22, 22, 25),
+            schema_cloud_function("createStore", 25, 35, 611),
+            schema_cloud_function("execute", 27, 29, 100_000),
+            schema_cloud_function("map", 28, 28, 21_200_000),
+            schema_cloud_function("rollback", 30, 30, 33),
+            schema_cloud_function("get closed", 31, 33, 36_800_000),
+        ];
+        let identities: Vec<(String, String)> = functions
+            .iter()
+            .map(|function| {
+                (
+                    function.function_name.clone(),
+                    function
+                        .stable_id
+                        .clone()
+                        .expect("the fixture sets a stable id"),
+                )
+            })
+            .collect();
+        let mut snapshot = cloud_context(functions.len(), 0);
+        snapshot.functions = functions;
+
+        let CloudMergeOutput { report, unmatched } =
+            merge_cloud_snapshot(&snapshot, &static_index, 1);
+
+        assert!(
+            unmatched.is_empty(),
+            "every instrumenter-named function has a local counterpart, got {unmatched:?}"
+        );
+        for (name, stable_id) in &identities {
+            let indexed = static_index.by_stable_id.get(stable_id);
+            assert_eq!(
+                indexed.map(|info| info.name.as_str()),
+                Some(name.as_str()),
+                "{name} must join on the stable-id tier, not on a positional fallback"
+            );
+        }
+        let mut hot: Vec<(String, u64)> = report
+            .hot_paths
+            .iter()
+            .map(|path| (path.function.clone(), path.invocations))
+            .collect();
+        hot.sort_by_key(|(_, invocations)| std::cmp::Reverse(*invocations));
+        assert_eq!(
+            hot.first().map(|(name, hits)| (name.as_str(), *hits)),
+            Some(("get closed", 36_800_000)),
+            "the busiest instrumenter-named function must lead the hot paths"
+        );
+        assert!(
+            hot.iter()
+                .any(|(name, hits)| name == "map" && *hits == 21_200_000),
+            "the map callback must reach the hot paths with its invocation count, got {hot:?}"
+        );
+        for hot_path in &report.hot_paths {
+            assert_eq!(hot_path.path, PathBuf::from("src/db/schema.ts"));
+        }
+    }
+
+    #[test]
+    fn instrumenter_functions_count_lines_like_the_complexity_pass() {
+        let (_dir, static_index) =
+            fixture_static_index_at("src/db/schema.ts", SCHEMA_FIXTURE_SOURCE);
+        let expected = [
+            ("references", 20, 1),
+            ("createStore", 25, 11),
+            ("execute", 27, 3),
+            ("map", 28, 1),
+            ("rollback", 30, 1),
+            ("get closed", 31, 3),
+        ];
+        for (name, line, line_count) in expected {
+            let stable_id = function_identity_id("src/db/schema.ts", name, line);
+            let cost = static_index
+                .by_stable_id
+                .get(&stable_id)
+                .and_then(|info| info.cost)
+                .unwrap_or_else(|| panic!("{name} must carry a static cost"));
+            assert_eq!(
+                cost.line_count, line_count,
+                "{name} must count its first and last line"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_callback_verdict_copy_points_at_the_call_site() {
+        let (_dir, static_index) =
+            fixture_static_index_at("src/db/schema.ts", SCHEMA_FIXTURE_SOURCE);
+        let mut cold = schema_cloud_function("references", 20, 20, 0);
+        cold.tracking_state = CloudTrackingState::NeverCalled;
+        cold.never_called_source = CloudNeverCalledSource::RuntimeObserved;
+        let mut snapshot = cloud_context(1, 0);
+        snapshot.summary.trace_count = 100;
+        snapshot.functions = vec![cold];
+
+        let CloudMergeOutput { report, unmatched } =
+            merge_cloud_snapshot(&snapshot, &static_index, 1);
+
+        assert!(
+            unmatched.is_empty(),
+            "the callback must match, got {unmatched:?}"
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.function == "references")
+            .expect("the cold callback must produce a finding");
+        let description = finding
+            .actions
+            .first()
+            .map(|action| action.description.clone())
+            .unwrap_or_default();
+        assert!(
+            description.starts_with("Callback passed to references;"),
+            "callback copy must name the call site, got {description:?}"
+        );
+    }
+
+    #[test]
+    fn cloud_function_without_local_counterpart_stays_unmatched() {
+        let (_dir, static_index) = fixture_static_index(CLOUD_FIXTURE_SOURCE);
+        let mut snapshot = cloud_context(1, 0);
+        let mut absent = cloud_function(
+            "/app/src/db/gone.ts",
+            "removedFlow",
+            Some(3),
+            Some(3),
+            Some(9),
+        );
+        absent.tracking_state = CloudTrackingState::Called;
+        absent.hit_count = Some(12);
+        snapshot.functions = vec![absent];
+
+        let CloudMergeOutput { report, unmatched } =
+            merge_cloud_snapshot(&snapshot, &static_index, 100);
+
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0].name, "removedFlow");
+        assert!(report.hot_paths.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "cloud_functions_unmatched")
+        );
+    }
+
+    #[test]
+    fn resolve_cloud_path_rebases_container_prefix() {
+        let static_index =
+            static_index_with(vec![static_info("src/db/file-client.ts", "run", 1, 4)]);
+
+        assert_eq!(
+            resolve_cloud_path(&static_index, "app/src/db/file-client.ts"),
+            Some("src/db/file-client.ts")
+        );
+        assert_eq!(
+            resolve_cloud_path(&static_index, "src/db/file-client.ts"),
+            Some("src/db/file-client.ts")
+        );
+        assert_eq!(resolve_cloud_path(&static_index, "app/other.ts"), None);
+    }
+
+    #[test]
+    fn resolve_cloud_path_rejects_two_equally_deep_local_files() {
+        let static_index = static_index_with(vec![
+            static_info("packages/api/src/index.ts", "run", 1, 4),
+            static_info("packages/web/src/index.ts", "run", 1, 4),
+        ]);
+
+        assert_eq!(resolve_cloud_path(&static_index, "app/src/index.ts"), None);
+    }
+
+    #[test]
+    fn positional_match_rejects_two_functions_opening_on_one_line() {
+        let static_index = static_index_with(vec![
+            static_info("src/api.ts", "outer", 10, 14),
+            static_info("src/api.ts", "<arrow>", 10, 14),
+        ]);
+        let function = cloud_function("src/api.ts", "then", Some(10), Some(10), Some(14));
+
+        assert!(match_cloud_function(&function, &static_index).is_none());
+    }
+
+    #[test]
+    fn positional_match_breaks_a_line_tie_on_the_end_line() {
+        let static_index = static_index_with(vec![
+            static_info("src/api.ts", "outer", 10, 40),
+            static_info("src/api.ts", "<arrow>", 10, 14),
+        ]);
+        let function = cloud_function("src/api.ts", "then", Some(10), Some(10), Some(14));
+
+        let matched = match_cloud_function(&function, &static_index).expect("end line breaks tie");
+        assert_eq!(matched.end_line, 14);
+    }
+
     #[test]
     fn cloud_never_called_static_used_emits_review_runtime_action() {
-        let actions = runtime_actions(RuntimeCoverageVerdict::ReviewRequired);
+        let actions = runtime_actions(RuntimeCoverageVerdict::ReviewRequired, false, None);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].kind, "review-runtime");
     }
@@ -1898,6 +2963,7 @@ mod tests {
             verdict: None,
             provenance: None,
             window: crate::coverage::cloud_client::CloudRuntimeWindow { period_days: 30 },
+            evidence_window: None,
             summary: crate::coverage::cloud_client::CloudRuntimeSummary {
                 trace_count: 0,
                 deployments_seen: 0,
@@ -1939,6 +3005,7 @@ mod tests {
             verdict: None,
             provenance: None,
             window: crate::coverage::cloud_client::CloudRuntimeWindow { period_days: 30 },
+            evidence_window: None,
             summary: crate::coverage::cloud_client::CloudRuntimeSummary {
                 trace_count: 0,
                 deployments_seen: 0,
@@ -1979,6 +3046,7 @@ mod tests {
             verdict: None,
             provenance: None,
             window: crate::coverage::cloud_client::CloudRuntimeWindow { period_days: 7 },
+            evidence_window: None,
             summary: crate::coverage::cloud_client::CloudRuntimeSummary {
                 trace_count: 0,
                 deployments_seen: 0,
@@ -2025,7 +3093,7 @@ mod tests {
             stale_after_days: Some(14),
         });
 
-        let report = merge_cloud_snapshot(&snapshot, &StaticIndex::default(), 100);
+        let report = merge_cloud_snapshot(&snapshot, &StaticIndex::default(), 100).report;
 
         assert!(!report.actionable);
         assert_eq!(
@@ -2046,7 +3114,8 @@ mod tests {
 
     #[test]
     fn cloud_report_uses_legacy_actionability_fallback_when_fields_are_absent() {
-        let report = merge_cloud_snapshot(&cloud_context(1, 2), &StaticIndex::default(), 100);
+        let report =
+            merge_cloud_snapshot(&cloud_context(1, 2), &StaticIndex::default(), 100).report;
 
         assert!(report.actionable);
         assert_eq!(report.actionability_reason, None);
@@ -2136,11 +3205,11 @@ mod tests {
 
     #[test]
     fn runtime_helper_tables_cover_actions_ranks_tracking_and_paths() {
-        let delete_actions = runtime_actions(RuntimeCoverageVerdict::SafeToDelete);
+        let delete_actions = runtime_actions(RuntimeCoverageVerdict::SafeToDelete, false, None);
         assert_eq!(delete_actions.len(), 1);
         assert_eq!(delete_actions[0].kind, "delete-cold-code");
-        assert!(runtime_actions(RuntimeCoverageVerdict::Active).is_empty());
-        assert!(runtime_actions(RuntimeCoverageVerdict::Unknown).is_empty());
+        assert!(runtime_actions(RuntimeCoverageVerdict::Active, false, None).is_empty());
+        assert!(runtime_actions(RuntimeCoverageVerdict::Unknown, false, None).is_empty());
 
         assert!(
             runtime_verdict_rank(RuntimeCoverageVerdict::SafeToDelete)
@@ -2209,6 +3278,7 @@ mod tests {
             evidence: RuntimeCoverageEvidence {
                 static_status: "used".to_owned(),
                 test_coverage: "not_covered".to_owned(),
+                test_only_reference: None,
                 v8_tracking: "tracked".to_owned(),
                 untracked_reason: None,
                 observation_days: 0,
@@ -2227,12 +3297,15 @@ mod tests {
             start_line,
             end_line,
             static_used: false,
+            test_only_reference: None,
             test_covered: false,
             cyclomatic: 1,
+            cost: None,
             caller_count: 0,
             owner_count: None,
             stable_id: function_identity_id(&rel, name, start_line),
             source_hash: None,
+            is_callback: false,
         }
     }
 
@@ -2240,18 +3313,7 @@ mod tests {
         let mut static_index = StaticIndex::default();
         for function in functions {
             let path = normalize_runtime_path(&function.path);
-            static_index.by_key.insert(
-                (path.clone(), function.name.clone(), function.start_line),
-                function.clone(),
-            );
-            static_index
-                .by_stable_id
-                .insert(function.stable_id.clone(), function.clone());
-            static_index
-                .by_path_name
-                .entry((path, function.name.clone()))
-                .or_default()
-                .push(function);
+            index_static_function(&mut static_index, &path, function);
         }
         static_index
     }
@@ -2275,6 +3337,8 @@ mod tests {
             never_called_source: CloudNeverCalledSource::Unknown,
             deployments_observed: 1,
             untracked_reason: None,
+            repo_path: None,
+            period_tracking_state: None,
         }
     }
 
@@ -2286,6 +3350,7 @@ mod tests {
             verdict: None,
             provenance: None,
             window: crate::coverage::cloud_client::CloudRuntimeWindow { period_days: 30 },
+            evidence_window: None,
             summary: crate::coverage::cloud_client::CloudRuntimeSummary {
                 trace_count: 7,
                 deployments_seen: 1,
@@ -2314,6 +3379,7 @@ mod tests {
             invocations: 1,
             percentile: 100,
             actions: vec![],
+            optimization_target: None,
         }
     }
 
@@ -2393,5 +3459,68 @@ mod tests {
         std::fs::write(nested.join("vendor.js.map"), "{}").unwrap();
         // The only .map lives under node_modules, which the scan skips.
         assert!(source_map_upload_hint(&unresolved_warning(), dir.path()).is_none());
+    }
+
+    #[test]
+    fn cloud_finding_decision_keeps_code_called_in_an_earlier_deployment() {
+        let unused = static_info("src/db.ts", "applyPragmas", 10, 20);
+        let mut function =
+            cloud_function("src/db.ts", "applyPragmas", Some(10), Some(10), Some(20));
+        function.never_called_source = CloudNeverCalledSource::RuntimeObserved;
+        function.period_tracking_state = Some(CloudTrackingState::Called);
+        assert_eq!(
+            cloud_finding_decision(&function, &unused),
+            (
+                RuntimeCoverageVerdict::ReviewRequired,
+                RuntimeCoverageConfidence::High,
+                Some(0)
+            )
+        );
+        function.period_tracking_state = Some(CloudTrackingState::NeverCalled);
+        assert_eq!(
+            cloud_finding_decision(&function, &unused).0,
+            RuntimeCoverageVerdict::SafeToDelete
+        );
+    }
+
+    #[test]
+    fn cloud_observation_days_reads_the_real_evidence_span() {
+        let mut snapshot = cloud_context(1, 0);
+        snapshot.window.period_days = 30;
+        let mut function = cloud_function("src/a.ts", "a", Some(1), Some(1), Some(2));
+        assert_eq!(cloud_observation_days(&snapshot, &function), 30);
+
+        snapshot.evidence_window = Some(crate::coverage::cloud_client::CloudEvidenceWindow {
+            observed_hours: 2.9,
+        });
+        assert_eq!(cloud_observation_days(&snapshot, &function), 1);
+
+        function.period_tracking_state = Some(CloudTrackingState::NeverCalled);
+        assert_eq!(cloud_observation_days(&snapshot, &function), 30);
+    }
+
+    #[test]
+    fn resolve_function_path_prefers_the_repo_path() {
+        let static_index = static_index_with(vec![
+            static_info("src/covered.ts", "covered", 1, 3),
+            static_info("lib/covered.ts", "covered", 1, 3),
+        ]);
+        let mut function =
+            cloud_function("/app/lib/covered.ts", "covered", Some(1), Some(1), Some(3));
+        assert_eq!(
+            resolve_function_path(&function, &static_index),
+            Some("lib/covered.ts")
+        );
+        function.repo_path = Some("src/covered.ts".to_owned());
+        assert_eq!(
+            resolve_function_path(&function, &static_index),
+            Some("src/covered.ts")
+        );
+        function.repo_path = Some("gone/covered.ts".to_owned());
+        assert_eq!(
+            resolve_function_path(&function, &static_index),
+            Some("lib/covered.ts"),
+            "a repo_path the checkout lacks falls back to the suffix match"
+        );
     }
 }

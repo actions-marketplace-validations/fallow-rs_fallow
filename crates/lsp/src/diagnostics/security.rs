@@ -25,7 +25,7 @@ use crate::position::PositionMapper;
 /// Documentation page for the security candidate surface. The dead-code
 /// `DOCS_BASE` in `super` points at the dead-code explanation; security has its
 /// own CLI page, so this block uses a dedicated link.
-const SECURITY_DOCS_URL: &str = "https://docs.fallow.tools/cli/security";
+const SECURITY_DOCS_URL: &str = "https://fallow.tools/docs/cli/security/";
 
 /// The `// fallow-ignore-file` / `// fallow-ignore-next-line` suppression token
 /// for a security finding's kind. One token per kind covers all catalogue
@@ -71,6 +71,8 @@ fn security_doc_link() -> Option<CodeDescription> {
 /// hover round-trip or a CLI re-run. Mirrors the `circularDependency` data
 /// precedent in `structural.rs`; `attach_changed_since_data` merges
 /// `changedSince` into this object rather than clobbering it.
+/// `security_diagnostic` adds `findingId` next to `security`: the same
+/// `finding_id` that the CLI JSON output reports for the candidate.
 fn security_data(finding: &SecurityFinding) -> serde_json::Value {
     let kind = match finding.kind {
         SecurityFindingKind::ClientServerLeak => "client-server-leak",
@@ -119,7 +121,10 @@ pub fn security_diagnostic(finding: &SecurityFinding, mapper: &mut PositionMappe
         )),
         code_description: security_doc_link(),
         message: format!("Security candidate ({label}): {}", finding.evidence),
-        data: Some(security_data(finding)),
+        data: super::with_finding_id(
+            Some(security_data(finding)),
+            (!finding.finding_id.is_empty()).then_some(finding.finding_id.as_str()),
+        ),
         ..Default::default()
     }
 }

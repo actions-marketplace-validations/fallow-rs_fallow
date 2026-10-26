@@ -2,8 +2,8 @@
 //!
 //! `fallow agent install` composes the pieces that previously lived behind
 //! separate entry points (`init --agents`, `hooks install --target agent`,
-//! the README's MCP snippet, and the skill shipped under
-//! `node_modules/fallow/skills/fallow`) into one idempotent pass per detected
+//! the README's MCP snippet, and the skills shipped under
+//! `node_modules/fallow/skills/`) into one idempotent pass per detected
 //! harness. Every file or block it writes carries a versioned
 //! `fallow:agent-install` marker so `status` can report it and `uninstall`
 //! can remove exactly that content and nothing else.
@@ -31,7 +31,7 @@ pub const MARKER_VERSION: &str = "v1";
 /// Common prefix of every marker this command writes.
 pub const MARKER_PREFIX: &str = "fallow:agent-install";
 /// JSON envelope version of `agent install|status|uninstall`.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// A coding-agent harness fallow knows how to wire up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, clap::ValueEnum)]
@@ -39,7 +39,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub enum Harness {
     /// Claude Code: `.mcp.json`, `.claude/skills/`, `.claude/settings.json` gate, `CLAUDE.md` import.
     Claude,
-    /// OpenAI Codex CLI: `.codex/config.toml`, `.agents/skills/`, `AGENTS.md` block.
+    /// OpenAI Codex CLI: `.codex/config.toml`, `.agents/skills/`, `.codex/hooks.json` gate, `AGENTS.md` block.
     Codex,
     /// Cursor: `.cursor/mcp.json`, `.agents/skills/`, `AGENTS.md`.
     Cursor,
@@ -84,7 +84,7 @@ pub enum HarnessArg {
 pub enum Step {
     /// `AGENTS.md` scaffold or task-map block, plus the `CLAUDE.md` import for Claude Code.
     Guide,
-    /// The fallow skill under `.claude/skills/` or `.agents/skills/`.
+    /// The fallow skills under `.claude/skills/` or `.agents/skills/`.
     Skill,
     /// MCP server registration for the harness.
     Mcp,
@@ -447,7 +447,10 @@ pub fn run_agent_install(
         steps.extend(hooks::install(&ctx, &harnesses));
     }
 
-    let next_actions = next_actions(&ctx, &harnesses, detected, mcp_command.as_ref(), &steps);
+    let mut next_actions = next_actions(&ctx, &harnesses, detected, mcp_command.as_ref(), &steps);
+    if let Some(apply) = apply_dry_run_action(opts, &root, &harnesses, &steps) {
+        next_actions.insert(0, apply);
+    }
     let report = Report {
         kind: "agent-install",
         schema_version: SCHEMA_VERSION,
@@ -504,6 +507,66 @@ pub fn run_agent_uninstall(
         next_actions: Vec::new(),
     };
     render(&report, output, json_style)
+}
+
+/// After a dry run that plans writes, name the command that applies the plan.
+///
+/// The command repeats every flag that changes the plan, also the harness set
+/// that detection found, so it writes the same steps that the dry run lists.
+/// An empty detected set stays implicit, because no flag selects "no harness".
+/// A dry run with nothing to write gets no action.
+fn apply_dry_run_action(
+    opts: &AgentInstallOptions<'_>,
+    root: &Path,
+    harnesses: &[Harness],
+    steps: &[StepReport],
+) -> Option<NextAction> {
+    if !opts.dry_run || !steps.iter().any(|step| step.status == StepStatus::Written) {
+        return None;
+    }
+    Some(NextAction {
+        id: "agent-install-apply",
+        command: apply_command(opts, root, harnesses),
+        reason: "This was a dry run. The command writes the steps marked \"would write\"."
+            .to_string(),
+        mutating: true,
+    })
+}
+
+/// `fallow agent install` with the plan-changing flags of `opts`, without
+/// `--dry-run`.
+fn apply_command(opts: &AgentInstallOptions<'_>, root: &Path, harnesses: &[Harness]) -> String {
+    let mut words: Vec<String> = vec!["fallow".into(), "agent".into(), "install".into()];
+    // Repeat a detected set too. Detection reads the session environment and
+    // `$HOME`, so a run from another shell can detect a different set and
+    // write a different plan.
+    for harness in harnesses {
+        words.push("--harness".into());
+        words.push(harness.as_str().into());
+    }
+    if opts.user {
+        words.push("--user".into());
+    }
+    for step in opts.without {
+        words.push("--without".into());
+        words.push(step.as_str().into());
+    }
+    for (set, flag) in [
+        (opts.force, "--force"),
+        (opts.approve, "--approve"),
+        (opts.gitignore_claude, "--gitignore-claude"),
+    ] {
+        if set {
+            words.push(flag.into());
+        }
+    }
+    if opts.root_explicit {
+        words.push("--root".into());
+        words.push(fallow_engine::shell_quote::shell_quote(
+            &root.to_string_lossy(),
+        ));
+    }
+    words.join(" ")
 }
 
 fn next_actions(

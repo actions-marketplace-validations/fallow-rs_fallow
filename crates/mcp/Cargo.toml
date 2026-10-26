@@ -22,16 +22,23 @@ path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "3.1", features = ["transport-io"] }
-rquickjs = "0.12"
-fallow-api = { workspace = true, features = ["schema"] }
+rquickjs = "0.14"
+fallow-api.workspace = true
+fallow-output.workspace = true
 fallow-process = { workspace = true, features = ["tokio"] }
 fallow-types.workspace = true
+rustc-hash = { workspace = true }
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 schemars.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
 
 [dev-dependencies]
 regex.workspace = true

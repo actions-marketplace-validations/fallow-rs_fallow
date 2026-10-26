@@ -1,7 +1,7 @@
 /// Detailed timing breakdown for the health pipeline.
 ///
 /// Only populated when `--performance` is passed.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HealthTimings {
     /// Wall-clock time of config loading, in milliseconds.
     pub config_ms: f64,
@@ -22,6 +22,11 @@ pub struct HealthTimings {
     pub git_churn_ms: f64,
     /// True when churn data came from the on-disk churn cache.
     pub git_churn_cache_hit: bool,
+    /// Bytes of `git log` output that the churn stage read. Exact for a given
+    /// repository, commit, churn window and date: commits move out of a
+    /// relative window as the date changes. Zero when the churn cache or a
+    /// churn file supplied all the history.
+    pub git_log_bytes: u64,
     /// Wall-clock time of hotspot ranking, in milliseconds.
     pub hotspots_ms: f64,
     /// Wall-clock time of duplication analysis, in milliseconds.
@@ -38,7 +43,7 @@ pub struct HealthTimings {
 }
 
 /// Framework-specific health detector coverage surfaced for agent consumers.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FrameworkHealthDiagnostics {
     /// Detected framework IDs, sorted and deduplicated.
@@ -48,7 +53,7 @@ pub struct FrameworkHealthDiagnostics {
 }
 
 /// Status for one framework-specific health detector.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FrameworkHealthDetector {
     /// Rule or detector ID, matching fallow's stable rule names where possible.
@@ -63,7 +68,7 @@ pub struct FrameworkHealthDetector {
 }
 
 /// Detector status codes for framework health observability.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FrameworkHealthDetectorStatus {

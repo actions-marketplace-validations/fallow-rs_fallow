@@ -403,6 +403,7 @@ fn reconcile_review(
         ..opts
     };
     let current = envelope_fingerprints(&envelope);
+    let legacy = envelope_legacy_fingerprints(&envelope);
     let state = match load_provider_state(provider, target, opts) {
         Ok(state) => state,
         Err(e) if opts.dry_run => {
@@ -422,7 +423,7 @@ fn reconcile_review(
             return emit_error_with_style(&e, crate::api::NETWORK_EXIT_CODE, output, json_style);
         }
     };
-    let plan = PlannedReconcile::new(&current, &state);
+    let plan = PlannedReconcile::new(&current, &legacy, &state);
 
     let applied = if opts.dry_run {
         ApplyResult::default()
@@ -505,7 +506,6 @@ fn emit_reconcile_result(
     };
     match fallow_output::serialize_review_reconcile_json_output(
         envelope_struct,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) {
         Ok(value) => emit_ci_command_json(&value, "review reconcile", output, json_style),
@@ -583,6 +583,27 @@ fn envelope_fingerprints(value: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+/// Map each `legacy_fingerprint` in the envelope to the `fingerprint` of the
+/// same comment.
+///
+/// An older release wrote the legacy value into the v2 marker of a thread.
+/// For one release, a thread with that marker is the same lifecycle as the
+/// current comment: it is neither stale nor a reason to post again.
+fn envelope_legacy_fingerprints(value: &Value) -> BTreeMap<String, String> {
+    value
+        .get("comments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|comment| {
+            let fingerprint = comment.get("fingerprint").and_then(Value::as_str)?;
+            let legacy = comment.get("legacy_fingerprint").and_then(Value::as_str)?;
+            (!fingerprint.trim().is_empty() && !legacy.trim().is_empty())
+                .then(|| (legacy.to_owned(), fingerprint.to_owned()))
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct ProviderState {
     /// Fingerprints whose latest owned lifecycle has not received a
@@ -650,12 +671,41 @@ impl ReconcilePlan {
     }
 }
 
-fn reconcile_sets(current: &BTreeSet<String>, existing: &BTreeSet<String>) -> ReconcilePlan {
+/// Compare the current fingerprints with the open lifecycles on the provider.
+///
+/// `legacy` maps a legacy fingerprint to the current fingerprint of the same
+/// finding. An existing lifecycle whose marker holds a legacy value matches
+/// that finding: it is not stale, and the finding is not new.
+fn reconcile_sets(
+    current: &BTreeSet<String>,
+    legacy: &BTreeMap<String, String>,
+    existing: &BTreeSet<String>,
+) -> ReconcilePlan {
+    let covered: BTreeSet<&String> = existing
+        .iter()
+        .filter_map(|fingerprint| {
+            if current.contains(fingerprint) {
+                Some(fingerprint)
+            } else {
+                legacy.get(fingerprint)
+            }
+        })
+        .collect();
     ReconcilePlan {
         current: current.iter().cloned().collect(),
         existing: existing.iter().cloned().collect(),
-        new: current.difference(existing).cloned().collect(),
-        stale: existing.difference(current).cloned().collect(),
+        new: current
+            .iter()
+            .filter(|fingerprint| !covered.contains(fingerprint))
+            .cloned()
+            .collect(),
+        stale: existing
+            .iter()
+            .filter(|fingerprint| {
+                !current.contains(*fingerprint) && !legacy.contains_key(*fingerprint)
+            })
+            .cloned()
+            .collect(),
         provider_warning: None,
     }
 }
@@ -667,9 +717,13 @@ struct PlannedReconcile<'state> {
 }
 
 impl<'state> PlannedReconcile<'state> {
-    fn new(current: &BTreeSet<String>, state: &'state ProviderState) -> Self {
+    fn new(
+        current: &BTreeSet<String>,
+        legacy: &BTreeMap<String, String>,
+        state: &'state ProviderState,
+    ) -> Self {
         Self {
-            plan: reconcile_sets(current, &state.fingerprints),
+            plan: reconcile_sets(current, legacy, &state.fingerprints),
             state,
         }
     }
@@ -687,7 +741,7 @@ struct ApplyResult {
 impl ApplyResult {
     fn hint(&self) -> Option<String> {
         (!self.errors.is_empty()).then(|| {
-            "Reconcile apply stopped before all provider lifecycle operations were applied. Refresh provider state and rerun the job; fingerprints listed in unapplied_fingerprints were not fully applied.".to_owned()
+            "Some provider lifecycle operations failed. Fingerprints listed in unapplied_fingerprints were not fully applied; refresh provider state and rerun the job to retry them.".to_owned()
         })
     }
 
@@ -721,6 +775,8 @@ fn load_github_state(
     target: Option<&str>,
     opts: ReconcileOptions<'_>,
 ) -> Result<ProviderState, String> {
+    let bot_login_var = std::env::var("FALLOW_BOT_LOGIN");
+    let bot_login = BotLogin::from_var(&bot_login_var);
     let pr = require_target("GitHub pull request", target)?;
     let repo = opts
         .repo
@@ -766,10 +822,10 @@ fn load_github_state(
     // after every page is loaded so their markers can be tied to a root even
     // if provider ordering or pagination places the reply first.
     for (position, comment) in review_comments.iter().enumerate() {
-        record_github_review_root(&mut state, comment, opts.review_id, position)?;
+        record_github_review_root(&mut state, comment, opts.review_id, position, bot_login)?;
     }
     for (position, comment) in review_comments.iter().enumerate() {
-        record_github_resolution_marker(&mut state, comment, opts.review_id, position)?;
+        record_github_resolution_marker(&mut state, comment, opts.review_id, position, bot_login)?;
     }
 
     load_github_review_threads(
@@ -792,9 +848,10 @@ fn record_github_review_root(
     comment: &Value,
     review_id: Option<&ReviewId>,
     provider_position: usize,
+    bot_login: BotLogin<'_>,
 ) -> Result<(), String> {
     let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
-    if is_github_bot_comment(comment)
+    if is_github_bot_comment(comment, bot_login)
         && let Some(fingerprint) = extract_fallow_fingerprint(body)
     {
         if fallow_output::parse_review_id_marker(body)?.as_ref() != review_id {
@@ -832,9 +889,10 @@ fn record_github_resolution_marker(
     comment: &Value,
     review_id: Option<&ReviewId>,
     provider_position: usize,
+    bot_login: BotLogin<'_>,
 ) -> Result<(), String> {
     let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
-    if is_github_bot_comment(comment) {
+    if is_github_bot_comment(comment, bot_login) {
         let Some(marker) = parse_resolution_marker(body)? else {
             return Ok(());
         };
@@ -1105,8 +1163,6 @@ fn apply_github_reconcile(
     result
 }
 
-/// Apply each staged GitHub operation in order, recording a failure (with the
-/// not-yet-applied suffix) and stopping at the first error.
 /// The GitHub PR connection context (agent + repo/PR coordinates + auth)
 /// shared by every staged operation, bundled so the operation runner takes one
 /// parameter instead of five.
@@ -1119,6 +1175,15 @@ struct GithubConnection<'a> {
     api: &'a str,
 }
 
+/// Apply each staged GitHub operation in order. A failure blocks only the
+/// remaining operations that carry the same fingerprint, so that lifecycle is
+/// retried whole on the next run while every other fingerprint still gets
+/// applied. The block is keyed on the fingerprint, not on a single thread, so
+/// it also covers a sibling discussion of the same fingerprint and the
+/// re-close pass that `stage_github_operations` appends for a
+/// provider-reopened thread that already carries a resolution marker. That is
+/// deliberate: a fingerprint whose first mutation failed is left entirely to
+/// the next run rather than half-applied here.
 fn run_github_operations(
     operations: &[GithubApplyOperation],
     conn: GithubConnection<'_>,
@@ -1131,7 +1196,12 @@ fn run_github_operations(
         token,
         api,
     } = conn;
-    for (index, operation) in operations.iter().enumerate() {
+    let mut blocked: BTreeSet<&str> = BTreeSet::new();
+    for operation in operations {
+        let fingerprint = operation.fingerprint();
+        if blocked.contains(fingerprint) {
+            continue;
+        }
         if let Err(failure) = apply_github_operation(&mut GithubOperationInput {
             operation,
             agent,
@@ -1141,13 +1211,8 @@ fn run_github_operations(
             api,
             result,
         }) {
-            result.record_failure(
-                failure,
-                operations[index..]
-                    .iter()
-                    .map(GithubApplyOperation::fingerprint_owned),
-            );
-            return;
+            blocked.insert(fingerprint);
+            result.record_failure(failure, [fingerprint.to_owned()]);
         }
     }
 }
@@ -1323,6 +1388,11 @@ fn apply_github_operation(input: &mut GithubOperationInput<'_>) -> Result<(), Ap
             comment_id,
             body,
         } => {
+            // GitHub attaches every standalone review-comment reply to a
+            // review, so it auto-creates an empty-bodied COMMENTED review to
+            // hold this one and the PR timeline renders that as a content-free
+            // "reviewed" row. Fallow never posts that review itself and there
+            // is no batch reply endpoint that avoids it.
             let payload = serde_json::json!({ "body": body });
             let url = format!(
                 "{}/repos/{}/pulls/{}/comments/{comment_id}/replies",
@@ -1393,6 +1463,8 @@ fn load_gitlab_state(
     target: Option<&str>,
     opts: ReconcileOptions<'_>,
 ) -> Result<ProviderState, String> {
+    let bot_login_var = std::env::var("FALLOW_BOT_LOGIN");
+    let bot_login = BotLogin::from_var(&bot_login_var);
     let mr = require_target("GitLab merge request", target)?;
     let project_id = opts
         .project_id
@@ -1413,18 +1485,15 @@ fn load_gitlab_state(
 
     for page in 1..=100 {
         let url = format!(
-            "{api}/projects/{}/merge_requests/{mr}/discussions?per_page=100&page={page}",
+            "{api}/projects/{}/merge_requests/{mr}/discussions?per_page={GITLAB_PER_PAGE}&page={page}",
             url_encode_path_segment(&project_id)
         );
-        let value = gitlab_get_json(&agent, &url, &token)?;
+        let (value, next_page) = gitlab_get_page(&agent, &url, &token)?;
         let discussions = value
             .as_array()
             .ok_or_else(|| "GitLab discussions response was not an array".to_owned())?;
-        if discussions.is_empty() {
-            break;
-        }
         all_discussions.extend(discussions.iter().cloned());
-        if discussions.len() < 100 {
+        if !gitlab_has_more_pages(next_page, discussions.len()) {
             break;
         }
         if page == 100 {
@@ -1434,7 +1503,7 @@ fn load_gitlab_state(
             );
         }
     }
-    let authenticated_user = if needs_gitlab_authenticated_user(&all_discussions) {
+    let authenticated_user = if needs_gitlab_authenticated_user(&all_discussions, bot_login) {
         Some(load_gitlab_authenticated_user(&agent, &api, &token)?)
     } else {
         None
@@ -1445,16 +1514,14 @@ fn load_gitlab_state(
             discussion,
             opts.review_id,
             authenticated_user.as_ref(),
+            bot_login,
         )?;
     }
     Ok(state)
 }
 
-fn needs_gitlab_authenticated_user(discussions: &[Value]) -> bool {
-    if !matches!(
-        std::env::var("FALLOW_BOT_LOGIN"),
-        Err(std::env::VarError::NotPresent)
-    ) {
+fn needs_gitlab_authenticated_user(discussions: &[Value], bot_login: BotLogin<'_>) -> bool {
+    if !matches!(bot_login, BotLogin::Unset) {
         return false;
     }
     discussions
@@ -1504,6 +1571,7 @@ fn collect_gitlab_discussion_fingerprints(
     discussion: &Value,
     review_id: Option<&ReviewId>,
     authenticated_user: Option<&GitlabAuthenticatedUser>,
+    bot_login: BotLogin<'_>,
 ) -> Result<(), String> {
     let discussion_id = discussion
         .get("id")
@@ -1521,7 +1589,7 @@ fn collect_gitlab_discussion_fingerprints(
         .ok_or_else(|| format!("GitLab discussion {discussion_id} did not contain a root note"))?;
     {
         let body = root.get("body").and_then(Value::as_str).unwrap_or("");
-        if is_gitlab_bot_note(root, authenticated_user)
+        if is_gitlab_bot_note(root, authenticated_user, bot_login)
             && let Some(fingerprint) = extract_fallow_fingerprint(body)
         {
             if fallow_output::parse_review_id_marker(body)?.as_ref() != review_id {
@@ -1550,7 +1618,7 @@ fn collect_gitlab_discussion_fingerprints(
             let mut has_resolution_marker = false;
             for note in notes {
                 let note_body = note.get("body").and_then(Value::as_str).unwrap_or("");
-                if !is_gitlab_bot_note(note, authenticated_user) {
+                if !is_gitlab_bot_note(note, authenticated_user, bot_login) {
                     continue;
                 }
                 let Some(marker) = parse_resolution_marker(note_body)? else {
@@ -1653,8 +1721,15 @@ struct GitlabConnection<'a> {
     api: &'a str,
 }
 
-/// Apply each staged GitLab operation in order, recording a failure (with the
-/// not-yet-applied suffix) and stopping at the first error.
+/// Apply each staged GitLab operation in order. A failure blocks only the
+/// remaining operations that carry the same fingerprint, so that lifecycle is
+/// retried whole on the next run while every other fingerprint still gets
+/// applied. The block is keyed on the fingerprint, not on a single discussion,
+/// so it also covers a sibling discussion of the same fingerprint and the
+/// re-close pass that `stage_gitlab_operations` appends for a provider-reopened
+/// discussion that already carries a resolution marker. That is deliberate: a
+/// fingerprint whose first mutation failed is left entirely to the next run
+/// rather than half-applied here.
 fn run_gitlab_operations(
     operations: &[GitlabApplyOperation],
     conn: GitlabConnection<'_>,
@@ -1667,7 +1742,12 @@ fn run_gitlab_operations(
         token,
         api,
     } = conn;
-    for (index, operation) in operations.iter().enumerate() {
+    let mut blocked: BTreeSet<&str> = BTreeSet::new();
+    for operation in operations {
+        let fingerprint = operation.fingerprint();
+        if blocked.contains(fingerprint) {
+            continue;
+        }
         if let Err(failure) = apply_gitlab_operation(&mut GitlabOperationInput {
             operation,
             agent,
@@ -1677,13 +1757,8 @@ fn run_gitlab_operations(
             api,
             result,
         }) {
-            result.record_failure(
-                failure,
-                operations[index..]
-                    .iter()
-                    .map(GitlabApplyOperation::fingerprint_owned),
-            );
-            return;
+            blocked.insert(fingerprint);
+            result.record_failure(failure, [fingerprint.to_owned()]);
         }
     }
 }
@@ -1890,6 +1965,67 @@ fn github_token() -> Result<String, String> {
         .map_err(|_| "GitHub reconciliation requires GH_TOKEN or GITHUB_TOKEN".to_owned())
 }
 
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Resolves the GitHub repository for a post command. `purpose` names the
+/// posted object in the error text, for example "review" or "PR comment".
+fn github_repo(explicit: Option<&str>, purpose: &str) -> Result<String, String> {
+    github_repo_from(explicit, purpose, process_env)
+}
+
+fn github_repo_from(
+    explicit: Option<&str>,
+    purpose: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    explicit
+        .map(str::to_owned)
+        .or_else(|| env("GH_REPO"))
+        .or_else(|| env("GITHUB_REPOSITORY"))
+        .ok_or_else(|| {
+            format!("GitHub {purpose} posting requires --repo, GH_REPO, or GITHUB_REPOSITORY")
+        })
+}
+
+/// Resolves the GitLab project for a post command. `purpose` names the posted
+/// object in the error text, for example "review" or "MR comment".
+fn gitlab_project_id(explicit: Option<&str>, purpose: &str) -> Result<String, String> {
+    gitlab_project_id_from(explicit, purpose, process_env)
+}
+
+fn gitlab_project_id_from(
+    explicit: Option<&str>,
+    purpose: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    explicit
+        .map(str::to_owned)
+        .or_else(|| env("CI_PROJECT_ID"))
+        .ok_or_else(|| format!("GitLab {purpose} posting requires --project-id or CI_PROJECT_ID"))
+}
+
+fn gitlab_token(purpose: &str) -> Result<String, String> {
+    gitlab_token_from(purpose, process_env)
+}
+
+fn gitlab_token_from(
+    purpose: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    env("GITLAB_TOKEN").ok_or_else(|| format!("GitLab {purpose} posting requires GITLAB_TOKEN"))
+}
+
+fn gitlab_api_url(explicit: Option<&str>) -> String {
+    explicit
+        .map(str::to_owned)
+        .or_else(|| std::env::var("CI_API_V4_URL").ok())
+        .unwrap_or_else(|| "https://gitlab.com/api/v4".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
 fn github_get_json(agent: &ureq::Agent, url: &str, token: &str) -> Result<Value, String> {
     with_rate_limit_retry("GitHub", || {
         agent
@@ -1961,13 +2097,45 @@ fn github_patch_json(
 }
 
 fn gitlab_get_json(agent: &ureq::Agent, url: &str, token: &str) -> Result<Value, String> {
-    with_rate_limit_retry("GitLab", || {
-        agent
-            .get(url)
-            .header("PRIVATE-TOKEN", token)
-            .header("User-Agent", "fallow-cli")
-            .call()
-    })
+    gitlab_get_page(agent, url, token).map(|(value, _)| value)
+}
+
+/// GET one page of a GitLab list endpoint. The flag is `x-next-page` read as
+/// "another page follows", or `None` when the header is missing.
+fn gitlab_get_page(
+    agent: &ureq::Agent,
+    url: &str,
+    token: &str,
+) -> Result<(Value, Option<bool>), String> {
+    with_retryable_response(
+        "GitLab",
+        should_retry_status,
+        || {
+            agent
+                .get(url)
+                .header("PRIVATE-TOKEN", token)
+                .header("User-Agent", "fallow-cli")
+                .call()
+        },
+        |response| {
+            let next_page = response
+                .headers()
+                .get("x-next-page")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| !value.trim().is_empty());
+            read_json_response(response, "GitLab").map(|value| (value, next_page))
+        },
+    )
+}
+
+/// Page size for every paginated GitLab list request.
+const GITLAB_PER_PAGE: usize = 100;
+
+/// GitLab drops items the token cannot see after slicing a page, so a short
+/// page is not the last one. Trust `x-next-page`; fall back to page size only
+/// when the header is missing.
+fn gitlab_has_more_pages(next_page: Option<bool>, page_len: usize) -> bool {
+    next_page.unwrap_or(page_len >= GITLAB_PER_PAGE)
 }
 
 /// POST a non-idempotent GitLab creation without retrying ambiguous gateway
@@ -2046,10 +2214,26 @@ where
     with_retryable_status(provider, should_retry_status, op)
 }
 
-fn with_retryable_status<F, P>(provider: &str, should_retry: P, mut op: F) -> Result<Value, String>
+fn with_retryable_status<F, P>(provider: &str, should_retry: P, op: F) -> Result<Value, String>
 where
     F: FnMut() -> Result<http::Response<ureq::Body>, ureq::Error>,
     P: Fn(u16) -> bool,
+{
+    with_retryable_response(provider, should_retry, op, |response| {
+        read_json_response(response, provider)
+    })
+}
+
+fn with_retryable_response<F, P, R, T>(
+    provider: &str,
+    should_retry: P,
+    mut op: F,
+    read: R,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<http::Response<ureq::Body>, ureq::Error>,
+    P: Fn(u16) -> bool,
+    R: FnOnce(&mut http::Response<ureq::Body>) -> Result<T, String>,
 {
     let max_attempts = retries_from_env();
     let floor_delay = retry_delay_from_env();
@@ -2072,7 +2256,7 @@ where
                     std::thread::sleep(std::time::Duration::from_secs(wait));
                     continue;
                 }
-                return read_json_response(&mut response, provider);
+                return read(&mut response);
             }
             Err(e) => {
                 return Err(sanitize_network_error(&format!(
@@ -2145,6 +2329,30 @@ fn read_json_response(
         .map_err(|e| format!("{provider} response was not valid JSON: {e}"))
 }
 
+/// Resolved `FALLOW_BOT_LOGIN` state, read once per provider load and threaded
+/// down to the ownership checks.
+///
+/// The three cases are behaviorally distinct and cannot collapse into an
+/// `Option`: an unset variable falls back to native bot metadata, a
+/// non-unicode value trusts nothing, and a set value narrows ownership to that
+/// exact login (an empty or whitespace-only one trusting nothing).
+#[derive(Clone, Copy)]
+enum BotLogin<'a> {
+    Unset,
+    NonUnicode,
+    Configured(&'a str),
+}
+
+impl<'a> BotLogin<'a> {
+    fn from_var(var: &'a Result<String, std::env::VarError>) -> Self {
+        match var {
+            Ok(value) => Self::Configured(value),
+            Err(std::env::VarError::NotUnicode(_)) => Self::NonUnicode,
+            Err(std::env::VarError::NotPresent) => Self::Unset,
+        }
+    }
+}
+
 /// Determine whether a GitHub PR review comment was authored by a bot account.
 ///
 /// We trust resolved-fingerprint markers only from bot identities so a human
@@ -2156,16 +2364,16 @@ fn read_json_response(
 /// is the compatibility trust boundary. Setting `FALLOW_BOT_LOGIN` narrows
 /// ownership to that exact posting login and also supports PAT-backed human
 /// accounts that lack native bot metadata.
-fn is_github_bot_comment(comment: &Value) -> bool {
+fn is_github_bot_comment(comment: &Value, bot_login: BotLogin<'_>) -> bool {
     let user = comment.get("user");
     let login = user.and_then(|u| u.get("login")).and_then(Value::as_str);
-    match std::env::var("FALLOW_BOT_LOGIN") {
-        Ok(allow) => {
+    match bot_login {
+        BotLogin::Configured(allow) => {
             let allow = allow.trim();
             return !allow.is_empty() && login == Some(allow);
         }
-        Err(std::env::VarError::NotUnicode(_)) => return false,
-        Err(std::env::VarError::NotPresent) => {}
+        BotLogin::NonUnicode => return false,
+        BotLogin::Unset => {}
     }
     user.and_then(|u| u.get("type")).and_then(Value::as_str) == Some("Bot")
 }
@@ -2175,18 +2383,22 @@ fn is_github_bot_comment(comment: &Value) -> bool {
 /// Without an explicit login, GitLab's native bot metadata and the identity
 /// returned for the authenticated token are trusted. Setting
 /// `FALLOW_BOT_LOGIN` narrows ownership to that exact username.
-fn is_gitlab_bot_note(note: &Value, authenticated_user: Option<&GitlabAuthenticatedUser>) -> bool {
+fn is_gitlab_bot_note(
+    note: &Value,
+    authenticated_user: Option<&GitlabAuthenticatedUser>,
+    bot_login: BotLogin<'_>,
+) -> bool {
     let author = note.get("author");
     let username = author
         .and_then(|a| a.get("username"))
         .and_then(Value::as_str);
-    match std::env::var("FALLOW_BOT_LOGIN") {
-        Ok(allow) => {
+    match bot_login {
+        BotLogin::Configured(allow) => {
             let allow = allow.trim();
             return !allow.is_empty() && username == Some(allow);
         }
-        Err(std::env::VarError::NotUnicode(_)) => return false,
-        Err(std::env::VarError::NotPresent) => {}
+        BotLogin::NonUnicode => return false,
+        BotLogin::Unset => {}
     }
     if gitlab_note_has_native_bot_metadata(note) {
         return true;
@@ -2275,17 +2487,21 @@ fn parse_resolution_marker(body: &str) -> Result<Option<String>, String> {
     Ok(found)
 }
 
-/// Extract a fallow fingerprint from any v1 or v2 marker shape in `body`.
-/// v2 (`<!-- fallow-fingerprint:v2: <fp> -->`) wins over v1 because the v2
-/// marker's text also matches the v1 substring search, so the v2-first
-/// check has to run first or the v1 fallback would skip past `v2:` and
-/// return the literal `"v2:"` as the extracted fingerprint.
+/// Extract a fallow fingerprint from any v1, v2 or v3 marker shape in `body`.
+/// The versioned shapes (`<!-- fallow-fingerprint:v3: <fp> -->`) win over v1
+/// because their text also matches the v1 substring search. The versioned
+/// checks have to run first, or the v1 fallback would return the literal
+/// `"v3:"` as the extracted fingerprint.
 ///
 /// Returns the raw fingerprint string with any kind prefix preserved
 /// (`merged:<hex>` stays `merged:<hex>`). Consumers match the returned
-/// string against the comment's `fingerprint` field verbatim.
+/// string against the comment's `fingerprint` field verbatim, and against its
+/// `legacy_fingerprint` field for a v1 or v2 marker that an older release
+/// wrote. A v3 fingerprint and a legacy fingerprint are both 64-bit hashes,
+/// so one lookup set holds both without a real risk of collision.
 fn extract_fallow_fingerprint(body: &str) -> Option<String> {
-    extract_marker(body, "fallow-fingerprint:v2:")
+    extract_marker(body, "fallow-fingerprint:v3:")
+        .or_else(|| extract_marker(body, "fallow-fingerprint:v2:"))
         .or_else(|| extract_marker(body, "fallow-fingerprint:"))
 }
 
@@ -2349,6 +2565,24 @@ mod tests {
     }
 
     #[test]
+    fn extracts_fingerprint_from_v3_marker() {
+        assert_eq!(
+            extract_fallow_fingerprint(
+                "**error**\n\n<!-- fallow-fingerprint:v3: abc1234567890def -->"
+            )
+            .as_deref(),
+            Some("abc1234567890def")
+        );
+        assert_eq!(
+            extract_fallow_fingerprint(
+                "**error**\n\n<!-- fallow-fingerprint:v3: merged:0123456789abcdef -->"
+            )
+            .as_deref(),
+            Some("merged:0123456789abcdef")
+        );
+    }
+
+    #[test]
     fn extract_fallow_fingerprint_falls_back_to_v1_shape() {
         assert_eq!(
             extract_fallow_fingerprint("**error**\n\n<!-- fallow-fingerprint: abc123 -->")
@@ -2370,7 +2604,7 @@ mod tests {
     fn computes_reconcile_sets() {
         let current = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
         let existing = BTreeSet::from(["b".to_owned(), "c".to_owned()]);
-        let plan = reconcile_sets(&current, &existing);
+        let plan = reconcile_sets(&current, &BTreeMap::new(), &existing);
         assert_eq!(plan.new, vec!["a"]);
         assert_eq!(plan.stale, vec!["c"]);
     }
@@ -2499,79 +2733,50 @@ mod tests {
 
     #[test]
     fn github_bot_check_accepts_bot_user_type() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let comment = serde_json::json!({
             "user": { "type": "Bot", "login": "github-actions[bot]" },
         });
-        assert!(is_github_bot_comment(&comment));
+        assert!(is_github_bot_comment(&comment, BotLogin::Unset));
     }
 
     #[test]
     fn github_bot_check_rejects_human_user_type() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let comment = serde_json::json!({
             "user": { "type": "User", "login": "alice" },
             "body": "<!-- fallow-resolved-fingerprint: abc123 -->",
         });
-        assert!(!is_github_bot_comment(&comment));
+        assert!(!is_github_bot_comment(&comment, BotLogin::Unset));
     }
 
-    // Serializes the FALLOW_BOT_LOGIN env-mutating tests so the GitHub and
-    // GitLab override cases cannot overwrite each other's value when run in
-    // parallel (which raced and failed on Windows CI).
-    static BOT_LOGIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    #[allow(
-        unsafe_code,
-        reason = "test-only env mutation, serialized via BOT_LOGIN_ENV_LOCK"
-    )]
     fn github_bot_check_accepts_explicit_login_override() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let comment = serde_json::json!({
             "user": { "type": "User", "login": "fallow-bot-account" },
         });
-        // SAFETY: serialized by BOT_LOGIN_ENV_LOCK; cleared before returning.
-        unsafe {
-            std::env::set_var("FALLOW_BOT_LOGIN", "fallow-bot-account");
-        }
-        assert!(is_github_bot_comment(&comment));
-        // SAFETY: Restore the process environment after the scoped override.
-        unsafe {
-            std::env::remove_var("FALLOW_BOT_LOGIN");
-        }
+        assert!(is_github_bot_comment(
+            &comment,
+            BotLogin::Configured("fallow-bot-account")
+        ));
     }
 
     #[test]
     fn gitlab_bot_check_accepts_system_and_bot_flag() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let system_note = serde_json::json!({ "system": true });
-        assert!(is_gitlab_bot_note(&system_note, None));
+        assert!(is_gitlab_bot_note(&system_note, None, BotLogin::Unset));
         let bot_author = serde_json::json!({
             "system": false,
             "author": { "bot": true, "username": "project-bot" },
         });
-        assert!(is_gitlab_bot_note(&bot_author, None));
+        assert!(is_gitlab_bot_note(&bot_author, None, BotLogin::Unset));
     }
 
     #[test]
     fn gitlab_bot_check_rejects_human_author() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let human = serde_json::json!({
             "system": false,
             "author": { "bot": false, "username": "alice" },
         });
-        assert!(!is_gitlab_bot_note(&human, None));
+        assert!(!is_gitlab_bot_note(&human, None, BotLogin::Unset));
     }
 
     #[test]
@@ -2717,6 +2922,69 @@ mod tests {
         assert_eq!(envelope_comments_len(&value), 0);
     }
 
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn github_repo_missing_error_names_the_purpose() {
+        assert_eq!(
+            github_repo_from(None, "review", no_env).unwrap_err(),
+            "GitHub review posting requires --repo, GH_REPO, or GITHUB_REPOSITORY"
+        );
+        assert_eq!(
+            github_repo_from(None, "PR comment", no_env).unwrap_err(),
+            "GitHub PR comment posting requires --repo, GH_REPO, or GITHUB_REPOSITORY"
+        );
+    }
+
+    #[test]
+    fn github_repo_prefers_explicit_then_gh_repo_then_github_repository() {
+        let env = |name: &str| match name {
+            "GH_REPO" => Some("gh/repo".to_owned()),
+            "GITHUB_REPOSITORY" => Some("github/repository".to_owned()),
+            _ => None,
+        };
+        assert_eq!(
+            github_repo_from(Some("explicit/repo"), "review", env).as_deref(),
+            Ok("explicit/repo")
+        );
+        assert_eq!(
+            github_repo_from(None, "review", env).as_deref(),
+            Ok("gh/repo")
+        );
+        let only_actions =
+            |name: &str| (name == "GITHUB_REPOSITORY").then(|| "github/repository".to_owned());
+        assert_eq!(
+            github_repo_from(None, "review", only_actions).as_deref(),
+            Ok("github/repository")
+        );
+    }
+
+    #[test]
+    fn gitlab_project_id_missing_error_names_the_purpose() {
+        assert_eq!(
+            gitlab_project_id_from(None, "review", no_env).unwrap_err(),
+            "GitLab review posting requires --project-id or CI_PROJECT_ID"
+        );
+        assert_eq!(
+            gitlab_project_id_from(None, "MR comment", no_env).unwrap_err(),
+            "GitLab MR comment posting requires --project-id or CI_PROJECT_ID"
+        );
+    }
+
+    #[test]
+    fn gitlab_token_missing_error_names_the_purpose() {
+        assert_eq!(
+            gitlab_token_from("review", no_env).unwrap_err(),
+            "GitLab review posting requires GITLAB_TOKEN"
+        );
+        assert_eq!(
+            gitlab_token_from("MR comment", no_env).unwrap_err(),
+            "GitLab MR comment posting requires GITLAB_TOKEN"
+        );
+    }
+
     // --- extract_fallow_fingerprint: v2-first ordering (lines 1376-1388) ---
 
     #[test]
@@ -2791,7 +3059,7 @@ mod tests {
     #[test]
     fn reconcile_sets_with_all_overlap_produces_empty_new_and_stale() {
         let fps = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
-        let plan = reconcile_sets(&fps, &fps);
+        let plan = reconcile_sets(&fps, &BTreeMap::new(), &fps);
         assert!(plan.new.is_empty());
         assert!(plan.stale.is_empty());
         assert_eq!(plan.current.len(), 2);
@@ -2802,7 +3070,7 @@ mod tests {
     fn reconcile_sets_with_disjoint_sets_marks_all_current_new_and_all_existing_stale() {
         let current = BTreeSet::from(["c1".to_owned(), "c2".to_owned()]);
         let existing = BTreeSet::from(["e1".to_owned(), "e2".to_owned()]);
-        let plan = reconcile_sets(&current, &existing);
+        let plan = reconcile_sets(&current, &BTreeMap::new(), &existing);
         assert_eq!(plan.new, vec!["c1", "c2"]);
         assert_eq!(plan.stale, vec!["e1", "e2"]);
     }
@@ -2811,7 +3079,7 @@ mod tests {
     fn reconcile_sets_with_empty_current_marks_all_existing_stale() {
         let current = BTreeSet::new();
         let existing = BTreeSet::from(["old".to_owned()]);
-        let plan = reconcile_sets(&current, &existing);
+        let plan = reconcile_sets(&current, &BTreeMap::new(), &existing);
         assert!(plan.new.is_empty());
         assert_eq!(plan.stale, vec!["old"]);
     }
@@ -2820,7 +3088,7 @@ mod tests {
     fn reconcile_sets_with_empty_existing_marks_all_current_new() {
         let current = BTreeSet::from(["new-fp".to_owned()]);
         let existing = BTreeSet::new();
-        let plan = reconcile_sets(&current, &existing);
+        let plan = reconcile_sets(&current, &BTreeMap::new(), &existing);
         assert_eq!(plan.new, vec!["new-fp"]);
         assert!(plan.stale.is_empty());
     }
@@ -2920,6 +3188,7 @@ mod tests {
             }),
             None,
             0,
+            BotLogin::Unset,
         )
         .unwrap();
         collect_github_thread_fingerprints(&mut state, &thread, None).unwrap();
@@ -2963,6 +3232,7 @@ mod tests {
             }),
             None,
             0,
+            BotLogin::Unset,
         )
         .unwrap();
         collect_github_thread_fingerprints(&mut state, &thread, None).unwrap();
@@ -2988,6 +3258,7 @@ mod tests {
             }),
             None,
             0,
+            BotLogin::Unset,
         )
         .unwrap();
         record_github_resolution_marker(
@@ -3000,6 +3271,7 @@ mod tests {
             }),
             None,
             1,
+            BotLogin::Unset,
         )
         .unwrap();
         finalize_github_state(&mut state);
@@ -3021,6 +3293,7 @@ mod tests {
             }),
             None,
             1,
+            BotLogin::Unset,
         )
         .unwrap_err();
 
@@ -3041,6 +3314,7 @@ mod tests {
             }),
             None,
             1,
+            BotLogin::Unset,
         )
         .unwrap_err();
 
@@ -3072,8 +3346,14 @@ mod tests {
             ]
         });
         let mut state = ProviderState::default();
-        let error = collect_gitlab_discussion_fingerprints(&mut state, &discussion, None, None)
-            .unwrap_err();
+        let error = collect_gitlab_discussion_fingerprints(
+            &mut state,
+            &discussion,
+            None,
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap_err();
         assert!(error.contains("string id"));
         assert!(state.fingerprints.is_empty());
     }
@@ -3087,7 +3367,14 @@ mod tests {
             ]
         });
         let mut state = ProviderState::default();
-        collect_gitlab_discussion_fingerprints(&mut state, &discussion, None, None).unwrap();
+        collect_gitlab_discussion_fingerprints(
+            &mut state,
+            &discussion,
+            None,
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap();
         assert!(state.fingerprints.contains("fp-gitlab"));
         let lifecycle = &state.gitlab_discussions_by_fingerprint["fp-gitlab"][0];
         assert_eq!(lifecycle.discussion_id, "disc-99");
@@ -3107,7 +3394,14 @@ mod tests {
             ]
         });
         let mut state = ProviderState::default();
-        collect_gitlab_discussion_fingerprints(&mut state, &discussion, None, None).unwrap();
+        collect_gitlab_discussion_fingerprints(
+            &mut state,
+            &discussion,
+            None,
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap();
         assert!(state.gitlab_discussions_by_fingerprint["fp-resolved"][0].has_resolution_marker);
     }
 
@@ -3125,7 +3419,14 @@ mod tests {
             ]
         });
         let mut state = ProviderState::default();
-        collect_gitlab_discussion_fingerprints(&mut state, &discussion, None, None).unwrap();
+        collect_gitlab_discussion_fingerprints(
+            &mut state,
+            &discussion,
+            None,
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap();
         assert!(!state.gitlab_discussions_by_fingerprint["fp-human"][0].has_resolution_marker);
     }
 
@@ -3137,6 +3438,7 @@ mod tests {
             &serde_json::json!({ "id": "disc-empty", "notes": [] }),
             None,
             None,
+            BotLogin::Unset,
         )
         .unwrap_err();
 
@@ -3157,6 +3459,7 @@ mod tests {
             }),
             None,
             None,
+            BotLogin::Unset,
         )
         .unwrap_err();
 
@@ -3428,95 +3731,90 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        unsafe_code,
-        reason = "test-only env mutation, serialized via BOT_LOGIN_ENV_LOCK"
-    )]
     fn empty_configured_bot_login_trusts_no_native_bot() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: serialized by BOT_LOGIN_ENV_LOCK; cleared before returning.
-        unsafe {
-            std::env::set_var("FALLOW_BOT_LOGIN", "   ");
-        }
-        assert!(!is_github_bot_comment(&serde_json::json!({
-            "user": { "type": "Bot", "login": "foreign[bot]" }
-        })));
+        assert!(!is_github_bot_comment(
+            &serde_json::json!({
+                "user": { "type": "Bot", "login": "foreign[bot]" }
+            }),
+            BotLogin::Configured("   ")
+        ));
         assert!(!is_gitlab_bot_note(
             &serde_json::json!({
                 "system": false,
                 "author": { "bot": true, "username": "foreign-bot" }
             }),
-            None
+            None,
+            BotLogin::Configured("   ")
         ));
-        // SAFETY: Restore the process environment after the scoped override.
-        unsafe {
-            std::env::remove_var("FALLOW_BOT_LOGIN");
-        }
+    }
+
+    #[test]
+    fn non_unicode_bot_login_trusts_no_native_bot() {
+        assert!(!is_github_bot_comment(
+            &serde_json::json!({
+                "user": { "type": "Bot", "login": "foreign[bot]" }
+            }),
+            BotLogin::NonUnicode
+        ));
+        assert!(!is_gitlab_bot_note(
+            &serde_json::json!({
+                "system": true,
+                "author": { "bot": true, "username": "foreign-bot" }
+            }),
+            None,
+            BotLogin::NonUnicode
+        ));
     }
 
     // --- is_github_bot_comment: missing branch (line 1323-1331) ---
 
     #[test]
     fn github_bot_check_returns_false_when_no_user_field() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let comment = serde_json::json!({ "body": "no user" });
-        assert!(!is_github_bot_comment(&comment));
+        assert!(!is_github_bot_comment(&comment, BotLogin::Unset));
     }
 
     #[test]
     fn github_bot_check_returns_false_when_fallow_bot_login_not_set_and_type_not_bot() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let comment = serde_json::json!({
             "user": { "type": "User", "login": "someperson" },
         });
-        assert!(!is_github_bot_comment(&comment));
+        assert!(!is_github_bot_comment(&comment, BotLogin::Unset));
     }
 
     // --- is_gitlab_bot_note: FALLOW_BOT_LOGIN path (lines 1356-1364) ---
 
     #[test]
-    #[allow(
-        unsafe_code,
-        reason = "test-only env mutation, serialized via BOT_LOGIN_ENV_LOCK"
-    )]
     fn gitlab_bot_check_accepts_explicit_login_override() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let note = serde_json::json!({
             "system": false,
             "author": { "bot": false, "username": "fallow-gl-bot" },
         });
-        // SAFETY: serialized by BOT_LOGIN_ENV_LOCK; cleared before returning.
-        unsafe {
-            std::env::set_var("FALLOW_BOT_LOGIN", "fallow-gl-bot");
-        }
-        assert!(is_gitlab_bot_note(&note, None));
-        // SAFETY: Restore the process environment after the scoped override.
-        unsafe {
-            std::env::remove_var("FALLOW_BOT_LOGIN");
-        }
+        assert!(is_gitlab_bot_note(
+            &note,
+            None,
+            BotLogin::Configured("fallow-gl-bot")
+        ));
     }
 
     #[test]
     fn gitlab_bot_check_returns_false_when_bot_flag_is_false_and_no_login_override() {
-        let _env = BOT_LOGIN_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let note = serde_json::json!({
             "system": false,
             "author": { "bot": false, "username": "contributor" },
         });
-        assert!(!is_gitlab_bot_note(&note, None));
+        assert!(!is_gitlab_bot_note(&note, None, BotLogin::Unset));
     }
 
     // --- read_json_response: non-2xx path (lines 1288-1303) ---
+
+    #[test]
+    fn gitlab_has_more_pages_trusts_next_page_header_over_page_size() {
+        assert!(gitlab_has_more_pages(Some(true), 99));
+        assert!(!gitlab_has_more_pages(Some(false), 100));
+        assert!(gitlab_has_more_pages(None, 100));
+        assert!(!gitlab_has_more_pages(None, 99));
+    }
 
     #[test]
     fn read_json_response_error_on_non_2xx_status() {
@@ -3559,6 +3857,10 @@ mod tests {
                 200
             }
 
+            #[expect(
+                clippy::unwrap_in_result,
+                reason = "test helper: a panic fails the test"
+            )]
             fn read_json<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, ureq::Error> {
                 // Serialize to string and back to produce the generic T
                 let s = serde_json::to_string(&self.body).unwrap();
@@ -3627,9 +3929,77 @@ mod tests {
         let mut state = ProviderState::default();
         state.fingerprints.insert("fp-shared".to_owned());
         state.fingerprints.insert("fp-stale".to_owned());
-        let planned = PlannedReconcile::new(&current, &state);
+        let planned = PlannedReconcile::new(&current, &BTreeMap::new(), &state);
         assert_eq!(planned.plan.new, vec!["fp-new"]);
         assert_eq!(planned.plan.stale, vec!["fp-stale"]);
+    }
+
+    /// The first run after an upgrade: an open thread carries the v2 marker
+    /// with the line-based fingerprint. The envelope maps that value to the
+    /// new fingerprint of the same finding, so the thread is not stale and
+    /// the finding is not new. A v2 thread for a finding that went away is
+    /// still stale.
+    #[test]
+    fn a_v2_thread_matches_its_finding_through_the_legacy_fingerprint() {
+        let envelope = serde_json::json!({
+            "comments": [
+                {
+                    "body": "<!-- fallow-fingerprint:v3: 0123456789abcdef -->",
+                    "fingerprint": "0123456789abcdef",
+                    "legacy_fingerprint": "fedcba9876543210"
+                },
+                {
+                    "body": "<!-- fallow-fingerprint:v3: 1111111111111111 -->",
+                    "fingerprint": "1111111111111111"
+                }
+            ]
+        });
+        let mut state = ProviderState::default();
+        for body in [
+            "<!-- fallow-fingerprint:v2: fedcba9876543210 -->",
+            "<!-- fallow-fingerprint:v2: 1111111111111111 -->",
+            "<!-- fallow-fingerprint:v2: 9999999999999999 -->",
+        ] {
+            state
+                .fingerprints
+                .insert(extract_fallow_fingerprint(body).expect("marker parses"));
+        }
+
+        let planned = PlannedReconcile::new(
+            &envelope_fingerprints(&envelope),
+            &envelope_legacy_fingerprints(&envelope),
+            &state,
+        );
+
+        assert!(planned.plan.new.is_empty(), "{:?}", planned.plan.new);
+        assert_eq!(planned.plan.stale, vec!["9999999999999999"]);
+    }
+
+    /// After the legacy window, a line shift gives a new legacy value but the
+    /// same v3 fingerprint, so a v3 thread stays matched.
+    #[test]
+    fn a_v3_thread_survives_a_line_shift() {
+        let envelope = serde_json::json!({
+            "comments": [{
+                "body": "<!-- fallow-fingerprint:v3: 0123456789abcdef -->",
+                "fingerprint": "0123456789abcdef",
+                "legacy_fingerprint": "aaaaaaaaaaaaaaaa"
+            }]
+        });
+        let mut state = ProviderState::default();
+        state.fingerprints.insert(
+            extract_fallow_fingerprint("<!-- fallow-fingerprint:v3: 0123456789abcdef -->")
+                .expect("marker parses"),
+        );
+
+        let planned = PlannedReconcile::new(
+            &envelope_fingerprints(&envelope),
+            &envelope_legacy_fingerprints(&envelope),
+            &state,
+        );
+
+        assert!(planned.plan.new.is_empty());
+        assert!(planned.plan.stale.is_empty());
     }
 
     // --- require_target (lines 1093-1097) ---
@@ -3693,8 +4063,22 @@ mod tests {
         });
         let mut state = ProviderState::default();
 
-        record_github_review_root(&mut state, &frontend_comment, Some(&frontend), 0).unwrap();
-        record_github_review_root(&mut state, &backend_comment, Some(&frontend), 1).unwrap();
+        record_github_review_root(
+            &mut state,
+            &frontend_comment,
+            Some(&frontend),
+            0,
+            BotLogin::Unset,
+        )
+        .unwrap();
+        record_github_review_root(
+            &mut state,
+            &backend_comment,
+            Some(&frontend),
+            1,
+            BotLogin::Unset,
+        )
+        .unwrap();
 
         assert_eq!(
             state.github_discussions_by_fingerprint["abcdef0123456789"][0].comment_id,
@@ -3723,8 +4107,8 @@ mod tests {
         });
         let mut state = ProviderState::default();
 
-        record_github_review_root(&mut state, &scoped, None, 0).unwrap();
-        record_github_review_root(&mut state, &reply, None, 1).unwrap();
+        record_github_review_root(&mut state, &scoped, None, 0, BotLogin::Unset).unwrap();
+        record_github_review_root(&mut state, &reply, None, 1, BotLogin::Unset).unwrap();
 
         assert!(state.fingerprints.is_empty());
     }
@@ -3749,9 +4133,22 @@ mod tests {
         let mut scoped = ProviderState::default();
         let mut unscoped = ProviderState::default();
 
-        collect_gitlab_discussion_fingerprints(&mut scoped, &discussion, Some(&frontend), None)
-            .unwrap();
-        collect_gitlab_discussion_fingerprints(&mut unscoped, &discussion, None, None).unwrap();
+        collect_gitlab_discussion_fingerprints(
+            &mut scoped,
+            &discussion,
+            Some(&frontend),
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap();
+        collect_gitlab_discussion_fingerprints(
+            &mut unscoped,
+            &discussion,
+            None,
+            None,
+            BotLogin::Unset,
+        )
+        .unwrap();
 
         assert!(!scoped.fingerprints.contains("abcdef0123456789"));
         assert!(

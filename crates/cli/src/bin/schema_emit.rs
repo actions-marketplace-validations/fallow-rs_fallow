@@ -34,34 +34,37 @@ use fallow_api::{
 };
 use fallow_config::{AuthoredRule, LogicalGroup, LogicalGroupStatus};
 use fallow_output::{
-    AcceptedJudgment, AgentSchema, AuditCommand, BoundariesListRule, BoundariesListZone,
-    ChangeAnchor, CheckGroupedEntry, CheckGroupedOutput, CheckOutput, ComplexityViolation,
-    ConfidenceFlag, ContainmentEvent, ContributorEntry, ContributorIdentifierFormat,
-    CoverageAnalyzeOutput, CoverageAnalyzeSchemaVersion, CoverageGapSummary, CoverageGaps,
-    CoverageModel, CoverageSetupFileToEdit, CoverageSetupFramework, CoverageSetupMember,
-    CoverageSetupOutput, CoverageSetupPackageManager, CoverageSetupRuntimeTarget,
-    CoverageSetupSchemaVersion, CoverageSetupSnippet, CoverageTier, CrossRepoImpactReport,
-    CrossRepoImpactSchemaVersion, CrossRepoProjectEntry, CrossRepoTotals, Decision, DecisionAction,
-    DecisionActionType, DecisionCategory, DecisionSurface, DecisionSurfaceOutput,
-    DecisionSurfaceSchemaVersion, DecisionWithActions, DiffTriage, DirectionUnit, DupesOutput,
-    EnabledSource, ExceededThreshold, ExplainOutput, FileHealthScore, FindingSeverity, FocusLabel,
-    FocusMap, FocusScore, FocusUnit, GitHubReviewComment, GitHubReviewSide, GitLabReviewComment,
-    GitLabReviewPosition, GitLabReviewPositionType, GraphFacts, GroupByMode, HealthActionsMeta,
-    HealthGroup, HealthOutput, HealthReport, HealthScore, HealthScorePenalties, HealthSummary,
-    HealthTrend, HotspotEntry, HotspotFinding, HotspotSummary, ImpactCounts, ImpactReport,
-    ImpactReportSchemaVersion, ImpactTrendDirection, InspectEvidence, InspectEvidenceScope,
-    InspectEvidenceSection, InspectFileIdentity, InspectIdentity, InspectOutput,
-    InspectSectionStatus, InspectSymbolIdentity, InspectTargetDescriptor, LargeFunctionEntry,
-    OwnershipMetrics, RecommendationCategory, RefactoringTarget, RefactoringTargetFinding,
-    RejectedJudgment, ResolutionEvent, ReviewBriefSchemaVersion, ReviewCheckConclusion,
-    ReviewComment, ReviewDirection, ReviewEffort, ReviewEnvelopeEvent, ReviewEnvelopeSchema,
-    ReviewEnvelopeSummary, ReviewEnvelopeWireOutput, ReviewProvider, ReviewReconcileOutput,
-    ReviewReconcileSchema, RiskClass, RiskProfile, RuntimeCoverageReport, SecurityBlindSpotFile,
-    SecurityBlindSpotGroup, SecurityBlindSpotsOutput, SecurityBlindSpotsSchemaVersion,
-    SecurityBlindSpotsSummary, SecurityGateVerdict, SecurityReachabilityCounts,
-    SecurityRuntimeStateCounts, SecuritySchemaVersion, SecuritySeverityCounts, SecuritySummary,
-    SecuritySurvivor, SecuritySurvivorsOutput, SecuritySurvivorsSchemaVersion,
-    SecuritySurvivorsSummary, SecurityUnresolvedCalleeDiagnostics,
+    AcceptedJudgment, AgentSchema, ArchitectureSchemaVersion, AuditCommand, BoundariesListRule,
+    BoundariesListZone, ChangeAnchor, CheckGroupedEntry, CheckGroupedOutput, CheckOutput,
+    ComplexityViolation, ConfidenceFlag, ContainmentEvent, ContributorEntry,
+    ContributorIdentifierFormat, CoverageAnalyzeOutput, CoverageAnalyzeSchemaVersion,
+    CoverageGapSummary, CoverageGaps, CoverageModel, CoverageSetupFileToEdit,
+    CoverageSetupFramework, CoverageSetupMember, CoverageSetupOutput, CoverageSetupPackageManager,
+    CoverageSetupRuntimeTarget, CoverageSetupSchemaVersion, CoverageSetupSnippet, CoverageTier,
+    CrossRepoImpactReport, CrossRepoImpactSchemaVersion, CrossRepoProjectEntry, CrossRepoTotals,
+    Decision, DecisionAction, DecisionActionType, DecisionCategory, DecisionSurface,
+    DecisionSurfaceOutput, DecisionSurfaceSchemaVersion, DecisionWithActions, DiffTriage,
+    DirectionUnit, DoctorCheck, DoctorCheckCategory, DoctorCheckId, DoctorCheckStatus,
+    DoctorOutput, DoctorRemediation, DoctorStatus, DoctorSummary, DupesOutput, EnabledSource,
+    ExceededThreshold, ExplainOutput, FileHealthScore, FindingSeverity, FocusLabel, FocusMap,
+    FocusScore, FocusUnit, GateName, GateOutcome, GateStatus, GitHubReviewComment,
+    GitHubReviewSide, GitLabReviewComment, GitLabReviewPosition, GitLabReviewPositionType,
+    GraphFacts, GroupByMode, HealthActionsMeta, HealthGroup, HealthOutput, HealthReport,
+    HealthScore, HealthScorePenalties, HealthSummary, HealthTrend, HotspotEntry, HotspotFinding,
+    HotspotSummary, ImpactCounts, ImpactReport, ImpactReportSchemaVersion, ImpactTrendDirection,
+    InspectEvidence, InspectEvidenceScope, InspectEvidenceSection, InspectFileIdentity,
+    InspectIdentity, InspectOutput, InspectSectionStatus, InspectSymbolIdentity,
+    InspectTargetDescriptor, LargeFunctionEntry, MutationInspectOutput, MutationPlanOutput,
+    MutationReport, MutationVerdictInput, OwnershipMetrics, RecommendationCategory,
+    RefactoringTarget, RefactoringTargetFinding, RejectedJudgment, RequestName, ResolutionEvent,
+    ReviewBriefSchemaVersion, ReviewCheckConclusion, ReviewComment, ReviewDirection, ReviewEffort,
+    ReviewEnvelopeEvent, ReviewEnvelopeSchema, ReviewEnvelopeSummary, ReviewEnvelopeWireOutput,
+    ReviewProvider, ReviewReconcileOutput, ReviewReconcileSchema, RiskClass, RiskProfile,
+    RuntimeCoverageReport, SecurityBlindSpotFile, SecurityBlindSpotGroup, SecurityBlindSpotsOutput,
+    SecurityBlindSpotsSchemaVersion, SecurityBlindSpotsSummary, SecurityGateVerdict,
+    SecurityReachabilityCounts, SecurityRuntimeStateCounts, SecuritySchemaVersion,
+    SecuritySeverityCounts, SecuritySummary, SecuritySurvivor, SecuritySurvivorsOutput,
+    SecuritySurvivorsSchemaVersion, SecuritySurvivorsSummary, SecurityUnresolvedCalleeDiagnostics,
     SecurityUnresolvedCalleeReasonCount, SecurityUnresolvedCalleeSample,
     SecurityUnresolvedCalleeTopFile, SecurityVerifierVerdict, SecurityVerifierVerdictStatus,
     SimilarCodeCacheClearOutput, SimilarCodeCacheClearSchemaVersion, SimilarCodeInspectOutput,
@@ -178,7 +181,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Argument that prints the similar-code snapshot schema instead of the output
+/// schema. `scripts/generate-all.mjs` writes the result to
+/// `crates/api/similar-code-snapshot-schema.json`.
+const SIMILAR_CODE_SNAPSHOT_FLAG: &str = "--similar-code-snapshot";
+
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some(SIMILAR_CODE_SNAPSHOT_FLAG) {
+        let pretty = serde_json::to_string_pretty(
+            &fallow_output::SimilarCodeCandidateSnapshot::json_schema(),
+        )
+        .map_err(|err| format!("failed to serialize snapshot schema: {err}"))?;
+        println!("{pretty}");
+        return Ok(());
+    }
     let derived = derived_definitions();
     validate_graph_facts_descriptions(&derived)?;
     validate_review_brief_wire_contract(&derived)?;
@@ -342,21 +358,25 @@ const DERIVED_DEFINITION_NAMES: &[&str] = &[
     "SchemaVersion",
     "AuditSchemaVersion",
     "CheckSchemaVersion",
+    "ArchitectureSchemaVersion",
     "CombinedSchemaVersion",
     "DupesSchemaVersion",
     "FeatureFlagsSchemaVersion",
     "HealthSchemaVersion",
+    "DoctorSchemaVersion",
     "TypeAwareStatusSchemaVersion",
     "ToolVersion",
     "RuntimeCoverageAction",
     "RuntimeCoverageBlastRadiusEntry",
     "RuntimeCoverageCaptureQuality",
     "RuntimeCoverageConfidence",
+    "RuntimeCoverageCostBasis",
     "RuntimeCoverageEvidence",
     "RuntimeCoverageFinding",
     "RuntimeCoverageHotPath",
     "RuntimeCoverageImportanceEntry",
     "RuntimeCoverageMessage",
+    "RuntimeCoverageOptimizationTarget",
     "RuntimeCoverageReportVerdict",
     "RuntimeCoverageRiskBand",
     "RuntimeCoverageSignal",
@@ -369,6 +389,8 @@ const DERIVED_DEFINITION_NAMES: &[&str] = &[
     "CheckGroupedEntry",
     "CheckGroupedOutput",
     "CheckOutput",
+    "ArchitectureGroupedOutput",
+    "ArchitectureOutput",
     "CodeClimateIssue",
     "CodeClimateOutput",
     "CombinedOutput",
@@ -428,6 +450,14 @@ const DERIVED_DEFINITION_NAMES: &[&str] = &[
     "ImpactOutput",
     "SemanticSymbolTrace",
     "SemanticSymbolImpact",
+    "DoctorOutput",
+    "DoctorCheck",
+    "DoctorCheckCategory",
+    "DoctorCheckId",
+    "DoctorCheckStatus",
+    "DoctorRemediation",
+    "DoctorStatus",
+    "DoctorSummary",
     "TypeAwareStatusOutput",
     "FallowOutput",
     "BoundariesListLogicalGroup",
@@ -564,6 +594,41 @@ const DERIVED_DEFINITION_NAMES: &[&str] = &[
     "SimilarCodeVerdictMatch",
     "SimilarCodeReviewedCandidate",
     "SimilarCodeReviewProvenance",
+    "MutationReport",
+    "MutationPlanOutput",
+    "MutationInspectOutput",
+    "MutationVerdictInput",
+    "MutationSchemaVersion",
+    "MutationPlanSchemaVersion",
+    "MutationInspectSchemaVersion",
+    "MutationVerdictSchemaVersion",
+    "MutantStatus",
+    "MutationStatusCounts",
+    "MutationCompletion",
+    "MutationCompletionStatus",
+    "MutationIncompleteReason",
+    "MutationScopeKind",
+    "MutationScopeOutput",
+    "MutationRunnerOutput",
+    "MutationRuntimeOutput",
+    "MutantResult",
+    "MutationFunctionResult",
+    "MutationSummary",
+    "MutationBaselineFailure",
+    "MutationSkippedFile",
+    "MutationWorktreeCheck",
+    "MutationRunIssue",
+    "MutationTimings",
+    "MutationPlanFile",
+    "MutationVerdictJoin",
+    "MutationVerdict",
+    "MutationVerdictKind",
+    "MutationPlanDisposition",
+    "MutationPlanMutant",
+    "MutationPlanCountsOutput",
+    "MutationInspectStatus",
+    "MutationStaleReason",
+    "MutationInspectCode",
 ];
 
 pub(crate) fn derived_definition_names() -> &'static [&'static str] {
@@ -619,11 +684,90 @@ fn derived_definitions() -> Map<String, Value> {
     register_security_definitions(&mut generator);
     register_suppression_inventory_definitions(&mut generator);
     register_similar_code_definitions(&mut generator);
+    register_mutation_definitions(&mut generator);
     let _ = generator.subschema_for::<FallowOutput>();
     register_list_boundaries_definitions(&mut generator);
     register_health_action_definitions(&mut generator);
 
-    generator.take_definitions(true)
+    let mut definitions = generator.take_definitions(true);
+    derive_architecture_envelope_definitions(&mut definitions);
+    definitions
+}
+
+/// The architecture envelopes that share the dead-code body:
+/// `(architecture definition, dead-code definition, title, description)`.
+const ARCHITECTURE_ENVELOPE_DEFINITIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "ArchitectureOutput",
+        "CheckOutput",
+        "fallow architecture --format json",
+        "Envelope emitted by `fallow architecture --format json`.\n\nThe body is the `CheckOutput` body of `fallow dead-code`: the same issue arrays, `summary`, `entry_points`, actions and `gate_outcomes`. The architecture arrays (`circular_dependencies`, `re_export_cycles`, `package_cycles`, `boundary_violations`, `boundary_coverage_violations`, `boundary_call_violations`, `policy_violations`) carry the findings. The combined and audit envelopes do not use this envelope; their `check` block stays `CheckOutput`.",
+    ),
+    (
+        "ArchitectureGroupedOutput",
+        "CheckGroupedOutput",
+        "fallow architecture --group-by <owner|directory|package|section> --format json",
+        "Envelope emitted by `fallow architecture --group-by ... --format json`.\n\nThe body is the `CheckGroupedOutput` body of `fallow dead-code`: issues are partitioned into resolver buckets (CODEOWNERS team, directory prefix, workspace package, or GitLab CODEOWNERS section), and each bucket carries the same issue-array shape as `ArchitectureOutput`, plus per-group `key` / `owners` / `total_issues`.",
+    ),
+];
+
+/// Derive the `fallow architecture` envelope definitions from the dead-code
+/// ones.
+///
+/// `fallow architecture` serializes the same `CheckOutput` and
+/// `CheckGroupedOutput` structs, so a clone of the derived schema keeps the
+/// body equal by construction. Only the title, the description and the
+/// `schema_version` reference change. Runs inside [`derived_definitions`], so the emitter and
+/// every drift test see the same definitions.
+fn derive_architecture_envelope_definitions(definitions: &mut Map<String, Value>) {
+    for (architecture, dead_code, title, description) in ARCHITECTURE_ENVELOPE_DEFINITIONS {
+        let Some(mut schema) = definitions.get(*dead_code).cloned() else {
+            continue;
+        };
+        if let Some(object) = schema.as_object_mut() {
+            object.insert("title".to_string(), Value::String((*title).to_string()));
+            object.insert(
+                "description".to_string(),
+                Value::String((*description).to_string()),
+            );
+        }
+        if let Some(version) = schema
+            .pointer_mut("/properties/schema_version")
+            .and_then(Value::as_object_mut)
+        {
+            retarget_schema_version_refs(version);
+            version.insert(
+                "description".to_string(),
+                Value::String(
+                    "Architecture output schema version; currently [`ARCHITECTURE_SCHEMA_VERSION`]. A change to the shared dead-code body bumps this version and the dead-code version together."
+                        .to_string(),
+                ),
+            );
+        }
+        definitions.insert((*architecture).to_string(), schema);
+    }
+}
+
+/// Point every `CheckSchemaVersion` reference in a cloned `schema_version`
+/// property at `ArchitectureSchemaVersion`. The raw generator output can put
+/// the reference in a one-item `allOf`, so the walk covers the whole subtree.
+fn retarget_schema_version_refs(value: &mut Map<String, Value>) {
+    for (key, child) in value.iter_mut() {
+        match child {
+            Value::String(reference) if key == "$ref" => {
+                if let Some(prefix) = reference.strip_suffix("CheckSchemaVersion") {
+                    *reference = format!("{prefix}ArchitectureSchemaVersion");
+                }
+            }
+            Value::Object(map) => retarget_schema_version_refs(map),
+            Value::Array(items) => {
+                for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                    retarget_schema_version_refs(item);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn register_analysis_definitions(generator: &mut schemars::SchemaGenerator) {
@@ -772,6 +916,16 @@ fn register_meta_definitions(generator: &mut schemars::SchemaGenerator) {
     let _ = generator.subschema_for::<MetaMetric>();
     let _ = generator.subschema_for::<MetaRule>();
     let _ = generator.subschema_for::<TelemetryMeta>();
+    // Registered explicitly: the shared gate type is reachable from every
+    // analysis envelope, and the orphan check rejects a committed definition
+    // `derived_definitions` does not produce.
+    let _ = generator.subschema_for::<GateOutcome>();
+    let _ = generator.subschema_for::<GateName>();
+    let _ = generator.subschema_for::<GateStatus>();
+    // Same reason for the request catalogue: `RequestOutcomes` is a keyed map,
+    // so the name enum is reachable from nothing and would otherwise be the one
+    // part of the object the mirror does not publish.
+    let _ = generator.subschema_for::<RequestName>();
 }
 
 /// Register the `fallow audit --brief --format json` envelope.
@@ -891,6 +1045,14 @@ fn register_suppression_inventory_definitions(generator: &mut schemars::SchemaGe
     let _ = generator.subschema_for::<SuppressionInventoryOutput>();
 }
 
+/// Register the independent mutation report, plan, inspect, and verdict contracts.
+fn register_mutation_definitions(generator: &mut schemars::SchemaGenerator) {
+    let _ = generator.subschema_for::<MutationReport>();
+    let _ = generator.subschema_for::<MutationPlanOutput>();
+    let _ = generator.subschema_for::<MutationInspectOutput>();
+    let _ = generator.subschema_for::<MutationVerdictInput>();
+}
+
 /// Register the independent similar-code candidate, inspect, and review contracts.
 fn register_similar_code_definitions(generator: &mut schemars::SchemaGenerator) {
     let _ = generator.subschema_for::<SimilarCodeOutput>();
@@ -935,6 +1097,7 @@ fn register_per_command_envelope_definitions(generator: &mut schemars::SchemaGen
     let _ = generator.subschema_for::<CheckOutput>();
     let _ = generator.subschema_for::<CheckGroupedOutput>();
     let _ = generator.subschema_for::<CheckGroupedEntry>();
+    let _ = generator.subschema_for::<ArchitectureSchemaVersion>();
     let _ = generator.subschema_for::<DupesOutput<DupesReportPayload, DuplicationGroup>>();
     let _ = generator.subschema_for::<HealthOutput<HealthReport, HealthGroup>>();
     let _ = generator.subschema_for::<HealthGroup>();
@@ -952,10 +1115,29 @@ fn register_per_command_envelope_definitions(generator: &mut schemars::SchemaGen
     let _ = generator.subschema_for::<InspectEvidenceScope>();
     // Symbol-level call chain (`fallow trace`, `FallowOutput::Trace`).
     let _ = generator.subschema_for::<fallow_types::trace_chain::SymbolChainTrace>();
+    // Shortest import path (`fallow trace --path`, `FallowOutput::Trace`).
+    let _ = generator.subschema_for::<fallow_types::trace::ImportPathTrace>();
+    // Stack-trace frame resolution (`fallow trace-error`,
+    // `FallowOutput::TraceError`).
+    let _ = generator.subschema_for::<fallow_types::trace_error::ErrorTrace>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::ErrorTraceFrame>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::ErrorTraceCandidate>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::ErrorTraceCounts>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::ErrorTraceSchemaVersion>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::FrameOrigin>();
+    let _ = generator.subschema_for::<fallow_types::trace_error::FrameResolution>();
     let _ = generator.subschema_for::<TraceOutput>();
     let _ = generator.subschema_for::<ImpactOutput>();
     let _ = generator.subschema_for::<SemanticSymbolTrace>();
     let _ = generator.subschema_for::<SemanticSymbolImpact>();
+    let _ = generator.subschema_for::<DoctorOutput>();
+    let _ = generator.subschema_for::<DoctorCheck>();
+    let _ = generator.subschema_for::<DoctorCheckCategory>();
+    let _ = generator.subschema_for::<DoctorCheckId>();
+    let _ = generator.subschema_for::<DoctorCheckStatus>();
+    let _ = generator.subschema_for::<DoctorRemediation>();
+    let _ = generator.subschema_for::<DoctorStatus>();
+    let _ = generator.subschema_for::<DoctorSummary>();
     let _ = generator.subschema_for::<TypeAwareStatusOutput>();
     let _ = generator.subschema_for::<fallow_types::trace_chain::ChainHop>();
     let _ = generator.subschema_for::<fallow_types::trace_chain::UnresolvedCallee>();
@@ -1059,6 +1241,7 @@ fn augment_audit_wire_definitions(definitions: &mut Map<String, Value>) -> Resul
         "styling_introduced",
         "styling_inherited",
         "duplication_demoted",
+        "diff_risk_introduced",
     ] {
         properties.insert(name.to_string(), serde_json::json!({"type": "integer"}));
     }
@@ -1070,6 +1253,7 @@ fn augment_audit_wire_definitions(definitions: &mut Map<String, Value>) -> Resul
         "styling_introduced",
         "styling_inherited",
         "duplication_demoted",
+        "diff_risk_introduced",
     ] {
         if !required.iter().any(|item| item.as_str() == Some(name)) {
             required.push(Value::String(name.to_string()));
@@ -1123,10 +1307,16 @@ const FALLOW_OUTPUT_VARIANTS: &[(&str, &[&str], &str)] = &[
             "DependencyTrace",
             "CloneTrace",
             "ImpactClosureTrace",
+            "ImportPathTrace",
             "SymbolChainTrace",
             "SemanticSymbolTrace",
         ],
-        "Export, member, file, dependency, clone, impact-closure, or symbol-level\ntrace, including exact TypeScript checker evidence when requested.",
+        "Export, member, file, dependency, clone, impact-closure, import-path, or\nsymbol-level trace, including exact TypeScript checker evidence when\nrequested.",
+    ),
+    (
+        "trace-error",
+        &["ErrorTrace"],
+        "`fallow trace-error [FILE|-] --format json`. Required `schema_version`\nsingleton plus `source`, `frames`, `counts`, and `reason`.",
     ),
     (
         "review-envelope",
@@ -1170,6 +1360,11 @@ const FALLOW_OUTPUT_VARIANTS: &[(&str, &[&str], &str)] = &[
         "`fallow dead-code --format json --group-by <mode>`. Required `grouped_by`\nplus a `groups` array.",
     ),
     (
+        "architecture-grouped",
+        &["ArchitectureGroupedOutput"],
+        "`fallow architecture --format json --group-by <mode>`. The grouped\ndead-code body with its own `schema_version`.",
+    ),
+    (
         "impact",
         &["ImpactReport", "SemanticSymbolImpact"],
         "Project-wide change impact or exact TypeScript symbol impact.",
@@ -1198,6 +1393,11 @@ const FALLOW_OUTPUT_VARIANTS: &[(&str, &[&str], &str)] = &[
         "dead-code",
         &["CheckOutput"],
         "`fallow dead-code --format json`.\nRequired `total_issues` plus `summary: CheckSummary`.",
+    ),
+    (
+        "architecture",
+        &["ArchitectureOutput"],
+        "`fallow architecture --format json`. The dead-code body with its own\n`schema_version`: import cycles, boundary violations and rule-pack policy\nviolations.",
     ),
     (
         "combined",
@@ -1235,6 +1435,11 @@ const FALLOW_OUTPUT_VARIANTS: &[(&str, &[&str], &str)] = &[
         "`fallow suppressions --format json`. Required `schema_version: \"1\"`\nsingleton plus `summary` and per-file `files` listings. Read-only\nsuppression inventory; always emitted with exit 0.",
     ),
     (
+        "doctor",
+        &["DoctorOutput"],
+        "`fallow doctor --format json`. Deterministic, read-only project readiness checks.",
+    ),
+    (
         "type-aware-status",
         &["TypeAwareStatusOutput"],
         "`fallow type-aware status --format json`. Companion discovery and\nprotocol compatibility without exposing an absolute host path.",
@@ -1253,6 +1458,31 @@ const FALLOW_OUTPUT_VARIANTS: &[(&str, &[&str], &str)] = &[
         "similar-code-review",
         &["SimilarCodeReviewOutput"],
         "`fallow similar-code review --format json`. Deterministically joins raw\ncandidates with a separate verdict document without mutating candidate truth.",
+    ),
+    (
+        "similar-code-status",
+        &["SimilarCodeStatusOutput"],
+        "`fallow similar-code status --format json` and successful setup output.\nLocal-provider and pinned-model readiness.",
+    ),
+    (
+        "similar-code-cache-clear",
+        &["SimilarCodeCacheClearOutput"],
+        "`fallow similar-code cache clear --format json`. Project-local vector-cache\nclear result.",
+    ),
+    (
+        "mutation",
+        &["MutationReport"],
+        "`fallow mutation --format json`. Independently versioned mutation testing\nresults: one status per mutant, the score, and the completion status. No\nsource text: the `change` of a mutant uses a fixed token vocabulary.",
+    ),
+    (
+        "mutation-plan",
+        &["MutationPlanOutput"],
+        "`fallow mutation --plan --format json`. The static mutation plan: ranked\nmutants, prune reasons and file digests. Runs no project code.",
+    ),
+    (
+        "mutation-inspect",
+        &["MutationInspectOutput"],
+        "`fallow mutation inspect --format json`. One mutant of a saved report against\nthe current file, with a fresh or stale status. Runs no project code.",
     ),
 ];
 
@@ -1458,6 +1688,19 @@ mod drift_tests {
     const BACKWARDS_COMPATIBILITY_DOC: &str =
         include_str!("../../../../docs/backwards-compatibility.md");
 
+    /// The MCP server serves the committed snapshot schema without the
+    /// `schema` feature, so the committed copy must equal the derive. The
+    /// serialized forms are compared, because `Value` equality ignores key order.
+    #[test]
+    fn committed_similar_code_snapshot_schema_matches_the_derive() {
+        assert_eq!(
+            fallow_api::schemas::similar_code_snapshot_schema().to_string(),
+            fallow_output::SimilarCodeCandidateSnapshot::json_schema().to_string(),
+            "crates/api/similar-code-snapshot-schema.json is stale. Regenerate it with \
+             `npm run generate:contracts`."
+        );
+    }
+
     /// Recursively normalize a JSON value for drift comparison.
     fn canonicalize(mut value: Value) -> Value {
         normalize_one(&mut value);
@@ -1583,6 +1826,10 @@ mod drift_tests {
             ("AuditSchemaVersion", fallow_output::AUDIT_SCHEMA_VERSION),
             ("CheckSchemaVersion", fallow_output::CHECK_SCHEMA_VERSION),
             (
+                "ArchitectureSchemaVersion",
+                fallow_output::ARCHITECTURE_SCHEMA_VERSION,
+            ),
+            (
                 "CombinedSchemaVersion",
                 fallow_output::COMBINED_SCHEMA_VERSION,
             ),
@@ -1591,6 +1838,7 @@ mod drift_tests {
                 fallow_output::FEATURE_FLAGS_SCHEMA_VERSION,
             ),
             ("HealthSchemaVersion", fallow_output::HEALTH_SCHEMA_VERSION),
+            ("DoctorSchemaVersion", fallow_output::DOCTOR_SCHEMA_VERSION),
             (
                 "ReviewBriefSchemaVersion",
                 fallow_output::REVIEW_BRIEF_SCHEMA_VERSION,
@@ -1640,6 +1888,8 @@ mod drift_tests {
             ("AuditOutput", "AuditSchemaVersion"),
             ("CheckGroupedOutput", "CheckSchemaVersion"),
             ("CheckOutput", "CheckSchemaVersion"),
+            ("ArchitectureGroupedOutput", "ArchitectureSchemaVersion"),
+            ("ArchitectureOutput", "ArchitectureSchemaVersion"),
             ("CombinedOutput", "CombinedSchemaVersion"),
             ("CoverageAnalyzeOutput", "CoverageAnalyzeSchemaVersion"),
             ("CrossRepoImpactReport", "CrossRepoImpactSchemaVersion"),
@@ -1650,6 +1900,7 @@ mod drift_tests {
             ("ReviewBriefWireOutput", "ReviewBriefSchemaVersion"),
             ("SecurityOutput", "SecuritySchemaVersion"),
             ("SecuritySummaryOutput", "SecuritySchemaVersion"),
+            ("DoctorOutput", "DoctorSchemaVersion"),
             ("TypeAwareStatusOutput", "TypeAwareStatusSchemaVersion"),
         ];
         for (envelope, version_type) in envelope_refs {
@@ -1672,90 +1923,105 @@ mod drift_tests {
         );
     }
 
+    /// Each `FallowOutput` variant and the type that it wraps.
+    const REGISTERED_VARIANTS: &[(&str, &str)] = &[
+        ("Audit", "AuditOutput"),
+        ("Explain", "ExplainOutput"),
+        ("Inspect", "InspectOutput"),
+        ("Trace", "TraceOutput"),
+        ("TraceError", "ErrorTrace"),
+        ("ReviewEnvelope", "ReviewEnvelopeOutput"),
+        ("ReviewReconcile", "ReviewReconcileOutput"),
+        ("CoverageSetup", "CoverageSetupOutput"),
+        ("CoverageAnalyze", "CoverageAnalyzeOutput"),
+        ("ListBoundaries", "ListBoundariesOutput"),
+        ("Workspaces", "WorkspacesOutput"),
+        ("Health", "HealthOutput"),
+        ("Dupes", "DupesOutput"),
+        ("CheckGrouped", "CheckGroupedOutput"),
+        ("ArchitectureGrouped", "ArchitectureGroupedOutput"),
+        ("Impact", "ImpactOutput"),
+        ("ImpactCrossRepo", "CrossRepoImpactReport"),
+        ("Security", "SecurityOutput"),
+        ("SecuritySummary", "SecuritySummaryOutput"),
+        ("SecuritySurvivors", "SecuritySurvivorsOutput"),
+        ("SecurityBlindSpots", "SecurityBlindSpotsOutput"),
+        ("Check", "CheckOutput"),
+        ("Architecture", "ArchitectureOutput"),
+        ("Combined", "CombinedOutput"),
+        ("FeatureFlags", "FeatureFlagsOutput"),
+        ("AuditBrief", "ReviewBriefWireOutput"),
+        ("DecisionSurface", "DecisionSurfaceOutput"),
+        ("WalkthroughGuide", "WalkthroughGuide"),
+        ("WalkthroughValidation", "WalkthroughValidation"),
+        ("SuppressionInventory", "SuppressionInventoryOutput"),
+        ("Doctor", "DoctorOutput"),
+        ("TypeAwareStatus", "TypeAwareStatusOutput"),
+        ("SimilarCode", "SimilarCodeOutput"),
+        ("SimilarCodeInspect", "SimilarCodeInspectOutput"),
+        ("SimilarCodeReview", "SimilarCodeReviewOutput"),
+        ("SimilarCodeStatus", "SimilarCodeStatusOutput"),
+        ("SimilarCodeCacheClear", "SimilarCodeCacheClearOutput"),
+        ("Mutation", "MutationReport"),
+        ("MutationPlan", "MutationPlanOutput"),
+        ("MutationInspect", "MutationInspectOutput"),
+    ];
+
+    #[expect(
+        dead_code,
+        reason = "compile-time exhaustiveness guard for the REGISTERED_VARIANTS list; never called at runtime"
+    )]
+    fn variant_count_is_locked(value: &FallowOutput) -> &'static str {
+        match value {
+            FallowOutput::Audit(_) => "Audit",
+            FallowOutput::Explain(_) => "Explain",
+            FallowOutput::Inspect(_) => "Inspect",
+            FallowOutput::Trace(_) => "Trace",
+            FallowOutput::TraceError(_) => "TraceError",
+            FallowOutput::ReviewEnvelope(_) => "ReviewEnvelope",
+            FallowOutput::ReviewReconcile(_) => "ReviewReconcile",
+            FallowOutput::CoverageSetup(_) => "CoverageSetup",
+            FallowOutput::CoverageAnalyze(_) => "CoverageAnalyze",
+            FallowOutput::ListBoundaries(_) => "ListBoundaries",
+            FallowOutput::Workspaces(_) => "Workspaces",
+            FallowOutput::Health(_) => "Health",
+            FallowOutput::Dupes(_) => "Dupes",
+            FallowOutput::CheckGrouped(_) => "CheckGrouped",
+            FallowOutput::ArchitectureGrouped(_) => "ArchitectureGrouped",
+            FallowOutput::Impact(_) => "Impact",
+            FallowOutput::ImpactCrossRepo(_) => "ImpactCrossRepo",
+            FallowOutput::SecuritySummary(_) => "SecuritySummary",
+            FallowOutput::Security(_) => "Security",
+            FallowOutput::SecuritySurvivors(_) => "SecuritySurvivors",
+            FallowOutput::SecurityBlindSpots(_) => "SecurityBlindSpots",
+            FallowOutput::Check(_) => "Check",
+            FallowOutput::Architecture(_) => "Architecture",
+            FallowOutput::Combined(_) => "Combined",
+            FallowOutput::FeatureFlags(_) => "FeatureFlags",
+            FallowOutput::AuditBrief(_) => "AuditBrief",
+            FallowOutput::DecisionSurface(_) => "DecisionSurface",
+            FallowOutput::WalkthroughGuide(_) => "WalkthroughGuide",
+            FallowOutput::WalkthroughValidation(_) => "WalkthroughValidation",
+            FallowOutput::SuppressionInventory(_) => "SuppressionInventory",
+            FallowOutput::Doctor(_) => "Doctor",
+            FallowOutput::TypeAwareStatus(_) => "TypeAwareStatus",
+            FallowOutput::SimilarCode(_) => "SimilarCode",
+            FallowOutput::SimilarCodeInspect(_) => "SimilarCodeInspect",
+            FallowOutput::SimilarCodeReview(_) => "SimilarCodeReview",
+            FallowOutput::SimilarCodeStatus(_) => "SimilarCodeStatus",
+            FallowOutput::SimilarCodeCacheClear(_) => "SimilarCodeCacheClear",
+            FallowOutput::Mutation(_) => "Mutation",
+            FallowOutput::MutationPlan(_) => "MutationPlan",
+            FallowOutput::MutationInspect(_) => "MutationInspect",
+        }
+    }
+
     /// Ensure every `FallowOutput` variant stays registered.
     #[test]
     fn every_fallow_output_variant_is_registered_in_derived_definitions() {
-        const VARIANTS: &[(&str, &str)] = &[
-            ("Audit", "AuditOutput"),
-            ("Explain", "ExplainOutput"),
-            ("Inspect", "InspectOutput"),
-            ("Trace", "TraceOutput"),
-            ("ReviewEnvelope", "ReviewEnvelopeOutput"),
-            ("ReviewReconcile", "ReviewReconcileOutput"),
-            ("CoverageSetup", "CoverageSetupOutput"),
-            ("CoverageAnalyze", "CoverageAnalyzeOutput"),
-            ("ListBoundaries", "ListBoundariesOutput"),
-            ("Workspaces", "WorkspacesOutput"),
-            ("Health", "HealthOutput"),
-            ("Dupes", "DupesOutput"),
-            ("CheckGrouped", "CheckGroupedOutput"),
-            ("Impact", "ImpactOutput"),
-            ("ImpactCrossRepo", "CrossRepoImpactReport"),
-            ("Security", "SecurityOutput"),
-            ("SecuritySummary", "SecuritySummaryOutput"),
-            ("SecuritySurvivors", "SecuritySurvivorsOutput"),
-            ("SecurityBlindSpots", "SecurityBlindSpotsOutput"),
-            ("Check", "CheckOutput"),
-            ("Combined", "CombinedOutput"),
-            ("FeatureFlags", "FeatureFlagsOutput"),
-            ("AuditBrief", "ReviewBriefWireOutput"),
-            ("DecisionSurface", "DecisionSurfaceOutput"),
-            ("WalkthroughGuide", "WalkthroughGuide"),
-            ("WalkthroughValidation", "WalkthroughValidation"),
-            ("SuppressionInventory", "SuppressionInventoryOutput"),
-            ("TypeAwareStatus", "TypeAwareStatusOutput"),
-            ("SimilarCode", "SimilarCodeOutput"),
-            ("SimilarCodeInspect", "SimilarCodeInspectOutput"),
-            ("SimilarCodeReview", "SimilarCodeReviewOutput"),
-            ("SimilarCodeStatus", "SimilarCodeStatusOutput"),
-            ("SimilarCodeCacheClear", "SimilarCodeCacheClearOutput"),
-        ];
-
-        #[expect(
-            dead_code,
-            reason = "compile-time exhaustiveness guard for the VARIANTS list above; never called at runtime"
-        )]
-        fn variant_count_is_locked(value: &FallowOutput) -> &'static str {
-            match value {
-                FallowOutput::Audit(_) => "Audit",
-                FallowOutput::Explain(_) => "Explain",
-                FallowOutput::Inspect(_) => "Inspect",
-                FallowOutput::Trace(_) => "Trace",
-                FallowOutput::ReviewEnvelope(_) => "ReviewEnvelope",
-                FallowOutput::ReviewReconcile(_) => "ReviewReconcile",
-                FallowOutput::CoverageSetup(_) => "CoverageSetup",
-                FallowOutput::CoverageAnalyze(_) => "CoverageAnalyze",
-                FallowOutput::ListBoundaries(_) => "ListBoundaries",
-                FallowOutput::Workspaces(_) => "Workspaces",
-                FallowOutput::Health(_) => "Health",
-                FallowOutput::Dupes(_) => "Dupes",
-                FallowOutput::CheckGrouped(_) => "CheckGrouped",
-                FallowOutput::Impact(_) => "Impact",
-                FallowOutput::ImpactCrossRepo(_) => "ImpactCrossRepo",
-                FallowOutput::SecuritySummary(_) => "SecuritySummary",
-                FallowOutput::Security(_) => "Security",
-                FallowOutput::SecuritySurvivors(_) => "SecuritySurvivors",
-                FallowOutput::SecurityBlindSpots(_) => "SecurityBlindSpots",
-                FallowOutput::Check(_) => "Check",
-                FallowOutput::Combined(_) => "Combined",
-                FallowOutput::FeatureFlags(_) => "FeatureFlags",
-                FallowOutput::AuditBrief(_) => "AuditBrief",
-                FallowOutput::DecisionSurface(_) => "DecisionSurface",
-                FallowOutput::WalkthroughGuide(_) => "WalkthroughGuide",
-                FallowOutput::WalkthroughValidation(_) => "WalkthroughValidation",
-                FallowOutput::SuppressionInventory(_) => "SuppressionInventory",
-                FallowOutput::TypeAwareStatus(_) => "TypeAwareStatus",
-                FallowOutput::SimilarCode(_) => "SimilarCode",
-                FallowOutput::SimilarCodeInspect(_) => "SimilarCodeInspect",
-                FallowOutput::SimilarCodeReview(_) => "SimilarCodeReview",
-                FallowOutput::SimilarCodeStatus(_) => "SimilarCodeStatus",
-                FallowOutput::SimilarCodeCacheClear(_) => "SimilarCodeCacheClear",
-            }
-        }
-
         let derived = derived_definitions();
         let mut missing: Vec<String> = Vec::new();
-        for (variant, inner) in VARIANTS {
+        for (variant, inner) in REGISTERED_VARIANTS {
             if !derived.contains_key(*inner) {
                 missing.push(format!(
                     "variant `FallowOutput::{variant}({inner})` produces an inline schema in the root `oneOf` because `{inner}` is not registered in `derived_definitions()`. Add `let _ = generator.subschema_for::<{inner}>();` (or include it via `register_per_command_envelope_definitions` / `register_list_boundaries_definitions`)."
@@ -1780,6 +2046,154 @@ mod drift_tests {
                 registered.contains(name),
                 "finding type `{name}` is augmented with `actions`/`introduced` but never registered as a derived definition. Add it to `derived_definition_names()` (and the corresponding `subschema_for::<{name}>()` call) before listing it as a finding."
             );
+        }
+    }
+
+    /// Collect every `kind` constant that the derived `FallowOutput` enum
+    /// schema declares, before the `oneOf` rewrite replaces it with the
+    /// `FALLOW_OUTPUT_VARIANTS` table.
+    fn derived_fallow_output_kinds() -> std::collections::BTreeSet<String> {
+        fn collect(value: &Value, out: &mut std::collections::BTreeSet<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(kind) = map
+                        .get("properties")
+                        .and_then(|properties| properties.get("kind"))
+                    {
+                        if let Some(name) = kind.get("const").and_then(Value::as_str) {
+                            out.insert(name.to_string());
+                        }
+                        for name in kind
+                            .get("enum")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                        {
+                            out.insert(name.to_string());
+                        }
+                    }
+                    for child in map.values() {
+                        collect(child, out);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        collect(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let derived = derived_definitions();
+        let output = derived
+            .get("FallowOutput")
+            .expect("derived FallowOutput schema");
+        let mut kinds = std::collections::BTreeSet::new();
+        collect(output, &mut kinds);
+        kinds
+    }
+
+    /// The typed root enum and the schema kind table must name the same set of
+    /// kinds. A variant without a table row emits a kind that the published
+    /// schema rejects; a table row without a variant documents a kind that no
+    /// typed root can produce.
+    #[test]
+    fn fallow_output_tags_match_the_kind_table() {
+        let enum_kinds = derived_fallow_output_kinds();
+        let table_kinds: std::collections::BTreeSet<String> = FALLOW_OUTPUT_VARIANTS
+            .iter()
+            .map(|(kind, _, _)| (*kind).to_string())
+            .collect();
+        assert!(
+            !enum_kinds.is_empty(),
+            "the derived FallowOutput schema declares no kind constants"
+        );
+        let only_enum: Vec<_> = enum_kinds.difference(&table_kinds).collect();
+        let only_table: Vec<_> = table_kinds.difference(&enum_kinds).collect();
+        assert!(
+            only_enum.is_empty() && only_table.is_empty(),
+            "FallowOutput variants and FALLOW_OUTPUT_VARIANTS disagree.\n  \
+             only in the enum: {only_enum:?}\n  only in the table: {only_table:?}"
+        );
+    }
+
+    /// Every analysis command kind, flat and grouped, is a branch of the
+    /// published root schema.
+    #[test]
+    fn every_command_envelope_kind_is_a_schema_kind() {
+        let table: std::collections::BTreeSet<&str> = FALLOW_OUTPUT_VARIANTS
+            .iter()
+            .map(|(kind, _, _)| *kind)
+            .collect();
+        for row in fallow_types::command_surfaces::COMMAND_ENVELOPES {
+            for kind in std::iter::once(row.kind).chain(row.grouped_kind) {
+                assert!(
+                    table.contains(kind),
+                    "`fallow {}` writes kind `{kind}`, which FALLOW_OUTPUT_VARIANTS lacks",
+                    row.command
+                );
+            }
+        }
+    }
+
+    /// `fallow architecture` serializes the dead-code structs, so its schema
+    /// definitions must keep the dead-code body: the same properties, the same
+    /// required list, and the same property schemas except `schema_version`.
+    #[test]
+    fn architecture_envelopes_share_the_dead_code_body() {
+        let derived = derived_definitions_for_drift();
+        for (architecture, dead_code, _, _) in ARCHITECTURE_ENVELOPE_DEFINITIONS {
+            let architecture_schema = derived
+                .get(*architecture)
+                .unwrap_or_else(|| panic!("missing derived {architecture}"));
+            let description = architecture_schema
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                description.contains("`fallow architecture")
+                    && !description.contains("dead-code --"),
+                "{architecture} must describe the architecture command, not dead-code: {description}"
+            );
+            let dead_code_schema = derived
+                .get(*dead_code)
+                .unwrap_or_else(|| panic!("missing derived {dead_code}"));
+            assert_eq!(
+                architecture_schema.get("required"),
+                dead_code_schema.get("required"),
+                "{architecture} and {dead_code} must require the same fields"
+            );
+            let architecture_properties = architecture_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("architecture properties");
+            let dead_code_properties = dead_code_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("dead-code properties");
+            let architecture_keys: Vec<&String> = architecture_properties.keys().collect();
+            let dead_code_keys: Vec<&String> = dead_code_properties.keys().collect();
+            assert_eq!(
+                architecture_keys, dead_code_keys,
+                "{architecture} and {dead_code} must have the same properties"
+            );
+            for (name, schema) in dead_code_properties {
+                if name == "schema_version" {
+                    assert_eq!(
+                        architecture_properties[name]
+                            .get("$ref")
+                            .and_then(Value::as_str),
+                        Some("#/definitions/ArchitectureSchemaVersion"),
+                        "{architecture}.schema_version must reference its own version"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    &architecture_properties[name], schema,
+                    "{architecture}.{name} must equal {dead_code}.{name}"
+                );
+            }
         }
     }
 

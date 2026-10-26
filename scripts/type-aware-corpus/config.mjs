@@ -1,3 +1,14 @@
+const REQUIRED_GATES = [
+  "minimum_confirmation_precision",
+  "minimum_checked_confirmation_yield",
+  "minimum_checked_candidates",
+  "minimum_correct_unused_retention",
+  "maximum_abstention",
+  "maximum_blocking_diagnostics_share",
+  "maximum_p95_marginal_overhead_ms",
+  "maximum_p95_refined_rss_kb",
+];
+
 const requireValid = (condition, message, fail) => {
   if (!condition) fail(message);
 };
@@ -43,10 +54,8 @@ const validateProjectSource = (project, dependencies) => {
 const expectedCandidates = (role) => new Map([["zero-control", "zero"]]).get(role) ?? "nonzero";
 
 const validFeatureBuckets = (buckets) =>
-  [
-    Array.isArray(buckets),
-    buckets.every((bucket) => [typeof bucket === "string", bucket.trim() !== ""].every(Boolean)),
-  ].every(Boolean);
+  Array.isArray(buckets) &&
+  buckets.every((bucket) => typeof bucket === "string" && bucket.trim() !== "");
 
 const validateProjectContract = (project, fail) => {
   const expectation = expectedCandidates(project.role);
@@ -83,9 +92,9 @@ const validateProject = (project, seen, dependencies) => {
 };
 
 export const validateManifest = (manifest, dependencies) => {
-  const { fail, isObject, requiredGates, requiredProjects } = dependencies;
+  const { fail, isObject, requiredProjects } = dependencies;
   requireValid(
-    [isObject(manifest), manifest.schema_version === 1].every(Boolean),
+    isObject(manifest) && manifest.schema_version === 1,
     "manifest schema_version must be 1",
     fail,
   );
@@ -95,11 +104,9 @@ export const validateManifest = (manifest, dependencies) => {
     fail,
   );
   requireValid(isObject(manifest.gates), "manifest gates must be an object", fail);
-  requiredGates.forEach((gate) => validateGate(manifest.gates, gate, fail));
+  REQUIRED_GATES.forEach((gate) => validateGate(manifest.gates, gate, fail));
   requireValid(
-    [Array.isArray(manifest.projects), manifest.projects.length === requiredProjects.size].every(
-      Boolean,
-    ),
+    Array.isArray(manifest.projects) && manifest.projects.length === requiredProjects.size,
     `manifest must contain exactly ${requiredProjects.size} corpus projects`,
     fail,
   );

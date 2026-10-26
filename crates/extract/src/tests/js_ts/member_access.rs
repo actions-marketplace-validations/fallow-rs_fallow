@@ -1,4 +1,4 @@
-use fallow_types::extract::ImportedName;
+use fallow_types::extract::{ImportedName, SemanticFact};
 
 use crate::tests::{parse_ts as parse_source, parse_tsx};
 
@@ -238,16 +238,17 @@ fn jsx_namespace_member_tag_records_single_access_for_paired_tags() {
 }
 
 #[test]
-fn non_namespace_destructuring_not_captured() {
+fn non_namespace_destructuring_records_member_access() {
+    // `const { a } = obj` reads `obj.a`, so it records the same access as the
+    // member expression. An imported instance or a `this.field` source needs
+    // this access to credit its class members.
     let info =
         parse_source("import { foo } from './utils';\nconst obj = { a: 1 };\nconst { a } = obj;");
-    let has_obj_a = info
-        .member_accesses
-        .iter()
-        .any(|a| a.object == "obj" && a.member == "a");
     assert!(
-        !has_obj_a,
-        "Should not capture destructuring of non-namespace variables"
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "obj" && a.member == "a"),
+        "destructuring must record the same access as `obj.a`"
     );
 }
 
@@ -609,4 +610,239 @@ fn cyclic_object_binding_candidates_terminate() {
     let info = parse_source(&source);
     // The direct one-hop path still resolves through the cycle guard.
     assert!(info.member_accesses.iter().any(|m| m.member == "m"));
+}
+
+fn spy_call_credits_one_member(source: &str) {
+    let info = parse_source(source);
+    assert!(
+        info.member_accesses
+            .iter()
+            .any(|a| a.object == "target" && a.member == "helper"),
+        "spy call must record `target.helper`: {:?}",
+        info.member_accesses
+    );
+    assert!(
+        !info.whole_object_uses.contains(&"target".to_string()),
+        "spy call with a static member must not use the whole namespace: {source}"
+    );
+}
+
+fn spy_call_uses_whole_namespace(source: &str) {
+    let info = parse_source(source);
+    assert!(
+        info.whole_object_uses.contains(&"target".to_string()),
+        "call must keep the whole-namespace use: {source}"
+    );
+}
+
+#[test]
+fn namespace_spy_call_with_static_member_records_member_access() {
+    for source in [
+        "import { vi } from 'vitest';\nimport * as target from './target';\nvi.spyOn(target, 'helper');",
+        "import * as target from './target';\nvi.spyOn(target, 'helper');",
+        "import * as target from './target';\njest.spyOn(target, `helper`);",
+        "import { jest } from '@jest/globals';\nimport * as target from './target';\njest.spyOn(target, 'helper');",
+        "import { spyOn } from 'bun:test';\nimport * as target from './target';\nspyOn(target, 'helper');",
+        "import * as target from './target';\nit('x', () => { spyOn(target, 'helper'); });",
+        "import { mock } from 'node:test';\nimport * as target from './target';\nmock.method(target, 'helper');",
+        "import { test } from 'node:test';\nimport * as target from './target';\ntest('x', (t) => { t.mock.method(target, 'helper'); });",
+    ] {
+        spy_call_credits_one_member(source);
+    }
+}
+
+#[test]
+fn namespace_spy_call_without_static_member_keeps_whole_object_use() {
+    for source in [
+        // The member name is not a static string.
+        "import * as target from './target';\nconst name = 'helper';\nvi.spyOn(target, name);",
+        "import * as target from './target';\nconst name = 'helper';\nvi.spyOn(target, `${name}`);",
+        // A local function named `spyOn` can read every export.
+        "import * as target from './target';\nconst spyOn = (o: object, k: string) => Reflect.get(o, k);\nspyOn(target, 'helper');",
+        "import * as target from './target';\nit('x', () => { spyOn(target, 'helper'); });\nfunction spyOn(o: object, k: string) { return Object.keys(o).concat(k); }",
+        // A `spyOn` import from a module that is not a test framework.
+        "import { spyOn } from './spy';\nimport * as target from './target';\nspyOn(target, 'helper');",
+        // A `mock` binding that does not come from `node:test`.
+        "import * as target from './target';\nconst mock = { method: (o: object, k: string) => Reflect.get(o, k) };\nmock.method(target, 'helper');",
+        // A local `vi` object.
+        "import * as target from './target';\nconst vi = { spyOn: (o: object, k: string) => Reflect.get(o, k) };\nvi.spyOn(target, 'helper');",
+    ] {
+        spy_call_uses_whole_namespace(source);
+    }
+}
+
+#[test]
+fn namespace_spy_call_on_shadowed_namespace_records_nothing() {
+    let info = parse_source(
+        "import * as target from './target';\nfunction f(target: object) { vi.spyOn(target, 'helper'); }",
+    );
+    assert!(
+        !info
+            .member_accesses
+            .iter()
+            .any(|a| a.object == "target" && a.member == "helper"),
+        "a shadowed namespace binding must not record a member access"
+    );
+}
+
+/// The most links a recorded receiver name holds.
+const RECORDED_LINKS: usize = 64;
+
+#[test]
+fn long_member_chain_records_receiver_names_up_to_the_cap() {
+    const LINKS: usize = 500;
+    for link in [".b", "?.b"] {
+        let info = parse_source(&format!(
+            "import {{ a }} from './a';\nexport const x = a{};",
+            link.repeat(LINKS)
+        ));
+        let deepest = format!("a{}", ".b".repeat(RECORDED_LINKS));
+        assert!(
+            info.member_accesses
+                .iter()
+                .any(|access| access.object == deepest && access.member == "b"),
+            "a `{link}` chain must record the receiver name at the cap"
+        );
+        assert!(
+            info.member_accesses
+                .iter()
+                .all(|access| access.object.len() <= deepest.len()),
+            "a `{link}` chain must record no receiver name past the cap"
+        );
+    }
+}
+
+/// A chain long enough that a record per link with the full chain name
+/// makes about 400 MB of output.
+const LONG_CHAIN_LINKS: usize = 20_000;
+
+/// Extract `source` on a thread with a large stack: the recursive AST walk
+/// needs more than the default test thread stack for a long chain.
+fn parse_long_chain(source: String) -> fallow_types::extract::ModuleInfo {
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || parse_source(&source))
+        .expect("spawn the extraction thread")
+        .join()
+        .expect("extraction must not panic")
+}
+
+#[test]
+fn long_member_chain_records_a_bounded_receiver_output() {
+    let info = parse_long_chain(format!(
+        "export const x = a{};\n",
+        ".b".repeat(LONG_CHAIN_LINKS)
+    ));
+    let longest = info
+        .member_accesses
+        .iter()
+        .map(|access| access.object.matches('.').count())
+        .max();
+    assert_eq!(longest, Some(RECORDED_LINKS));
+    assert_eq!(info.member_accesses.len(), RECORDED_LINKS + 1);
+}
+
+#[test]
+fn long_fluent_chain_records_each_step_name_once() {
+    let info = parse_long_chain(format!(
+        "import {{ a }} from './a';\nexport const x = a{};\n",
+        ".b()".repeat(LONG_CHAIN_LINKS)
+    ));
+    let chains = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            SemanticFact::FluentChainMemberAccess(access) => Some(access.steps.len()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // One fact for the chain, with the one distinct step name `b`.
+    assert_eq!(chains, [1]);
+}
+
+#[test]
+fn long_fluent_chain_of_distinct_steps_records_one_linear_fact() {
+    let mut steps = String::new();
+    for step in 0..LONG_CHAIN_LINKS {
+        steps.push_str(".m");
+        steps.push_str(&step.to_string());
+        steps.push_str("()");
+    }
+    let info = parse_long_chain(format!(
+        "import {{ a }} from './a';\nexport const x = a{steps};\n"
+    ));
+    let chains = info
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            SemanticFact::FluentChainMemberAccess(access) => Some(access.steps.len()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // A fact for each call held the steps before it: O(N^2) step names.
+    assert_eq!(chains, [LONG_CHAIN_LINKS - 1]);
+}
+
+/// The deepest receiver and the number of member accesses that `info` holds.
+fn receiver_output_bound(info: &fallow_types::extract::ModuleInfo) -> (Option<usize>, usize) {
+    let longest = info
+        .member_accesses
+        .iter()
+        .map(|access| access.object.matches('.').count())
+        .max();
+    (longest, info.member_accesses.len())
+}
+
+#[test]
+fn long_heritage_type_name_records_a_bounded_receiver_output() {
+    let info = parse_long_chain(format!(
+        "export interface X extends a{} {{}}\n",
+        ".b".repeat(LONG_CHAIN_LINKS)
+    ));
+    assert_eq!(
+        receiver_output_bound(&info),
+        (Some(RECORDED_LINKS), RECORDED_LINKS + 1)
+    );
+}
+
+#[test]
+fn long_jsx_member_tag_records_a_bounded_receiver_output() {
+    let source = format!("export const x = <a{} />;\n", ".b".repeat(LONG_CHAIN_LINKS));
+    let info = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || parse_tsx(&source))
+        .expect("spawn the extraction thread")
+        .join()
+        .expect("extraction must not panic");
+    assert_eq!(
+        receiver_output_bound(&info),
+        (Some(RECORDED_LINKS), RECORDED_LINKS + 1)
+    );
+}
+
+#[test]
+fn long_text_member_tag_records_a_bounded_receiver_output() {
+    let tag = format!("a{}", ".b".repeat(LONG_CHAIN_LINKS));
+    for (path, source) in [
+        (
+            "test.mdx",
+            format!("import * as a from './a'\n\n<{tag}>x</{tag}>\n"),
+        ),
+        (
+            "test.astro",
+            format!("---\nimport * as a from './a';\n---\n<{tag} />\n"),
+        ),
+    ] {
+        let info = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || crate::tests::parse_at_path(path, &source))
+            .expect("spawn the extraction thread")
+            .join()
+            .expect("extraction must not panic");
+        assert_eq!(
+            receiver_output_bound(&info),
+            (Some(RECORDED_LINKS), RECORDED_LINKS + 1),
+            "{path}"
+        );
+    }
 }

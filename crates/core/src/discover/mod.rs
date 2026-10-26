@@ -1,5 +1,7 @@
 mod entry_points;
+mod entry_report;
 mod infrastructure;
+mod orphan_declarations;
 mod parse_scripts;
 mod walk;
 
@@ -11,15 +13,18 @@ use rustc_hash::FxHashSet;
 pub use entry_points::{
     CategorizedEntryPoints, compile_glob_set, discover_dynamically_loaded_entry_points,
     discover_entry_points, discover_plugin_entry_point_sets, discover_plugin_entry_points,
-    discover_workspace_entry_points,
 };
 pub(crate) use entry_points::{
-    EntryPointDiscovery, discover_entry_points_with_warnings_from_pkg,
-    discover_workspace_entry_points_with_runtime_scripts, resolve_entry_path,
-    warn_skipped_entry_summary, workspace_runtime_script_seeds,
+    DiscoveredPaths, EntryPointDiscovery, ScriptWorkspaces, collect_workspace_packages,
+    discover_plugin_entry_point_sets_timed, discover_root_entry_points,
+    discover_workspace_package_entry_points, resolve_entry_path_with_discovered,
+    resolve_entry_path_with_tracking, warn_skipped_entry_summary, workspace_runtime_script_seeds,
 };
+pub(crate) use entry_report::{record_entry_pattern_effect, summarize_entry_points};
 pub use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
 pub(crate) use infrastructure::discover_infrastructure_entry_points;
+pub(crate) use orphan_declarations::find_orphan_module_declaration_files;
+pub(crate) use parse_scripts::CommandRefContext;
 pub use walk::{
     DiscoveredSources, HiddenDirMatch, HiddenDirScope, PRODUCTION_EXCLUDE_PATTERNS,
     SOURCE_EXTENSIONS, discover_files, discover_files_and_config_candidates,
@@ -55,6 +60,21 @@ pub fn collect_plugin_hidden_dir_scopes(
     }
 
     scopes
+}
+
+/// The compiled set of plugin entry patterns, or `None` with a warning when it
+/// does not compile. Without the set no plugin entry point applies, so the
+/// run must not stay silent.
+fn plugin_glob_set_or_warn(
+    built: Result<globset::GlobSet, globset::Error>,
+) -> Option<globset::GlobSet> {
+    built
+        .inspect_err(|err| {
+            tracing::warn!(
+                "plugin entry patterns could not be compiled, so no plugin entry point applies: {err}"
+            );
+        })
+        .ok()
 }
 
 /// Combined plugin-derived and script-derived hidden directory scopes.
@@ -119,7 +139,8 @@ fn push_plugin_hidden_dir_scope(
 #[must_use]
 pub fn discover_files_with_plugin_scopes(config: &ResolvedConfig) -> Vec<DiscoveredFile> {
     let root_pkg = fallow_config::load_dir_package_json(&config.root);
-    let workspaces = fallow_config::discover_workspaces(&config.root);
+    let workspaces =
+        fallow_config::discover_workspaces_with_patterns(&config.root, &config.workspace_patterns);
     let scopes = collect_hidden_dir_scopes(config, root_pkg.as_ref(), &workspaces);
     discover_files_with_additional_hidden_dirs(config, &scopes)
 }
@@ -367,24 +388,6 @@ mod tests {
                 "allowed hidden dir '{dir}' should not have trailing slash"
             );
         }
-    }
-
-    #[test]
-    fn file_id_re_exported() {
-        let id = FileId(42);
-        assert_eq!(id.0, 42);
-    }
-
-    #[test]
-    fn source_extensions_re_exported() {
-        assert!(SOURCE_EXTENSIONS.contains(&"ts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"tsx"));
-    }
-
-    #[test]
-    fn compile_glob_set_re_exported() {
-        let result = compile_glob_set(&["**/*.ts".to_string()]);
-        assert!(result.is_some());
     }
 
     #[test]
@@ -715,5 +718,20 @@ mod tests {
             !names.contains(&"packages/other/.config/eslint.config.js".to_string()),
             "unscoped workspace must not get .config traversed"
         );
+    }
+
+    #[test]
+    fn plugin_glob_set_or_warn_returns_none_for_a_failed_build() {
+        let failed = globset::Glob::new("src/[").map(|_| globset::GlobSet::empty());
+        assert!(failed.is_err(), "an unclosed class must not compile");
+        assert!(plugin_glob_set_or_warn(failed).is_none());
+    }
+
+    #[test]
+    fn plugin_glob_set_or_warn_keeps_a_built_set() {
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("src/app.ts").expect("valid glob"));
+        let set = plugin_glob_set_or_warn(builder.build()).expect("set builds");
+        assert!(set.is_match("src/app.ts"));
     }
 }

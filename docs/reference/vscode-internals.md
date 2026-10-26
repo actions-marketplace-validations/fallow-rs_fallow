@@ -24,9 +24,41 @@ Do not duplicate the full setting list in durable prose.
 
 ## Invariants
 
+- Activation events match root files or a language only. Do not add a
+  `workspaceContains` glob with `**`: VS Code then searches the full
+  workspace tree at startup. A source language of the LSP document selector
+  needs an `onLanguage` event, so that a monorepo folder with no root
+  `package.json` starts the extension when a source file opens.
+  `test/package-manifest.test.ts` and the activation integration suite check
+  this.
 - Binary resolution follows the documented priority: explicit user path,
   workspace dependency, system path, managed binary, then auto-download.
 - Validate managed downloads before execution.
+- Managed downloads select the release asset for the host C library. On Linux,
+  `src/libc.ts` reports musl when `/etc/alpine-release` exists or when the Node
+  diagnostic report has no `header.glibcVersionRuntime`. A musl host gets the
+  `linux-<cpu>-musl` binaries. Each download records its asset target in a
+  `<binary>.target` file. A binary without that file comes from a version that
+  downloaded only glibc binaries on Linux. A binary for another target does not
+  count as installed, so an Alpine host replaces an earlier glibc binary.
+- A managed download is complete only once its file descriptor is closed.
+  Stream completion is not enough: Unix refuses to execute a file that any
+  process still holds open for writing, and the extension chmods, renames,
+  and spawns what it just downloaded.
+- A version mismatch is not a trust failure. A managed binary that passed
+  signature or digest verification but reports another version stays on disk
+  until a download of the matching version replaces it atomically; only a
+  failed verification purges. The extension downloads from the GitHub Release
+  of its own version, and that release is created after the VSIX is public,
+  so while the release endpoint answers HTTP 404 the extension keeps serving
+  the installed binary, says so once per session without a modal, and, when
+  `fallow.autoDownload` is on, retries in the background with a bounded
+  backoff and offers `fallow.restart` when the new version has landed. With
+  `fallow.autoDownload` off no unattended download is scheduled, and a retry
+  already scheduled stops when the setting is turned off. The next activation
+  retries on its own because the version check keeps failing until then.
+  Without an installed binary the download prompt still appears and names the
+  missing release.
 - Keep LSP analysis, health, audit, security, and runtime coverage as separate
   lazy workflows unless a measured UX change justifies combining them.
 - Configuration changes restart only the surfaces whose initialization state
@@ -46,6 +78,24 @@ Do not duplicate the full setting list in durable prose.
   one matching backend; the untargeted universal fallback contains all
   supported backends.
 - `dist/` is generated for packaging and remains untracked.
+- Release CI derives the extension version from the release tag. Do not manually
+  bump `editors/vscode/package.json` for a release.
+- `fallow/analysisComplete` notifications update editor status without requiring
+  another CLI analysis. Keep this notification contract synchronized with LSP.
+- The status bar shows `package baselines` for a mixed package scope and lists
+  each workspace root and ref in its tooltip. A global `fallow.changedSince`
+  setting takes precedence, including when its ref is dropped. The Set Baseline
+  at HEAD command explains that its workspace-wide setting overrides package
+  refs before changing that setting, when the last analysis applied package
+  baselines. `fallow.packageBaselines: false` turns the map off: the LSP gets
+  `packageBaselines: false` in its initialization options, and the sidebar run
+  gets the version-gated `--no-package-baselines` flag. The setting restarts
+  the server and re-runs the sidebar analysis. A CLI sidebar refresh reads scope
+  provenance from the combined report root, while LSP notifications carry
+  their own status; neither display path reuses the other's scope. Health and
+  security are separate reports with their own scope controls.
+- CLI output buffers accommodate large monorepos; preserve the limits in
+  `commands.ts` when changing subprocess handling.
 
 ## Verification
 

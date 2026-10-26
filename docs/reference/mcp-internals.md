@@ -23,12 +23,12 @@ Do not hand-copy the complete tool list into durable prose. Read
 
 ## Resources
 
-Resources are the server's read-only, cacheable reference channel: compile-time
-material an agent lists once (`resources/list`, `resources/templates/list`)
-and reads by URI (`resources/read`) with no subprocess and no analysis run;
-clients cache by URI. (Hosts such as Claude Code still read a resource through
-their own resource tool, so this is not a saved tool call.) Tools remain the
-surface for anything that depends on a project root.
+Resources provide read-only, cacheable references compiled into the server.
+An agent lists them with `resources/list` and `resources/templates/list`, then
+reads them by URI with `resources/read`. These requests start no subprocess
+and run no analysis. Clients cache by URI. Hosts such as Claude Code still
+use a resource tool to read them, so resources do not save a tool call. Use
+tools for operations that depend on a project root.
 
 Sources of truth:
 
@@ -40,7 +40,10 @@ Sources of truth:
   functions because rmcp's `RequestContext` cannot be constructed in tests;
   the `ServerHandler` methods in `crates/mcp/src/server/mod.rs` are one-line
   delegators.
-- Payload data comes from shared crates only: `fallow_types::mcp_manifest`
+- `crates/mcp/src/tool_guides.rs` owns the authored note, summaries, and detail
+  strings served by the `fallow://tools/{name}` guide template.
+- Catalogue, explanation, task-matrix, and schema payloads use shared crates:
+  `fallow_types::mcp_manifest`
   (tools), `fallow_api::explain` plus `fallow_types::issue_meta` (issue types,
   explain index, explain documents), `fallow_types::task_matrix` (task
   matrix), and `fallow_api::schemas` (config, plugin, and rule-pack JSON
@@ -70,6 +73,13 @@ Contract rules:
 - Schema resources are byte-for-byte the CLI schema documents
   (`fallow config-schema`, `fallow plugin-schema`, `fallow rule-pack-schema`);
   the explain template is exactly the `fallow_explain` tool payload.
+- A `fallow://tools/{name}` miss distinguishes its two causes. A registered
+  tool with no long-form guide answers `code: "no_tool_guide"` with
+  `registered_tool: true` (the `tools/list` description is the whole
+  contract); a name that is not a fallow MCP tool answers
+  `code: "unknown_tool"` with `registered_tool: false` (correct the name).
+  Membership is tested against `MCP_TOOLS`, so a new tool inherits the split
+  without a resources-side change.
 - Unknown URIs and unknown issue types return a structured
   `resource_not_found` error whose `data` lists the known URIs and templates,
   or the nearest explain URIs plus the index URI. The wire code depends on the
@@ -88,16 +98,224 @@ Contract rules:
 
 - Prefer typed API execution. Use CLI subprocess fallback only where the policy
   explicitly allows it.
+- Keep the three routes equal on the rules a caller acts on:
+  - The direct subprocess route (`captured_output_result`) and Code Mode
+    (`code_mode_subprocess::normalize_output`) call one exit-code policy,
+    `cli_exit_body`. An exit 1 run that requires complete type-aware evidence
+    and reports it incomplete is an error on both.
+  - The subprocess route and the typed route (`api_runtime::json_success`)
+    share the 16 MiB cap and the over-limit body (`over_limit_result`, code
+    `FALLOW_MCP_SUBPROCESS_OUTPUT_LIMIT`). The `context` field is
+    `subprocess` or `typed`.
+  - Every spawned CLI reads stdin from the null device unless the tool sends
+    bounded input. The server reads JSON-RPC frames from its own stdin, and a
+    child must not consume them.
 - Return structured results and structured errors. Do not require clients to
   parse human output.
 - Use JSON, quiet mode, and explanation metadata for CLI-backed analysis.
+- A tool result is the analysis envelope plus the run's verdicts, never a
+  prose prefix. `--quiet` removes the gate's stderr line and
+  `cli_exit_body` converts exit 1 into a success, both deliberately, so
+  `crates/mcp/src/tools/gate_verdicts.rs` restates what the envelope already
+  decided as plain strings on the root `warnings` array: `baseline_staleness`,
+  every `gate_outcomes` entry that reported `fail` or `warn`, and one
+  aggregated entry when `workspace_diagnostics` carries `degrades_analysis`.
+  It runs on every route that returns an envelope, the subprocess one in
+  `captured_output_result`, Code Mode in `normalize_output`, and the typed one
+  in `api_runtime::json_success`. The annotation is therefore route-complete;
+  the envelopes are not. `fallow_api` publishes no `gate_outcomes` from
+  `serialize_audit_programmatic_json`, `serialize_combined_programmatic_json` or
+  `serialize_health_programmatic_json` (`crates/api/src/runtime_json.rs`), so a
+  typed `audit` restates its diagnostics and its baseline and has no gate object
+  to read. A tool whose gate the programmatic route cannot evaluate takes the
+  CLI instead: `min_score` in the `health.rs` `requires_cli_fallback`, and
+  `threshold` in `fallback_policy::duplication_needs_cli`. Without the
+  `threshold` check, `find_dupes` with a failing `threshold` returned a
+  clean-looking result, while the same call with a `group_by` beside it
+  reported the gate. Audit's verdict is not routed that
+  way, because every audit computes one and forcing the CLI would retire the
+  typed route; its absence is stated in the server instructions instead.
+  The lookup tables name each envelope
+  shape's sites, because `audit` nests its diagnostics inside its `dead_code` /
+  `duplication` / `complexity` sections and publishes one staleness object per
+  loaded baseline, at `dead_code.baseline_staleness`,
+  `duplication.baseline_staleness` and
+  `complexity.summary.baseline_staleness`. The other commands publish their
+  diagnostics at the root. `health` publishes its staleness object inside
+  `summary`, and the combined run publishes one per section. It adds no verdict of
+  its own and moves no existing member, a response with nothing to state is not
+  re-serialized at all, and no result changes its `isError`: an exit-1 gate
+  stays a success carrying findings and an exit-8 security gate stays an error
+  that now names the gate. The tool results carry no `structured_content`: no
+  tool declares an `output_schema` for one to validate against, and a
+  verdict-only block would be a second shape with no manifest row and no drift
+  test.
 - Keep parameter names, defaults, license metadata, read-only status, and tool
   descriptions synchronized with the shared manifest.
+- Every dead-code finding carries a `finding_id` (`dc1:<rule>:<hash>`).
+  `run_engine_owned_dead_code_pipeline` stamps it once, before the filters,
+  so the typed path and the CLI fallback return the same id. The `analyze`
+  and `check_changed` descriptions name the field. They also say that an id
+  that is absent from a scoped run, or from a run with other config, means
+  unknown and not resolved. Drift invariant I10 checks the ids on both
+  paths.
+- `check_architecture` is the MCP surface of `fallow architecture`. It runs
+  `fallow_api::run_architecture` and returns the `kind: "architecture"`
+  envelope. A `baseline` or `group_by` call runs `fallow architecture` as a
+  subprocess, because the typed runner loads no baseline and does not group.
+  Code Mode exposes it as `checkArchitecture` on the subprocess path, like
+  `analyze`. The `analyze` tool keeps the architecture findings in its
+  `kind: "dead-code"` result. Drift invariant I2 compares the CLI,
+  `fallow_api` and both MCP paths for this command.
+- `mutation_plan` and `mutation_inspect` are the read-only halves of
+  `fallow mutation`. `mutation_plan` calls `fallow_api::plan_mutation` in
+  process and serializes with
+  `fallow_output::serialize_mutation_plan_json_output`, so its envelope is the
+  `fallow mutation --plan` JSON, with `kind: "mutation-plan"`.
+  `mutation_inspect` runs `fallow mutation inspect <id> [--report <file>]` as
+  a subprocess. A relative `report` resolves against `root`, and outer
+  whitespace is trimmed. Without `report`, the CLI reads
+  `<cache dir>/mutation/last-report.json`, and `root`, `config` and
+  `allow_remote_extends` select that cache directory. A plan document is a
+  valid `report` input. No MCP tool runs
+  mutants in version 1: a run executes the tests of the project, so the agent
+  host decides it through the CLI. Both descriptions name `fallow mutation`
+  for that reason. Code Mode refuses both tools and names the standalone
+  tools.
+- The `analyze` description keeps the routing summary and the `finding_id`
+  contract. The `fallow://tools/analyze` guide (`crates/mcp/src/tool_guides.rs`)
+  holds the per-flag prose: the `boundary_violations` alias, the `group_by`
+  modes and the `next_steps[]` dispatch rule. The description names the
+  guide, and `crates/mcp/src/server/tests/resources.rs` checks both sides.
+- A tool that can write a file declares `read_only_hint = false`. `fix_apply`
+  changes source and declares `destructive_hint = true`. `analyze`,
+  `check_changed`, `find_dupes` and `check_health` write only a baseline,
+  regression baseline or snapshot file when the caller asks. They declare
+  `destructive_hint = false` explicitly, because MCP defaults `destructiveHint`
+  to true when `readOnlyHint` is false. They declare no idempotent hint,
+  because a `save_snapshot` call with no path writes a new file on each call.
+  `code_execute` stays read-only, so it refuses `save_baseline`,
+  `save_regression_baseline` and `save_snapshot` before dispatch and names
+  the standalone tool that declares the write.
+- `tools/list` is budgeted on both of its channels, because every byte of it is
+  resident in every agent session that connects whether or not the tool is ever
+  called. `crates/mcp/src/server/tests/tool_descriptions.rs` ratchets the total
+  `description` bytes and, separately, the total serialized `input_schema`
+  bytes. A parameter doc comment is wire text: schemars renders it into the
+  schema's `description`, so it spends the schema budget the same way prose
+  spends the description one. Both ratchets re-pin downward within the same
+  tolerance, sized as a small multiple of the per-tool one, so a real reduction
+  is banked in the change that made it instead of becoming silent budget.
 - Preserve project-relative paths in analysis results.
-- Mutation tools expose preview and explicit confirmation semantics.
+- Rule severity, including per-path `overrides[].rules`, is resolved by the
+  programmatic runtime through `fallow_engine::dead_code::apply_rule_severities`
+  before results reach a tool, on the dead-code route and on the decision
+  surface alike, so a decision is never framed from a finding a rule turns off.
+  MCP tools receive an already-resolved result set and must not filter by rule
+  themselves; that would put project policy in a protocol adapter and let the
+  two implementations drift.
+- Fix tools that change source expose preview and explicit confirmation
+  semantics.
 - Apply bounded timeouts and clean up the complete owned process tree on
   completion, cancellation, or timeout.
 - Never inherit unbounded environment or filesystem authority into code mode.
+- The Code Mode allowlist lives in `fallow_types::mcp_manifest`: a tool is
+  reachable from `code_execute` exactly when its `McpToolInfo` row carries a
+  `code_mode_alias`, and `CODE_MODE_ONLY_TOOLS` holds the few host helpers with
+  no standalone tool. The sandbox bindings, the `fallow schema` `mcp_tools`
+  rows, and the `fallow://tools` resource are all projections of that field, so
+  an agent on those surfaces reads reachability from data instead of the
+  `code_execute` description. The generated skill reference
+  (`npm/fallow/skills/fallow/references/mcp.md`) does not carry the column; an
+  agent reading only that file still has to read the description.
+  Drift tests bind the manifest to the `CodeModeTool` enum in both directions.
+- Each Code Mode host call has exactly one backing, `CodeModeBacking::Api` or
+  `CodeModeBacking::Subprocess`, derived from the single `api_route` match that
+  also performs the dispatch, so no tool can be listed as in-process without a
+  route. `fallow-api` cancellation is cooperative: a deadline or a client cancel sets the call's
+  token and the analysis stops at its next pipeline stage boundary, or inside
+  the per-file parse loop, which is the one place work stops per item. That has
+  no upper bound, because duplication detection and the dead-code detectors
+  hold no check once entered and are each seconds of work on a large
+  repository. So the whole-project analyses (`analyze`, `find_dupes`,
+  `check_health`, `audit`) still take the killable subprocess even though a
+  typed route exists for them: killing the child is the only stop `timeout_ms`
+  can promise. `check_health` also builds its own session below the API
+  options, so the token would not reach it, and `audit` runs a second analysis
+  in a temporary base worktree whose cleanup under cancellation is unexamined.
+  An in-process call that does outlive `timeout_ms` is counted as abandoned,
+  and while abandoned work is still winding down later host calls fall back to
+  the subprocess, which bounds how much orphaned analysis a long-lived server
+  can accumulate. The direct tools count into the same total, so Code Mode
+  also falls back while a direct typed call that timed out or was cancelled
+  still winds down.
+- Host calls are memoized per snippet, keyed on the tool plus its merged params
+  in canonical form (object keys sorted, array order preserved), so
+  `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` are one entry. A hit spawns nothing,
+  spends no `max_host_calls` slot, and charges no output bytes, but still
+  appears in `calls[]` with `cache_hit: true` so the trace stays honest. Only
+  successful calls are memoized, the cache lives in `CodeModeState`, and it
+  dies with the snippet: nothing persists between `code_execute` invocations.
+  The cache is therefore bounded by `MAX_HOST_CALLS` entries and by
+  `max_output_bytes` in total size.
+- The `calls[]` trace is bounded independently, at `MAX_RECORDED_CALLS`
+  entries, reported as `limits.max_recorded_calls`. Dispatches and refusals
+  each have a budget, but a memo hit spends neither, so without this bound a
+  snippet looping one cached call would grow the response envelope without
+  limit while every documented limit still reported as respected. Past the
+  bound the host calls still run and still return; only their trace entries
+  are dropped, and the response carries `calls_omitted` with the count. The
+  field is absent when nothing was dropped, so an ordinary response keeps the
+  shape its consumers already parse.
+- `fallow.all(requests)` is the fan-out. It runs in Rust, not in JS: the
+  sandbox stays synchronous and promise-free, and the call blocks until every
+  element has resolved. Elements are returned positionally aligned with the
+  requests as `{ ok, value }` or `{ ok, error }`, so a batch degrades per
+  element rather than as a whole; only whole-batch problems (a non-array
+  argument, an element that is not an object carrying a `tool` string, more
+  elements than `max_host_calls`, a batch bigger than the remaining budget, an
+  expired deadline) throw. Every element goes through the
+  same `resolve` (tool allowlist, `root` merging, memo key), the same shared
+  deadline, and the same output accounting as a single call, and the accounting
+  is applied in element order so the response does not depend on which element
+  finished first. The output budget is shared, not per element: what is left of
+  `max_output_bytes` is divided evenly across the dispatches a batch makes, so a
+  fan-out reads at most `max_output_bytes` in total. Dividing up front rather
+  than charging on arrival is what keeps the outcome independent of which worker
+  reported first. Subprocess-backed elements overlap on a worker pool capped at
+  `MAX_BATCH_CONCURRENCY`; in-process elements run one at a time on the calling
+  thread, because `fallow-api` stops only cooperatively and two concurrent
+  in-process analyses would be exactly the pile-up the abandoned-call
+  accounting exists to prevent.
+- `max_output_bytes` bounds two independent things: the total fallow JSON read
+  by host calls, and the serialized snippet result. The result is the only part
+  of a Code Mode response that enters the calling agent's context, so an
+  oversized one is refused with `ok:false`, `truncated:true`, `result_bytes`,
+  and a short `result_preview`, never returned whole and never truncated into
+  invalid JSON. The envelope's `error` string is clamped the same way, at
+  `max_output_bytes` or a 4 KiB floor, whichever is larger, so a structured
+  programmatic error stays readable while a thrown megabyte does not reach the
+  agent.
+- The sandbox denies dynamic code compilation, not just the `Function` global.
+  Undefining the binding leaves the intrinsic reachable through
+  `(function () {}).constructor`, so a hardening prelude replaces the
+  `constructor` slot on the function, async-function, generator-function, and
+  async-generator-function prototypes with a non-configurable `undefined`
+  before the snippet runs. `harden_globals` stays a denylist, so a test
+  enumerates `globalThis` own property names against a reviewed allowlist: a
+  runtime upgrade that adds a global fails the build instead of widening the
+  sandbox silently.
+- Host calls refused before dispatch (unknown or unsupported tool name,
+  malformed params, an output budget with nothing left to spend) run no
+  analysis and read no output, so they do not spend the `max_host_calls`
+  budget. The budget counts dispatches rather than `calls[]` entries, so
+  neither a rejection nor a memo hit shrinks what a later distinct call can
+  spend. Every such refusal is charged to `max_rejected_host_calls` instead,
+  which is what keeps a snippet looping over bad names, or over a spent output
+  budget, from spending an analysis budget it never used; the recorded tool
+  name is clamped as well, so an unvalidated `fallow.run` argument cannot
+  inflate the response envelope. Bounding the trace itself is a separate
+  concern, handled by `max_recorded_calls` above.
 - Keep tool ordering deterministic.
 - The `audit` and `check_health` typed routes resolve Istanbul coverage
   through `fallow_api::coverage::resolve_coverage_inputs` with the CLI's
@@ -119,9 +337,165 @@ Contract rules:
   validation, so a call that is invalid in two ways (a rejected coverage input
   and, say, `threads: 0`) reports the coverage error, which is also the order
   the CLI reports them in.
+- The `audit` typed route reads the `audit` config section with the CLI's
+  precedence: a `gate`, `worsened` or `css_deep` parameter wins, then
+  `audit.gate`, `audit.worsened`, `audit.css` and `audit.cssDeep`, then the
+  defaults. An invalid `worsened` value takes the CLI route, so the CLI
+  reports the error, as for `gate`. `css: false` turns
+  styling off, as `--no-css` does, but `css: true` cannot override
+  `audit.css: false`, because the CLI has no flag for that. `fallow_api::run_audit` resolves the
+  section after it loads the config, so an unset `AuditOptions` field means
+  "use the config". The baseline keys of the section are CLI-only: on a
+  non-empty changeset the API returns `FALLOW_AUDIT_BASELINE_UNSUPPORTED` and
+  the tool runs the CLI. The
+  drift case `i5_audit_config_section_agrees_across_surfaces` holds both
+  routes to the CLI result.
+- The typed routes run type-aware analysis only when the caller sets
+  `AnalysisOptions.type_aware`. The CLI also turns it on from
+  `FALLOW_TYPE_AWARE`, `audit.typeAware` (audit only) and
+  `typeAware.enabled`, with that precedence. `fallow_api` therefore refuses a
+  run that these layers make type-aware with
+  `FALLOW_TYPE_AWARE_CONFIG_UNSUPPORTED`: `run_dead_code`,
+  `run_circular_dependencies`, `run_boundary_violations`, `run_audit`,
+  `run_combined` when its dead-code or health section runs, and `run_health`
+  when no section and no `css` is selected (the CLI adds type coupling only
+  then). `api_runtime::typed_error_needs_cli` reads the code, and `analyze`,
+  `check_changed`, `check_health`, `audit` and the Code Mode `combined` and
+  `checkChanged` routes run the CLI instead. `TypeAwareOptions.enabled` is
+  an `Option<bool>`, like the `--type-aware` and `--no-type-aware` flags: a
+  set value wins over the environment and the config, so `Some(false)` runs
+  syntactic without a refusal. The `type_aware: false` parameter passes
+  `Some(false)` to the typed route and `--no-type-aware` to the CLI fallback.
+  `run_trace_export` refuses every type-aware request, the `Some(true)`
+  option included: `fallow dead-code --trace` then adds semantic evidence
+  and its completeness exit, which the typed trace cannot. The
+  `trace_export` tool and the Code Mode `traceExport` route run the CLI on
+  that code. The drift case `type_aware_config_agrees_across_surfaces` holds
+  the MCP envelope to the `_meta.type_aware` of the CLI, and the
+  `trace_export` answer to the CLI trace.
 - `trace_symbol` and `symbol_impact` expose exact TypeScript evidence for
   Fallow-owned project questions. They do not expose compiler diagnostics or
   typed lint findings.
+
+## Dependency usage parameters
+
+- `trace_dependency` accepts `usage`, `specifiers`, `sites`, `limit`, `cursor`
+  and `closure_depth`. `specifiers`, `limit` and `cursor` imply `sites`;
+  `sites` and `closure_depth` imply `usage`. `usage: false` or
+  `sites: false` alone sets nothing.
+- With no usage parameter, the typed path leaves
+  `TraceDependencyOptions.usage` as `None` and the CLI fallback keeps
+  `dead-code --trace-dependency <pkg>`. The response is byte-identical to the
+  response before these parameters existed.
+- With a usage parameter, `dependency_usage_query` builds the query with
+  `DependencyUsageQuery::new`, which checks `limit` 1 to 500 and
+  `closure_depth` 1 to 10 at run time. The CLI fallback
+  (`build_trace_dependency_args`) then emits
+  `trace --dependency <pkg> [--specifier NAME]... [--sites --limit N
+  [--cursor TOKEN]] [--callers --depth N]` plus the same `push_scope` flags.
+- Code Mode deserializes `TraceDependencyParams` on the in-process route, so
+  `traceDependency({ package_name, specifiers, sites })` needs no binding
+  change. One page is one call inside the host-call cap.
+
+## Finding-id queries
+
+- `analyze` accepts `finding_ids`. The typed path passes them to
+  `fallow_api::run_dead_code`; the CLI fallback passes one `--finding-id` per
+  id. A query always runs the full dead-code family: `analyze_family` never
+  routes it to the circular-dependency or boundary runner, because a missing id
+  there says nothing about the other families. `fallow_api` refuses
+  `finding_ids` on those runners with `FALLOW_UNSUPPORTED_OPTION`.
+- The response carries `finding_id_query`. Read the contract in
+  [CLI internals](cli-internals.md): a missing id is resolved only when
+  `conclusive` is true.
+
+## Execution and telemetry
+
+The standalone tools choose typed execution or an explicit CLI fallback; the
+server is not universally a subprocess wrapper. The Code Mode backing policy
+above is a separate timeout boundary. `FALLOW_BIN` selects the CLI for routes
+that need it, and `FALLOW_TIMEOUT_SECS` controls response deadlines.
+
+A tool call stops for two reasons: its deadline passes, or the client
+sends `notifications/cancelled`. rmcp reports a cancel only through the
+request's token and keeps polling the handler, so the server's `call_tool`
+runs every tool inside that token's scope
+(`crates/mcp/src/tools/cancellation.rs`). The scope is a task-local value, not
+a parameter, so a new tool gets the same behavior without a signature change.
+
+- The subprocess route waits for the deadline, the cancel, or the process,
+  whichever comes first. On a cancel it kills the owned process tree, as on a
+  timeout.
+- The typed route gives each call one cancellation flag, which goes into
+  `AnalysisOptions::cancellation`. A timeout or a cancel sets it and the call
+  returns at once. The stop is
+  cooperative: the analysis ends at its next stage boundary. Until the worker
+  ends, the call counts as abandoned, in the same count that Code Mode reads
+  before it starts in-process work. The `audit` base worktree is removed on
+  drop, so an early stop does not leave it behind.
+- Code Mode runs its snippet on a blocking thread, outside the task-local
+  scope. `code_execute` therefore reads the request token before
+  `spawn_blocking` and passes it to `execute_code_mode`. A cancel then acts at
+  each place where the deadline acts. The sandbox interrupt handler stops the
+  snippet. A new host call or batch element runs nothing. A subprocess host
+  call kills its process tree in the `run_fallow_sync` poll loop. An in-process
+  host call sets its cancellation flag and counts as abandoned, as on a
+  timeout.
+
+A cancelled call gets no response on the wire. rmcp removes the request from
+its pool when `notifications/cancelled` arrives, and drops the response that
+the handler returns later, as the MCP specification requires. The handler
+still builds a `FALLOW_MCP_CANCELLED` result, but only tests that call a tool
+directly see it. Only a timeout gives the client a structured error:
+`FALLOW_MCP_SUBPROCESS_TIMEOUT` or `FALLOW_MCP_API_TIMEOUT`.
+
+Each typed options builder starts from `shared_analysis_options` in
+`api_runtime.rs`. It maps root, config, remote extends, cache and threads,
+places `FALLOW_CHANGED_SINCE` and `FALLOW_DIFF_FILE` by `EnvScope`, and sets
+the cancellation flag. A tool sets only its own fields on top. A tool with
+both routes has a parity test (`tools/route_parity.rs`) that builds the argv
+and the typed options from the same params and compares the shared settings,
+`production` included: `false` is `--no-production` on the CLI route.
+
+The server installs one store of parsed modules for the process
+(`crates/mcp/src/warm_session.rs`, `fallow_engine::warm_parse`). Each typed
+call still builds a new session, which loads the config and discovers the
+files again. The session then takes its modules from the store when the root,
+the parse cache config hash, the ordered file list and each file fingerprint
+match a kept parse. Any difference, including a file that was added or
+removed, makes the session parse through the persisted cache, which parses the
+changed files only. A fingerprint with no ctime (Windows) is never kept. A
+kept fingerprint that is not three seconds older than the read of its parse
+can belong to a same-length write in the same timestamp tick, so the session
+reads that file and compares its content hash with the kept module. The
+store never changes an answer:
+`crates/mcp/tests/integration/warm_session.rs` compares the text of each typed
+answer with and without the store.
+`FALLOW_MCP_WARM_SESSION=0` turns the store off. CLI subprocess calls and
+subprocess-backed Code Mode calls run in their own process and do not use it.
+Code Mode host calls with an API backing, such as `traceFile`, `traceExport`
+and `projectInfo`, run in the server process and share the store.
+
+A parse through the store always computes complexity. When a CLI `dead-code`
+run wrote the persisted cache, its entries have no complexity. The first
+typed call then parses each file from source, and the later calls take the
+modules from the store.
+
+The store limit is on memory, not on source size. Each kept file list holds
+its own modules, so a full list and a production list of one project each
+count in full. The store cannot measure the memory of the modules, so it makes
+an estimate: 12 bytes for each source byte, plus the size of one module
+struct for each file. On ten public projects, the heap of the parsed modules
+was 4.4 to 10.5 times the source size. The default limit is 4 file lists and
+512 MiB of estimated memory. A file list with an estimate over the limit is
+not kept, so a project with more than about 40 MiB of source parses as
+before.
+
+CLI dispatch in `tools/mod.rs` tags the child with
+`FALLOW_INTEGRATION_SURFACE=mcp` and `FALLOW_MCP_TOOL`. The CLI owns any
+consented telemetry event. Typed routes do not spawn that child or emit a
+replacement event from the MCP server. Keep tool names synchronized with the
+manifest used to validate those tags.
 
 ## Verification
 
@@ -135,5 +509,5 @@ npm run verify:fast
 Tool changes require a protocol-level test plus a real MCP invocation when the
 execution path changes. Resource changes are covered by
 `crates/mcp/src/server/tests/resources.rs` (catalogue, reader, errors) and the
-spawned-binary `crates/mcp/tests/resources.rs` (initialize, `resources/list`,
-`resources/templates/list`, `resources/read`).
+spawned-binary `crates/mcp/tests/integration/resources.rs` (initialize,
+`resources/list`, `resources/templates/list`, `resources/read`).

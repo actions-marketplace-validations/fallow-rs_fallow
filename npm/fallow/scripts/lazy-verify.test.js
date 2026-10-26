@@ -5,14 +5,9 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const {
-  ensureVerified,
-  SENTINEL_SCHEMA_VERSION,
-  VERIFY_LOG_ENV,
-  _resetWarningState,
-} = require("./lazy-verify");
+const { ensureVerified, SENTINEL_SCHEMA_VERSION, _resetWarningState } = require("./lazy-verify");
 const { SENTINEL_FILENAME } = require("./sentinel-path");
-const { _verifyWithKey, SKIP_ENV } = require("./verify-binary");
+const { _verifyWithKey, binaryTargetsForPlatform, SKIP_ENV } = require("./verify-binary");
 
 // ---- shared fixtures ------------------------------------------------------
 
@@ -74,13 +69,15 @@ function cleanup(dir) {
 
 function captureStderr(t) {
   const lines = [];
-  const original = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk) => {
+  // lazy-verify writes diagnostics to fd 2 with fs.writeSync (issue #3276).
+  const original = fs.writeSync;
+  fs.writeSync = (fd, chunk, ...rest) => {
+    if (fd !== 2) return original(fd, chunk, ...rest);
     lines.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
-    return true;
+    return chunk.length;
   };
   t.after(() => {
-    process.stderr.write = original;
+    fs.writeSync = original;
   });
   return { lines };
 }
@@ -147,6 +144,28 @@ test("ensureVerified verifies and caches a win32 executable on any host", (t) =>
   });
   assert.equal(cached.ok, true);
   assert.equal(cached.cached, true);
+});
+
+test("sentinel records the same binaries that verify-binary verifies", (t) => {
+  const cases = [
+    { platform: "linux", platformId: "linux-x64-gnu" },
+    { platform: "win32", platformId: "win32-x64-msvc" },
+  ];
+  for (const { platform, platformId } of cases) {
+    _resetWarningState();
+    const { privateKey, rawPub } = makeKeypair();
+    const dir = mkPlatformDir(privateKey, { platform });
+    t.after(() => cleanup(dir));
+    const input = baseInput(dir, (binaryPath) => _verifyWithKey(binaryPath, rawPub), {
+      platform,
+    });
+
+    const result = ensureVerified(input);
+    assert.equal(result.ok, true);
+    const sentinel = JSON.parse(fs.readFileSync(result.sentinelPath, "utf8"));
+    const verified = binaryTargetsForPlatform(platformId).map((target) => target.binary);
+    assert.deepEqual(Object.keys(sentinel.binaries), verified);
+  }
 });
 
 test("ensureVerified returns cached:true on a valid sentinel", (t) => {
@@ -542,10 +561,4 @@ test("ensureVerified warns once on stderr when FALLOW_SKIP_BINARY_VERIFY is set"
     (l) => l.includes(`${SKIP_ENV} is set`) && l.includes("verification is skipped"),
   );
   assert.equal(warnings.length, 1, "warning should fire exactly once per process");
-});
-
-// ---- VERIFY_LOG_ENV export ------------------------------------------------
-
-test("VERIFY_LOG_ENV is exported with the documented name", () => {
-  assert.equal(VERIFY_LOG_ENV, "FALLOW_VERIFY_LOG");
 });

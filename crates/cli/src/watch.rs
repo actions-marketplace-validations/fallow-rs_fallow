@@ -33,6 +33,8 @@ pub struct WatchOptions<'a> {
     pub explain: bool,
     /// Mirror of the global `--include-entry-exports` flag.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
     pub type_aware: Option<bool>,
     pub type_aware_projects: &'a [PathBuf],
     pub type_aware_require: Option<fallow_config::TypeAwareRequire>,
@@ -92,7 +94,7 @@ fn build_production_glob_set() -> Option<globset::GlobSet> {
 #[derive(Clone)]
 struct WatchFilter {
     root: PathBuf,
-    ignore_patterns: globset::GlobSet,
+    ignore_patterns: fallow_config::IgnorePatternSet,
     production_excludes: Option<globset::GlobSet>,
     gitignores: Vec<ignore::gitignore::Gitignore>,
     global_gitignore: ignore::gitignore::Gitignore,
@@ -123,7 +125,9 @@ impl WatchFilter {
             return false;
         }
         let relative = path.strip_prefix(&self.root).unwrap_or(path);
-        if has_disallowed_hidden_dir(relative) {
+        // A `!` entry in `ignorePatterns` can add a file in a hidden directory
+        // to discovery (issue #2452), so a change to it must trigger a rerun.
+        if has_disallowed_hidden_dir(relative) && !self.ignore_patterns.is_lifted(relative) {
             return false;
         }
         if self.ignore_patterns.is_match(relative) {
@@ -155,7 +159,13 @@ impl WatchFilter {
     fn project_gitignore_match(&self, path: &Path, is_dir: bool) -> Option<bool> {
         let mut ignored = None;
         for gitignore in &self.gitignores {
-            match gitignore.matched_path_or_any_parents(path, is_dir) {
+            // `ignore` strips the matcher root as a byte prefix and panics on a
+            // path outside that root. Strip the root by path component here, so
+            // `pkg` does not match `pkg-extra` and other subtrees are skipped.
+            let Ok(relative) = path.strip_prefix(gitignore.path()) else {
+                continue;
+            };
+            match gitignore.matched_path_or_any_parents(relative, is_dir) {
                 Match::Ignore(_) => ignored = Some(true),
                 Match::Whitelist(_) => ignored = Some(false),
                 Match::None => {}
@@ -219,7 +229,10 @@ fn build_gitignore(base: &Path, path: &Path) -> Option<ignore::gitignore::Gitign
     builder.build().ok()
 }
 
-fn discover_project_gitignores(root: &Path, ignore_patterns: &globset::GlobSet) -> Vec<PathBuf> {
+fn discover_project_gitignores(
+    root: &Path,
+    ignore_patterns: &fallow_config::IgnorePatternSet,
+) -> Vec<PathBuf> {
     let root = root.to_path_buf();
     let ignore_patterns = ignore_patterns.clone();
     let filter_root = root.clone();
@@ -376,8 +389,17 @@ fn analyze_and_report(config: &fallow_config::ResolvedConfig, opts: &WatchOption
         ) {
             Ok(outcome) => outcome.map(|outcome| outcome.type_aware.meta),
             Err(error) => {
-                eprintln!("Type-aware analysis failed: {error}");
-                return ExitCode::from(2);
+                if config.type_aware.require == fallow_config::TypeAwareRequire::Complete {
+                    eprintln!("Type-aware analysis failed: {error}");
+                    return ExitCode::from(2);
+                }
+                let message =
+                    crate::type_aware_degrade::degraded_message(&config.root, &error.to_string());
+                eprintln!("Warning: {message}");
+                Some(crate::type_aware_degrade::degraded_meta(
+                    message,
+                    config.type_aware.require,
+                ))
             }
         }
     } else {
@@ -390,6 +412,7 @@ fn analyze_and_report(config: &fallow_config::ResolvedConfig, opts: &WatchOption
     crate::telemetry::note_result_count(results.total_issues());
     let elapsed = start.elapsed();
     let ctx = report::ReportContext {
+        package_baselines: &[],
         root: &config.root,
         rules: &config.rules,
         workspace_diagnostics: &[],
@@ -404,18 +427,36 @@ fn analyze_and_report(config: &fallow_config::ResolvedConfig, opts: &WatchOption
         summary_heading: true,
         show_explain_tip: true,
         baseline_matched: None,
+        baseline_staleness: None,
+        finding_id_query: None,
+        // `watch` is the interactive loop; it arms no CI gate.
+        gate_outcomes: None,
         config_fixable: crate::fix::is_config_fixable(&config.root, opts.config_path.as_ref()),
+        failed_parse_files: 0,
         skip_score_and_trend: false,
         css_requested: false,
         json_style: opts.json_style,
+        include_fragments: true,
+        architecture_layout: report::ArchitectureLayout::Embedded,
     };
     let report_code = report::print_results(&results, &ctx, config.output, None);
     if report_code != ExitCode::SUCCESS {
         eprintln!("Warning: report output failed");
     }
+    watch_type_aware_exit_code(config, type_aware.as_ref())
+}
+
+/// Exit 1 when the watch cycle required complete semantic analysis and did not
+/// get it, mirroring the standalone commands' completeness gate.
+///
+/// Split out of `analyze_and_report` so that function stays inside the
+/// `too_many_lines` budget after gaining a `ReportContext` member.
+fn watch_type_aware_exit_code(
+    config: &fallow_config::ResolvedConfig,
+    type_aware: Option<&fallow_types::envelope::TypeAwareMeta>,
+) -> ExitCode {
     if config.type_aware.require == fallow_config::TypeAwareRequire::Complete
         && type_aware
-            .as_ref()
             .and_then(|meta| meta.identity.as_ref())
             .is_some_and(|identity| {
                 identity.completeness != fallow_types::semantic::SemanticCompleteness::Complete
@@ -447,6 +488,9 @@ fn reload_config_or_keep_previous(
         Ok(mut reloaded) => {
             if opts.include_entry_exports {
                 reloaded.include_entry_exports = true;
+            }
+            if opts.show_cascade {
+                reloaded.show_cascade = true;
             }
             *config = reloaded;
         }
@@ -619,6 +663,9 @@ fn load_watch_config(opts: &WatchOptions<'_>) -> Result<fallow_config::ResolvedC
     )?;
     if opts.include_entry_exports {
         config.include_entry_exports = true;
+    }
+    if opts.show_cascade {
+        config.show_cascade = true;
     }
     crate::check::apply_type_aware_overrides_from(
         opts.output,
@@ -981,6 +1028,47 @@ mod tests {
     }
 
     #[test]
+    fn watch_filter_handles_paths_outside_disjoint_nested_gitignores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for package in ["a", "b"] {
+            std::fs::create_dir_all(dir.path().join(format!("packages/{package}/src")))
+                .expect("create package dir");
+            std::fs::write(
+                dir.path().join(format!("packages/{package}/.gitignore")),
+                "generated/\n",
+            )
+            .expect("write nested gitignore");
+        }
+        let config = make_config(dir.path(), OutputFormat::Human, 1, false);
+        let filter = WatchFilter::new(&config);
+        let event = make_event(&[
+            &dir.path().join("packages/a/src/index.ts"),
+            &dir.path().join("packages/b/generated/client.ts"),
+            &dir.path().join("src/main.ts"),
+        ]);
+        let paths = display_changed_paths(filter_event_paths(event, &filter), dir.path());
+        assert_eq!(paths, vec!["packages/a/src/index.ts", "src/main.ts"]);
+    }
+
+    #[test]
+    fn watch_filter_does_not_apply_nested_gitignore_to_sibling_with_shared_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("packages/pkg")).expect("create pkg dir");
+        std::fs::create_dir_all(dir.path().join("packages/pkg-extra/generated"))
+            .expect("create pkg-extra dir");
+        std::fs::write(dir.path().join("packages/pkg/.gitignore"), "generated/\n")
+            .expect("write nested gitignore");
+        let config = make_config(dir.path(), OutputFormat::Human, 1, false);
+        let filter = WatchFilter::new(&config);
+        let event = make_event(&[
+            &dir.path().join("packages/pkg/generated/client.ts"),
+            &dir.path().join("packages/pkg-extra/generated/client.ts"),
+        ]);
+        let paths = display_changed_paths(filter_event_paths(event, &filter), dir.path());
+        assert_eq!(paths, vec!["packages/pkg-extra/generated/client.ts"]);
+    }
+
+    #[test]
     fn watch_filter_rejects_ignored_config_files() {
         let root = PathBuf::from("/project");
         let config = make_config_with_ignores(
@@ -1116,6 +1204,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -1124,8 +1213,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules: fallow_config::RulesConfig::default(),
@@ -1145,7 +1236,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
         }
         .resolve(root.to_path_buf(), output, threads, false, quiet, None)
@@ -1170,6 +1263,7 @@ mod tests {
             clear_screen: false,
             explain: false,
             include_entry_exports: false,
+            show_cascade: false,
             type_aware: None,
             type_aware_projects: &[],
             type_aware_require: None,

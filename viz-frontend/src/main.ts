@@ -1,11 +1,13 @@
-import { applyHash, createState, runSearch, setDarkMode, syncHash } from "./state";
+import { applyHash, createState, runSearch, setDarkMode, storeTheme, syncHash } from "./state";
 import type { AppState } from "./state";
-import type { Lens, TreeNode } from "./types";
+import type { Lens, SecondaryAnalysis, TreeNode } from "./types";
 import {
+  attachHoverLayer,
   captureLensColors,
   drillInto,
   drillTo,
   drillUp,
+  paintTreemapHover,
   renderTreemap,
   startLensFade,
   treemapHitTest,
@@ -20,6 +22,7 @@ import {
   graphHandleClick,
   graphHoverTarget,
   graphPathTrace,
+  graphInitSteps,
   initGraphNodes,
   nodeScreenPos,
   refitOnResize,
@@ -32,6 +35,7 @@ import {
   roadFacts,
   setClusterMode,
   startGraphLensFade,
+  syncStandaloneForLens,
 } from "./graph";
 import { buildHelpOverlay } from "./overlays";
 import { buildChrome, statuslineOf, updateChrome } from "./chrome";
@@ -39,18 +43,49 @@ import type { ChromeRefs } from "./chrome";
 import { createPanel, panelRenderKey, renderPanel } from "./panel";
 import { hideTooltip, showDirTooltip, showFileTooltip, showRoadTooltip } from "./tooltip";
 import { installHintTips } from "./hint";
-import { dirname } from "./data";
+import { installSlider } from "./slider";
+import {
+  dirname,
+  findingsForFile,
+  healthHasFindingForFile,
+  securityCandidatesForFile,
+} from "./data";
+import { LENS_IDS } from "./lenses";
+import { createLoader, nextFrame, runSteps } from "./loading";
+import { readEmbeddedPayload } from "./payload";
+import { ROW_IDS, mountApp } from "./shell";
 
 const renderView = (state: AppState): void => {
   if (state.view === "map") {
     renderTreemap(state);
   } else {
+    // Clears the treemap hover marks that the graph view must not show.
+    paintTreemapHover(state);
     initGraphNodes(state);
   }
 };
 
+/** Mark the cluster segment button of `mode` as pressed. */
+const pressClusterButton = (refs: ChromeRefs, mode: string): void => {
+  for (const [clusterMode, button] of refs.clusterButtons) {
+    button.setAttribute("aria-pressed", String(clusterMode === mode));
+  }
+};
+
+const installSegmentSliders = (): void => {
+  for (const group of document.querySelectorAll<HTMLElement>(".lens-tabs, .seg")) {
+    installSlider(group);
+  }
+};
+
+/** True when keyboard focus sits in a text field. */
+const isTextInput = (target: EventTarget | null): boolean => {
+  const tag = (target as HTMLElement | null)?.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA";
+};
+
 const init = (): void => {
-  const data = window.__FALLOW_DATA__;
+  const data = readEmbeddedPayload(document);
   if (!data) {
     document.body.textContent = "Error: no fallow visualization data found.";
     return;
@@ -58,13 +93,11 @@ const init = (): void => {
 
   document.documentElement.dataset.theme = "dark";
 
-  const app = document.createElement("div");
-  app.id = "app";
-  document.body.appendChild(app);
+  const app = mountApp(document);
 
   // Stage (canvas + overlays)
   const stage = document.createElement("main");
-  stage.id = "stage";
+  stage.id = ROW_IDS.stage;
   const canvas = document.createElement("canvas");
   canvas.id = "canvas";
   canvas.tabIndex = 0;
@@ -103,9 +136,10 @@ const init = (): void => {
   };
 
   const setLens = (lens: Lens): void => {
-    if (state.lens === lens) return;
+    if (state.lens === lens && state.activeAnalysis === null) return;
     const prev = captureLensColors(state);
     state.lens = lens;
+    state.activeAnalysis = null;
     state.selectedClone = null;
     startLensFade(state, prev);
     // Crossfade the graph nodes too, so 1-5 animates in both views.
@@ -113,6 +147,21 @@ const init = (): void => {
     // The ranked panel opens or closes with the lens; keep the graph
     // fitted to the space that remains while the camera is untouched.
     if (state.view === "graph") refitOnResize(state);
+    if (state.view === "graph") syncStandaloneForLens(state);
+    requestRender();
+  };
+
+  const setSecondaryAnalysis = (analysis: SecondaryAnalysis): void => {
+    if (state.activeAnalysis === analysis) return;
+    const prev = captureLensColors(state);
+    state.activeAnalysis = analysis;
+    state.lens = "overview";
+    state.selectedClone = null;
+    startLensFade(state, prev);
+    if (state.view === "graph") {
+      startGraphLensFade(state, prev);
+      refitOnResize(state);
+    }
     requestRender();
   };
 
@@ -131,21 +180,19 @@ const init = (): void => {
   refs = buildChrome(state, app, {
     onView: setView,
     onLens: setLens,
+    onSecondary: setSecondaryAnalysis,
     onSearch: (query) => {
       runSearch(state, query);
       requestRender();
     },
     onTheme: () => {
       setDarkMode(state, !state.dark);
+      storeTheme(state.dark);
       requestRender();
     },
     onCrumb: () => {},
     onCluster: (mode) => {
-      if (refs) {
-        for (const [clusterMode, button] of refs.clusterButtons) {
-          button.setAttribute("aria-pressed", String(clusterMode === mode));
-        }
-      }
+      if (refs) pressClusterButton(refs, mode);
       setClusterMode(state, mode);
     },
   });
@@ -155,6 +202,13 @@ const init = (): void => {
   };
 
   stage.appendChild(canvas);
+  // Hover marks live on their own layer, so a hover change repaints one
+  // tile outline instead of the full treemap.
+  const hoverLayer = document.createElement("canvas");
+  hoverLayer.className = "hover-layer";
+  hoverLayer.setAttribute("aria-hidden", "true");
+  stage.appendChild(hoverLayer);
+  attachHoverLayer(state, hoverLayer);
   // Keyboard-focus ring for the full-width canvas, drawn as an overlay over
   // just the usable area so it never runs under the always-open panel (a CSS
   // outline on the canvas would frame the whole element, panel included).
@@ -165,9 +219,19 @@ const init = (): void => {
   // The arrange toggle floats over the map (top-right, graph view only);
   // chrome builds it but leaves mounting to the stage here.
   stage.appendChild(refs.clusterGroup);
+  installSegmentSliders();
   const panel = createPanel();
+  // Overview triage cards open their lens.
+  panel.addEventListener("fallow:lens", (event) => {
+    const lens = (event as CustomEvent<Lens>).detail;
+    if (LENS_IDS.includes(lens)) setLens(lens);
+  });
   stage.appendChild(panel);
   app.appendChild(stage);
+  const loader = createLoader(stage);
+  // The first graph build runs in steps behind the loading screen. Until it
+  // ends, a render would start a second, blocking build.
+  let booting = state.view === "graph";
   app.appendChild(statuslineOf(refs));
 
   // Floating [data-tip] hints: one body-level element, delegated globally so
@@ -250,7 +314,7 @@ const init = (): void => {
   // null forces the very first render to build the panel.
   let renderedPanelKey: string | null = null;
   const requestRender = (): void => {
-    if (renderQueued) return;
+    if (renderQueued || booting) return;
     renderQueued = true;
     requestAnimationFrame(() => {
       renderQueued = false;
@@ -267,12 +331,16 @@ const init = (): void => {
           (fileIndex) => selectFile(fileIndex, true),
           () => {
             state.selectedRoad = null;
+            clearGraphFocus(state);
             selectFile(null);
           },
           requestRender,
         );
       }
       renderView(state);
+      // Building the graph can change what the panel shows (the folder
+      // loops); repaint the panel on the next frame when it did.
+      if (panelRenderKey(state) !== renderedPanelKey) requestRender();
       syncHash(state);
     });
   };
@@ -290,7 +358,7 @@ const init = (): void => {
     const hit = treemapHitTest(state, x, y);
     if (hit !== state.hoveredCell) {
       state.hoveredCell = hit;
-      requestRender();
+      paintTreemapHover(state);
     }
     if (hit === null) {
       canvas.style.cursor = "default";
@@ -377,7 +445,7 @@ const init = (): void => {
     hideTooltip();
     if (state.view === "map" && state.hoveredCell !== null) {
       state.hoveredCell = null;
-      requestRender();
+      paintTreemapHover(state);
     }
     if (state.view === "graph") {
       const changed = state.graphHovered !== null;
@@ -437,7 +505,7 @@ const init = (): void => {
   });
 
   // ── Keyboard ──────────────────────────────────────────────────
-  const lensOrder: Lens[] = ["overview", "deadcode", "dupes", "boundaries", "hotspots"];
+  const lensOrder: readonly Lens[] = LENS_IDS;
   /** One step back per press: help, search, selection, drill, lens. */
   const handleEscape = (inInput: boolean): void => {
     if (state.helpOpen) {
@@ -456,7 +524,7 @@ const init = (): void => {
     } else if (state.selectedClone !== null) {
       state.selectedClone = null;
       requestRender();
-    } else if (state.selectedRoad !== null || clearGraphFocus(state)) {
+    } else if (clearGraphFocus(state) || state.selectedRoad !== null) {
       state.selectedRoad = null;
       requestRender();
     } else if (state.search !== "" && refs) {
@@ -465,52 +533,75 @@ const init = (): void => {
       requestRender();
     } else if (state.view === "map" && drillUp(state)) {
       requestRender();
-    } else if (state.lens !== "overview") {
+    } else if (state.activeAnalysis !== null || state.lens !== "overview") {
       setLens("overview");
     }
   };
 
-  window.addEventListener("keydown", (event) => {
-    const target = event.target as HTMLElement | null;
-    const inInput = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+  /** Step through the active lens's findings without going back to the list. */
+  const stepFinding = (key: string): void => {
+    if (state.selected === null) return;
+    document
+      .querySelector<HTMLButtonElement>(key === "j" ? "#panel .step-next" : "#panel .step-prev")
+      ?.click();
+  };
 
-    if (event.key === "Escape") {
-      handleEscape(inInput);
+  const resetZoom = (): void => {
+    if (state.view === "graph") {
+      resetGraphView(state);
       return;
     }
-    if (inInput) {
-      if (event.key === "Enter" && state.view === "graph" && state.search.trim() !== "") {
-        graphFocusSearch(state);
-      }
-      return;
-    }
+    drillTo(state, "");
+    requestRender();
+  };
 
+  const keyActions = new Map<string, (event: KeyboardEvent) => void>([
+    [
+      "/",
+      (event) => {
+        event.preventDefault();
+        refs?.search.focus();
+      },
+    ],
+    ["?", () => toggleHelp()],
+    ["t", () => setView("map")],
+    ["m", () => setView("map")],
+    ["g", () => setView("graph")],
+    ["j", () => stepFinding("j")],
+    ["k", () => stepFinding("k")],
+    ["0", resetZoom],
+  ]);
+  lensOrder.forEach((lens, index) => {
+    keyActions.set(String(index + 1), () => setLens(lens));
+  });
+
+  const handleInputKey = (event: KeyboardEvent): void => {
+    if (event.key === "Enter" && state.view === "graph" && state.search.trim() !== "") {
+      graphFocusSearch(state);
+    }
+  };
+
+  const handleShortcut = (event: KeyboardEvent): void => {
     if (state.helpOpen) {
       // With the modal open, only "?" (toggle closed) acts; lens/view
       // shortcuts must not mutate the map behind the dialog.
       if (event.key === "?") toggleHelp();
       return;
     }
+    keyActions.get(event.key)?.(event);
+  };
 
-    if (event.key === "/") {
-      event.preventDefault();
-      refs?.search.focus();
-    } else if (event.key === "?") {
-      toggleHelp();
-    } else if (event.key >= "1" && event.key <= "5") {
-      setLens(lensOrder[Number(event.key) - 1]);
-    } else if (event.key === "t" || event.key === "m") {
-      setView("map");
-    } else if (event.key === "g") {
-      setView("graph");
-    } else if (event.key === "0") {
-      if (state.view === "graph") {
-        resetGraphView(state);
-      } else {
-        drillTo(state, "");
-        requestRender();
-      }
+  window.addEventListener("keydown", (event) => {
+    const inInput = isTextInput(event.target);
+    if (event.key === "Escape") {
+      handleEscape(inInput);
+      return;
     }
+    if (inInput) {
+      handleInputKey(event);
+      return;
+    }
+    handleShortcut(event);
   });
 
   window.addEventListener("resize", () => {
@@ -523,17 +614,32 @@ const init = (): void => {
     requestRender();
   });
   window.addEventListener("hashchange", () => {
+    const lensBefore = state.lens;
     applyHash(state, window.location.hash);
+    // Back and forward can change the lens; the strip of unconnected
+    // folders must follow it as it does for a tab click.
+    if (state.lens !== lensBefore && state.view === "graph") syncStandaloneForLens(state);
     requestRender();
   });
 
-  // Initial paint.
-  requestRender();
+  // Initial paint, then again once the embedded census fonts are ready:
+  // the canvas measures and draws text with whatever face is loaded.
+  const firstPaint = async (): Promise<void> => {
+    if (booting) {
+      await runSteps(graphInitSteps(state), loader);
+      loader.update({ label: "Drawing the map", fraction: 0.96 });
+      await nextFrame();
+      booting = false;
+    }
+    requestRender();
+    // The render frame is queued first, so the loading screen leaves after it.
+    requestAnimationFrame(() => requestAnimationFrame(loader.done));
+  };
+  void firstPaint();
+  void document.fonts?.ready.then(() => requestRender());
 
   // Keep the cluster segment in sync with the actual mode at boot.
-  for (const [clusterMode, button] of refs.clusterButtons) {
-    button.setAttribute("aria-pressed", String(clusterMode === getClusterMode(state)));
-  }
+  pressClusterButton(refs, getClusterMode(state));
 };
 
 const countLeaves = (node: {
@@ -561,17 +667,20 @@ const countLensFindings = (
       switch (state.lens) {
         case "overview":
           break;
-        case "deadcode":
+        case "unused":
           if (file.status === "unused" || file.status === "hasUnusedExports") value++;
           break;
-        case "dupes":
+        case "duplication":
           if (file.dup_lines > 0) value++;
           break;
-        case "boundaries":
-          if (state.index.violationSources.has(current.fileIndex)) value++;
+        case "architecture":
+          if (findingsForFile(state.data, "architecture", current.fileIndex).length > 0) value++;
           break;
-        case "hotspots":
-          if (file.max_cyclomatic >= 10) value++;
+        case "health":
+          if (healthHasFindingForFile(state.data, current.fileIndex)) value++;
+          break;
+        case "security":
+          if (securityCandidatesForFile(state.data, current.fileIndex).length > 0) value++;
           break;
       }
       return;
@@ -581,10 +690,11 @@ const countLensFindings = (
   walk(node);
   const labels: Record<Lens, string> = {
     overview: "",
-    deadcode: "unused",
-    dupes: "with clones",
-    boundaries: "violating",
-    hotspots: "complex",
+    unused: "unused",
+    duplication: "with clones",
+    architecture: "violating",
+    health: "at risk",
+    security: "with candidates",
   };
   return { value, label: labels[state.lens] };
 };

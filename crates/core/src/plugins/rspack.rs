@@ -37,7 +37,7 @@ define_plugin! {
     config_patterns: CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
 
         let imports = config_parser::extract_imports(source, config_path);
@@ -46,9 +46,13 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        let entries =
-            config_parser::extract_config_string_or_array(source, config_path, &["entry"]);
-        result.extend_entry_patterns(entries);
+        let base = super::webpack::apply_entries(
+            &mut result,
+            source,
+            super::webpack::ConfigFile { path: config_path, root },
+            &["entry"],
+            "context",
+        );
 
         let require_deps =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
@@ -67,6 +71,18 @@ define_plugin! {
         }
 
         super::webpack::parse_webpack_loaders(source, config_path, &mut result);
+
+        super::module_federation::apply_bundler_plugin_options(
+            &mut result,
+            source,
+            config_path,
+            root,
+            super::module_federation::FederationBase {
+                context: base.as_deref(),
+                package_dir: None,
+            },
+            "rspack",
+        );
 
         result
     }
@@ -109,6 +125,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_entry_module_request_is_credited_as_dependency() {
+        let source = r#"
+            module.exports = {
+                entry: ["react-hot-loader/patch", "./src/index.tsx"],
+            };
+        "#;
+        let plugin = RspackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/rspack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["src/index.tsx"]);
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"react-hot-loader".to_string())
+        );
+    }
+
+    #[test]
     fn resolve_config_loaders() {
         let source = r"
             module.exports = {
@@ -130,5 +167,49 @@ mod tests {
         assert!(deps.contains(&"style-loader".to_string()));
         assert!(deps.contains(&"css-loader".to_string()));
         assert!(deps.contains(&"svgr-loader".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_reads_inline_module_federation_options() {
+        let source = r#"
+            const { ModuleFederationPlugin } = require("@module-federation/enhanced/rspack");
+
+            module.exports = {
+                plugins: [
+                    new ModuleFederationPlugin({
+                        name: "checkout",
+                        exposes: { "./Button": "./src/Button.tsx" },
+                    }),
+                ],
+            };
+        "#;
+        let plugin = RspackPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/rspack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(result.entry_patterns, vec!["src/Button.tsx"]);
+    }
+
+    #[test]
+    fn resolve_config_context_roots_relative_entries_and_exposes() {
+        let source = r#"
+            const path = require("path");
+            module.exports = {
+                context: path.resolve(__dirname, "src"),
+                entry: "./app.ts",
+                plugins: [
+                    new ModuleFederationPlugin({ exposes: { "./B": "./B.tsx" } }),
+                ],
+            };
+        "#;
+        let result = RspackPlugin.resolve_config(
+            std::path::Path::new("/project/rspack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["src/app.ts", "src/B.tsx"]);
     }
 }

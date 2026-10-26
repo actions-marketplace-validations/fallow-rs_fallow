@@ -3,15 +3,33 @@ use crate::graph::ModuleGraph;
 use crate::results::UnusedFile;
 use crate::suppress::{IssueKind, SuppressionContext};
 
-use super::predicates::{
-    is_barrel_with_reachable_sources, is_config_file, is_declaration_file, is_html_file,
-};
+use super::predicates::{is_barrel_with_reachable_sources, is_config_file, is_html_file};
+
+/// The reported unused files only. Tests read this shape.
+#[cfg(test)]
+pub fn find_unused_files(
+    graph: &ModuleGraph,
+    suppressions: &SuppressionContext<'_>,
+) -> Vec<UnusedFile> {
+    find_unused_file_scan(graph, suppressions).files
+}
+
+/// The unused files of one run, with and without inline suppressions.
+pub struct UnusedFileScan {
+    /// The files that the report lists.
+    pub files: Vec<UnusedFile>,
+    /// The unused files whose finding an inline `fallow-ignore-file
+    /// unused-file` comment suppressed. The cascade filter treats them as
+    /// reported, so a suppression comment never adds a finding.
+    pub suppressed: Vec<std::path::PathBuf>,
+}
 
 /// Find files that are not reachable from any entry point.
 ///
-/// TypeScript declaration files (`.d.ts`) are excluded because they are consumed
-/// by the TypeScript compiler via `tsconfig.json` includes, not via explicit
-/// import statements. Flagging them as unused is a false positive.
+/// TypeScript declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are entry points
+/// unless they are orphan module declaration files (see
+/// `discover::find_orphan_module_declaration_files`), so only an orphan that
+/// nothing reachable imports is reported here.
 ///
 /// Configuration files (e.g., `babel.config.js`, `.eslintrc.js`, `knip.config.ts`)
 /// are also excluded because they are consumed by tools, not via imports.
@@ -23,30 +41,33 @@ use super::predicates::{
 /// Barrel files (index.ts that only re-export) are excluded when their re-export
 /// sources are reachable , they serve an organizational purpose even if consumers
 /// import directly from the source files rather than through the barrel.
-#[deprecated(
-    since = "2.76.0",
-    note = "fallow_core is internal; use fallow_api::run_dead_code for typed output; serialize with fallow_api::serialize_dead_code_programmatic_json for JSON output. See docs/fallow-core-migration.md."
-)]
-pub fn find_unused_files(
+///
+/// The scan also keeps the files that an inline suppression removed from the
+/// report, for the cascade filter.
+pub fn find_unused_file_scan(
     graph: &ModuleGraph,
     suppressions: &SuppressionContext<'_>,
-) -> Vec<UnusedFile> {
-    graph
+) -> UnusedFileScan {
+    let (suppressed, reported): (Vec<_>, Vec<_>) = graph
         .modules
         .iter()
         .filter(|m| !m.is_reachable() && !m.is_entry_point())
-        .filter(|m| !is_declaration_file(&m.path))
         .filter(|m| !is_config_file(&m.path))
         .filter(|m| !is_html_file(&m.path))
         .filter(|m| !is_barrel_with_reachable_sources(m, graph))
         .filter(|m| !has_reachable_importer(m.file_id, graph))
         .filter(|m| !has_reachable_export_reference(m.file_id, graph))
         .filter(|m| m.path.exists())
-        .filter(|m| !suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile))
-        .map(|m| UnusedFile {
-            path: m.path.clone(),
-        })
-        .collect()
+        .partition(|m| suppressions.is_file_suppressed(m.file_id, IssueKind::UnusedFile));
+    UnusedFileScan {
+        files: reported
+            .into_iter()
+            .map(|m| UnusedFile {
+                path: m.path.clone(),
+            })
+            .collect(),
+        suppressed: suppressed.into_iter().map(|m| m.path.clone()).collect(),
+    }
 }
 
 /// Check if any reachable module has an edge to this file.
@@ -76,10 +97,6 @@ fn has_reachable_export_reference(file_id: FileId, graph: &ModuleGraph) -> bool 
 }
 
 #[cfg(test)]
-#[expect(
-    deprecated,
-    reason = "Core-internal policy keeps direct detector unit tests while the public warning targets external callers"
-)]
 mod tests {
     use super::*;
     use crate::discover::{DiscoveredFile, EntryPoint, EntryPointSource};
@@ -137,6 +154,7 @@ mod tests {
                 exported_factory_returns: std::sync::Arc::default(),
                 exported_factory_return_object_shapes: std::sync::Arc::default(),
                 type_member_types: std::sync::Arc::default(),
+                missing_export_targets: vec![],
             })
             .collect();
 
@@ -183,6 +201,8 @@ mod tests {
             span: Span::new(0, 10),
             members: vec![],
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         }]
         .into();
         resolved_modules[from as usize]
@@ -336,6 +356,7 @@ mod tests {
                 exported_factory_returns: std::sync::Arc::default(),
                 exported_factory_return_object_shapes: std::sync::Arc::default(),
                 type_member_types: std::sync::Arc::default(),
+                missing_export_targets: vec![],
             })
             .collect();
         let graph = ModuleGraph::build(&resolved_modules, &entry_points, &files);
@@ -346,8 +367,14 @@ mod tests {
         supp_map.insert(FileId(1), supps_slice);
         let suppressions = SuppressionContext::from_map(supp_map);
 
-        let result = find_unused_files(&graph, &suppressions);
-        assert!(result.is_empty(), "suppressed file should not be flagged");
+        let scan = find_unused_file_scan(&graph, &suppressions);
+        assert!(
+            scan.files.is_empty(),
+            "suppressed file should not be flagged"
+        );
+        // The suppressed file stays known to the cascade filter, so the
+        // suppression comment does not make the findings in it visible again.
+        assert_eq!(scan.suppressed, vec![dir.path().join("orphan.ts")]);
     }
 
     #[test]

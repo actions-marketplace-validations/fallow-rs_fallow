@@ -18,10 +18,17 @@ pub struct BaseWorktree {
 }
 
 impl BaseWorktree {
-    pub fn create(repo_root: &Path, base_ref: &str, base_sha: Option<&str>) -> Option<Self> {
+    /// `workspace_patterns` are the `workspaces.patterns` of the resolved
+    /// config, so the base view links the context of those packages too.
+    pub fn create(
+        repo_root: &Path,
+        base_ref: &str,
+        base_sha: Option<&str>,
+        workspace_patterns: &[String],
+    ) -> Option<Self> {
         sweep_orphan_audit_worktrees(repo_root);
         if let Some(base_sha) = base_sha
-            && let Some(worktree) = Self::reuse_or_create(repo_root, base_sha)
+            && let Some(worktree) = Self::reuse_or_create(repo_root, base_sha, workspace_patterns)
         {
             return Some(worktree);
         }
@@ -58,11 +65,15 @@ impl BaseWorktree {
             persistent: false,
             _reusable_lock: None,
         };
-        materialize_base_dependency_context(repo_root, worktree.path());
+        materialize_base_dependency_context(repo_root, worktree.path(), workspace_patterns);
         Some(worktree)
     }
 
-    pub fn reuse_or_create(repo_root: &Path, base_sha: &str) -> Option<Self> {
+    pub fn reuse_or_create(
+        repo_root: &Path,
+        base_sha: &str,
+        workspace_patterns: &[String],
+    ) -> Option<Self> {
         let path = reusable_audit_worktree_path(repo_root);
         let reusable_lock =
             ReusableWorktreeLock::try_acquire(&path, "falling back to non-reusable worktree")?;
@@ -75,7 +86,7 @@ impl BaseWorktree {
                 persistent: true,
                 _reusable_lock: Some(reusable_lock),
             };
-            materialize_base_dependency_context(repo_root, worktree.path());
+            materialize_base_dependency_context(repo_root, worktree.path(), workspace_patterns);
             record_last_used(worktree.path(), repo_root);
             return Some(worktree);
         }
@@ -130,7 +141,7 @@ impl BaseWorktree {
             persistent: true,
             _reusable_lock: Some(reusable_lock),
         };
-        materialize_base_dependency_context(repo_root, worktree.path());
+        materialize_base_dependency_context(repo_root, worktree.path(), workspace_patterns);
         if readiness_published {
             record_last_used(worktree.path(), repo_root);
         }
@@ -321,7 +332,7 @@ fn write_reusable_sha(reusable_path: &Path, base_sha: &str) -> std::io::Result<(
 /// Default GC threshold for persistent reusable base-snapshot caches.
 const DEFAULT_AUDIT_CACHE_MAX_AGE_DAYS: u32 = 30;
 
-const SECONDS_PER_DAY: u64 = 86_400;
+pub const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Env var that overrides `audit.cacheMaxAgeDays` from the config.
 const AUDIT_CACHE_MAX_AGE_ENV: &str = "FALLOW_AUDIT_CACHE_MAX_AGE_DAYS";
@@ -693,6 +704,9 @@ pub enum SweepPass {
     Legacy,
     /// Entries under other repo hashes (cross-repo pass, issue #2169).
     Foreign,
+    /// Base-snapshot payload files below the project cache directory
+    /// (`<cache>/cache/audit-base-v*/<hash>.bin`).
+    Snapshot,
 }
 
 impl SweepPass {
@@ -702,6 +716,7 @@ impl SweepPass {
             Self::Owned => "owned",
             Self::Legacy => "legacy",
             Self::Foreign => "foreign",
+            Self::Snapshot => "snapshot",
         }
     }
 }
@@ -735,10 +750,19 @@ pub enum SweepDisposition {
     ReclaimedOrphan,
     /// Entry aged past the effective threshold.
     ReclaimedAged,
+    /// Foreign entry whose recorded owner root is gone, reclaimed while
+    /// age-based GC is disabled (`cacheMaxAgeDays = 0`). Nothing will ever
+    /// sweep it under its own hash again, so the age gate that `0` switches
+    /// off would otherwise strand it on disk forever.
+    ReclaimedOwnerMissing,
     /// A released SHA-keyed directory still REGISTERED as a git worktree by
     /// pre-#1815 fallow; the root-owned cache cannot reuse it, so it is
     /// deregistered AND removed.
     ReclaimedLegacyRegistered,
+    /// Base-snapshot file past the newest-files cap of its cache directory.
+    /// The cap applies even when age-based GC is disabled, because each
+    /// payload can be large and a snapshot is cheap to compute again.
+    ReclaimedOverCapacity,
     /// The current cache path still REGISTERED as a git worktree by pre-#1815
     /// fallow (a mixed-version registration); only the git registration is
     /// reclaimed and the directory stays warm on disk, so its measured size
@@ -777,9 +801,11 @@ impl SweepDisposition {
     #[must_use]
     pub const fn decision(self) -> SweepDecision {
         match self {
-            Self::ReclaimedOrphan | Self::ReclaimedAged | Self::ReclaimedLegacyRegistered => {
-                SweepDecision::Removed
-            }
+            Self::ReclaimedOrphan
+            | Self::ReclaimedAged
+            | Self::ReclaimedOwnerMissing
+            | Self::ReclaimedLegacyRegistered
+            | Self::ReclaimedOverCapacity => SweepDecision::Removed,
             Self::KeptLegacyDeregistered
             | Self::KeptFresh
             | Self::KeptOwnerLive
@@ -801,7 +827,9 @@ impl SweepDisposition {
         match self {
             Self::ReclaimedOrphan => "orphaned-sidecars",
             Self::ReclaimedAged => "aged-out",
+            Self::ReclaimedOwnerMissing => "owner-missing",
             Self::ReclaimedLegacyRegistered => "legacy-registered",
+            Self::ReclaimedOverCapacity => "over-capacity",
             Self::KeptLegacyDeregistered => "legacy-deregistered",
             Self::KeptFresh => "fresh",
             Self::KeptOwnerLive => "owner-live",
@@ -819,7 +847,10 @@ impl SweepDisposition {
     /// Whether this disposition increments the legacy `removed` counter used
     /// by the per-audit stderr summary. Legacy-registered reclaims never did.
     const fn counts_toward_summary(self) -> bool {
-        matches!(self, Self::ReclaimedOrphan | Self::ReclaimedAged)
+        matches!(
+            self,
+            Self::ReclaimedOrphan | Self::ReclaimedAged | Self::ReclaimedOwnerMissing
+        )
     }
 }
 
@@ -1298,8 +1329,11 @@ fn reclaim_aged_cache_entry(
 /// the outside. Entries with a dead owner, or with no recorded owner (pre-
 /// upgrade or externally created), are abandoned: nothing will ever sweep
 /// them under their own hash again, so they age out under THIS run's
-/// threshold. The grace seed for a missing sidecar stays mtime-only because
-/// the true owner is unknown here.
+/// threshold, and a probed-dead owner is reclaimed outright when that
+/// threshold is switched off (`cacheMaxAgeDays = 0`), which is the documented
+/// contract of `0` and the only thing that keeps abandoned entries from
+/// accumulating forever. The grace seed for a missing sidecar stays
+/// mtime-only because the true owner is unknown here.
 fn reclaim_foreign_cache_entry(
     repo_root: &Path,
     path: &Path,
@@ -1311,16 +1345,24 @@ fn reclaim_foreign_cache_entry(
     if !path.exists() {
         return reclaim_orphan_cache_entry(repo_root, path);
     }
+    let mut owner_missing = false;
     if let Some(owner) = read_last_used_owner(path) {
         match probe_owner_liveness(&owner) {
             OwnerLiveness::Live => return SweepDisposition::KeptOwnerLive,
             OwnerLiveness::Unverifiable(kind) => {
                 return SweepDisposition::KeptOwnerUnverifiable(kind);
             }
-            OwnerLiveness::Dead => {}
+            OwnerLiveness::Dead => owner_missing = true,
         }
     }
     let Some(max_age) = max_age else {
+        if owner_missing {
+            return remove_cache_entry_under_lock(
+                repo_root,
+                path,
+                SweepDisposition::ReclaimedOwnerMissing,
+            );
+        }
         return SweepDisposition::KeptAgeGcDisabled;
     };
     let Some(mtime) = last_used_mtime(path) else {
@@ -1378,6 +1420,7 @@ fn classify_entry_dry_run(
         }
         return classify_would_remove(path, SweepDisposition::ReclaimedOrphan);
     }
+    let mut owner_missing = false;
     if owner_gate == OwnerGate::On
         && let Some(owner) = read_last_used_owner(path)
     {
@@ -1386,10 +1429,13 @@ fn classify_entry_dry_run(
             OwnerLiveness::Unverifiable(kind) => {
                 return SweepDisposition::KeptOwnerUnverifiable(kind);
             }
-            OwnerLiveness::Dead => {}
+            OwnerLiveness::Dead => owner_missing = true,
         }
     }
     let Some(max_age) = max_age else {
+        if owner_missing {
+            return classify_would_remove(path, SweepDisposition::ReclaimedOwnerMissing);
+        }
         return SweepDisposition::KeptAgeGcDisabled;
     };
     let Some(mtime) = last_used_mtime(path) else {
@@ -1434,11 +1480,20 @@ fn remove_entry_past_max_age(
     if age < max_age {
         return SweepDisposition::KeptFresh;
     }
+    remove_cache_entry_under_lock(repo_root, path, SweepDisposition::ReclaimedAged)
+}
+
+/// Lock, remove, and map the outcome, reporting `removed` on success.
+fn remove_cache_entry_under_lock(
+    repo_root: &Path,
+    path: &Path,
+    removed: SweepDisposition,
+) -> SweepDisposition {
     let Some(_lock) = ReusableWorktreeLock::try_acquire(path, GC_LOCK_CONTEXT) else {
         return SweepDisposition::SkippedLocked;
     };
     match remove_cache_entry_for_sweep(repo_root, path) {
-        Ok(CacheRemovalOutcome::Removed) => SweepDisposition::ReclaimedAged,
+        Ok(CacheRemovalOutcome::Removed) => removed,
         Ok(CacheRemovalOutcome::NothingLeft) => SweepDisposition::KeptLockOnly,
         Ok(CacheRemovalOutcome::NotOwned) => SweepDisposition::KeptNotOwned,
         Err(err) => {

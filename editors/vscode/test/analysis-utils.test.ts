@@ -2,18 +2,21 @@ import { describe, expect, it } from "vitest";
 import {
   buildAnalysisArgs,
   buildCleanAnalysisSummary,
-  compareVersions,
+  countCheckIssues,
   countDuplicationGroups,
+  describeAnalysisFailure,
   parseUnexpectedArgument,
   planDegradation,
   stripArgument,
 } from "../src/analysis-utils.js";
+import { compareVersions } from "../src/cli-args-utils.js";
 import type { FallowCheckResult, FallowDupesResult } from "../src/types.js";
 
 const baseOptions = {
   // `undefined` is the "auto"/defer state: no production flag is forwarded.
   production: undefined as boolean | undefined,
   changedSince: "",
+  packageBaselines: true,
   workspace: "",
   configPath: "",
   dupesMode: undefined,
@@ -25,11 +28,12 @@ const baseOptions = {
   dupesSkipLocal: undefined,
   dupesCrossLanguage: undefined,
   dupesIgnoreImports: undefined,
+  dupesIgnoreSymlinks: undefined,
   cliVersion: null,
 };
 
 const emptyCheck = (): FallowCheckResult => ({
-  schema_version: 9,
+  schema_version: 10,
   version: "0.0.0-test",
   elapsed_ms: 0,
   total_issues: 0,
@@ -56,6 +60,7 @@ const emptyCheck = (): FallowCheckResult => ({
     unused_exports: 0,
     unused_types: 0,
     private_type_leaks: 0,
+    deprecated_exports_in_use: 0,
     unused_dependencies: 0,
     unused_enum_members: 0,
     unused_class_members: 0,
@@ -91,6 +96,7 @@ const dupesResult = (
     total_tokens: 1000,
     duplicated_tokens: duplicationPercentage > 0 ? 100 : 0,
     clone_groups: cloneGroups,
+    clone_families: cloneGroups > 0 ? 1 : 0,
     clone_instances: cloneGroups * 2,
     duplication_percentage: duplicationPercentage,
     clone_groups_below_min_occurrences: 0,
@@ -98,6 +104,25 @@ const dupesResult = (
 });
 
 describe("buildAnalysisArgs", () => {
+  it("forwards --no-package-baselines only when the setting is off", () => {
+    expect(buildAnalysisArgs(baseOptions).args).not.toContain("--no-package-baselines");
+    const { args, skipped } = buildAnalysisArgs({ ...baseOptions, packageBaselines: false });
+    expect(args).toContain("--no-package-baselines");
+    expect(skipped).toEqual([]);
+  });
+
+  it("skips --no-package-baselines on a CLI that predates it", () => {
+    const { args, skipped } = buildAnalysisArgs({
+      ...baseOptions,
+      packageBaselines: false,
+      cliVersion: "3.30.0",
+    });
+    expect(args).not.toContain("--no-package-baselines");
+    expect(skipped).toEqual([
+      { flag: "--no-package-baselines", requires: "3.31.0", cliVersion: "3.30.0" },
+    ]);
+  });
+
   it("does not emit duplication overrides when VS Code settings are unconfigured", () => {
     expect(buildAnalysisArgs(baseOptions)).toEqual({
       args: ["--format", "json", "--quiet", "--skip", "health"],
@@ -152,9 +177,7 @@ describe("buildAnalysisArgs", () => {
     });
 
     expect(args).not.toContain("--dupes-near");
-    expect(skipped).toEqual([
-      { flag: "--dupes-near", requires: "3.15.0", cliVersion: "3.14.0" },
-    ]);
+    expect(skipped).toEqual([{ flag: "--dupes-near", requires: "3.15.0", cliVersion: "3.14.0" }]);
   });
 
   it("forwards --dupes-no-ignore-imports when the user opts out (false) on a new CLI", () => {
@@ -186,6 +209,50 @@ describe("buildAnalysisArgs", () => {
     });
     expect(args).not.toContain("--dupes-ignore-imports");
     expect(args).not.toContain("--dupes-no-ignore-imports");
+  });
+
+  it("forwards --dupes-ignore-symlinks when the setting is true", () => {
+    const { args, skipped } = buildAnalysisArgs({
+      ...baseOptions,
+      dupesIgnoreSymlinks: true,
+      cliVersion: "3.32.0",
+    });
+    expect(args).toContain("--dupes-ignore-symlinks");
+    expect(args).not.toContain("--dupes-no-ignore-symlinks");
+    expect(skipped).toEqual([]);
+  });
+
+  it("forwards --dupes-no-ignore-symlinks when the user opts out (false)", () => {
+    const { args, skipped } = buildAnalysisArgs({
+      ...baseOptions,
+      dupesIgnoreSymlinks: false,
+      cliVersion: "3.32.0",
+    });
+    expect(args).toContain("--dupes-no-ignore-symlinks");
+    expect(args).not.toContain("--dupes-ignore-symlinks");
+    expect(skipped).toEqual([]);
+  });
+
+  it("skips the symlink flags on a CLI without symlink support", () => {
+    const { args, skipped } = buildAnalysisArgs({
+      ...baseOptions,
+      dupesIgnoreSymlinks: true,
+      cliVersion: "3.31.0",
+    });
+    expect(args).not.toContain("--dupes-ignore-symlinks");
+    expect(skipped).toEqual([
+      { flag: "--dupes-ignore-symlinks", requires: "3.32.0", cliVersion: "3.31.0" },
+    ]);
+  });
+
+  it("forwards neither symlink flag when the setting is unset", () => {
+    const { args } = buildAnalysisArgs({
+      ...baseOptions,
+      dupesIgnoreSymlinks: undefined,
+      cliVersion: "3.32.0",
+    });
+    expect(args).not.toContain("--dupes-ignore-symlinks");
+    expect(args).not.toContain("--dupes-no-ignore-symlinks");
   });
 
   it("forwards --dupes-min-occurrences at the floor when explicitly configured", () => {
@@ -351,6 +418,36 @@ describe("buildCleanAnalysisSummary", () => {
   });
 });
 
+describe("countCheckIssues", () => {
+  it("returns zero without a check result", () => {
+    expect(countCheckIssues(null)).toBe(0);
+  });
+
+  it("counts arrays that an older CLI omits as zero", () => {
+    const check = {
+      ...emptyCheck(),
+      unused_files: [{}],
+      unused_exports: [{}, {}],
+      private_type_leaks: undefined,
+      unused_optional_dependencies: undefined,
+    } as unknown as FallowCheckResult;
+
+    expect(countCheckIssues(check)).toBe(3);
+  });
+
+  it("does not count advisory arrays", () => {
+    const check = {
+      ...emptyCheck(),
+      unused_types: [{}],
+      prop_drilling_chains: [{}],
+      thin_wrappers: [{}],
+      duplicate_prop_shapes: [{}],
+    } as unknown as FallowCheckResult;
+
+    expect(countCheckIssues(check)).toBe(1);
+  });
+});
+
 describe("countDuplicationGroups", () => {
   it("uses duplication stats for duplicate-group notification routing", () => {
     expect(countDuplicationGroups(dupesResult(2, 5, 12.5))).toBe(2);
@@ -448,6 +545,22 @@ describe("planDegradation", () => {
     expect(plan.kind).toBe("retry");
   });
 
+  it("retries an audit run with --worsened and its value stripped for older CLIs", () => {
+    const plan = planDegradation("unexpected argument '--worsened' found", [
+      "audit",
+      "--format",
+      "json",
+      "--quiet",
+      "--worsened",
+      "error",
+    ]);
+    expect(plan).toEqual({
+      kind: "retry",
+      dropped: "--worsened",
+      args: ["audit", "--format", "json", "--quiet"],
+    });
+  });
+
   it("retries with complexity breakdown stripped for older CLIs", () => {
     const plan = planDegradation("unexpected argument '--complexity-breakdown' found", [
       "health",
@@ -500,5 +613,34 @@ describe("planDegradation", () => {
     expect(
       planDegradation("unexpected argument '--dupes-min-occurrences' found", ["--format", "json"]),
     ).toEqual({ kind: "rethrow" });
+  });
+});
+
+describe("describeAnalysisFailure", () => {
+  it("recovers the CLI message from the stdout error envelope", () => {
+    const stdout = JSON.stringify({
+      error: true,
+      message: "Type-aware analysis failed: semantic companion timed out after 120s",
+      exit_code: 2,
+    });
+
+    expect(describeAnalysisFailure(stdout, "fallow exited with code 2")).toBe(
+      "Type-aware analysis failed: semantic companion timed out after 120s",
+    );
+  });
+
+  it("falls back to the stderr-derived message when stdout is empty", () => {
+    expect(describeAnalysisFailure("", "fallow exited with code 2")).toBe(
+      "fallow exited with code 2",
+    );
+  });
+
+  it("falls back when stdout is not a structured error envelope", () => {
+    expect(describeAnalysisFailure('{"check":{}}', "fallow exited with code 2")).toBe(
+      "fallow exited with code 2",
+    );
+    expect(describeAnalysisFailure("not json at all", "fallow exited with code 2")).toBe(
+      "fallow exited with code 2",
+    );
   });
 });

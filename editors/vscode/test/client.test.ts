@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let mockIssueTypes = {};
 let mockChangedSince = "";
+let mockPackageBaselines = true;
 let mockConfigPath = "";
 let mockAllowRemoteExtends = false;
 let mockProductionOverride: boolean | undefined;
@@ -13,6 +14,7 @@ let mockDuplicationMinOccurrences = 2;
 let mockDuplicationSkipLocal = false;
 let mockDuplicationCrossLanguage = false;
 let mockDuplicationIgnoreImports = false;
+let mockDuplicationIgnoreSymlinks: boolean | undefined = undefined;
 let mockHealthInlineComplexity = false;
 let mockTypeAwareSettings: {
   enabled: boolean;
@@ -134,6 +136,7 @@ vi.mock("../src/config.js", () => ({
   getAutoDownload: () => false,
   getIssueTypes: () => mockIssueTypes,
   getChangedSince: () => mockChangedSince,
+  getPackageBaselines: () => mockPackageBaselines,
   getResolvedConfigPath: () => mockConfigPath,
   getAllowRemoteExtends: () => mockAllowRemoteExtends,
   getProductionOverride: () => mockProductionOverride,
@@ -147,6 +150,7 @@ vi.mock("../src/config.js", () => ({
   getDuplicationSkipLocalOverride: () => mockDuplicationSkipLocal,
   getDuplicationCrossLanguageOverride: () => mockDuplicationCrossLanguage,
   getDuplicationIgnoreImportsOverride: () => mockDuplicationIgnoreImports,
+  getDuplicationIgnoreSymlinksOverride: () => mockDuplicationIgnoreSymlinks,
   getHealthInlineComplexity: () => mockHealthInlineComplexity,
   getMutedDiagnosticCategories: () => mockMutedDiagnosticCategories,
 }));
@@ -178,6 +182,7 @@ afterEach(async () => {
 beforeEach(() => {
   mockIssueTypes = { "code-duplication": true };
   mockChangedSince = "origin/main";
+  mockPackageBaselines = true;
   mockConfigPath = "/workspace/.fallowrc.jsonc";
   mockAllowRemoteExtends = false;
   mockProductionOverride = undefined;
@@ -189,6 +194,7 @@ beforeEach(() => {
   mockDuplicationSkipLocal = true;
   mockDuplicationCrossLanguage = true;
   mockDuplicationIgnoreImports = true;
+  mockDuplicationIgnoreSymlinks = true;
   mockHealthInlineComplexity = false;
   mockTypeAwareSettings = { enabled: false, projects: [], require: "best-effort" };
   mockMutedDiagnosticCategories = new Set();
@@ -210,10 +216,16 @@ const outputChannel = () => ({
 });
 
 describe("createInitializationOptions", () => {
+  it("forwards fallow.packageBaselines: false to fallow-lsp", () => {
+    mockPackageBaselines = false;
+    expect(createInitializationOptions().packageBaselines).toBe(false);
+  });
+
   it("forwards duplication settings to fallow-lsp", () => {
     expect(createInitializationOptions()).toEqual({
       issueTypes: { "code-duplication": true },
       changedSince: "origin/main",
+      packageBaselines: true,
       configPath: "/workspace/.fallowrc.jsonc",
       allowRemoteExtends: false,
       production: undefined,
@@ -227,8 +239,19 @@ describe("createInitializationOptions", () => {
         skipLocal: true,
         crossLanguage: true,
         ignoreImports: true,
+        ignoreSymlinks: true,
       },
     });
+  });
+
+  it("leaves ignoreSymlinks unset so the project config decides", () => {
+    mockDuplicationIgnoreSymlinks = undefined;
+    expect(createInitializationOptions().duplication.ignoreSymlinks).toBeUndefined();
+  });
+
+  it("forwards an explicit ignoreSymlinks: false to fallow-lsp", () => {
+    mockDuplicationIgnoreSymlinks = false;
+    expect(createInitializationOptions().duplication.ignoreSymlinks).toBe(false);
   });
 
   it("forwards type-aware settings to fallow-lsp", () => {

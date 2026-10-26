@@ -6,7 +6,7 @@ pub use fallow_output::HEALTH_SCHEMA_VERSION;
 use fallow_output::{
     CheckOutput, DupesOutput, FeatureFlagFinding, FeatureFlagsOutput as FeatureFlagsOutputContract,
     GroupByMode, HealthGroup, HealthGrouping, HealthJsonOutputInput, HealthOutputInput,
-    HealthReport, RootEnvelopeMode, health_meta,
+    HealthReport, health_meta,
 };
 use fallow_types::output::NextStep;
 use fallow_types::output_dead_code::{
@@ -28,6 +28,9 @@ pub type CircularDependenciesOutput = CheckOutput;
 
 /// Concrete boundary-family output contract returned by typed runs.
 pub type BoundaryViolationsOutput = CheckOutput;
+
+/// Concrete `fallow architecture` output contract returned by typed runs.
+pub type ArchitectureOutput = CheckOutput;
 
 /// Concrete duplication output contract returned by typed programmatic runs.
 pub type DuplicationOutput = DupesOutput<DupesReportPayload, DuplicationGroup>;
@@ -63,11 +66,25 @@ pub type TraceFileOutput = fallow_types::trace::FileTrace;
 /// Concrete dependency trace output returned by typed programmatic runs.
 pub type TraceDependencyOutput = fallow_types::trace::DependencyTrace;
 
+/// Concrete import-path trace output returned by typed programmatic runs.
+pub type TraceImportPathOutput = fallow_types::trace::ImportPathTrace;
+
 /// Concrete duplicate-code trace output returned by typed programmatic runs.
 pub type TraceCloneOutput = fallow_types::trace::CloneTrace;
 
+/// Concrete stack-trace resolution returned by typed programmatic runs.
+pub type TraceErrorOutput = fallow_types::trace_error::ErrorTrace;
+
 /// Inputs for serializing health JSON output through the API boundary.
 pub struct HealthJsonReportInput<'a> {
+    /// Every gate this run evaluated, absent when it evaluated none. The
+    /// programmatic route runs no CLI-layer gate and leaves this `None`.
+    pub gate_outcomes: Option<fallow_output::GateOutcomes>,
+    /// Every narrowing or shaping request this run received, absent when it
+    /// was asked for nothing. The programmatic route resolves no CLI flag and
+    /// leaves this `None`; an entry whose `status` is not `applied` means the
+    /// report is wider than what was asked for.
+    pub request_outcomes: Option<fallow_output::RequestOutcomes>,
     /// Typed health report to serialize.
     pub report: HealthReport,
     /// Project root; its prefix is stripped from every path in the output.
@@ -83,12 +100,12 @@ pub struct HealthJsonReportInput<'a> {
     pub grouped_by: Option<GroupByMode>,
     /// Precomputed group buckets matching `grouped_by`.
     pub groups: Option<Vec<HealthGroup>>,
+    /// The `--group` selector patterns, when the run kept only some groups.
+    pub group_filter: Option<Vec<String>>,
     /// Non-fatal per-file diagnostics collected during the workspace walk.
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<&'a str>,
 }
@@ -110,10 +127,12 @@ pub struct CombinedProgrammaticOutput {
     pub explain: bool,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
+    /// What became of the narrowing requests the run received, emitted at the
+    /// envelope root as `request_outcomes`, the only carrier on the combined
+    /// envelope.
+    pub request_outcomes: Option<fallow_output::RequestOutcomes>,
 }
 
 /// Typed programmatic dead-code output before JSON serialization.
@@ -130,8 +149,6 @@ pub struct DeadCodeProgrammaticOutput {
     /// Whether duplicate-export findings can be auto-fixed through config;
     /// propagated onto their fix actions when serialized.
     pub config_fixable: bool,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -161,8 +178,6 @@ pub struct CircularDependenciesProgrammaticOutput {
     pub output: CircularDependenciesOutput,
     /// Project root used when serializing stable JSON paths.
     pub root: PathBuf,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -186,7 +201,38 @@ impl From<DeadCodeProgrammaticOutput> for CircularDependenciesProgrammaticOutput
         Self {
             output: value.output,
             root: value.root,
-            envelope_mode: value.envelope_mode,
+            telemetry_analysis_run_id: value.telemetry_analysis_run_id,
+        }
+    }
+}
+
+/// Typed programmatic `fallow architecture` output before JSON serialization.
+///
+/// The body is the dead-code body. The JSON envelope has
+/// `kind: "architecture"` and its own `schema_version`.
+#[derive(Debug, Clone)]
+pub struct ArchitectureProgrammaticOutput {
+    /// Typed check envelope scoped to the architecture findings.
+    pub output: ArchitectureOutput,
+    /// Project root used when serializing stable JSON paths.
+    pub root: PathBuf,
+    /// Analysis run id stamped into telemetry metadata when present.
+    pub telemetry_analysis_run_id: Option<String>,
+}
+
+impl ArchitectureProgrammaticOutput {
+    /// Full typed issue arrays retained by this run.
+    #[must_use]
+    pub fn results(&self) -> &AnalysisResults {
+        &self.output.results
+    }
+}
+
+impl From<DeadCodeProgrammaticOutput> for ArchitectureProgrammaticOutput {
+    fn from(value: DeadCodeProgrammaticOutput) -> Self {
+        Self {
+            output: value.output,
+            root: value.root,
             telemetry_analysis_run_id: value.telemetry_analysis_run_id,
         }
     }
@@ -202,8 +248,6 @@ pub struct BoundaryViolationsProgrammaticOutput {
     pub output: BoundaryViolationsOutput,
     /// Project root used when serializing stable JSON paths.
     pub root: PathBuf,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -239,7 +283,6 @@ impl From<DeadCodeProgrammaticOutput> for BoundaryViolationsProgrammaticOutput {
         Self {
             output: value.output,
             root: value.root,
-            envelope_mode: value.envelope_mode,
             telemetry_analysis_run_id: value.telemetry_analysis_run_id,
         }
     }
@@ -255,8 +298,6 @@ pub struct DuplicationProgrammaticOutput {
     /// Maximum allowed duplication percentage from the resolved config;
     /// 0 disables the percentage gate.
     pub threshold: f64,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -292,8 +333,6 @@ impl DuplicationProgrammaticOutput {
 pub struct FeatureFlagsProgrammaticOutput {
     /// Typed feature-flag envelope produced by the run.
     pub output: FeatureFlagsOutput,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -362,6 +401,21 @@ impl TraceFileProgrammaticOutput {
     }
 }
 
+/// Typed programmatic import-path-trace output before JSON serialization.
+#[derive(Debug)]
+pub struct TraceImportPathProgrammaticOutput {
+    /// Typed import-path trace produced by the run.
+    pub output: TraceImportPathOutput,
+}
+
+impl TraceImportPathProgrammaticOutput {
+    /// Typed import-path trace retained by this run.
+    #[must_use]
+    pub const fn trace(&self) -> &TraceImportPathOutput {
+        &self.output
+    }
+}
+
 /// Typed programmatic dependency-trace output before JSON serialization.
 #[derive(Debug)]
 pub struct TraceDependencyProgrammaticOutput {
@@ -373,6 +427,21 @@ impl TraceDependencyProgrammaticOutput {
     /// Typed dependency trace retained by this run.
     #[must_use]
     pub const fn trace(&self) -> &TraceDependencyOutput {
+        &self.output
+    }
+}
+
+/// Typed programmatic stack-trace resolution before JSON serialization.
+#[derive(Debug)]
+pub struct TraceErrorProgrammaticOutput {
+    /// Typed stack-trace resolution produced by the run.
+    pub output: TraceErrorOutput,
+}
+
+impl TraceErrorProgrammaticOutput {
+    /// Typed stack-trace resolution retained by this run.
+    #[must_use]
+    pub const fn trace(&self) -> &TraceErrorOutput {
         &self.output
     }
 }
@@ -409,10 +478,11 @@ pub struct HealthProgrammaticOutput {
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
+    /// What became of the narrowing requests the run received, emitted as the
+    /// envelope's `request_outcomes`.
+    pub request_outcomes: Option<fallow_output::RequestOutcomes>,
 }
 
 /// Typed programmatic audit output before JSON serialization.
@@ -434,11 +504,15 @@ pub struct AuditProgrammaticOutput {
     pub head_sha: Option<String>,
     /// Audit wall time, emitted as `elapsed_ms` when serialized.
     pub elapsed: std::time::Duration,
-    /// `Some(true)` when the base snapshot was skipped, so no attribution
-    /// ran.
+    /// Always `None` on the typed route. A skipped base means that the head
+    /// keys stand in for the base, so every finding is inherited. It does not
+    /// mean that no attribution ran.
     pub base_snapshot_skipped: Option<bool>,
-    /// Attribution key sets computed from the base run; present only when a
-    /// base snapshot was analyzed.
+    /// Attribution key sets of the base run, scoped to the changed files and
+    /// the pre-rename paths, with the rename remap and the dependency scope
+    /// applied. When the head run stands in for the base, it holds the head
+    /// keys. `None` when the gate needs no base or when the changeset is
+    /// empty.
     pub base_snapshot: Option<AuditProgrammaticKeySnapshot>,
     /// Dead-code section; `None` when the audit skipped it.
     pub dead_code: Option<DeadCodeProgrammaticOutput>,
@@ -446,10 +520,10 @@ pub struct AuditProgrammaticOutput {
     pub duplication: Option<DuplicationProgrammaticOutput>,
     /// Complexity (health) section; `None` when the audit skipped it.
     pub complexity: Option<HealthProgrammaticOutput>,
+    /// Diff-risk findings. Every one is introduced by the change.
+    pub diff_risk: fallow_output::DiffRiskReport,
     /// Suggested follow-up commands for the consumer.
     pub next_steps: Vec<NextStep>,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -472,8 +546,6 @@ pub struct DecisionSurfaceProgrammaticOutput {
     pub surface: fallow_output::DecisionSurface,
     /// Analysis wall time, emitted as `elapsed_ms` when serialized.
     pub elapsed: std::time::Duration,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
     /// Analysis run id stamped into telemetry metadata when present.
     pub telemetry_analysis_run_id: Option<String>,
 }
@@ -502,18 +574,20 @@ pub fn serialize_health_report_json(
     };
     fallow_output::serialize_health_json_output(HealthJsonOutputInput {
         output: HealthOutputInput {
+            gate_outcomes: input.gate_outcomes,
+            request_outcomes: input.request_outcomes,
             schema_version: HEALTH_SCHEMA_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             elapsed: input.elapsed,
             report: input.report,
             grouped_by: input.grouped_by,
             groups: input.groups,
+            group_filter: input.group_filter,
             meta,
             workspace_diagnostics: input.workspace_diagnostics,
             next_steps: input.next_steps,
         },
         root_prefix: Some(&root_prefix),
-        envelope_mode: input.envelope_mode,
         analysis_run_id: input.telemetry_analysis_run_id,
     })
 }

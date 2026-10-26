@@ -7,8 +7,13 @@ use crate::Cli;
 pub const SECURITY_UNSUPPORTED_GLOBAL_LONGS: &[&str] = &[
     "baseline",
     "save-baseline",
+    "fail-on-stale-baseline",
+    "fail-on-baseline-growth",
+    "baseline-base",
+    "fail-on-parse-error",
     "production",
     "no-production",
+    "no-package-baselines",
     "group-by",
     "performance",
     "explain-skipped",
@@ -16,14 +21,19 @@ pub const SECURITY_UNSUPPORTED_GLOBAL_LONGS: &[&str] = &[
     "regression-baseline",
     "save-regression-baseline",
     "dupes-mode",
+    "dupes-near",
     "dupes-threshold",
     "dupes-min-tokens",
     "dupes-min-lines",
     "dupes-min-occurrences",
     "dupes-skip-local",
+    "dupes-ignore-symlinks",
+    "dupes-no-ignore-symlinks",
     "dupes-cross-language",
     "dupes-ignore-imports",
+    "dupes-no-ignore-imports",
     "include-entry-exports",
+    "show-cascade",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 //! Impact report output contracts.
 
-use crate::root_envelopes::{RootEnvelopeMode, attach_telemetry_meta, serialize_named_json_output};
+use crate::root_envelopes::{attach_telemetry_meta, serialize_named_json_output};
 use fallow_types::envelope::Meta;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,38 @@ impl ImpactCounts {
             complexity,
             duplication,
         }
+    }
+}
+
+/// Recorded gate runs grouped by the gate that produced them. Local
+/// provenance only: the store never leaves the machine, so this answers "where
+/// do my gate runs come from", never "how widely is fallow adopted".
+///
+/// Counted over the recorded runs the store still holds, which is the same
+/// window `record_count` reports. The store keeps a bounded number of runs and
+/// drops the oldest, so on a long-lived project these are the shape of recent
+/// gate activity, not a lifetime total: read them as a floor. Absent when no
+/// run in that window carries a gate source, which is not the same as "no gate
+/// ever ran here".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct GateRunCounts {
+    /// Runs recorded by the agent gate (`--gate-marker agent`).
+    pub agent: usize,
+    /// Runs recorded by the git pre-commit hook (`--gate-marker pre-commit`).
+    pub pre_commit: usize,
+    /// Runs recorded by a CI gate (`--gate-marker ci`).
+    pub ci: usize,
+    /// Gate runs whose marker this build does not recognise, plus every gate
+    /// run recorded before the store kept its source (store schema 6 and older).
+    pub unknown: usize,
+}
+
+impl GateRunCounts {
+    /// Whether any gate run was recorded at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.agent == 0 && self.pre_commit == 0 && self.ci == 0 && self.unknown == 0
     }
 }
 
@@ -180,6 +212,12 @@ pub struct ImpactReport {
     /// `trend`. None until two full `fallow` runs exist. v1.6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_trend: Option<TrendSummary>,
+    /// Recorded gate runs grouped by source, over the same bounded window of
+    /// recorded runs `record_count` reports. A floor, not a lifetime total, and
+    /// absent when no run in that window carries a gate source. Local
+    /// provenance, never an adoption metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_runs: Option<GateRunCounts>,
     /// Lifetime count of commit-gate containment events.
     pub containment_count: usize,
     /// Most recent containment events (newest last), capped for display.
@@ -291,10 +329,9 @@ pub struct CrossRepoImpactReport {
 /// Returns a serde error when the report cannot be converted to JSON.
 pub fn serialize_impact_json_output(
     report: ImpactReport,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(report, "impact", mode)?;
+    let mut value = serialize_named_json_output(report, "impact")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -306,10 +343,9 @@ pub fn serialize_impact_json_output(
 /// Returns a serde error when the report cannot be converted to JSON.
 pub fn serialize_cross_repo_impact_json_output(
     report: CrossRepoImpactReport,
-    mode: RootEnvelopeMode,
     analysis_run_id: Option<&str>,
 ) -> Result<serde_json::Value, serde_json::Error> {
-    let mut value = serialize_named_json_output(report, "impact-cross-repo", mode)?;
+    let mut value = serialize_named_json_output(report, "impact-cross-repo")?;
     attach_telemetry_meta(&mut value, analysis_run_id);
     Ok(value)
 }
@@ -331,6 +367,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: Vec::new(),
             resolved_total: 0,
@@ -344,9 +381,8 @@ mod tests {
 
     #[test]
     fn impact_json_output_uses_named_root_contract() {
-        let value =
-            serialize_impact_json_output(impact_report(), RootEnvelopeMode::Tagged, Some("run-1"))
-                .expect("impact report should serialize");
+        let value = serialize_impact_json_output(impact_report(), Some("run-1"))
+            .expect("impact report should serialize");
 
         assert_eq!(value["kind"], "impact");
         assert_eq!(value["schema_version"], "2");
@@ -369,12 +405,8 @@ mod tests {
             }],
         };
 
-        let value = serialize_cross_repo_impact_json_output(
-            report,
-            RootEnvelopeMode::Tagged,
-            Some("run-2"),
-        )
-        .expect("cross-repo impact report should serialize");
+        let value = serialize_cross_repo_impact_json_output(report, Some("run-2"))
+            .expect("cross-repo impact report should serialize");
 
         assert_eq!(value["kind"], "impact-cross-repo");
         assert_eq!(value["schema_version"], "2");

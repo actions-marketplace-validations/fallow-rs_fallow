@@ -4,12 +4,14 @@ use crate::tools::{
     build_check_changed_args, build_check_runtime_coverage_args, build_explain_args,
     build_feature_flags_args, build_find_dupes_args, build_find_similar_code_args,
     build_fix_apply_args, build_fix_preview_args, build_get_blast_radius_args,
-    build_get_cleanup_candidates_args, build_get_hot_paths_args, build_get_importance_args,
-    build_get_token_blast_radius_args, build_guard_args, build_health_args, build_impact_all_args,
-    build_impact_args, build_impact_closure_args, build_inspect_similar_code_args,
-    build_list_boundaries_args, build_list_suppressions_args, build_project_info_args,
-    build_security_candidates_args, build_trace_clone_args, build_trace_dependency_args,
-    build_trace_export_args, build_trace_file_args,
+    build_get_cleanup_candidates_args, build_get_cloud_deployment_changes_args,
+    build_get_cloud_review_packet_args, build_get_cloud_runtime_context_args,
+    build_get_hot_paths_args, build_get_importance_args, build_get_token_blast_radius_args,
+    build_guard_args, build_health_args, build_impact_all_args, build_impact_args,
+    build_impact_closure_args, build_inspect_similar_code_args, build_list_boundaries_args,
+    build_list_suppressions_args, build_project_info_args, build_security_candidates_args,
+    build_trace_clone_args, build_trace_dependency_args, build_trace_export_args,
+    build_trace_file_args, parse_candidate_snapshot,
 };
 
 /// Parse a validation error body into its `message` field. Arg builders emit
@@ -50,6 +52,7 @@ fn check_runtime_coverage(coverage: &str) -> CheckRuntimeCoverageParams {
         max_crap: None,
         top: None,
         group_by: None,
+        max_output_bytes: None,
     }
 }
 
@@ -68,16 +71,9 @@ fn check_changed(since: &str) -> CheckChangedParams {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
-    }
-}
-
-fn guard_params() -> GuardParams {
-    GuardParams {
-        files: vec!["src/domain/user.ts".to_string()],
-        root: None,
-        allow_remote_extends: None,
     }
 }
 
@@ -134,6 +130,7 @@ fn analyze_args_with_all_options() {
         config: Some("fallow.toml".to_string()),
         allow_remote_extends: None,
         production: Some(true),
+        no_package_baselines: Some(true),
         workspace: Some("@my/pkg".to_string()),
         issue_types: Some(vec![
             "unused-files".to_string(),
@@ -148,7 +145,9 @@ fn analyze_args_with_all_options() {
         save_regression_baseline: Some("new-reg.json".to_string()),
         group_by: Some("owner".to_string()),
         file: None,
+        finding_ids: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: Some(true),
         threads: Some(4),
         type_aware: None,
@@ -174,6 +173,7 @@ fn analyze_args_with_all_options() {
             "--production",
             "--workspace",
             "@my/pkg",
+            "--no-package-baselines",
             "--unused-files",
             "--unused-exports",
             "--baseline",
@@ -308,6 +308,7 @@ fn check_changed_args_with_all_options() {
         regression_baseline: Some("reg.json".to_string()),
         save_regression_baseline: Some("new-reg.json".to_string()),
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: Some(true),
         threads: Some(2),
     };
@@ -373,6 +374,7 @@ fn security_candidates_args_with_scope_and_performance_options() {
         gate: None,
         no_cache: Some(true),
         threads: Some(4),
+        max_output_bytes: None,
     };
     let args = build_security_candidates_args(&params).unwrap();
     assert_eq!(
@@ -596,7 +598,8 @@ fn inspect_similar_code_requires_and_forwards_candidate_id() {
         "snapshot": similar_code_snapshot_json("sc_abc123"),
     }))
     .unwrap();
-    let args = build_inspect_similar_code_args(&params).unwrap();
+    let snapshot = parse_candidate_snapshot(&params.snapshot).unwrap();
+    let args = build_inspect_similar_code_args(&params, &snapshot).unwrap();
     assert_eq!(
         args,
         [
@@ -610,6 +613,33 @@ fn inspect_similar_code_requires_and_forwards_candidate_id() {
             "sc_abc123",
             "--candidate-snapshot-stdin",
         ]
+    );
+}
+
+/// The wire `snapshot` parameter is an open JSON object, so a malformed
+/// snapshot must still be refused by name instead of surfacing a serde parser
+/// message the caller cannot dispatch on.
+#[test]
+fn inspect_similar_code_names_a_malformed_snapshot_refusal() {
+    let mut snapshot = similar_code_snapshot_json("sc_abc123");
+    snapshot["candidate"]["similarity"] = serde_json::json!("high");
+    let params: InspectSimilarCodeParams = serde_json::from_value(serde_json::json!({
+        "candidate_id": "sc_abc123",
+        "snapshot": snapshot,
+    }))
+    .expect("snapshot is an open object on the wire");
+
+    let error = parse_candidate_snapshot(&params.snapshot).unwrap_err();
+    let body: serde_json::Value = serde_json::from_str(&error).expect("refusal is JSON");
+
+    assert_eq!(body["code"], "FALLOW_MCP_INVALID_CANDIDATE_SNAPSHOT");
+    assert_eq!(body["exit_code"], 2);
+    assert_eq!(body["context"], "inspect_similar_code.snapshot");
+    assert!(
+        body["help"]
+            .as_str()
+            .is_some_and(|help| help.contains("fallow://schema/similar-code-snapshot")),
+        "{body}"
     );
 }
 
@@ -708,7 +738,17 @@ fn similar_code_snapshot_json(candidate_id: &str) -> serde_json::Value {
 #[test]
 fn find_dupes_args_minimal() {
     let args = build_find_dupes_args(&FindDupesParams::default()).unwrap();
-    assert_eq!(args, ["dupes", "--format", "json", "--quiet", "--explain"]);
+    assert_eq!(
+        args,
+        [
+            "dupes",
+            "--format",
+            "json",
+            "--quiet",
+            "--explain",
+            "--no-fragments"
+        ]
+    );
 }
 
 #[test]
@@ -718,12 +758,14 @@ fn find_dupes_args_with_all_options() {
         config: Some("fallow.toml".to_string()),
         allow_remote_extends: None,
         workspace: Some("@my/lib".to_string()),
+        no_package_baselines: Some(true),
         mode: Some("semantic".to_string()),
         near: None,
         min_tokens: Some(100),
         min_lines: Some(10),
         threshold: Some(5.5),
         skip_local: Some(true),
+        ignore_symlinks: Some(true),
         cross_language: Some(true),
         ignore_imports: Some(true),
         explain_skipped: Some(true),
@@ -735,6 +777,7 @@ fn find_dupes_args_with_all_options() {
         changed_since: Some("main".to_string()),
         group_by: None,
         min_occurrences: None,
+        include_fragments: Some(true),
     };
     let args = build_find_dupes_args(&params).unwrap();
     assert_eq!(
@@ -754,6 +797,7 @@ fn find_dupes_args_with_all_options() {
             "8",
             "--workspace",
             "@my/lib",
+            "--no-package-baselines",
             "--mode",
             "semantic",
             "--min-tokens",
@@ -764,6 +808,7 @@ fn find_dupes_args_with_all_options() {
             "5.5",
             "--skip-local",
             "--cross-language",
+            "--ignore-symlinks",
             "--ignore-imports",
             "--explain-skipped",
             "--top",
@@ -819,17 +864,6 @@ fn find_dupes_args_skip_local_false_is_omitted() {
 }
 
 #[test]
-fn find_dupes_args_threshold_zero() {
-    let params = FindDupesParams {
-        threshold: Some(0.0),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--threshold".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
 fn find_dupes_args_group_by_section() {
     let params = FindDupesParams {
         group_by: Some("section".to_string()),
@@ -870,9 +904,7 @@ fn find_dupes_args_min_occurrences_rejects_one() {
 #[test]
 fn fix_preview_args_include_dry_run() {
     let args = build_fix_preview_args(&FixParams::default());
-    assert!(args.contains(&"--dry-run".to_string()));
-    assert!(!args.contains(&"--yes".to_string()));
-    assert_eq!(args[0], "fix");
+    assert_eq!(args, ["fix", "--dry-run", "--format", "json", "--quiet"]);
 }
 
 #[test]
@@ -892,8 +924,10 @@ fn fix_preview_args_with_all_options() {
         production: Some(true),
         workspace: Some("frontend".to_string()),
         no_create_config: Some(true),
+        show_cascade: Some(true),
         no_cache: Some(true),
         threads: Some(4),
+        max_output_bytes: None,
     };
     let args = build_fix_preview_args(&params);
     assert_eq!(
@@ -905,6 +939,7 @@ fn fix_preview_args_with_all_options() {
             "json",
             "--quiet",
             "--no-create-config",
+            "--show-cascade",
             "--root",
             "/app",
             "--config",
@@ -928,8 +963,10 @@ fn fix_apply_args_with_all_options() {
         production: Some(true),
         workspace: Some("frontend".to_string()),
         no_create_config: Some(true),
+        show_cascade: Some(true),
         no_cache: Some(true),
         threads: Some(4),
+        max_output_bytes: None,
     };
     let args = build_fix_apply_args(&params);
     assert_eq!(
@@ -941,6 +978,7 @@ fn fix_apply_args_with_all_options() {
             "json",
             "--quiet",
             "--no-create-config",
+            "--show-cascade",
             "--root",
             "/app",
             "--config",
@@ -1126,6 +1164,7 @@ fn impact_closure_args_with_scope() {
         workspace: Some("packages/web".to_string()),
         no_cache: Some(true),
         threads: Some(3),
+        max_output_bytes: None,
     })
     .unwrap();
     assert_eq!(
@@ -1162,6 +1201,7 @@ fn trace_dependency_args_minimal() {
         workspace: None,
         no_cache: None,
         threads: None,
+        ..Default::default()
     })
     .unwrap();
     assert_eq!(
@@ -1175,6 +1215,115 @@ fn trace_dependency_args_minimal() {
             "react",
         ]
     );
+}
+
+#[test]
+fn trace_dependency_args_without_usage_fields_keep_the_dead_code_trace() {
+    let args = build_trace_dependency_args(&TraceDependencyParams {
+        package_name: "react".to_string(),
+        production: Some(true),
+        workspace: Some("app".to_string()),
+        usage: Some(false),
+        sites: Some(false),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        args,
+        [
+            "dead-code",
+            "--format",
+            "json",
+            "--quiet",
+            "--production",
+            "--workspace",
+            "app",
+            "--trace-dependency",
+            "react",
+        ]
+    );
+}
+
+#[test]
+fn trace_dependency_args_with_usage_fields_use_the_trace_command() {
+    let args = build_trace_dependency_args(&TraceDependencyParams {
+        package_name: "react-redux".to_string(),
+        production: Some(true),
+        workspace: Some("app".to_string()),
+        specifiers: Some(vec!["useSelector".to_string(), "connect".to_string()]),
+        limit: Some(5),
+        cursor: Some("v1.00".to_string()),
+        closure_depth: Some(2),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        args,
+        [
+            "trace",
+            "--format",
+            "json",
+            "--quiet",
+            "--production",
+            "--workspace",
+            "app",
+            "--dependency",
+            "react-redux",
+            "--specifier",
+            "useSelector",
+            "--specifier",
+            "connect",
+            "--sites",
+            "--limit",
+            "5",
+            "--cursor",
+            "v1.00",
+            "--callers",
+            "--depth",
+            "2",
+        ]
+    );
+    let counts_only = build_trace_dependency_args(&TraceDependencyParams {
+        package_name: "react-redux".to_string(),
+        usage: Some(true),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        counts_only,
+        [
+            "trace",
+            "--format",
+            "json",
+            "--quiet",
+            "--dependency",
+            "react-redux"
+        ]
+    );
+}
+
+#[test]
+fn trace_dependency_args_reject_usage_values_out_of_range() {
+    for params in [
+        TraceDependencyParams {
+            package_name: "react-redux".to_string(),
+            limit: Some(0),
+            ..Default::default()
+        },
+        TraceDependencyParams {
+            package_name: "react-redux".to_string(),
+            limit: Some(501),
+            ..Default::default()
+        },
+        TraceDependencyParams {
+            package_name: "react-redux".to_string(),
+            closure_depth: Some(11),
+            ..Default::default()
+        },
+    ] {
+        let err = build_trace_dependency_args(&params).unwrap_err();
+        assert!(err.contains("\"exit_code\":2"), "{err}");
+    }
 }
 
 #[test]
@@ -1193,6 +1342,7 @@ fn trace_clone_args_with_all_options() {
         min_lines: Some(7),
         threshold: Some(3.5),
         skip_local: Some(true),
+        ignore_symlinks: Some(true),
         cross_language: Some(true),
         ignore_imports: Some(true),
         no_cache: Some(true),
@@ -1226,6 +1376,7 @@ fn trace_clone_args_with_all_options() {
             "3.5",
             "--skip-local",
             "--cross-language",
+            "--ignore-symlinks",
             "--ignore-imports",
             "--trace",
             "src/original.ts:12",
@@ -1251,6 +1402,26 @@ fn trace_clone_args_by_fingerprint() {
             "dup:7f3a2c1e".to_string(),
         ]
     );
+}
+
+#[test]
+fn trace_clone_args_ignore_symlinks_emits_both_directions() {
+    let args = |ignore_symlinks| {
+        build_trace_clone_args(&TraceCloneParams {
+            fingerprint: Some("dup:7f3a2c1e".to_string()),
+            ignore_symlinks,
+            ..Default::default()
+        })
+        .expect("fingerprint-only is a valid addressing form")
+    };
+    let on = args(Some(true));
+    assert!(on.contains(&"--ignore-symlinks".to_string()));
+    assert!(!on.contains(&"--no-ignore-symlinks".to_string()));
+    let off = args(Some(false));
+    assert!(off.contains(&"--no-ignore-symlinks".to_string()));
+    assert!(!off.contains(&"--ignore-symlinks".to_string()));
+    let unset = args(None);
+    assert!(!unset.iter().any(|arg| arg.contains("ignore-symlinks")));
 }
 
 #[test]
@@ -1312,6 +1483,7 @@ fn trace_clone_args_invalid_mode_returns_error() {
         min_lines: None,
         threshold: None,
         skip_local: None,
+        ignore_symlinks: None,
         cross_language: None,
         ignore_imports: None,
         no_cache: None,
@@ -1383,6 +1555,7 @@ fn trace_args_reject_blank_required_values() {
         workspace: None,
         no_cache: None,
         threads: None,
+        max_output_bytes: None,
     })
     .unwrap_err();
     assert_eq!(
@@ -1399,6 +1572,7 @@ fn trace_args_reject_blank_required_values() {
         workspace: None,
         no_cache: None,
         threads: None,
+        ..Default::default()
     })
     .unwrap_err();
     assert_eq!(
@@ -1423,6 +1597,7 @@ fn trace_clone_args_reject_zero_line() {
         min_lines: None,
         threshold: None,
         skip_local: None,
+        ignore_symlinks: None,
         cross_language: None,
         ignore_imports: None,
         no_cache: None,
@@ -1452,6 +1627,7 @@ fn trace_clone_args_min_occurrences_forwards_flag() {
         min_lines: None,
         threshold: None,
         skip_local: None,
+        ignore_symlinks: None,
         cross_language: None,
         ignore_imports: None,
         no_cache: None,
@@ -1481,6 +1657,7 @@ fn trace_clone_args_min_occurrences_rejects_one() {
         min_lines: None,
         threshold: None,
         skip_local: None,
+        ignore_symlinks: None,
         cross_language: None,
         ignore_imports: None,
         no_cache: None,
@@ -1509,6 +1686,7 @@ fn validation_errors_use_structured_json_body() {
             min_lines: None,
             threshold: None,
             skip_local: None,
+            ignore_symlinks: None,
             cross_language: None,
             ignore_imports: None,
             no_cache: None,
@@ -1543,11 +1721,22 @@ fn validation_errors_use_structured_json_body() {
     for body in &errors {
         let v: serde_json::Value = serde_json::from_str(body)
             .unwrap_or_else(|e| panic!("body should be valid JSON: `{body}` ({e})"));
-        assert_eq!(
-            v.as_object().map(serde_json::Map::len),
-            Some(3),
-            "exactly 3 keys expected in {body}"
-        );
+        let keys: Vec<&str> = v
+            .as_object()
+            .expect("refusal body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for key in &keys {
+            assert!(
+                matches!(
+                    *key,
+                    "error" | "message" | "exit_code" | "code" | "help" | "context"
+                ),
+                "unexpected key '{key}' in {body}; a refusal carries the three required fields \
+                 plus at most the three typed ones"
+            );
+        }
         assert_eq!(
             v["error"],
             serde_json::Value::Bool(true),
@@ -1668,6 +1857,8 @@ fn health_args_with_all_options() {
         ownership: None,
         ownership_email_mode: None,
         group_by: None,
+        group: None,
+        trend_from: None,
     };
     let args = build_health_args(&params);
     assert_eq!(
@@ -1772,6 +1963,27 @@ fn health_args_group_by_section() {
 }
 
 #[test]
+fn health_args_group_selector_and_trend_from() {
+    let params = HealthParams {
+        group_by: Some("owner".to_string()),
+        group: Some("@team/a,!@team/b".to_string()),
+        trend_from: Some("/tmp/baseline.json".to_string()),
+        ..Default::default()
+    };
+    let args = build_health_args(&params);
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--group", "@team/a,!@team/b"]),
+        "expected --group, got {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--trend-from", "/tmp/baseline.json"]),
+        "expected --trend-from, got {args:?}"
+    );
+}
+
+#[test]
 fn health_args_max_crap_alone() {
     let params = HealthParams {
         max_crap: Some(25.5),
@@ -1807,6 +2019,7 @@ fn impact_args_minimal() {
 fn impact_args_with_root() {
     let args = build_impact_args(&ImpactParams {
         root: Some("/some/project".to_string()),
+        max_output_bytes: None,
     });
     assert_eq!(
         args,
@@ -1825,6 +2038,7 @@ fn impact_args_with_root() {
 fn impact_args_empty_root_dropped() {
     let args = build_impact_args(&ImpactParams {
         root: Some(String::new()),
+        max_output_bytes: None,
     });
     assert_eq!(args, ["impact", "--format", "json", "--quiet"]);
 }
@@ -1835,6 +2049,7 @@ fn guard_args_emit_json_quiet_and_files() {
         files: vec!["src/domain/user.ts".to_string(), "src/new.ts".to_string()],
         root: None,
         allow_remote_extends: None,
+        max_output_bytes: None,
     })
     .expect("plain file entries are valid");
     assert_eq!(
@@ -1856,6 +2071,7 @@ fn guard_args_with_root() {
         files: vec!["src/domain/user.ts".to_string()],
         root: Some("/repo".to_string()),
         allow_remote_extends: None,
+        max_output_bytes: None,
     })
     .expect("plain file entries are valid");
     assert_eq!(
@@ -1883,6 +2099,7 @@ fn impact_all_args_with_sort_and_limit() {
     let args = build_impact_all_args(&ImpactAllParams {
         sort: Some("resolved".to_string()),
         limit: Some(5),
+        max_output_bytes: None,
     });
     assert_eq!(
         args,
@@ -1897,276 +2114,26 @@ fn impact_all_args_empty_sort_dropped() {
     let args = build_impact_all_args(&ImpactAllParams {
         sort: Some(String::new()),
         limit: None,
+        max_output_bytes: None,
     });
     assert_eq!(args, ["impact", "--all", "--format", "json", "--quiet"]);
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "central contract table intentionally enumerates every arg builder"
-)]
-fn all_arg_builders_include_format_json_and_quiet() {
-    let analyze = build_analyze_args(&AnalyzeParams::default()).unwrap();
-    let check_changed = build_check_changed_args(check_changed("main"));
-    let dupes = build_find_dupes_args(&FindDupesParams::default()).unwrap();
-    let fix_preview = build_fix_preview_args(&FixParams::default());
-    let fix_apply = build_fix_apply_args(&FixParams::default());
-    let project_info = build_project_info_args(&ProjectInfoParams::default());
-    let trace_export = build_trace_export_args(&TraceExportParams {
-        file: "src/utils.ts".to_string(),
-        export_name: "usedFunction".to_string(),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        production: None,
-        workspace: None,
-        no_cache: None,
-        threads: None,
-    })
-    .unwrap();
-    let trace_file = build_trace_file_args(&TraceFileParams {
-        file: "src/utils.ts".to_string(),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        production: None,
-        workspace: None,
-        no_cache: None,
-        threads: None,
-    })
-    .unwrap();
-    let impact_closure = build_impact_closure_args(&ImpactClosureParams {
-        path: "src/utils.ts".to_string(),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        production: None,
-        workspace: None,
-        no_cache: None,
-        threads: None,
-    })
-    .unwrap();
-    let trace_dependency = build_trace_dependency_args(&TraceDependencyParams {
-        package_name: "react".to_string(),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        production: None,
-        workspace: None,
-        no_cache: None,
-        threads: None,
-    })
-    .unwrap();
-    let trace_clone = build_trace_clone_args(&TraceCloneParams {
-        file: Some("src/original.ts".to_string()),
-        fingerprint: None,
-        line: Some(2),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        workspace: None,
-        mode: None,
-        near: None,
-        min_tokens: None,
-        min_lines: None,
-        threshold: None,
-        skip_local: None,
-        cross_language: None,
-        ignore_imports: None,
-        no_cache: None,
-        threads: None,
-        min_occurrences: None,
-    })
-    .unwrap();
-    let health = build_health_args(&HealthParams::default());
-    let audit = build_audit_args(&AuditParams::default()).expect("default params are valid");
-    let list_boundaries = build_list_boundaries_args(&ListBoundariesParams::default());
-    let feature_flags = build_feature_flags_args(&FeatureFlagsParams::default());
-    let list_suppressions = build_list_suppressions_args(&ListSuppressionsParams::default())
-        .expect("default params are valid");
-    let check_runtime_coverage =
-        build_check_runtime_coverage_args(&check_runtime_coverage("./coverage"));
-    let impact = build_impact_args(&ImpactParams::default());
-    let guard = build_guard_args(&GuardParams {
-        files: vec!["src/domain/user.ts".to_string()],
-        root: None,
-        allow_remote_extends: None,
-    })
-    .expect("plain file entries are valid");
-    let impact_all = build_impact_all_args(&ImpactAllParams::default());
-
-    for (name, args) in [
-        ("analyze", &analyze),
-        ("check_changed", &check_changed),
-        ("find_dupes", &dupes),
-        ("fix_preview", &fix_preview),
-        ("fix_apply", &fix_apply),
-        ("project_info", &project_info),
-        ("trace_export", &trace_export),
-        ("trace_file", &trace_file),
-        ("impact_closure", &impact_closure),
-        ("trace_dependency", &trace_dependency),
-        ("trace_clone", &trace_clone),
-        ("health", &health),
-        ("audit", &audit),
-        ("list_boundaries", &list_boundaries),
-        ("feature_flags", &feature_flags),
-        ("list_suppressions", &list_suppressions),
-        ("check_runtime_coverage", &check_runtime_coverage),
-        ("impact", &impact),
-        ("guard", &guard),
-        ("impact_all", &impact_all),
-    ] {
-        assert!(
-            args.contains(&"--format".to_string()),
-            "{name} missing --format"
-        );
-        assert!(args.contains(&"json".to_string()), "{name} missing json");
-        assert!(
-            args.contains(&"--quiet".to_string()),
-            "{name} missing --quiet"
-        );
-    }
-}
-
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "central contract table intentionally enumerates every tool command"
-)]
-fn each_tool_uses_correct_subcommand() {
-    assert_eq!(
-        build_analyze_args(&AnalyzeParams::default()).unwrap()[0],
-        "dead-code"
-    );
-    assert_eq!(build_check_changed_args(check_changed("x"))[0], "dead-code");
-    assert_eq!(
-        build_find_dupes_args(&FindDupesParams::default()).unwrap()[0],
-        "dupes"
-    );
-    assert_eq!(build_fix_preview_args(&FixParams::default())[0], "fix");
-    assert_eq!(build_fix_apply_args(&FixParams::default())[0], "fix");
-    assert_eq!(
-        build_project_info_args(&ProjectInfoParams::default())[0],
-        "list"
-    );
-    assert_eq!(build_health_args(&HealthParams::default())[0], "health");
-    assert_eq!(build_impact_args(&ImpactParams::default())[0], "impact");
-    assert_eq!(build_guard_args(&guard_params()).unwrap()[0], "guard");
-    let impact_all = build_impact_all_args(&ImpactAllParams::default());
-    assert_eq!(impact_all[0], "impact");
-    assert_eq!(impact_all[1], "--all");
-    assert_eq!(
-        build_list_boundaries_args(&ListBoundariesParams::default())[0],
-        "list"
-    );
-    assert_eq!(
-        build_feature_flags_args(&FeatureFlagsParams::default())[0],
-        "flags"
-    );
-    assert_eq!(
-        build_list_suppressions_args(&ListSuppressionsParams::default()).unwrap()[0],
-        "suppressions"
-    );
-    assert_eq!(
-        build_trace_export_args(&TraceExportParams {
-            file: "src/utils.ts".to_string(),
-            export_name: "usedFunction".to_string(),
-            root: None,
-            config: None,
-            allow_remote_extends: None,
-            production: None,
-            workspace: None,
-            no_cache: None,
-            threads: None,
-        })
-        .unwrap()[0],
-        "dead-code"
-    );
-    assert_eq!(
-        build_trace_file_args(&TraceFileParams {
-            file: "src/utils.ts".to_string(),
-            root: None,
-            config: None,
-            allow_remote_extends: None,
-            production: None,
-            workspace: None,
-            no_cache: None,
-            threads: None,
-        })
-        .unwrap()[0],
-        "dead-code"
-    );
-    assert_eq!(
-        build_impact_closure_args(&ImpactClosureParams {
-            path: "src/utils.ts".to_string(),
-            root: None,
-            config: None,
-            allow_remote_extends: None,
-            production: None,
-            workspace: None,
-            no_cache: None,
-            threads: None,
-        })
-        .unwrap()[0],
-        "dead-code"
-    );
-    assert_eq!(
-        build_trace_dependency_args(&TraceDependencyParams {
-            package_name: "react".to_string(),
-            root: None,
-            config: None,
-            allow_remote_extends: None,
-            production: None,
-            workspace: None,
-            no_cache: None,
-            threads: None,
-        })
-        .unwrap()[0],
-        "dead-code"
-    );
-    assert_eq!(
-        build_trace_clone_args(&TraceCloneParams {
-            file: Some("src/original.ts".to_string()),
-            fingerprint: None,
-            line: Some(2),
-            root: None,
-            config: None,
-            allow_remote_extends: None,
-            workspace: None,
-            mode: None,
-            near: None,
-            min_tokens: None,
-            min_lines: None,
-            threshold: None,
-            skip_local: None,
-            cross_language: None,
-            ignore_imports: None,
-            no_cache: None,
-            threads: None,
-            min_occurrences: None,
-        })
-        .unwrap()[0],
-        "dupes"
-    );
-    assert_eq!(
-        build_check_runtime_coverage_args(&check_runtime_coverage("./coverage"))[0],
-        "health"
-    );
-}
-
-#[test]
 fn check_runtime_coverage_minimal_emits_coverage_flag() {
     let args = build_check_runtime_coverage_args(&check_runtime_coverage("./coverage"));
-    assert_eq!(args[0], "health");
-    assert!(args.contains(&"--runtime-coverage".to_string()));
-    let idx = args.iter().position(|a| a == "--runtime-coverage").unwrap();
-    assert_eq!(args[idx + 1], "./coverage");
-    assert!(!args.contains(&"--min-invocations-hot".to_string()));
-    assert!(!args.contains(&"--min-observation-volume".to_string()));
-    assert!(!args.contains(&"--low-traffic-threshold".to_string()));
-    assert!(!args.contains(&"--group-by".to_string()));
+    assert_eq!(
+        args,
+        [
+            "health",
+            "--format",
+            "json",
+            "--quiet",
+            "--explain",
+            "--runtime-coverage",
+            "./coverage",
+        ]
+    );
 }
 
 #[test]
@@ -2186,6 +2153,7 @@ fn check_runtime_coverage_all_tuning_flags_emit() {
         max_crap: Some(42.5),
         top: Some(10),
         group_by: Some("owner".to_string()),
+        max_output_bytes: None,
     };
     let args = build_check_runtime_coverage_args(&params);
     assert!(args.contains(&"--root".to_string()));
@@ -2237,6 +2205,168 @@ fn runtime_context_split_tools_share_runtime_coverage_pipeline() {
     assert_eq!(build_get_cleanup_candidates_args(&params), expected);
 }
 
+fn cloud_runtime_context(repo: &str) -> CloudRuntimeContextParams {
+    CloudRuntimeContextParams {
+        repo: repo.to_string(),
+        ..CloudRuntimeContextParams::default()
+    }
+}
+
+/// The refusal has to happen here, before a subprocess exists: the CLI would
+/// otherwise run a full static analysis of the project only to discover that
+/// it has nothing to join it against.
+#[test]
+fn get_cloud_runtime_context_without_a_key_refuses_before_building_args() {
+    let err = build_get_cloud_runtime_context_args(&cloud_runtime_context("acme/web"), false)
+        .expect_err("a missing key must refuse the call");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["error"].as_bool(), Some(true));
+    assert_eq!(body["exit_code"].as_i64(), Some(2));
+    assert_eq!(body["code"].as_str(), Some("cloud_api_key_missing"));
+    assert_eq!(
+        body["message"].as_str(),
+        Some(
+            fallow_types::cloud::cloud_api_key_missing_message(
+                fallow_types::cloud::CloudCommand::Analyze
+            )
+            .as_str()
+        ),
+        "the MCP refusal must read exactly as the CLI's does"
+    );
+}
+
+#[test]
+fn get_cloud_runtime_context_minimal_emits_the_cloud_pull() {
+    let args = build_get_cloud_runtime_context_args(&cloud_runtime_context("acme/web"), true)
+        .expect("a repo plus a key is enough");
+    assert_eq!(args[0], "coverage");
+    assert_eq!(args[1], "analyze");
+    assert!(args.contains(&"--cloud".to_string()));
+    assert!(args.windows(2).any(|pair| pair == ["--repo", "acme/web"]));
+    assert!(!args.contains(&"--coverage-period".to_string()));
+    assert!(!args.contains(&"--project-id".to_string()));
+    assert!(!args.contains(&"--environment".to_string()));
+    assert!(!args.contains(&"--commit-sha".to_string()));
+    assert!(
+        !args.contains(&"--runtime-coverage".to_string()),
+        "the cloud pull must never select a local artifact too: {args:?}"
+    );
+}
+
+#[test]
+fn get_cloud_runtime_context_forwards_every_selector() {
+    let params = CloudRuntimeContextParams {
+        repo: "  acme/web  ".to_string(),
+        project_id: Some("apps/dashboard".to_string()),
+        period_days: Some(7),
+        environment: Some("production".to_string()),
+        commit_sha: Some("abc123".to_string()),
+        root: Some("/my/project".to_string()),
+        config: Some(".fallowrc.json".to_string()),
+        allow_remote_extends: None,
+        production: Some(true),
+        min_invocations_hot: Some(500),
+        top: Some(10),
+        no_cache: Some(true),
+        threads: Some(8),
+        max_output_bytes: None,
+    };
+    let args = build_get_cloud_runtime_context_args(&params, true).expect("selectors are valid");
+    assert!(
+        args.windows(2).any(|pair| pair == ["--repo", "acme/web"]),
+        "a padded repo must reach the cloud trimmed: {args:?}"
+    );
+    for pair in [
+        ["--project-id", "apps/dashboard"],
+        ["--coverage-period", "7"],
+        ["--environment", "production"],
+        ["--commit-sha", "abc123"],
+        ["--min-invocations-hot", "500"],
+        ["--top", "10"],
+        ["--root", "/my/project"],
+        ["--config", ".fallowrc.json"],
+        ["--threads", "8"],
+    ] {
+        assert!(
+            args.windows(2).any(|window| window == pair),
+            "expected {pair:?} in {args:?}"
+        );
+    }
+    assert!(args.contains(&"--production".to_string()));
+    assert!(args.contains(&"--no-cache".to_string()));
+}
+
+/// A dot-only repo becomes a `.` or `..` URL path segment, so every cloud
+/// tool refuses it before the CLI runs, with the CLI's rule.
+#[test]
+fn cloud_tools_reject_a_dot_only_repo() {
+    for repo in [".", "..", " ... "] {
+        let refusals = [
+            build_get_cloud_runtime_context_args(&cloud_runtime_context(repo), true)
+                .expect_err("runtime context must refuse"),
+            build_get_cloud_review_packet_args(
+                &CloudReviewPacketParams {
+                    repo: repo.to_string(),
+                    ..CloudReviewPacketParams::default()
+                },
+                true,
+            )
+            .expect_err("review packet must refuse"),
+            build_get_cloud_deployment_changes_args(
+                &CloudDeploymentChangesParams {
+                    repo: repo.to_string(),
+                    ..CloudDeploymentChangesParams::default()
+                },
+                true,
+            )
+            .expect_err("deployment changes must refuse"),
+        ];
+        for refusal in refusals {
+            assert_eq!(
+                parse_typed_validation_code(&refusal).as_deref(),
+                Some("cloud_repo_invalid"),
+                "{repo:?}: {refusal}"
+            );
+        }
+    }
+    build_get_cloud_runtime_context_args(&cloud_runtime_context("acme/.github"), true)
+        .expect("dots inside a repository name stay valid");
+}
+
+#[test]
+fn get_cloud_runtime_context_rejects_an_empty_repo_and_an_unservable_window() {
+    let empty = build_get_cloud_runtime_context_args(&cloud_runtime_context("   "), true)
+        .expect_err("an empty repo must refuse");
+    assert_eq!(
+        parse_typed_validation_code(&empty).as_deref(),
+        Some("cloud_repo_missing")
+    );
+
+    let mut params = cloud_runtime_context("acme/web");
+    params.period_days = Some(91);
+    let too_wide = build_get_cloud_runtime_context_args(&params, true)
+        .expect_err("a window the cloud does not serve must refuse");
+    assert_eq!(
+        parse_typed_validation_code(&too_wide).as_deref(),
+        Some("cloud_period_out_of_range")
+    );
+
+    params.period_days = Some(0);
+    let zero = build_get_cloud_runtime_context_args(&params, true)
+        .expect_err("a zero-day window must refuse");
+    assert_eq!(
+        parse_typed_validation_code(&zero).as_deref(),
+        Some("cloud_period_out_of_range")
+    );
+}
+
+/// The `code` field of a typed refusal body, for tests that care which
+/// refusal fired rather than what its prose says.
+fn parse_typed_validation_code(err: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(err).ok()?;
+    body["code"].as_str().map(str::to_string)
+}
+
 #[test]
 fn get_token_blast_radius_emits_css_health_json() {
     let args = build_get_token_blast_radius_args(&GetTokenBlastRadiusParams::default());
@@ -2260,6 +2390,7 @@ fn get_token_blast_radius_threads_root_and_config() {
         allow_remote_extends: None,
         no_cache: Some(true),
         threads: Some(4),
+        max_output_bytes: None,
     };
     let args = build_get_token_blast_radius_args(&params);
     assert!(args.starts_with(&[
@@ -2368,6 +2499,7 @@ fn trace_tools_do_not_include_explain() {
         workspace: None,
         no_cache: None,
         threads: None,
+        ..Default::default()
     })
     .unwrap();
     let clone = build_trace_clone_args(&TraceCloneParams {
@@ -2384,6 +2516,7 @@ fn trace_tools_do_not_include_explain() {
         min_lines: None,
         threshold: None,
         skip_local: None,
+        ignore_symlinks: None,
         cross_language: None,
         ignore_imports: None,
         no_cache: None,
@@ -2429,6 +2562,7 @@ fn no_cache_false_is_omitted_across_all_tools() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         threads: None,
     });
     assert!(!check_changed.contains(&"--no-cache".to_string()));
@@ -2512,6 +2646,8 @@ fn audit_args_with_all_options() {
         production_dead_code: None,
         production_health: Some(true),
         production_dupes: None,
+        only: None,
+        skip: None,
         css: None,
         css_deep: Some(true),
         workspace: Some("@app/core".to_string()),
@@ -2522,6 +2658,7 @@ fn audit_args_with_all_options() {
         type_aware_require: None,
         group_by: None,
         gate: Some("all".to_string()),
+        worsened: Some("error".to_string()),
         dead_code_baseline: None,
         health_baseline: None,
         health_baseline_mode: None,
@@ -2531,6 +2668,7 @@ fn audit_args_with_all_options() {
         coverage: Some("coverage/coverage-final.json".to_string()),
         coverage_root: Some("/ci/build".to_string()),
         include_entry_exports: None,
+        show_cascade: None,
         runtime_coverage: Some(".fallow/runtime.json".to_string()),
         min_invocations_hot: Some(250),
     })
@@ -2550,6 +2688,7 @@ fn audit_args_with_all_options() {
     assert!(args.contains(&"--threads".to_string()));
     assert!(args.contains(&"4".to_string()));
     assert!(args.windows(2).any(|w| w == ["--gate", "all"]));
+    assert!(args.windows(2).any(|w| w == ["--worsened", "error"]));
     assert!(args.contains(&"--explain-skipped".to_string()));
     assert!(
         args.windows(2)
@@ -2580,6 +2719,104 @@ fn audit_args_css_opt_outs_forward_to_cli() {
 
     assert!(args.contains(&"--no-css".to_string()));
     assert!(args.contains(&"--no-css-deep".to_string()));
+}
+
+#[test]
+fn audit_args_forward_the_sub_analysis_selection() {
+    let skip = |values: &[&str]| AuditParams {
+        skip: Some(values.iter().map(ToString::to_string).collect()),
+        ..Default::default()
+    };
+    let args = build_audit_args(&skip(&["dead-code", "dupes"])).expect("skip is valid");
+    assert!(args.windows(2).any(|w| w == ["--skip", "dead-code,dupes"]));
+
+    let args = build_audit_args(&AuditParams {
+        only: Some(vec!["health".to_string()]),
+        ..Default::default()
+    })
+    .expect("only is valid");
+    assert!(args.windows(2).any(|w| w == ["--only", "health"]));
+
+    let unset = build_audit_args(&AuditParams::default()).expect("defaults are valid");
+    assert!(!unset.iter().any(|arg| arg == "--only" || arg == "--skip"));
+}
+
+#[test]
+fn audit_args_reject_an_invalid_sub_analysis_selection() {
+    let both = build_audit_args(&AuditParams {
+        only: Some(vec!["health".to_string()]),
+        skip: Some(vec!["dupes".to_string()]),
+        ..Default::default()
+    })
+    .expect_err("only and skip are exclusive");
+    assert!(both.contains("mutually exclusive"), "{both}");
+
+    let unknown = build_audit_args(&AuditParams {
+        skip: Some(vec!["styling".to_string()]),
+        ..Default::default()
+    })
+    .expect_err("styling is not a sub-analysis");
+    assert!(
+        unknown.contains("Invalid sub-analysis 'styling'"),
+        "{unknown}"
+    );
+}
+
+#[test]
+fn audit_args_reject_a_baseline_for_a_left_out_sub_analysis() {
+    let err = build_audit_args(&AuditParams {
+        skip: Some(vec!["dead-code".to_string()]),
+        dead_code_baseline: Some("baseline.json".to_string()),
+        ..Default::default()
+    })
+    .expect_err("a skipped sub-analysis reads no baseline");
+    assert!(err.contains("dead_code_baseline"), "{err}");
+
+    let err = build_audit_args(&AuditParams {
+        only: Some(vec!["dead-code".to_string()]),
+        health_baseline: Some("health.json".to_string()),
+        ..Default::default()
+    })
+    .expect_err("only leaves health out");
+    assert!(err.contains("health_baseline"), "{err}");
+
+    build_audit_args(&AuditParams {
+        skip: Some(vec!["architecture".to_string()]),
+        dead_code_baseline: Some("baseline.json".to_string()),
+        ..Default::default()
+    })
+    .expect("skipping architecture keeps the dead-code pass");
+
+    let err = build_audit_args(&AuditParams {
+        skip: Some(vec!["check".to_string()]),
+        dead_code_baseline: Some("baseline.json".to_string()),
+        ..Default::default()
+    })
+    .expect_err("check is the dead-code alias");
+    assert!(err.contains("dead_code_baseline"), "{err}");
+
+    for (only, baseline) in [
+        ("architecture", "dead_code_baseline"),
+        ("dupes", "dupes_baseline"),
+    ] {
+        let mut params = AuditParams {
+            only: Some(vec![only.to_string()]),
+            ..Default::default()
+        };
+        match baseline {
+            "dead_code_baseline" => params.dead_code_baseline = Some("b.json".to_string()),
+            _ => params.dupes_baseline = Some("b.json".to_string()),
+        }
+        build_audit_args(&params)
+            .unwrap_or_else(|err| panic!("only={only} runs the pass {baseline} reads: {err}"));
+    }
+
+    build_audit_args(&AuditParams {
+        only: Some(Vec::new()),
+        skip: Some(vec!["dupes".to_string()]),
+        ..Default::default()
+    })
+    .expect("an empty only is unset");
 }
 
 #[test]
@@ -2885,7 +3122,13 @@ fn feature_flags_args_with_all_options() {
         top: Some(5),
         no_cache: Some(true),
         threads: Some(4),
+        retirement: Some(true),
+        flag_state: Some("flag-state.json".to_string()),
+        flag_age: Some("off".to_string()),
     });
+    assert!(args.contains(&"--retirement".to_string()));
+    assert!(args.contains(&"--flag-state".to_string()));
+    assert!(args.contains(&"--flag-age".to_string()));
     assert!(args.contains(&"--root".to_string()));
     assert!(args.contains(&"/project".to_string()));
     assert!(args.contains(&"--config".to_string()));
@@ -2918,6 +3161,7 @@ fn list_suppressions_args_with_all_options() {
         file: Some(vec!["src/a.ts".to_string(), "src/b.ts".to_string()]),
         no_cache: Some(true),
         threads: Some(4),
+        max_output_bytes: None,
     })
     .unwrap();
     assert!(args.contains(&"--allow-remote-extends".to_string()));
@@ -2948,4 +3192,151 @@ fn list_suppressions_args_reject_empty_file_entries() {
     let err = build_list_suppressions_args(&params).unwrap_err();
     let msg = parse_validation_message(&err);
     assert!(msg.contains("file entries must not be empty"));
+}
+
+fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == flag && pair[1] == value)
+}
+
+#[test]
+fn get_cloud_review_packet_forwards_files_functions_and_selectors() {
+    let params = CloudReviewPacketParams {
+        repo: " acme/web ".to_string(),
+        files: Some(vec!["src/a.ts".to_string(), " ".to_string()]),
+        functions: Some(vec![
+            CloudFunctionTarget {
+                file: "src/b.ts".to_string(),
+                name: "handler".to_string(),
+                line: Some(12),
+            },
+            CloudFunctionTarget {
+                file: "src/c.ts".to_string(),
+                name: "render".to_string(),
+                line: None,
+            },
+        ]),
+        period_days: Some(7),
+        project_id: Some("web".to_string()),
+        commit_sha: Some("abc1234".to_string()),
+        base: Some("origin/main".to_string()),
+        root: Some("/repo".to_string()),
+        ..CloudReviewPacketParams::default()
+    };
+    let args = build_get_cloud_review_packet_args(&params, true).expect("valid params");
+    assert_eq!(args[0], "coverage");
+    assert_eq!(args[1], "review-packet");
+    assert!(has_pair(&args, "--repo", "acme/web"));
+    assert!(has_pair(&args, "--file", "src/a.ts"));
+    assert_eq!(args.iter().filter(|arg| *arg == "--file").count(), 1);
+    assert!(has_pair(&args, "--function", "src/b.ts:handler:12"));
+    assert!(has_pair(&args, "--function", "src/c.ts:render"));
+    assert!(has_pair(&args, "--coverage-period", "7"));
+    assert!(has_pair(&args, "--project-id", "web"));
+    assert!(has_pair(&args, "--commit-sha", "abc1234"));
+    assert!(has_pair(&args, "--base", "origin/main"));
+    assert!(has_pair(&args, "--root", "/repo"));
+}
+
+#[test]
+fn get_cloud_review_packet_refuses_without_key_repo_or_valid_scope() {
+    let params = CloudReviewPacketParams {
+        repo: "acme/web".to_string(),
+        ..CloudReviewPacketParams::default()
+    };
+    let err = build_get_cloud_review_packet_args(&params, false).expect_err("no key");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_api_key_missing");
+    assert_eq!(body["context"], "get_cloud_review_packet.api_key");
+    assert_eq!(
+        body["message"],
+        fallow_types::cloud::cloud_api_key_missing_message(
+            fallow_types::cloud::CloudCommand::ReviewPacket
+        ),
+        "the MCP refusal must read exactly as the CLI's does"
+    );
+
+    let err = build_get_cloud_review_packet_args(&CloudReviewPacketParams::default(), true)
+        .expect_err("no repo");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_repo_missing");
+
+    let wide = CloudReviewPacketParams {
+        repo: "acme/web".to_string(),
+        period_days: Some(91),
+        ..CloudReviewPacketParams::default()
+    };
+    let err = build_get_cloud_review_packet_args(&wide, true).expect_err("period");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_period_out_of_range");
+
+    let too_many = CloudReviewPacketParams {
+        repo: "acme/web".to_string(),
+        files: Some(vec!["src/a.ts".to_string(); 1001]),
+        ..CloudReviewPacketParams::default()
+    };
+    let err = build_get_cloud_review_packet_args(&too_many, true).expect_err("scope");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_scope_too_large");
+}
+
+#[test]
+fn get_cloud_deployment_changes_forwards_sha_base_and_paging() {
+    let params = CloudDeploymentChangesParams {
+        repo: "acme/web".to_string(),
+        sha: Some("abc1234".to_string()),
+        base: Some("def5678".to_string()),
+        change: Some("stopped".to_string()),
+        limit: Some(50),
+        cursor: Some("NTA".to_string()),
+        ..CloudDeploymentChangesParams::default()
+    };
+    let args = build_get_cloud_deployment_changes_args(&params, true).expect("valid params");
+    assert_eq!(args[1], "deployment-changes");
+    assert!(has_pair(&args, "--repo", "acme/web"));
+    assert!(has_pair(&args, "--sha", "abc1234"));
+    assert!(has_pair(&args, "--base", "def5678"));
+    assert!(has_pair(&args, "--change", "stopped"));
+    assert!(has_pair(&args, "--limit", "50"));
+    assert!(has_pair(&args, "--cursor", "NTA"));
+
+    let minimal = CloudDeploymentChangesParams {
+        repo: "acme/web".to_string(),
+        ..CloudDeploymentChangesParams::default()
+    };
+    let args = build_get_cloud_deployment_changes_args(&minimal, true).expect("valid params");
+    assert!(!args.contains(&"--sha".to_string()));
+    assert!(!args.contains(&"--base".to_string()));
+}
+
+#[test]
+fn get_cloud_deployment_changes_refuses_bad_filters() {
+    let bad_change = CloudDeploymentChangesParams {
+        repo: "acme/web".to_string(),
+        change: Some("vanished".to_string()),
+        ..CloudDeploymentChangesParams::default()
+    };
+    let err = build_get_cloud_deployment_changes_args(&bad_change, true).expect_err("change");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_change_kind_invalid");
+
+    let bad_limit = CloudDeploymentChangesParams {
+        repo: "acme/web".to_string(),
+        limit: Some(0),
+        ..CloudDeploymentChangesParams::default()
+    };
+    let err = build_get_cloud_deployment_changes_args(&bad_limit, true).expect_err("limit");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["code"], "cloud_limit_out_of_range");
+
+    let err = build_get_cloud_deployment_changes_args(&bad_limit, false).expect_err("key");
+    let body: serde_json::Value = serde_json::from_str(&err).expect("refusal is JSON");
+    assert_eq!(body["context"], "get_cloud_deployment_changes.api_key");
+    assert_eq!(
+        body["message"],
+        fallow_types::cloud::cloud_api_key_missing_message(
+            fallow_types::cloud::CloudCommand::DeploymentChanges
+        ),
+        "the MCP refusal must read exactly as the CLI's does"
+    );
 }

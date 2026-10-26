@@ -14,15 +14,15 @@ use std::path::{Path, PathBuf};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use fallow_api::{
-    AnalysisOptions, CombinedOptions, ComplexityOptions, DeadCodeOptions, DuplicationMode,
-    DuplicationOptions, EditorAnalysisSession, EngineHealthRunner, FeatureFlagsOptions,
+    ComplexityOptions, DeadCodeOptions, EngineHealthRunner, FeatureFlagsOptions,
     benchmark_trace_clone_compact_json, benchmark_trace_graph_family_compact_json,
-    run_circular_dependencies, run_combined, run_feature_flags, run_health_with_runner,
+    run_circular_dependencies, run_feature_flags, run_health_with_runner,
 };
 use fallow_cli::{
     AuditReviewBenchmarkCorpus, InspectBenchmarkCorpus, SecurityBlindSpotsBenchmarkResult,
-    WatchFilterBenchmarkGlobalGitignore, benchmark_audit_review_brief_many_changed_files_json,
-    benchmark_dead_code_json, benchmark_fix_dry_run, benchmark_inspect_file_evidence_bundle_json,
+    WatchFilterBenchmarkGlobalGitignore, benchmark_audit_analyses,
+    benchmark_audit_review_brief_many_changed_files_json, benchmark_dead_code_json,
+    benchmark_fix_dry_run, benchmark_inspect_file_evidence_bundle_json,
     benchmark_list_boundaries_json, benchmark_list_json, benchmark_recommend_json,
     benchmark_rule_pack_test_json, benchmark_runtime_coverage_analyze_json,
     benchmark_security_blind_spots_json, benchmark_security_json,
@@ -37,23 +37,28 @@ use fallow_engine::{
     module_graph::impact_closure_for_changed_paths,
     session::AnalysisSession,
 };
-use fallow_extract::{
-    cache::{CacheStore, module_to_cached},
-    parse_all_files, parse_single_file,
-};
+use fallow_extract::parse_all_files;
 use fallow_types::{
-    discover::{DiscoveredFile, FileId},
     extract::{SkippedSecurityCalleeExpressionKind, SkippedSecurityCalleeReason},
     results::SecurityUnresolvedCalleeDiagnostic,
 };
 use tempfile::TempDir;
 
-const BENCH_THREADS: usize = 4;
+mod support;
+
+use support::{
+    CommandInput, analysis_options, bench_threads, create_editor_session_workspace_project,
+    create_warm_hash_workspace_project, create_workspace_project,
+    run_programmatic_combined_session, write_file,
+};
+
 const AUDIT_REVIEW_CHANGED_FILE_COUNT: usize = 16;
 const AUDIT_REVIEW_INTRODUCED_COUNT: usize = AUDIT_REVIEW_CHANGED_FILE_COUNT / 2;
 const AUDIT_REVIEW_INHERITED_COUNT: usize = AUDIT_REVIEW_CHANGED_FILE_COUNT / 2;
 const AUDIT_REVIEW_PUBLIC_API_ADDED_COUNT: usize = AUDIT_REVIEW_CHANGED_FILE_COUNT;
 const AUDIT_REVIEW_DECISION_COUNT: usize = 4;
+const AUDIT_ANALYSES_MODULE_COUNT: usize = 128;
+const AUDIT_ANALYSES_CHANGED_FILE_COUNT: usize = 16;
 const BUN_LOCK_PACKAGE_COUNT: usize = 4_096;
 const BUN_OVERRIDE_COUNT: usize = 512;
 const BUN_UNUSED_OVERRIDE_COUNT: usize = 1;
@@ -68,9 +73,9 @@ const LIST_BOUNDARY_ZONE_COUNT: usize = 32;
 const LIST_BOUNDARY_FILE_COUNT: usize = LIST_BOUNDARY_FILES_PER_ZONE * LIST_BOUNDARY_ZONE_COUNT;
 const LIST_FILE_COUNT: usize = 128;
 const LIST_WORKSPACE_COUNT: usize = 8;
-// Each workspace index is reported once as a default index and once from its
-// package metadata, preserving both production entry-point sources.
-const LIST_ENTRY_POINT_COUNT: usize = LIST_WORKSPACE_COUNT * 2;
+// One entry point per workspace: the `main` file from its package.json. The
+// list uses the same deduplicated entry points as the analysis.
+const LIST_ENTRY_POINT_COUNT: usize = LIST_WORKSPACE_COUNT;
 const RECOMMEND_DECISION_COUNT: usize = 13;
 const RECOMMEND_FRAMEWORK_COUNT: usize = 5;
 const RECOMMEND_WORKSPACE_COUNT: usize = 64;
@@ -95,32 +100,23 @@ const WATCH_FILTER_PACKAGE_COUNT: usize = 64;
 const WATCH_FILTER_PROJECT_MATCHER_COUNT: usize = WATCH_FILTER_PACKAGE_COUNT + 3;
 const WATCH_FILTER_PROJECT_PATTERN_COUNT: usize = WATCH_FILTER_PACKAGE_COUNT * 2 + 4;
 
-struct CommandInput {
-    _temp_dir: TempDir,
-    root: PathBuf,
-}
-
 struct InspectCommandInput {
     _temp_dir: TempDir,
     root: PathBuf,
     corpus: InspectBenchmarkCorpus,
 }
 
+struct AuditAnalysesCommandInput {
+    _temp_dir: TempDir,
+    head_root: PathBuf,
+    base_root: PathBuf,
+    changed_files: Vec<PathBuf>,
+}
+
 struct AuditReviewCommandInput {
     _temp_dir: TempDir,
     root: PathBuf,
     changed_files: Vec<PathBuf>,
-}
-
-struct ExtractCacheInput {
-    _temp_dir: TempDir,
-    files: Vec<DiscoveredFile>,
-    cache: CacheStore,
-}
-
-struct EditorSessionInput {
-    _temp_dir: TempDir,
-    session: EditorAnalysisSession,
 }
 
 struct RuntimeCoverageInput {
@@ -151,12 +147,6 @@ struct TraceCloneInput {
     expected_fingerprint: String,
     expected_group_count: usize,
     expected_instance_count: usize,
-}
-
-fn write_file(root: &Path, path: &str, source: impl AsRef<str>) {
-    let path = root.join(path);
-    fs::create_dir_all(path.parent().expect("fixture file has parent")).unwrap();
-    fs::write(path, source.as_ref()).unwrap();
 }
 
 fn create_trace_graph_project() -> TraceGraphInput {
@@ -291,7 +281,7 @@ fn create_inspect_project() -> InspectCommandInput {
         "src/target.ts",
         "export const target = (value: number) => value + 1;\n",
     );
-    let corpus = create_inspect_benchmark_corpus(&root, BENCH_THREADS);
+    let corpus = create_inspect_benchmark_corpus(&root, bench_threads());
     InspectCommandInput {
         _temp_dir: temp_dir,
         root,
@@ -340,181 +330,75 @@ fn create_audit_review_project() -> AuditReviewCommandInput {
     }
 }
 
-fn create_audit_review_corpus(input: &AuditReviewCommandInput) -> AuditReviewBenchmarkCorpus {
-    create_audit_review_benchmark_corpus(&input.root, &input.changed_files, BENCH_THREADS)
-        .expect("audit review benchmark corpus builds")
-}
-
-fn analysis_options(root: &Path, no_cache: bool) -> AnalysisOptions {
-    AnalysisOptions {
-        root: Some(root.to_path_buf()),
-        no_cache,
-        threads: Some(BENCH_THREADS),
-        ..AnalysisOptions::default()
+/// One module of the audit analyses fixture. The scoring functions differ only
+/// in their names, so the duplication analysis finds clone groups, and their
+/// branches give the health analysis complexity to score.
+fn audit_analyses_module(index: usize, changed: bool) -> String {
+    let mut source = format!(
+        "export const used{index} = {index};\n\
+         export const unused{index} = {index};\n\
+         export function score{index}(input: number[]): number {{\n\
+         \x20 let total = 0;\n\
+         \x20 for (const value of input) {{\n\
+         \x20   if (value > 10) {{\n\
+         \x20     total += value;\n\
+         \x20   }} else if (value < 0) {{\n\
+         \x20     total -= value;\n\
+         \x20   }} else {{\n\
+         \x20     total += 1;\n\
+         \x20   }}\n\
+         \x20 }}\n\
+         \x20 return total;\n\
+         }}\n"
+    );
+    if changed {
+        writeln!(&mut source, "export const added{index} = {index};").unwrap();
     }
+    source
 }
 
-fn is_source_path(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return false;
-    };
-
-    matches!(extension, "css" | "js" | "jsx" | "ts" | "tsx")
-}
-
-fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).expect("benchmark fixture directory is readable") {
-        let entry = entry.expect("benchmark fixture entry is readable");
-        let path = entry.path();
-        if path.is_dir() {
-            collect_source_paths(&path, paths);
-        } else if is_source_path(&path) {
-            paths.push(path);
-        }
-    }
-}
-
-fn discovered_source_files(root: &Path) -> Vec<DiscoveredFile> {
-    let mut paths = Vec::new();
-    collect_source_paths(root, &mut paths);
-    paths.sort();
-
-    paths
-        .into_iter()
-        .enumerate()
-        .map(|(index, path)| DiscoveredFile {
-            id: FileId(u32::try_from(index).expect("benchmark fixture file count fits in u32")),
-            size_bytes: fs::metadata(&path)
-                .expect("benchmark fixture metadata is readable")
-                .len(),
-            path,
-        })
-        .collect()
-}
-
-fn create_workspace_project() -> CommandInput {
-    let temp_dir = TempDir::new().unwrap();
-    let root = temp_dir.path().to_path_buf();
-
+fn write_audit_analyses_tree(root: &Path, changed_count: usize) {
     write_file(
-        &root,
+        root,
         "package.json",
-        r#"{
-  "name": "bench-workspace",
-  "private": true,
-  "packageManager": "pnpm@10.0.0",
-  "workspaces": ["apps/*", "packages/*"],
-  "dependencies": {}
-}"#,
+        r#"{"name":"bench-audit-analyses","type":"module","main":"src/index.ts"}"#,
     );
-    write_file(
-        &root,
-        "pnpm-workspace.yaml",
-        r#"
-packages:
-  - "apps/*"
-  - "packages/*"
-"#,
-    );
-    write_file(
-        &root,
-        "apps/web/package.json",
-        r#"{"name":"@bench/web","main":"src/index.ts","dependencies":{"@bench/config":"workspace:*","@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
-    );
-    write_file(
-        &root,
-        "apps/admin/package.json",
-        r#"{"name":"@bench/admin","main":"src/index.ts","dependencies":{"@bench/shared":"workspace:*","@bench/ui":"workspace:*"}}"#,
-    );
-    write_file(
-        &root,
-        "packages/shared/package.json",
-        r#"{"name":"@bench/shared","main":"src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "packages/ui/package.json",
-        r#"{"name":"@bench/ui","main":"src/index.ts","dependencies":{"react":"19.0.0"}}"#,
-    );
-    write_file(
-        &root,
-        "packages/config/package.json",
-        r#"{"name":"@bench/config","main":"src/index.ts"}"#,
-    );
-    write_file(
-        &root,
-        "apps/web/src/index.ts",
-        r#"
-import { featureFlags } from "@bench/config";
-import { formatUser } from "@bench/shared";
-import { Card } from "@bench/ui";
+    let mut index_source = String::new();
+    for index in 0..AUDIT_ANALYSES_MODULE_COUNT {
+        write_file(
+            root,
+            &format!("src/modules/module{index}.ts"),
+            audit_analyses_module(index, index < changed_count),
+        );
+        writeln!(
+            &mut index_source,
+            "import {{ used{index}, score{index} }} from \"./modules/module{index}\";\nconsole.log(score{index}([used{index}]));"
+        )
+        .unwrap();
+    }
+    write_file(root, "src/index.ts", index_source);
+}
 
-export const render = (name: string) => Card({ title: `${formatUser(name)}:${featureFlags.checkout}` });
-"#,
-    );
-    write_file(
-        &root,
-        "apps/admin/src/index.ts",
-        r#"
-import { formatUser } from "@bench/shared";
-import { Card } from "@bench/ui";
-
-export const renderAdmin = (name: string) => Card({ title: `admin:${formatUser(name)}` });
-"#,
-    );
-    write_file(
-        &root,
-        "packages/shared/src/index.ts",
-        r"
-export const formatUser = (name: string): string => name.trim();
-export const unusedSharedHelper = (name: string): string => name.toUpperCase();
-",
-    );
-    write_file(
-        &root,
-        "packages/ui/src/index.ts",
-        r#"
-export const Card = ({ title }: { title: string }) => `<section>${title}</section>`;
-export const UnusedCard = () => "<section>unused</section>";
-"#,
-    );
-    write_file(
-        &root,
-        "packages/config/src/index.ts",
-        r#"
-export const featureFlags = { checkout: "new" } as const;
-export const unusedExperiment = { search: "legacy" } as const;
-"#,
-    );
-
-    CommandInput {
+fn create_audit_analyses_project() -> AuditAnalysesCommandInput {
+    let temp_dir = TempDir::new().unwrap();
+    let head_root = temp_dir.path().join("head");
+    let base_root = temp_dir.path().join("base");
+    write_audit_analyses_tree(&head_root, AUDIT_ANALYSES_CHANGED_FILE_COUNT);
+    write_audit_analyses_tree(&base_root, 0);
+    let changed_files = (0..AUDIT_ANALYSES_CHANGED_FILE_COUNT)
+        .map(|index| head_root.join(format!("src/modules/module{index}.ts")))
+        .collect();
+    AuditAnalysesCommandInput {
         _temp_dir: temp_dir,
-        root,
+        head_root,
+        base_root,
+        changed_files,
     }
 }
 
-fn create_warm_hash_workspace_project() -> ExtractCacheInput {
-    let CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    } = create_workspace_project();
-    let files = discovered_source_files(&root);
-    let mut cache = CacheStore::new();
-
-    for file in &files {
-        let module = parse_single_file(file).expect("benchmark fixture parses");
-        let cached = module_to_cached(
-            &module,
-            fallow_types::source_fingerprint::SourceFingerprint::new(1, 1),
-        );
-        cache.insert(&file.path, cached);
-    }
-
-    ExtractCacheInput {
-        _temp_dir: temp_dir,
-        files,
-        cache,
-    }
+fn create_audit_review_corpus(input: &AuditReviewCommandInput) -> AuditReviewBenchmarkCorpus {
+    create_audit_review_benchmark_corpus(&input.root, &input.changed_files, bench_threads())
+        .expect("audit review benchmark corpus builds")
 }
 
 fn create_health_project() -> CommandInput {
@@ -1327,7 +1211,7 @@ fn create_watch_filter_project() -> WatchFilterInput {
         ],
         ..FallowConfig::default()
     }
-    .resolve(root, OutputFormat::Json, BENCH_THREADS, false, true, None);
+    .resolve(root, OutputFormat::Json, bench_threads(), false, true, None);
     let global_gitignore = create_watch_filter_benchmark_global_gitignore();
 
     WatchFilterInput {
@@ -1391,43 +1275,6 @@ fn create_warm_complexity_health_project() -> CommandInput {
     let _ = run_health_with_runner(&options, &EngineHealthRunner)
         .expect("warm complexity cache priming succeeds");
     input
-}
-
-fn run_programmatic_combined_session(input: &CommandInput) {
-    let duplication = DuplicationOptions {
-        mode: Some(DuplicationMode::Mild),
-        min_tokens: Some(35),
-        min_lines: Some(5),
-        min_occurrences: Some(2),
-        ..DuplicationOptions::default()
-    };
-    let health = ComplexityOptions {
-        complexity: true,
-        file_scores: true,
-        score: true,
-        ..ComplexityOptions::default()
-    };
-
-    let options = CombinedOptions {
-        analysis: analysis_options(&input.root, true),
-        duplication_options: duplication,
-        health_options: health,
-        ..CombinedOptions::default()
-    };
-
-    let _ = run_combined(&options).expect("combined succeeds");
-}
-
-fn create_editor_session_workspace_project() -> EditorSessionInput {
-    let CommandInput {
-        _temp_dir: temp_dir,
-        root,
-    } = create_workspace_project();
-    let session = EditorAnalysisSession::load(&root, None).expect("editor session loads");
-    EditorSessionInput {
-        _temp_dir: temp_dir,
-        session,
-    }
 }
 
 fn stable_combined_workspace_programmatic_session_reuse(c: &mut Criterion) {
@@ -1528,6 +1375,7 @@ fn stable_feature_flags_workspace_analysis(c: &mut Criterion) {
                 let options = FeatureFlagsOptions {
                     analysis: analysis_options(&input.root, true),
                     top: None,
+                    retirement: None,
                 };
                 let output = run_feature_flags(&options).expect("feature-flags benchmark succeeds");
                 assert_eq!(output.total_flags(), 64);
@@ -1566,6 +1414,33 @@ fn stable_audit_review_brief_many_changed_files_json(c: &mut Criterion) {
     );
 }
 
+fn stable_audit_base_and_head_analyses(c: &mut Criterion) {
+    let input = create_audit_analyses_project();
+    let run = || {
+        benchmark_audit_analyses(
+            &input.head_root,
+            &input.base_root,
+            &input.changed_files,
+            bench_threads(),
+        )
+        .expect("audit analyses benchmark runs")
+    };
+    let warmup = run();
+    // Each changed file adds one unused export, and its old unused export
+    // also exists at the base.
+    assert_eq!(warmup.introduced_count, AUDIT_ANALYSES_CHANGED_FILE_COUNT);
+    assert_eq!(warmup.inherited_count, AUDIT_ANALYSES_CHANGED_FILE_COUNT);
+    assert!(warmup.clone_group_count > 0);
+
+    c.bench_function("stable_audit_base_and_head_analyses", |bencher| {
+        bencher.iter(|| {
+            let result = run();
+            assert_eq!(result, warmup);
+            result
+        });
+    });
+}
+
 fn stable_audit_impact_closure_many_files(c: &mut Criterion) {
     let input = create_impact_closure_project();
     let session = AnalysisSession::load(&input.root, None).expect("impact session loads");
@@ -1599,7 +1474,7 @@ fn stable_fix_dry_run_many_exports(c: &mut Criterion) {
     let representative_path = input.root.join("src/features/feature0.ts");
     let original_source = fs::read_to_string(&representative_path).unwrap();
 
-    let (status, fix_count) = benchmark_fix_dry_run(&input.root, BENCH_THREADS);
+    let (status, fix_count) = benchmark_fix_dry_run(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(fix_count, FIX_FILE_COUNT);
     assert_eq!(
@@ -1609,7 +1484,7 @@ fn stable_fix_dry_run_many_exports(c: &mut Criterion) {
 
     c.bench_function("stable_fix_dry_run_many_exports", |bencher| {
         bencher.iter(|| {
-            let (status, fix_count) = benchmark_fix_dry_run(&input.root, BENCH_THREADS);
+            let (status, fix_count) = benchmark_fix_dry_run(&input.root, bench_threads());
             assert_eq!(status, std::process::ExitCode::SUCCESS);
             assert_eq!(fix_count, FIX_FILE_COUNT);
             (status, fix_count)
@@ -1626,7 +1501,7 @@ fn stable_inspect_file_evidence_bundle_json(c: &mut Criterion) {
     let input = create_inspect_project();
 
     let result =
-        benchmark_inspect_file_evidence_bundle_json(&input.root, BENCH_THREADS, &input.corpus);
+        benchmark_inspect_file_evidence_bundle_json(&input.root, bench_threads(), &input.corpus);
     assert_eq!(result.0, std::process::ExitCode::SUCCESS);
     assert_eq!(result.1, INSPECT_CHILD_CALL_COUNT);
     assert!(result.2 > 0);
@@ -1635,7 +1510,7 @@ fn stable_inspect_file_evidence_bundle_json(c: &mut Criterion) {
         bencher.iter(|| {
             let result = benchmark_inspect_file_evidence_bundle_json(
                 &input.root,
-                BENCH_THREADS,
+                bench_threads(),
                 &input.corpus,
             );
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
@@ -1650,14 +1525,14 @@ fn stable_dead_code_many_exports_json(c: &mut Criterion) {
     let input = create_fix_project();
 
     let (status, issue_count, rendered_bytes) =
-        benchmark_dead_code_json(&input.root, BENCH_THREADS);
+        benchmark_dead_code_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(issue_count, DEAD_CODE_FINDING_COUNT);
     assert!(rendered_bytes > 0);
 
     c.bench_function("stable_dead_code_many_exports_json", |bencher| {
         bencher.iter(|| {
-            let result = benchmark_dead_code_json(&input.root, BENCH_THREADS);
+            let result = benchmark_dead_code_json(&input.root, bench_threads());
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, DEAD_CODE_FINDING_COUNT);
             assert!(result.2 > 0);
@@ -1670,14 +1545,14 @@ fn stable_dead_code_bun_lock_many_packages_json(c: &mut Criterion) {
     let input = create_bun_lock_override_project();
 
     let (status, issue_count, rendered_bytes) =
-        benchmark_dead_code_json(&input.root, BENCH_THREADS);
+        benchmark_dead_code_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(issue_count, BUN_UNUSED_OVERRIDE_COUNT);
     assert!(rendered_bytes > 0);
 
     c.bench_function("stable_dead_code_bun_lock_many_packages_json", |bencher| {
         bencher.iter(|| {
-            let result = benchmark_dead_code_json(&input.root, BENCH_THREADS);
+            let result = benchmark_dead_code_json(&input.root, bench_threads());
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, BUN_UNUSED_OVERRIDE_COUNT);
             assert!(result.2 > 0);
@@ -1691,7 +1566,7 @@ fn stable_security_many_framework_sinks_json(c: &mut Criterion) {
     let expected_findings = SECURITY_FILE_COUNT * 2;
 
     let (status, finding_count, rendered_bytes) =
-        benchmark_security_json(&input.root, BENCH_THREADS);
+        benchmark_security_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(finding_count, expected_findings);
     assert!(rendered_bytes > 0);
@@ -1699,7 +1574,7 @@ fn stable_security_many_framework_sinks_json(c: &mut Criterion) {
     c.bench_function("stable_security_many_framework_sinks_json", |bencher| {
         bencher.iter(|| {
             let (status, finding_count, rendered_bytes) =
-                benchmark_security_json(&input.root, BENCH_THREADS);
+                benchmark_security_json(&input.root, bench_threads());
             assert_eq!(status, std::process::ExitCode::SUCCESS);
             assert_eq!(finding_count, expected_findings);
             assert!(rendered_bytes > 0);
@@ -1710,7 +1585,7 @@ fn stable_security_many_framework_sinks_json(c: &mut Criterion) {
 
 fn stable_security_survivors_verdict_join_json(c: &mut Criterion) {
     let input = create_security_project();
-    let corpus = create_security_survivors_benchmark_corpus(&input.root, BENCH_THREADS)
+    let corpus = create_security_survivors_benchmark_corpus(&input.root, bench_threads())
         .expect("security survivors benchmark corpus");
     let result = benchmark_security_survivors_json(&corpus);
     assert_eq!(result.0, std::process::ExitCode::SUCCESS);
@@ -1846,7 +1721,7 @@ fn stable_rule_pack_policy_analysis_json(c: &mut Criterion) {
     let expected_findings = RULE_PACK_FILE_COUNT * RULE_PACK_FINDINGS_PER_FILE;
 
     let (status, finding_count, rendered_bytes) =
-        benchmark_rule_pack_test_json(&input.root, BENCH_THREADS);
+        benchmark_rule_pack_test_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(finding_count, expected_findings);
     assert!(rendered_bytes > 0);
@@ -1854,7 +1729,7 @@ fn stable_rule_pack_policy_analysis_json(c: &mut Criterion) {
     c.bench_function("stable_rule_pack_policy_analysis_json", |bencher| {
         bencher.iter(|| {
             let (status, finding_count, rendered_bytes) =
-                benchmark_rule_pack_test_json(&input.root, BENCH_THREADS);
+                benchmark_rule_pack_test_json(&input.root, bench_threads());
             assert_eq!(status, std::process::ExitCode::SUCCESS);
             assert_eq!(finding_count, expected_findings);
             assert!(rendered_bytes > 0);
@@ -1893,7 +1768,7 @@ fn stable_coverage_analyze_local_runtime_json(c: &mut Criterion) {
         &input.root,
         &input.coverage_path,
         &input.response_bytes,
-        BENCH_THREADS,
+        bench_threads(),
     );
     assert_eq!(result.0, std::process::ExitCode::SUCCESS);
     assert_eq!(result.1, RUNTIME_COVERAGE_FINDING_COUNT);
@@ -1918,7 +1793,7 @@ fn stable_coverage_analyze_local_runtime_json(c: &mut Criterion) {
                 &input.root,
                 &input.coverage_path,
                 &input.response_bytes,
-                BENCH_THREADS,
+                bench_threads(),
             );
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, RUNTIME_COVERAGE_FINDING_COUNT);
@@ -1934,7 +1809,7 @@ fn stable_list_workspace_inventory_json(c: &mut Criterion) {
     let input = create_list_inventory_project();
 
     let (status, file_count, entry_point_count, workspace_count, rendered_bytes) =
-        benchmark_list_json(&input.root, BENCH_THREADS);
+        benchmark_list_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(file_count, LIST_FILE_COUNT);
     assert_eq!(entry_point_count, LIST_ENTRY_POINT_COUNT);
@@ -1943,7 +1818,7 @@ fn stable_list_workspace_inventory_json(c: &mut Criterion) {
 
     c.bench_function("stable_list_workspace_inventory_json", |bencher| {
         bencher.iter(|| {
-            let result = benchmark_list_json(&input.root, BENCH_THREADS);
+            let result = benchmark_list_json(&input.root, bench_threads());
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, LIST_FILE_COUNT);
             assert_eq!(result.2, LIST_ENTRY_POINT_COUNT);
@@ -1958,7 +1833,7 @@ fn stable_list_boundaries_many_zones_json(c: &mut Criterion) {
     let input = create_list_boundaries_project();
 
     let (status, zone_count, rule_count, matched_file_count, rendered_bytes) =
-        benchmark_list_boundaries_json(&input.root, BENCH_THREADS);
+        benchmark_list_boundaries_json(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(zone_count, LIST_BOUNDARY_ZONE_COUNT);
     assert_eq!(rule_count, LIST_BOUNDARY_ZONE_COUNT);
@@ -1967,7 +1842,7 @@ fn stable_list_boundaries_many_zones_json(c: &mut Criterion) {
 
     c.bench_function("stable_list_boundaries_many_zones_json", |bencher| {
         bencher.iter(|| {
-            let result = benchmark_list_boundaries_json(&input.root, BENCH_THREADS);
+            let result = benchmark_list_boundaries_json(&input.root, bench_threads());
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, LIST_BOUNDARY_ZONE_COUNT);
             assert_eq!(result.2, LIST_BOUNDARY_ZONE_COUNT);
@@ -2100,7 +1975,7 @@ fn stable_viz_project_html(c: &mut Criterion) {
     let expected_files = VIZ_MODULE_COUNT + 1;
 
     let (status, file_count, edge_count, rendered_bytes) =
-        benchmark_viz_html(&input.root, BENCH_THREADS);
+        benchmark_viz_html(&input.root, bench_threads());
     assert_eq!(status, std::process::ExitCode::SUCCESS);
     assert_eq!(file_count, expected_files);
     assert_eq!(edge_count, VIZ_MODULE_COUNT);
@@ -2108,7 +1983,7 @@ fn stable_viz_project_html(c: &mut Criterion) {
 
     c.bench_function("stable_viz_project_html", |bencher| {
         bencher.iter(|| {
-            let result = benchmark_viz_html(&input.root, BENCH_THREADS);
+            let result = benchmark_viz_html(&input.root, bench_threads());
             assert_eq!(result.0, std::process::ExitCode::SUCCESS);
             assert_eq!(result.1, expected_files);
             assert_eq!(result.2, VIZ_MODULE_COUNT);
@@ -2128,6 +2003,7 @@ criterion_group!(
     stable_feature_flags_workspace_analysis,
     stable_audit_review_brief_many_changed_files_json,
     stable_audit_impact_closure_many_files,
+    stable_audit_base_and_head_analyses,
     stable_fix_dry_run_many_exports,
     stable_inspect_file_evidence_bundle_json,
     stable_dead_code_many_exports_json,

@@ -6,6 +6,33 @@
  * to the manifest instead of duplicating this list.
  */
 
+/**
+ * The mutation runner companion files that `fallow-api` embeds, as paths
+ * relative to `tools/mutation-runner/src`. The generator copies each file to
+ * `crates/api/src/mutation/companion/`, because a published crate cannot read
+ * a file outside its own directory.
+ */
+export const MUTATION_COMPANION_SOURCE_ROOT = "tools/mutation-runner/src";
+export const MUTATION_COMPANION_TARGET_ROOT = "crates/api/src/mutation/companion";
+export const MUTATION_COMPANION_FILES = Object.freeze([
+  "adapters/bun-test.mjs",
+  "adapters/child-process.mjs",
+  "adapters/common.mjs",
+  "adapters/node-test.mjs",
+  "adapters/vitest.mjs",
+  "companion.mjs",
+  "generated-protocol.mjs",
+  "protocol.mjs",
+  "runtime/bun-test-preload.mjs",
+  "runtime/child-hooks.mjs",
+  "runtime/child.mjs",
+  "runtime/global.mjs",
+  "runtime/node-subprocess-preload.mjs",
+  "runtime/node-test-preload.mjs",
+  "runtime/overlay-hook.mjs",
+  "runtime/vitest-setup.mjs",
+]);
+
 export const contractSurfaces = Object.freeze([
   {
     id: "config-schema",
@@ -62,6 +89,15 @@ export const contractSurfaces = Object.freeze([
     newIssueKind: true,
   },
   {
+    id: "similar-code-snapshot-schema",
+    owner: "fallow-schema-emit --similar-code-snapshot",
+    generatedPaths: ["crates/api/similar-code-snapshot-schema.json"],
+    checkCommand: "npm run generate:contracts:check",
+    docs: ["docs/similar-code-analysis.md"],
+    publicStability: "stable",
+    newIssueKind: false,
+  },
+  {
     id: "typescript-output-contract",
     owner: "editors/vscode/scripts/codegen-contracts.mjs",
     generatedPaths: [
@@ -82,7 +118,9 @@ export const contractSurfaces = Object.freeze([
     generatedPaths: [
       "npm/fallow/skills/fallow/SKILL.md",
       "npm/fallow/skills/fallow/references/cli-reference.md",
+      "npm/fallow/skills/fallow/references/issue-types.md",
       "npm/fallow/skills/fallow/references/mcp.md",
+      "scripts/agent-doc-curated-seeds.json",
     ],
     checkCommand: "npm run generate:contracts:check",
     docs: ["docs/analyzer-authoring.md"],
@@ -105,6 +143,26 @@ export const contractSurfaces = Object.freeze([
     checkCommand: "npm run generate:contracts:check",
     docs: ["docs/type-aware-analysis.md", "docs/backwards-compatibility.md"],
     publicStability: "stable",
+    newIssueKind: false,
+  },
+  {
+    id: "mutation-runner-protocol",
+    owner: "crates/api/mutation-runner-protocol.json",
+    generatedPaths: [`${MUTATION_COMPANION_SOURCE_ROOT}/generated-protocol.mjs`],
+    checkCommand: "npm run generate:contracts:check",
+    docs: [],
+    publicStability: "internal",
+    newIssueKind: false,
+  },
+  {
+    id: "mutation-runner-companion",
+    owner: MUTATION_COMPANION_SOURCE_ROOT,
+    generatedPaths: MUTATION_COMPANION_FILES.map(
+      (file) => `${MUTATION_COMPANION_TARGET_ROOT}/${file}`,
+    ),
+    checkCommand: "npm run generate:contracts:check",
+    docs: [],
+    publicStability: "internal",
     newIssueKind: false,
   },
 ]);

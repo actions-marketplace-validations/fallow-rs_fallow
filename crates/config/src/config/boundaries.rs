@@ -1,9 +1,9 @@
 //! Architecture boundary zone and rule definitions.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use globset::Glob;
+use super::glob_validation::compile_path_glob;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -320,10 +320,12 @@ pub struct BoundaryConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BoundaryCoverageConfig {
-    /// Report source files that do not match any boundary zone.
+    /// Report every analyzed source file that does not match any boundary
+    /// zone, also a file that no entry point reaches.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_all_files: bool,
     /// Glob patterns for files that may remain unmatched by any zone.
+    /// A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_unmatched: Vec<String>,
 }
@@ -399,6 +401,7 @@ pub struct BoundaryZone {
     /// Zone name.
     pub name: String,
     /// Membership patterns.
+    /// A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
     /// Directories whose children become zones.
@@ -443,7 +446,8 @@ pub struct ResolvedBoundaryConfig {
 /// Resolved boundary zone coverage policy.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedBoundaryCoverageConfig {
-    /// Report source files that do not match any boundary zone.
+    /// Report every analyzed source file that does not match any boundary
+    /// zone, also a file that no entry point reaches.
     pub require_all_files: bool,
     /// Compiled allow-list matchers for unmatched files.
     pub allow_unmatched: Vec<globset::GlobMatcher>,
@@ -583,6 +587,39 @@ impl BoundaryConfig {
             .collect();
         merged_rules.append(&mut self.rules);
         self.rules = merged_rules;
+    }
+
+    /// The directories whose child directories `autoDiscover` turns into
+    /// zones, as absolute paths under `project_root`, after the preset
+    /// expansion. A new or removed child directory changes the zones.
+    /// Invalid `autoDiscover` paths are left out.
+    #[must_use]
+    pub fn auto_discover_dirs(&self, project_root: &Path) -> Vec<PathBuf> {
+        let mut expanded = self.clone();
+        super::resolution::expand_boundary_preset(&mut expanded, project_root);
+        let mut dirs: Vec<PathBuf> = expanded
+            .zones
+            .iter()
+            .flat_map(|zone| {
+                let zone_root = zone
+                    .root
+                    .as_deref()
+                    .map(normalize_zone_root)
+                    .unwrap_or_default();
+                zone.auto_discover.iter().filter_map(move |raw_dir| {
+                    let dir = normalize_auto_discover_dir(raw_dir)?;
+                    let relative = join_relative_path(&zone_root, &dir);
+                    Some(if relative.is_empty() {
+                        project_root.to_path_buf()
+                    } else {
+                        project_root.join(relative)
+                    })
+                })
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     /// Expand `autoDiscover` zones into concrete child zones.
@@ -868,17 +905,6 @@ fn expand_rules_for_groups(
 }
 
 impl BoundaryConfig {
-    /// Return the preset name if one is configured but not yet expanded.
-    #[must_use]
-    pub fn preset_name(&self) -> Option<&str> {
-        self.preset.as_ref().map(|p| match p {
-            BoundaryPreset::Layered => "layered",
-            BoundaryPreset::Hexagonal => "hexagonal",
-            BoundaryPreset::FeatureSliced => "feature-sliced",
-            BoundaryPreset::Bulletproof => "bulletproof",
-        })
-    }
-
     /// Validate that patterns do not repeat the zone root.
     #[must_use]
     pub fn validate_root_prefixes(&self) -> Vec<RedundantRootPrefix> {
@@ -1040,7 +1066,7 @@ impl BoundaryConfig {
                     .patterns
                     .iter()
                     .map(|pattern| {
-                        Glob::new(pattern)
+                        compile_path_glob(pattern)
                             .expect("boundaries.zones[].patterns was validated at config load time")
                             .compile_matcher()
                     })
@@ -1069,7 +1095,7 @@ impl BoundaryConfig {
                 .allow_unmatched
                 .iter()
                 .map(|pattern| {
-                    Glob::new(pattern)
+                    compile_path_glob(pattern)
                         .expect(
                             "boundaries.coverage.allowUnmatched was validated at config load time",
                         )
@@ -1419,17 +1445,26 @@ impl ResolvedBoundaryConfig {
     /// Classify a project-relative path into a zone.
     #[must_use]
     pub fn classify_zone(&self, relative_path: &str) -> Option<&str> {
+        // A candidate normalizes its path once. Unscoped zones share one
+        // candidate, so a path is not normalized again for every glob.
+        let unscoped = globset::Candidate::new(relative_path);
         for zone in &self.zones {
-            let candidate: &str = match zone.root.as_deref() {
+            let scoped;
+            let candidate = match zone.root.as_deref() {
                 Some(root) if !root.is_empty() => {
                     let Some(stripped) = relative_path.strip_prefix(root) else {
                         continue;
                     };
-                    stripped
+                    scoped = globset::Candidate::new(stripped);
+                    &scoped
                 }
-                _ => relative_path,
+                _ => &unscoped,
             };
-            if zone.matchers.iter().any(|m| m.is_match(candidate)) {
+            if zone
+                .matchers
+                .iter()
+                .any(|m| m.is_match_candidate(candidate))
+            {
                 return Some(&zone.name);
             }
         }
@@ -3350,45 +3385,6 @@ callee = ["console.*"]
         assert_eq!(resolved.classify_zone("src/domain/user.ts"), Some("domain"));
         assert!(!resolved.is_import_allowed("adapters", "domain"));
         assert!(resolved.is_import_allowed("adapters", "ports"));
-    }
-
-    #[test]
-    fn preset_name_returns_correct_string() {
-        let config = BoundaryConfig {
-            coverage: BoundaryCoverageConfig::default(),
-            calls: BoundaryCallsConfig::default(),
-            preset: Some(BoundaryPreset::FeatureSliced),
-            zones: vec![],
-            rules: vec![],
-        };
-        assert_eq!(config.preset_name(), Some("feature-sliced"));
-
-        let empty = BoundaryConfig::default();
-        assert_eq!(empty.preset_name(), None);
-    }
-
-    #[test]
-    fn preset_name_all_variants() {
-        let cases = [
-            (BoundaryPreset::Layered, "layered"),
-            (BoundaryPreset::Hexagonal, "hexagonal"),
-            (BoundaryPreset::FeatureSliced, "feature-sliced"),
-            (BoundaryPreset::Bulletproof, "bulletproof"),
-        ];
-        for (preset, expected_name) in cases {
-            let config = BoundaryConfig {
-                coverage: BoundaryCoverageConfig::default(),
-                calls: BoundaryCallsConfig::default(),
-                preset: Some(preset),
-                zones: vec![],
-                rules: vec![],
-            };
-            assert_eq!(
-                config.preset_name(),
-                Some(expected_name),
-                "preset_name() mismatch for variant"
-            );
-        }
     }
 
     #[test]

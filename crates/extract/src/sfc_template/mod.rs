@@ -24,7 +24,7 @@
 //! - **Glimmer (`glimmer`)**: Ember `.gts` / `.gjs` single-file components.
 //!   The host file IS valid JS once `<template>...</template>` blocks are
 //!   blanked by `crate::glimmer::strip_glimmer_templates`, so the standard
-//!   `crate::parse::parse_source_to_module` pipeline handles parsing. The
+//!   `crate::parse_source_to_module` pipeline handles parsing. The
 //!   Glimmer scanner is invoked from `parse.rs::
 //!   collect_glimmer_template_into_extractor` against the un-stripped source
 //!   AFTER `extractor.visit_program(...)` but BEFORE
@@ -38,6 +38,7 @@
 //! their host files are normal `.ts` / `.gts` / `.gjs` sources.
 
 pub mod angular;
+pub mod component_contracts;
 pub mod glimmer;
 mod scanners;
 mod shared;

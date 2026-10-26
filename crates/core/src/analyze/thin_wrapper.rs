@@ -47,7 +47,7 @@ use crate::graph::{ModuleGraph, ModuleNode};
 use crate::resolve::ResolvedModule;
 use crate::results::ThinWrapper;
 
-use super::predicates::is_react_file;
+use super::predicates::{declares_react_runtime, is_react_file};
 use super::react_resolve::ChildResolver;
 use super::{LineOffsetsMap, byte_offset_to_line_col};
 
@@ -72,7 +72,7 @@ pub fn find_thin_wrappers(
     declared_deps: &FxHashSet<String>,
     line_offsets_by_file: &LineOffsetsMap<'_>,
 ) -> ThinWrapperScan {
-    if !has_react_runtime_dep(declared_deps) {
+    if !declares_react_runtime(declared_deps) {
         return ThinWrapperScan::default();
     }
 
@@ -105,13 +105,6 @@ pub fn find_thin_wrappers(
     scan
 }
 
-fn has_react_runtime_dep(declared_deps: &FxHashSet<String>) -> bool {
-    declared_deps.contains("react")
-        || declared_deps.contains("react-dom")
-        || declared_deps.contains("next")
-        || declared_deps.contains("preact")
-}
-
 fn collect_module_thin_wrappers(
     node: &ModuleNode,
     module: &ModuleInfo,
@@ -141,7 +134,7 @@ fn collect_module_thin_wrappers(
     let complexity_by_name: FxHashMap<&str, &FunctionComplexity> = module
         .complexity
         .iter()
-        .map(|c| (c.name.as_str(), c))
+        .map(|c| (c.identity_name(), c))
         .collect();
     let hook_counts = component_hook_counts(module);
 

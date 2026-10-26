@@ -1,6 +1,9 @@
+use crate::nearest::nearest_name;
 use crate::params::AnalyzeParams;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use fallow_api::{
     AnalysisOptions, DeadCodeFilters, DeadCodeOptions, run_boundary_violations,
@@ -12,70 +15,47 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::{
     ISSUE_TYPE_FLAGS,
-    api_runtime::{changed_since_from_param, env_diff_file, run_api_blocking},
     api_runtime::{
-        json_success, non_empty_path, programmatic_error_body, workspace_patterns_from_param,
+        EnvScope, call_cancellation, run_api_blocking, shared_analysis_options, shared_params,
+        typed_tool_result, typed_type_aware, workspace_patterns_from_param,
     },
     fallback_policy::{
-        CliFallbackReason, baseline_fallback_reason, grouped_fallback_reason,
-        regression_fallback_reason,
+        baseline_requested, grouped_requested, regression_requested, type_aware_requested,
     },
     push_baseline, push_global, push_regression, push_remote_extends, push_scope, run_tool,
-    validation_error_body,
+    typed_validation_error_body,
 };
 
 /// Run `analyze` through the typed API when parameters map cleanly to the
 /// programmatic contract, falling back to the CLI for CLI-only surfaces.
 pub async fn run_analyze(binary: &str, params: AnalyzeParams) -> Result<CallToolResult, McpError> {
-    if requires_cli_fallback(&params) {
-        return match build_analyze_args(&params) {
-            Ok(args) => run_tool(binary, "analyze", &args).await,
-            Err(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
+    if !requires_cli_fallback(&params) {
+        let family = analyze_family(&params);
+        let cancellation = call_cancellation();
+        let options = match dead_code_options_from_params(&params, Some(Arc::clone(&cancellation)))
+        {
+            Ok(options) => options,
+            Err(msg) => return Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
         };
-    }
-
-    let family = analyze_family(&params);
-    let options = match dead_code_options_from_params(&params) {
-        Ok(options) => options,
-        Err(msg) => return Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
-    };
-
-    let result = run_api_blocking("analyze", move || match family {
-        AnalyzeFamily::Boundary => run_boundary_violations(&options)
-            .and_then(serialize_boundary_violations_programmatic_json),
-        AnalyzeFamily::Circular => run_circular_dependencies(&options)
-            .and_then(serialize_circular_dependencies_programmatic_json),
-        AnalyzeFamily::DeadCode => {
-            run_dead_code(&options).and_then(serialize_dead_code_programmatic_json)
-        }
-    })
-    .await?
-    .map_or_else(
-        |err| CallToolResult::error(vec![ContentBlock::text(programmatic_error_body(&err))]),
-        |value| json_success(&value),
-    );
-    Ok(result)
-}
-
-pub fn run_analyze_api_value(params: &AnalyzeParams) -> Result<Option<serde_json::Value>, String> {
-    if requires_cli_fallback(params) {
-        return Ok(None);
-    }
-
-    let family = analyze_family(params);
-    let options = dead_code_options_from_params(params)?;
-    let value = match family {
-        AnalyzeFamily::Boundary => run_boundary_violations(&options)
-            .and_then(serialize_boundary_violations_programmatic_json),
-        AnalyzeFamily::Circular => run_circular_dependencies(&options)
-            .and_then(serialize_circular_dependencies_programmatic_json),
-        AnalyzeFamily::DeadCode => {
-            run_dead_code(&options).and_then(serialize_dead_code_programmatic_json)
+        let result = run_api_blocking("analyze", cancellation, move || match family {
+            AnalyzeFamily::Boundary => run_boundary_violations(&options)
+                .and_then(serialize_boundary_violations_programmatic_json),
+            AnalyzeFamily::Circular => run_circular_dependencies(&options)
+                .and_then(serialize_circular_dependencies_programmatic_json),
+            AnalyzeFamily::DeadCode => {
+                run_dead_code(&options).and_then(serialize_dead_code_programmatic_json)
+            }
+        })
+        .await?;
+        if let Some(result) = typed_tool_result(result) {
+            return Ok(result);
         }
     }
-    .map_err(|err| programmatic_error_body(&err))?;
 
-    Ok(Some(value))
+    match build_analyze_args(&params) {
+        Ok(args) => run_tool(binary, "analyze", &args).await,
+        Err(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(msg)])),
+    }
 }
 
 /// Build CLI arguments for the `analyze` tool.
@@ -104,6 +84,9 @@ pub fn build_analyze_args(params: &AnalyzeParams) -> Result<Vec<String>, String>
         params.type_aware_require,
     );
     push_scope(&mut args, params.production, params.workspace.as_deref());
+    if params.no_package_baselines == Some(true) {
+        args.push("--no-package-baselines".to_string());
+    }
 
     push_analyze_issue_type_flags(&mut args, params)?;
     push_baseline(
@@ -126,34 +109,32 @@ pub fn build_analyze_args(params: &AnalyzeParams) -> Result<Vec<String>, String>
             args.extend(["--file".to_string(), f.clone()]);
         }
     }
+    for id in params.finding_ids.as_deref().unwrap_or_default() {
+        args.extend(["--finding-id".to_string(), id.clone()]);
+    }
     if params.include_entry_exports == Some(true) {
         args.push("--include-entry-exports".to_string());
+    }
+    if params.show_cascade == Some(true) {
+        args.push("--show-cascade".to_string());
     }
 
     Ok(args)
 }
 
 fn requires_cli_fallback(params: &AnalyzeParams) -> bool {
-    params.type_aware == Some(true)
-        || params
-            .type_aware_projects
-            .as_ref()
-            .is_some_and(|projects| !projects.is_empty())
-        || params.type_aware_require.is_some()
-        || cli_fallback_reason(params).is_some()
-}
-
-fn cli_fallback_reason(params: &AnalyzeParams) -> Option<CliFallbackReason> {
-    baseline_fallback_reason(params.baseline.as_deref(), params.save_baseline.as_deref())
-        .or_else(|| {
-            regression_fallback_reason(
-                params.fail_on_regression,
-                params.tolerance.as_deref(),
-                params.regression_baseline.as_deref(),
-                params.save_regression_baseline.as_deref(),
-            )
-        })
-        .or_else(|| grouped_fallback_reason(params.group_by.as_deref()))
+    type_aware_requested(
+        params.type_aware,
+        params.type_aware_projects.as_deref(),
+        params.type_aware_require.as_ref(),
+    ) || baseline_requested(params.baseline.as_deref(), params.save_baseline.as_deref())
+        || regression_requested(
+            params.fail_on_regression,
+            params.tolerance.as_deref(),
+            params.regression_baseline.as_deref(),
+            params.save_regression_baseline.as_deref(),
+        )
+        || grouped_requested(params.group_by.as_deref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +145,15 @@ enum AnalyzeFamily {
 }
 
 fn analyze_family(params: &AnalyzeParams) -> AnalyzeFamily {
+    // A finding-id query must see every issue family, so the narrow family
+    // runners never answer it.
+    if params
+        .finding_ids
+        .as_ref()
+        .is_some_and(|ids| !ids.is_empty())
+    {
+        return AnalyzeFamily::DeadCode;
+    }
     if params.boundary_violations == Some(true)
         && params
             .issue_types
@@ -172,32 +162,31 @@ fn analyze_family(params: &AnalyzeParams) -> AnalyzeFamily {
     {
         return AnalyzeFamily::Boundary;
     }
+    // The circular runner keeps only file-level cycles. Re-export cycles and
+    // package cycles go through the dead-code runner, which keeps each
+    // selected issue type.
     if params.issue_types.as_ref().is_some_and(|types| {
-        !types.is_empty()
-            && types
-                .iter()
-                .all(|issue| matches!(issue.as_str(), "circular-deps" | "re-export-cycles"))
+        !types.is_empty() && types.iter().all(|issue| issue == "circular-deps")
     }) {
         return AnalyzeFamily::Circular;
     }
     AnalyzeFamily::DeadCode
 }
 
-fn dead_code_options_from_params(params: &AnalyzeParams) -> Result<DeadCodeOptions, String> {
+fn dead_code_options_from_params(
+    params: &AnalyzeParams,
+    cancellation: Option<Arc<AtomicBool>>,
+) -> Result<DeadCodeOptions, String> {
     Ok(DeadCodeOptions {
+        finding_ids: params.finding_ids.clone().unwrap_or_default(),
         analysis: AnalysisOptions {
-            root: non_empty_path(params.root.as_deref()),
-            config_path: non_empty_path(params.config.as_deref()),
-            allow_remote_extends: params.allow_remote_extends.unwrap_or(false),
-            no_cache: params.no_cache.unwrap_or(false),
-            threads: params.threads,
             production: params.production.unwrap_or(false),
             production_override: params.production,
-            changed_since: changed_since_from_param(None),
-            diff_file: env_diff_file(),
+            no_package_baselines: params.no_package_baselines.unwrap_or(false),
             workspace: workspace_patterns_from_param(params.workspace.as_deref()),
             explain: true,
-            ..AnalysisOptions::default()
+            type_aware: typed_type_aware(params.type_aware),
+            ..shared_analysis_options(shared_params!(params), EnvScope::Ambient, cancellation)
         },
         filters: filters_from_params(params)?,
         files: params
@@ -209,6 +198,7 @@ fn dead_code_options_from_params(params: &AnalyzeParams) -> Result<DeadCodeOptio
             .map(PathBuf::from)
             .collect(),
         include_entry_exports: params.include_entry_exports.unwrap_or(false),
+        show_cascade: params.show_cascade.unwrap_or(false),
     })
 }
 
@@ -233,15 +223,27 @@ fn apply_issue_type_filter(filters: &mut DeadCodeFilters, issue_type: &str) -> R
     Ok(())
 }
 
+/// Refusal for an issue-type selector the `analyze` tool does not accept.
+///
+/// The accepted vocabulary is in hand at the refusal point, so a near miss
+/// names the selector the caller meant instead of leaving them to diff their
+/// token against the full list. Two matchers answer two different misses: the
+/// edit-distance one catches a slipped keystroke, and the affinity scorer
+/// catches a caller who spelled out a name fallow abbreviates
+/// (`unused-dependencies`), which is many edits away and used to fall through
+/// to a bare dump of the whole vocabulary.
 fn unknown_issue_type_error(issue_type: &str) -> String {
-    let valid = ISSUE_TYPE_FLAGS
-        .iter()
-        .map(|&(name, _)| name)
-        .collect::<Vec<_>>()
-        .join(", ");
-    validation_error_body(format!(
-        "Unknown issue type '{issue_type}'. Valid values: {valid}"
-    ))
+    let names = ISSUE_TYPE_FLAGS.iter().map(|&(name, _)| name);
+    let suggestion = nearest_name(issue_type, names.clone())
+        .map_or_else(String::new, |nearest| format!(" Did you mean '{nearest}'?"));
+    let valid = names.collect::<Vec<_>>().join(", ");
+    typed_validation_error_body(
+        format!("Unknown issue type '{issue_type}'.{suggestion} Valid values: {valid}"),
+        "unknown_issue_type",
+        "Pass a registered issue type from `fallow://issue-types`, or omit \
+         `issue_types` to analyze every one.",
+        "analyze.issue_types",
+    )
 }
 
 /// Push the `--boundary-violations` convenience flag and validated
@@ -277,6 +279,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absent_component_prop_selection_matches_typed_and_fallback_paths() {
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["absent-component-props".to_string()]),
+            ..AnalyzeParams::default()
+        };
+        let options = dead_code_options_from_params(&params, None).expect("options");
+        assert!(options.filters.absent_component_props);
+        assert!(!options.filters.unused_component_props);
+        assert!(!requires_cli_fallback(&params));
+        let fallback_params = AnalyzeParams {
+            group_by: Some("directory".to_string()),
+            ..params
+        };
+        assert!(requires_cli_fallback(&fallback_params));
+        let args = build_analyze_args(&fallback_params).expect("args");
+        assert!(args.iter().any(|arg| arg == "--absent-component-props"));
+        assert!(!args.iter().any(|arg| arg == "--unused-component-props"));
+    }
+
+    #[test]
+    fn finding_ids_reach_both_paths_and_force_the_full_family() {
+        let id = "dc1:unused-export:0123456789abcdef";
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["circular-deps".to_string()]),
+            finding_ids: Some(vec![id.to_string()]),
+            ..AnalyzeParams::default()
+        };
+
+        assert_eq!(analyze_family(&params), AnalyzeFamily::DeadCode);
+        let options = dead_code_options_from_params(&params, None).expect("options");
+        assert_eq!(options.finding_ids, vec![id.to_string()]);
+        let args = build_analyze_args(&params).expect("args");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--finding-id" && pair[1] == id),
+            "{args:?}"
+        );
+    }
+
+    #[test]
     fn api_path_maps_supported_analyze_params() {
         let params = AnalyzeParams {
             root: Some(String::new()),
@@ -295,7 +337,7 @@ mod tests {
         };
 
         assert!(!requires_cli_fallback(&params));
-        let options = dead_code_options_from_params(&params).expect("options");
+        let options = dead_code_options_from_params(&params, None).expect("options");
         assert!(options.analysis.root.is_none());
         assert!(options.analysis.config_path.is_none());
         assert_eq!(
@@ -326,7 +368,17 @@ mod tests {
                 issue_types: Some(vec!["re-export-cycles".to_string()]),
                 ..AnalyzeParams::default()
             }),
-            AnalyzeFamily::Circular
+            AnalyzeFamily::DeadCode
+        );
+        assert_eq!(
+            analyze_family(&AnalyzeParams {
+                issue_types: Some(vec![
+                    "circular-deps".to_string(),
+                    "package-cycles".to_string(),
+                ]),
+                ..AnalyzeParams::default()
+            }),
+            AnalyzeFamily::DeadCode
         );
         assert_eq!(
             analyze_family(&AnalyzeParams {
@@ -354,8 +406,72 @@ mod tests {
             ..AnalyzeParams::default()
         };
 
-        let err = dead_code_options_from_params(&params).expect_err("invalid issue type");
+        let err = dead_code_options_from_params(&params, None).expect_err("invalid issue type");
         assert!(err.contains("Unknown issue type"));
+    }
+
+    #[test]
+    fn near_miss_issue_type_names_the_selector_the_caller_meant() {
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["unused-exort".to_string()]),
+            ..AnalyzeParams::default()
+        };
+
+        let err = dead_code_options_from_params(&params, None).expect_err("invalid issue type");
+        assert!(
+            err.contains("Did you mean 'unused-exports'?"),
+            "near-miss selector should name the intended one: {err}"
+        );
+    }
+
+    /// `unused-dependencies` is the long form of `unused-deps`, seven edits
+    /// away, so the typo matcher cannot reach it. It is also the selector an
+    /// agent is most likely to guess, and it used to answer with a bare dump
+    /// of the whole vocabulary.
+    #[test]
+    fn long_form_issue_type_names_the_abbreviation_fallow_registers() {
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["unused-dependencies".to_string()]),
+            ..AnalyzeParams::default()
+        };
+
+        let err = dead_code_options_from_params(&params, None).expect_err("invalid issue type");
+        assert!(
+            err.contains("Did you mean 'unused-deps'?"),
+            "the highest-traffic near miss must name the selector it meant: {err}"
+        );
+    }
+
+    /// Every other fallow refusal carries a stable `code`; matching this one
+    /// on its prose is the only thing an agent could do before.
+    #[test]
+    fn unknown_issue_type_refusal_carries_the_typed_error_fields() {
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["not-real".to_string()]),
+            ..AnalyzeParams::default()
+        };
+
+        let err = dead_code_options_from_params(&params, None).expect_err("invalid issue type");
+        let body: serde_json::Value = serde_json::from_str(&err).expect("refusal body is JSON");
+        assert_eq!(body["error"], true);
+        assert_eq!(body["exit_code"], 2);
+        assert_eq!(body["code"], "unknown_issue_type");
+        assert_eq!(body["context"], "analyze.issue_types");
+        assert!(body["help"].as_str().is_some_and(|help| !help.is_empty()));
+    }
+
+    #[test]
+    fn novel_issue_type_stays_silent_rather_than_guessing() {
+        let params = AnalyzeParams {
+            issue_types: Some(vec!["teleport".to_string()]),
+            ..AnalyzeParams::default()
+        };
+
+        let err = dead_code_options_from_params(&params, None).expect_err("invalid issue type");
+        assert!(
+            !err.contains("Did you mean"),
+            "a completely novel selector must not get a misleading suggestion: {err}"
+        );
     }
 
     #[test]
@@ -366,7 +482,7 @@ mod tests {
                 ..AnalyzeParams::default()
             };
 
-            dead_code_options_from_params(&params)
+            dead_code_options_from_params(&params, None)
                 .unwrap_or_else(|err| panic!("{issue_type} should map through API path: {err}"));
         }
     }
@@ -405,6 +521,78 @@ mod tests {
         ] {
             assert!(requires_cli_fallback(&params));
         }
+    }
+
+    #[tokio::test]
+    async fn absent_prop_typed_run_preserves_candidates_and_manual_evidence() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"fixture","private":true,"dependencies":{"react":"19.0.0"}}"#,
+        )
+        .expect("package");
+        std::fs::write(
+            project.path().join(".fallowrc.json"),
+            r#"{"entry":["App.tsx"]}"#,
+        )
+        .expect("config");
+        std::fs::write(project.path().join("Card.tsx"), "export const Card = ({highlight}: {highlight?: boolean}) => <div>{highlight && <b>Featured</b>}</div>;\n").expect("component");
+        std::fs::write(
+            project.path().join("App.tsx"),
+            "import {Card} from './Card'; export const App = () => <Card />;\n",
+        )
+        .expect("caller");
+        let params = AnalyzeParams {
+            root: Some(project.path().display().to_string()),
+            no_cache: Some(true),
+            ..AnalyzeParams::default()
+        };
+        let default_result = run_analyze("unused-binary-on-api-path", params)
+            .await
+            .expect("default result");
+        let ContentBlock::Text(default_text) = &default_result.content[0] else {
+            panic!("text")
+        };
+        let default_json: serde_json::Value =
+            serde_json::from_str(&default_text.text).expect("json");
+        assert!(
+            default_json
+                .get("absent_component_props")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+        );
+        let result = run_analyze(
+            "unused-binary-on-api-path",
+            AnalyzeParams {
+                root: Some(project.path().display().to_string()),
+                no_cache: Some(true),
+                issue_types: Some(vec!["absent-component-props".to_string()]),
+                ..AnalyzeParams::default()
+            },
+        )
+        .await
+        .expect("result");
+        assert_eq!(result.is_error, Some(false));
+        let ContentBlock::Text(text) = &result.content[0] else {
+            panic!("text")
+        };
+        let json: serde_json::Value = serde_json::from_str(&text.text).expect("json");
+        let findings = json["absent_component_props"]
+            .as_array()
+            .expect("candidate array");
+        assert_eq!(findings.len(), 1, "{json}");
+        let finding = &findings[0];
+        assert_eq!(finding["prop_name"], "highlight");
+        assert_eq!(finding["path"], "Card.tsx");
+        assert_eq!(finding["inspected_call_sites"][0]["path"], "App.tsx");
+        assert!(
+            finding["finding_id"]
+                .as_str()
+                .expect("id")
+                .contains("absent-component-prop")
+        );
+        let actions = finding["actions"].as_array().expect("manual actions");
+        assert!(!actions.is_empty());
+        assert!(actions.iter().all(|action| action["auto_fixable"] == false));
     }
 
     #[tokio::test]
@@ -477,5 +665,70 @@ mod tests {
         assert_eq!(json["kind"], "dead-code");
         assert!(json["circular_dependencies"].is_array());
         assert_eq!(json["unused_exports"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// `typeAware.enabled` in config makes `fallow dead-code` type-aware. The
+    /// typed route cannot run that, so the tool runs the CLI for every family.
+    #[tokio::test]
+    async fn config_type_aware_falls_back_to_the_cli() {
+        use super::super::api_runtime::{
+            MISSING_FALLBACK_BINARY, assert_cli_fallback_ran, write_type_aware_config,
+        };
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"fixture","type":"module","main":"src/index.ts"}"#,
+        )
+        .expect("write package");
+        std::fs::create_dir(project.path().join("src")).expect("create src");
+        std::fs::write(project.path().join("src/index.ts"), "export const a = 1;\n")
+            .expect("write source");
+        write_type_aware_config(project.path(), r#"{"typeAware":{"enabled":true}}"#);
+
+        for issue_types in [None, Some(vec!["circular-deps".to_string()])] {
+            let params = AnalyzeParams {
+                root: Some(project.path().display().to_string()),
+                issue_types,
+                no_cache: Some(true),
+                ..AnalyzeParams::default()
+            };
+            assert!(!requires_cli_fallback(&params));
+            assert_cli_fallback_ran(run_analyze(MISSING_FALLBACK_BINARY, params).await);
+        }
+
+        // `type_aware: false` keeps the run syntactic on both routes.
+        let off = || AnalyzeParams {
+            root: Some(project.path().display().to_string()),
+            no_cache: Some(true),
+            type_aware: Some(false),
+            ..AnalyzeParams::default()
+        };
+        let result = run_analyze(MISSING_FALLBACK_BINARY, off())
+            .await
+            .expect("the typed route answers");
+        assert_eq!(result.is_error, Some(false));
+        let args = build_analyze_args(&off()).expect("analyze args");
+        assert!(args.contains(&"--no-type-aware".to_string()), "{args:?}");
+        assert!(!args.contains(&"--type-aware".to_string()), "{args:?}");
+    }
+}
+
+#[cfg(test)]
+mod route_parity_tests {
+    use super::*;
+
+    /// Both routes of `analyze` express the same shared settings.
+    #[test]
+    fn typed_and_cli_routes_agree_on_shared_settings() {
+        super::super::route_parity::assert_routes_agree(
+            "analyze",
+            &serde_json::json!({}),
+            |params: AnalyzeParams| build_analyze_args(&params).expect("argv"),
+            |params: AnalyzeParams| {
+                dead_code_options_from_params(&params, None)
+                    .expect("options")
+                    .analysis
+            },
+        );
     }
 }

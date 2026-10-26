@@ -5,7 +5,6 @@ name: Type-aware Benchmarks
 # under one run left CodSpeed unable to assemble a report (see issue #2024).
 
 on:
-  merge_group:
   pull_request:
     branches: [main]
     paths:
@@ -20,13 +19,17 @@ on:
       - 'scripts/check-benchmark-harness.py'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   benchmark-type-aware:
     name: CodSpeed walltime (type-aware cold and warm)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       id-token: write
@@ -36,18 +39,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: tools/type-aware-sidecar/package-lock.json
 
       - name: Install type-aware benchmark dependencies
-        run: npm ci --no-audit --no-fund
+        run: npm ci --no-audit --no-fund --ignore-scripts
         working-directory: tools/type-aware-sidecar
 
       - name: Run type-aware benchmarks
-        uses: CodSpeedHQ/action@4296e51e7041e24dadb86d1d6e8b9320d223dbe8 # v5.0.3
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: walltime
           run: npm run bench --prefix tools/type-aware-sidecar

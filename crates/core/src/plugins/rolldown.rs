@@ -21,12 +21,12 @@ define_plugin! {
     config_patterns: CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
         super::add_import_referenced_dependencies(&mut result, source, config_path);
 
         let inputs = config_parser::extract_config_string_or_array(source, config_path, &["input"]);
-        result.extend_entry_patterns(inputs);
+        result.extend_entry_patterns_and_dependencies(inputs, root);
 
         let external =
             config_parser::extract_config_shallow_strings(source, config_path, "external");
@@ -161,5 +161,39 @@ mod tests {
             Path::new("/project"),
         );
         assert!(result.entry_patterns.is_empty());
+    }
+
+    /// A bare `input` value is either a module request or a path that rollup
+    /// resolves against the working directory, so it credits the package and
+    /// keeps the entry pattern (issue #2753).
+    #[test]
+    fn a_bare_input_credits_the_package_and_keeps_the_entry_pattern() {
+        let source = r#"export default { input: { client: "my-lib/client", app: "src/app", main: "./src/main.js" } };"#;
+        let result = RolldownPlugin.resolve_config(
+            Path::new("rolldown.config.js"),
+            source,
+            Path::new("/project"),
+        );
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"my-lib".to_string()),
+            "got {:?}",
+            result.referenced_dependencies
+        );
+        let patterns: Vec<&str> = result
+            .entry_patterns
+            .iter()
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        for expected in ["my-lib/client", "src/app", "src/main.js"] {
+            assert!(patterns.contains(&expected), "{expected}: got {patterns:?}");
+        }
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| pattern.starts_with("src/app.{")),
+            "an extensionless input resolves to the file, got {patterns:?}"
+        );
     }
 }

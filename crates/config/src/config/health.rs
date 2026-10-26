@@ -114,6 +114,121 @@ impl Default for OwnershipConfig {
     }
 }
 
+/// Thresholds for change coupling (`change_coupling` in `fallow health`).
+///
+/// The defaults are the Code Maat defaults. A pair of files is hidden coupling
+/// when each file has `minRevisions` commits, the pair shares
+/// `minSharedRevisions` commits, the coupling degree reaches `minDegree`, and
+/// no import or re-export chain connects the two files.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChangeCouplingConfig {
+    /// Skip a commit that changes more analyzed files than this (default:
+    /// 30, from 2 to 1000). Bulk commits (renames, format passes) create
+    /// false pairs. The upper bound keeps the pair count of one commit small.
+    #[serde(default = "default_coupling_max_files_per_commit")]
+    #[schemars(range(min = 2, max = 1000))]
+    pub max_files_per_commit: usize,
+    /// Minimum commits for each file of a pair (default: 5).
+    #[serde(default = "default_coupling_min_revisions")]
+    pub min_revisions: u32,
+    /// Minimum commits that change both files of a pair (default: 5).
+    #[serde(default = "default_coupling_min_shared_revisions")]
+    pub min_shared_revisions: u32,
+    /// Minimum coupling degree, from 0 to 1 (default: 0.3). The degree is the
+    /// number of shared commits divided by the mean commit count of the two
+    /// files.
+    #[serde(default = "default_coupling_min_degree")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub min_degree: f64,
+}
+
+const fn default_coupling_max_files_per_commit() -> usize {
+    30
+}
+
+const fn default_coupling_min_revisions() -> u32 {
+    5
+}
+
+const fn default_coupling_min_shared_revisions() -> u32 {
+    5
+}
+
+const fn default_coupling_min_degree() -> f64 {
+    0.3
+}
+
+/// Smallest `maxFilesPerCommit`: a commit needs two files to form a pair.
+const MIN_COUPLING_FILES_PER_COMMIT: usize = 2;
+
+/// Largest `maxFilesPerCommit`. A commit with `n` files gives `n * (n - 1) / 2`
+/// pairs, so a higher value lets one bulk commit dominate the run time.
+const MAX_COUPLING_FILES_PER_COMMIT: usize = 1000;
+
+impl ChangeCouplingConfig {
+    /// Validate the ranges that serde cannot express.
+    #[must_use]
+    pub fn errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !(MIN_COUPLING_FILES_PER_COMMIT..=MAX_COUPLING_FILES_PER_COMMIT)
+            .contains(&self.max_files_per_commit)
+        {
+            errors.push(format!(
+                "health.changeCoupling.maxFilesPerCommit must be from {MIN_COUPLING_FILES_PER_COMMIT} to {MAX_COUPLING_FILES_PER_COMMIT}, found {}",
+                self.max_files_per_commit
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.min_degree) {
+            errors.push(format!(
+                "health.changeCoupling.minDegree must be from 0 to 1, found {}",
+                self.min_degree
+            ));
+        }
+        errors
+    }
+}
+
+impl Default for ChangeCouplingConfig {
+    fn default() -> Self {
+        Self {
+            max_files_per_commit: default_coupling_max_files_per_commit(),
+            min_revisions: default_coupling_min_revisions(),
+            min_shared_revisions: default_coupling_min_shared_revisions(),
+            min_degree: default_coupling_min_degree(),
+        }
+    }
+}
+
+/// How `fallow health` counts cyclomatic complexity for its gates.
+///
+/// The policy changes the cyclomatic value that the `maxCyclomatic` gate reads
+/// and the cyclomatic value in every CRAP score. It does not change the health
+/// score, the complexity density, or the hotspot ranking: those keep the
+/// standard count so that grades stay comparable across projects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CyclomaticPolicy {
+    /// Count every decision point, `&&`, `||`, and `??` operator (`McCabe`).
+    #[default]
+    Standard,
+    /// Count a literal membership chain as one predicate. A chain such as
+    /// `kind === "a" || kind === "b" || kind === "c"` adds no cyclomatic
+    /// increments for its `||` operators. Only strict equality checks of one
+    /// identifier against string, number, bigint, boolean, or `null` literals
+    /// qualify. Member access, calls, mixed operators, and different operands
+    /// keep the standard count.
+    LiteralMembership,
+}
+
+impl CyclomaticPolicy {
+    /// Whether this is the default `standard` policy.
+    #[must_use]
+    pub const fn is_standard(&self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
+
 /// Configuration for complexity health metrics (`fallow health`).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -124,6 +239,18 @@ pub struct HealthConfig {
     /// (use `health.ignore` to remove a file from the score).
     #[serde(default = "default_max_cyclomatic")]
     pub max_cyclomatic: u16,
+
+    /// How the cyclomatic gate counts complexity (default: `standard`).
+    /// `literal-membership` counts a chain of strict equality checks of one
+    /// identifier against primitive literals (`kind === "a" || kind === "b"`)
+    /// as one predicate. The policy applies to the `maxCyclomatic` gate and
+    /// to every CRAP score, so the `maxCrap` gate reads the same value.
+    /// Findings then report the standard value as `standard_cyclomatic`. The
+    /// health score, complexity density, and hotspots keep the standard
+    /// count. Older fallow versions reject this key as unknown, so pair it
+    /// with `minimumVersion`.
+    #[serde(default, skip_serializing_if = "CyclomaticPolicy::is_standard")]
+    pub cyclomatic_policy: CyclomaticPolicy,
 
     /// Maximum allowed cognitive complexity per function (default: 15).
     /// Functions exceeding this threshold are reported. Governs findings
@@ -143,7 +270,9 @@ pub struct HealthConfig {
     /// `crap_max` and the overall health score never move with it. Set to
     /// `0` to disable CRAP enforcement entirely: no findings, nothing counts
     /// above threshold, and file-score rows disclose baseline breaches as
-    /// exempt instead.
+    /// exempt instead. The `complexity-crap` rule is different: it decides if
+    /// a finding fails the run, and `off` hides the findings but keeps the
+    /// file-score signals.
     #[serde(default = "default_max_crap")]
     pub max_crap: f64,
 
@@ -167,11 +296,12 @@ pub struct HealthConfig {
     #[serde(default = "default_max_unit_size")]
     pub max_unit_size: u32,
 
-    /// Path to Istanbul-format coverage data for accurate per-function CRAP
-    /// scores. Relative paths resolve against the project root. The CLI
+    /// Path to Istanbul coverage data (coverage-final.json) or raw V8 coverage
+    /// (a `NODE_V8_COVERAGE` directory or one V8 JSON file) for accurate
+    /// per-function CRAP scores. Relative paths resolve against the project root. The CLI
     /// `--coverage` flag and `FALLOW_COVERAGE` environment variable override
     /// this value. Consulted by `fallow health`, bare `fallow`, `fallow audit`,
-    /// and the MCP `audit` / `check_health` tools.
+    /// `fallow viz`, and the MCP `audit` / `check_health` tools.
     #[serde(default)]
     pub coverage: Option<PathBuf>,
 
@@ -179,12 +309,13 @@ pub struct HealthConfig {
     /// Use when coverage was generated under a different checkout root in CI
     /// or Docker. The CLI `--coverage-root` flag and `FALLOW_COVERAGE_ROOT`
     /// environment variable override this value. Consulted by `fallow health`,
-    /// bare `fallow`, `fallow audit`, and the MCP `audit` / `check_health`
-    /// tools.
+    /// bare `fallow`, `fallow audit`, `fallow viz`, and the MCP `audit` /
+    /// `check_health` tools.
     #[serde(default)]
     pub coverage_root: Option<PathBuf>,
 
     /// Glob patterns to exclude from complexity analysis.
+    /// A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub ignore: Vec<String>,
 
@@ -198,6 +329,13 @@ pub struct HealthConfig {
     /// privacy mode for `--ownership` output.
     #[serde(default)]
     pub ownership: OwnershipConfig,
+
+    /// Change coupling thresholds for the `change_coupling` section and the
+    /// hidden-coupling refactoring targets. Older fallow versions reject this
+    /// key as unknown, so pair it with `minimumVersion` set to the release
+    /// that added it.
+    #[serde(default)]
+    pub change_coupling: ChangeCouplingConfig,
 
     /// Whether health JSON output emits `suppress-line` action hints
     /// alongside complexity findings (default: `true`). Set to `false` to
@@ -215,6 +353,7 @@ impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             max_cyclomatic: default_max_cyclomatic(),
+            cyclomatic_policy: CyclomaticPolicy::Standard,
             max_cognitive: default_max_cognitive(),
             max_crap: default_max_crap(),
             crap_refactor_band: default_crap_refactor_band(),
@@ -224,6 +363,7 @@ impl Default for HealthConfig {
             ignore: vec![],
             threshold_overrides: vec![],
             ownership: OwnershipConfig::default(),
+            change_coupling: ChangeCouplingConfig::default(),
             suggest_inline_suppression: default_suggest_inline_suppression(),
         }
     }
@@ -234,9 +374,14 @@ impl Default for HealthConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HealthThresholdOverride {
     /// Project-root-relative file globs this override applies to.
+    /// A single `*` stays within one path segment; use `**` to match across directories.
     pub files: Vec<String>,
     /// Exact emitted function names this override applies to. Empty means every
-    /// function in matching files.
+    /// function in matching files. Synthetic units are matched by their emitted
+    /// name, so `"<template>"` and `"<snippet:NAME>"` are valid keys. The
+    /// synthetic `"<module>"` unit is not: it carries a file's module-scope
+    /// decision points into the aggregate metrics and never produces a finding,
+    /// so there is no ceiling for an override to move.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub functions: Vec<String>,
     /// Local cyclomatic complexity ceiling.
@@ -297,6 +442,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn change_coupling_ranges_are_validated() {
+        assert!(ChangeCouplingConfig::default().errors().is_empty());
+        let at_bounds = ChangeCouplingConfig {
+            max_files_per_commit: 1000,
+            min_degree: 1.0,
+            ..ChangeCouplingConfig::default()
+        };
+        assert!(at_bounds.errors().is_empty());
+
+        for (max_files_per_commit, min_degree) in [(1, 0.3), (1001, 0.3), (30, -0.1), (30, 1.5)] {
+            let config = ChangeCouplingConfig {
+                max_files_per_commit,
+                min_degree,
+                ..ChangeCouplingConfig::default()
+            };
+            assert_eq!(
+                config.errors().len(),
+                1,
+                "maxFilesPerCommit {max_files_per_commit}, minDegree {min_degree}"
+            );
+        }
+        let nan = ChangeCouplingConfig {
+            min_degree: f64::NAN,
+            ..ChangeCouplingConfig::default()
+        };
+        assert_eq!(nan.errors().len(), 1);
+    }
+
+    #[test]
     fn health_config_defaults() {
         let config = HealthConfig::default();
         assert_eq!(config.max_cyclomatic, 20);
@@ -308,6 +482,13 @@ mod tests {
         assert!(config.coverage_root.is_none());
         assert!(config.ignore.is_empty());
         assert!(config.threshold_overrides.is_empty());
+        assert_eq!(config.change_coupling.max_files_per_commit, 30);
+        assert_eq!(config.change_coupling.min_revisions, 5);
+        assert_eq!(config.change_coupling.min_shared_revisions, 5);
+        assert!((config.change_coupling.min_degree - 0.3).abs() < f64::EPSILON);
+        let ownership = OwnershipConfig::default();
+        assert_eq!(config.ownership.bot_patterns, ownership.bot_patterns);
+        assert_eq!(config.ownership.email_mode, ownership.email_mode);
     }
 
     #[test]
@@ -368,6 +549,7 @@ mod tests {
         let config: HealthConfig = serde_json::from_str(json).unwrap();
         assert!((config.max_crap - 15.5).abs() < f64::EPSILON);
         assert_eq!(config.max_cyclomatic, 20); // default
+        assert_eq!(config.cyclomatic_policy, CyclomaticPolicy::Standard);
         assert_eq!(config.max_cognitive, 15); // default
         assert_eq!(config.crap_refactor_band, 5); // default
     }
@@ -424,6 +606,7 @@ maxCognitive = 25
     fn health_config_json_roundtrip() {
         let config = HealthConfig {
             max_cyclomatic: 50,
+            cyclomatic_policy: CyclomaticPolicy::LiteralMembership,
             max_cognitive: 40,
             max_crap: 75.0,
             crap_refactor_band: 4,
@@ -441,11 +624,20 @@ maxCognitive = 25
             coverage: None,
             coverage_root: None,
             ownership: OwnershipConfig::default(),
+            change_coupling: ChangeCouplingConfig {
+                min_degree: 0.4,
+                ..ChangeCouplingConfig::default()
+            },
             suggest_inline_suppression: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: HealthConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.max_cyclomatic, 50);
+        assert_eq!(
+            restored.cyclomatic_policy,
+            CyclomaticPolicy::LiteralMembership
+        );
+        assert!((restored.change_coupling.min_degree - 0.4).abs() < f64::EPSILON);
         assert_eq!(restored.max_cognitive, 40);
         assert!((restored.max_crap - 75.0).abs() < f64::EPSILON);
         assert_eq!(restored.crap_refactor_band, 4);
@@ -585,13 +777,6 @@ maxCognitive = 25
              contributors using GitHub's privacy default email)"
         );
         assert_eq!(cfg.email_mode, EmailMode::Handle);
-    }
-
-    #[test]
-    fn ownership_config_default_via_health() {
-        let cfg = HealthConfig::default();
-        assert_eq!(cfg.ownership.email_mode, EmailMode::Handle);
-        assert!(!cfg.ownership.bot_patterns.is_empty());
     }
 
     #[test]

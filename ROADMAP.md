@@ -1,8 +1,6 @@
 # Fallow Roadmap
 
-> This roadmap covers planned work and is reviewed periodically. For shipped capabilities, see the [releases](https://github.com/fallow-rs/fallow/releases) and [documentation](https://docs.fallow.tools).
-
-This roadmap tracks planned work on Fallow: what is queued, what is being scoped, and where the project is headed.
+> This roadmap covers planned work and is reviewed periodically. For shipped capabilities, see the [releases](https://github.com/fallow-rs/fallow/releases) and [documentation](https://fallow.tools/docs/).
 
 ---
 
@@ -12,19 +10,15 @@ Concrete work scoped to the next one or two minor releases.
 
 ### Richer MCP responses
 
-The `inspect_target` tool already combines re-export chains, importers, duplicate siblings, and optional recent churn into one evidence bundle. The remaining work is to bring the same decision-ready context to broader MCP analysis flows where agents currently have to follow up with a separate inspection call.
+The `inspect_target` tool already combines re-export chains, importers, duplicate siblings, and optional recent churn into one evidence bundle. The remaining work is to include the same context in broader MCP analysis responses that currently require a separate inspection call.
 
 ### Coverage sidecar ergonomics
 
-The coverage setup state machine works end to end, but the install handoff still depends on users trusting a download. Target: reproducible sidecar pinning, smoother framework recipe generation, clearer failure messages when the sidecar cannot attach.
+Coverage setup works end to end. Installation still requires users to trust a download. Planned improvements include reproducible sidecar pinning, simpler framework recipe generation, and clearer failure messages when the sidecar cannot attach.
 
 ### Post-fix formatter integration
 
 `fallow fix` leaves Prettier, dprint, or Biome to clean up whitespace after removals. Invoke the project's configured formatter automatically when running in-place.
-
-### Per-package `changedSince` overrides
-
-Monorepos with packages on different release cadences want different baseline refs per package (e.g. `packages/web` tracks `main`, `packages/legacy` tracks `release/2024.10`). Today `fallow.changedSince` is workspace-wide. Extending this to per-package overrides requires config-schema work (a new `[overrides]` block keyed on workspace root, or `package.json` field), resolution semantics (which baseline wins for a file in package A imported from package B), and matching status-bar logic.
 
 ---
 
@@ -34,16 +28,16 @@ Broader bets, still being scoped.
 
 ### Agent-driven cleanup loop
 
-Safe removals (unused exports, enum members, dependencies) are already auto-fixable. The open question is the judgment calls: deleting files, consolidating duplicates, restructuring modules. The bet: structured MCP output plus the right review workflow lets an agent propose those changes, a human approves the PR, and fallow verifies nothing regressed.
+Safe removals (unused exports, enum members, dependencies) are already auto-fixable. Deleting files, consolidating duplicates, and restructuring modules still need review. The proposal is to use structured MCP output so an agent can suggest these changes, a human can approve the PR, and fallow can check for regressions.
 
 ### Health score calibration and adoption
 
 Shipped today: `fallow health` provides a 0-100 score, an A-F letter grade,
 badge output, saved vital-sign snapshots, and trend comparisons. Planned work
-focuses on calibrating the formula against a broad real-world corpus, explaining
-how its multiple signals contribute to each result, and helping teams adopt
-baselines and thresholds that fit their project context. This direction improves
-confidence and multi-signal explainability rather than adding another grade.
+focuses on calibration against a broad real-world corpus and
+multi-signal explainability: showing how each signal contributes to the score
+and grade.
+Teams should be able to choose baselines and thresholds that fit their projects.
 
 ---
 

@@ -166,7 +166,7 @@ pub fn note_result_count(count: usize) {
     FINDINGS_PRESENT.fetch_max(value, Ordering::Relaxed);
 
     let capped = count.min(RESULT_COUNT_MAX) as u16;
-    let _ = RESULT_COUNT_CAPPED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = RESULT_COUNT_CAPPED.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         let next = match current {
             RESULT_COUNT_UNSET => capped,
             RESULT_COUNT_UNKNOWN => RESULT_COUNT_UNKNOWN,
@@ -230,11 +230,11 @@ pub fn note_report_truncation(truncated: bool, reason: TruncationReason) {
     if truncated {
         REPORT_TRUNCATED.store(REPORT_TRUNCATION_TRUE, Ordering::Relaxed);
         let reason_state = truncation_reason_to_state(reason);
-        let _ = TRUNCATION_REASON.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = TRUNCATION_REASON.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.max(reason_state))
         });
     } else {
-        let _ = REPORT_TRUNCATED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let _ = REPORT_TRUNCATED.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             if current == REPORT_TRUNCATION_UNSET {
                 Some(REPORT_TRUNCATION_FALSE)
             } else {
@@ -636,6 +636,7 @@ pub enum Workflow {
     Impact,
     Security,
     SimilarCode,
+    Architecture,
     Fix,
     Explain,
     ProjectInventory,
@@ -661,6 +662,7 @@ impl Workflow {
         match self {
             Workflow::Audit
             | Workflow::DeadCode
+            | Workflow::Architecture
             | Workflow::Health
             | Workflow::Dupes
             | Workflow::CodeQualityReview
@@ -964,8 +966,8 @@ struct TelemetryEvent {
     /// `outcome` gate. Absent on commands that run no analysis (admin commands)
     /// and on older binaries. On the combined `code_quality_review` and `audit`
     /// workflows this is an OR across the sub-analyses; per-analysis find-rate
-    /// is answerable only on the standalone `dead_code` / `dupes` / `health`
-    /// workflows.
+    /// is answerable on the standalone `dead_code` / `architecture` / `dupes` /
+    /// `health` / `security` workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     findings_present: Option<bool>,
     /// Coarse bucket of the rendered analysis result count. Never serializes
@@ -1420,7 +1422,7 @@ fn build_workflow_event_with(
         agent_source,
         output_format: output_format_label(record.output),
         quiet: record.quiet,
-        ci: is_ci(),
+        ci: fallow_engine::ci_env::is_ci(),
         tty: std::io::stdout().is_terminal(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -1478,7 +1480,7 @@ fn status_changed_event(enabled: bool) -> TelemetryEvent {
         agent_source: None,
         output_format: "human",
         quiet: false,
-        ci: is_ci(),
+        ci: fallow_engine::ci_env::is_ci(),
         tty: std::io::stdout().is_terminal(),
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -1555,7 +1557,7 @@ fn telemetry_context_field_purposes() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "workflow",
-            "Prioritizes audit, dead-code, health, dupes, and integration workflows.",
+            "Prioritizes audit, dead-code, architecture, health, dupes, and integration workflows.",
         ),
         (
             "integration_surface",
@@ -1621,7 +1623,7 @@ fn telemetry_result_field_purposes() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "findings_present",
-            "Whether the analysis surfaced any findings, decoupled from the exit-code gate. On combined and audit workflows it is an OR across sub-analyses; per-analysis find-rate is answerable only on standalone dead_code, dupes, and health.",
+            "Whether the analysis surfaced any findings, decoupled from the exit-code gate. On combined and audit workflows it is an OR across sub-analyses; per-analysis find-rate is answerable on the standalone dead_code, architecture, dupes, health, and security workflows.",
         ),
         (
             "result_count_bucket",
@@ -1703,7 +1705,7 @@ fn effective_config() -> EffectiveConfig {
             config_path: config_path(),
         };
     }
-    if is_ci() {
+    if fallow_engine::ci_env::is_ci() {
         return EffectiveConfig {
             mode: EffectiveMode::Off,
             source: ModeSource::Default,
@@ -1793,8 +1795,10 @@ fn debug_enabled() -> bool {
     env_truthy(DEBUG_ENV)
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
+/// True when env var `name` holds a truthy value (`1`, `true`, `yes`, `on`).
+/// Shared with the update check and the cache notice opt-out gate.
+pub fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -2169,7 +2173,7 @@ fn classify_invocation_context() -> InvocationContext {
     if classify_agent_source() != AgentSource::None {
         return InvocationContext::Agent;
     }
-    if is_ci() {
+    if fallow_engine::ci_env::is_ci() {
         return InvocationContext::Ci;
     }
     if std::env::var_os("VSCODE_PID").is_some() || std::env::var_os("TERM_PROGRAM").is_some() {
@@ -2179,6 +2183,30 @@ fn classify_invocation_context() -> InvocationContext {
         InvocationContext::Human
     } else {
         InvocationContext::Unknown
+    }
+}
+
+/// The detected agent source as its snake_case wire value, or `None` when no
+/// agent runs this process. Cloud reads send it as the
+/// `x-fallow-agent-source` header after the cloud allowlist filters it.
+pub fn agent_source_wire_value() -> Option<&'static str> {
+    match classify_agent_source() {
+        AgentSource::None => None,
+        AgentSource::Codex => Some("codex"),
+        AgentSource::ClaudeCode => Some("claude_code"),
+        AgentSource::Cursor => Some("cursor"),
+        AgentSource::Copilot => Some("copilot"),
+        AgentSource::Opencode => Some("opencode"),
+        AgentSource::Aider => Some("aider"),
+        AgentSource::Roo => Some("roo"),
+        AgentSource::Windsurf => Some("windsurf"),
+        AgentSource::Gemini => Some("gemini"),
+        AgentSource::Cline => Some("cline"),
+        AgentSource::Continue => Some("continue"),
+        AgentSource::Zed => Some("zed"),
+        AgentSource::Goose => Some("goose"),
+        AgentSource::OtherKnown => Some("other_known"),
+        AgentSource::Unknown => Some("unknown"),
     }
 }
 
@@ -2256,12 +2284,6 @@ where
 fn key_has_token(key: &str, token: &str) -> bool {
     key.match_indices(token)
         .any(|(idx, _)| idx == 0 || key.as_bytes()[idx - 1] == b'_')
-}
-
-pub fn is_ci() -> bool {
-    std::env::var_os("CI").is_some()
-        || std::env::var_os("GITHUB_ACTIONS").is_some()
-        || std::env::var_os("GITLAB_CI").is_some()
 }
 
 fn integration_surface(output: OutputFormat) -> IntegrationSurface {
@@ -2406,7 +2428,7 @@ fn followup_kind(workflow: Workflow) -> FollowupKind {
         Workflow::Audit => FollowupKind::Audit,
         Workflow::Security => FollowupKind::Security,
         Workflow::Health => FollowupKind::Health,
-        Workflow::DeadCode => FollowupKind::Check,
+        Workflow::DeadCode | Workflow::Architecture => FollowupKind::Check,
         Workflow::Dupes => FollowupKind::Dupes,
         Workflow::Fix => FollowupKind::Fix,
         Workflow::Explain => FollowupKind::Explain,
@@ -2836,7 +2858,8 @@ mod tests {
     }
 
     fn read_telemetry_doc() -> Option<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/telemetry.md");
+        let path = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?)
+            .join("../../docs/telemetry.md");
         std::fs::read_to_string(path).ok()
     }
 
@@ -2968,6 +2991,7 @@ mod tests {
         for workflow in [
             Workflow::Audit,
             Workflow::DeadCode,
+            Workflow::Architecture,
             Workflow::Health,
             Workflow::Dupes,
             Workflow::CodeQualityReview,
@@ -3272,7 +3296,7 @@ mod tests {
         assert_eq!(kept.first().copied(), Some(6), "oldest of the tail dropped");
         assert_eq!(
             kept.last().copied(),
-            Some((total - 1) as i64),
+            i64::try_from(total - 1).ok(),
             "newest kept"
         );
     }
@@ -3308,11 +3332,11 @@ mod tests {
         );
         assert_eq!(
             kept.first().copied(),
-            Some((total - SPOOL_MAX_EVENTS) as i64)
+            i64::try_from(total - SPOOL_MAX_EVENTS).ok()
         );
         assert_eq!(
             kept.last().copied(),
-            Some((total - 1) as i64),
+            i64::try_from(total - 1).ok(),
             "newest kept"
         );
     }
@@ -3983,6 +4007,18 @@ mod tests {
     // --- field_purposes and transport_headers (lines 1398-1532) ---
 
     #[test]
+    fn findings_present_purpose_lists_every_standalone_workflow() {
+        let purposes = field_purposes();
+        let (_, purpose) = purposes
+            .iter()
+            .find(|(field, _)| *field == "findings_present")
+            .expect("findings_present purpose");
+        for workflow in ["dead_code", "architecture", "dupes", "health", "security"] {
+            assert!(purpose.contains(workflow), "{workflow}: {purpose}");
+        }
+    }
+
+    #[test]
     fn field_purposes_is_non_empty_and_unique() {
         let purposes = field_purposes();
         assert!(
@@ -4178,7 +4214,7 @@ mod tests {
     fn invocation_context_is_ci_when_agent_source_is_none_and_ci_is_set() {
         // We cannot safely mutate env vars in parallel tests. However, we can
         // exercise the pure helper classify_agent_source_from_env with no keys,
-        // which yields AgentSource::None, and then observe that is_ci() returns
+        // which yields AgentSource::None, and then observe that `ci_env::is_ci()` returns
         // a bool based on the actual env (which may or may not be CI).
         // The function classify_invocation_context() itself reads env directly, so
         // we verify the surrounding pure helpers cover the branches instead.

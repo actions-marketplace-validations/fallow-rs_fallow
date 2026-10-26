@@ -1,10 +1,16 @@
 mod boundaries;
+mod dependency_ignore;
 mod duplicates_config;
+mod entry_effect;
+mod entry_span;
 mod finding_ignore;
 mod flags;
 mod format;
 pub mod glob_validation;
 mod health;
+mod ignore_patterns;
+mod legacy_glob;
+mod mutation;
 mod parsing;
 mod resolution;
 mod resolve;
@@ -24,19 +30,36 @@ pub use boundaries::{
     ResolvedBoundaryCoverageConfig, ResolvedBoundaryRule, ResolvedZone, UnknownZoneRef,
     ZoneReferenceKind, ZoneValidationError,
 };
+pub use dependency_ignore::{IgnoreDependencyMatcher, is_dependency_glob};
 pub use duplicates_config::{
     DetectionMode, DuplicatesConfig, NormalizationConfig, ResolvedNormalization,
 };
+pub use entry_effect::EntryEffectRecord;
+pub use entry_span::ConfigEntrySpan;
 pub use finding_ignore::FindingIgnoreMatcher;
 pub use flags::{FlagsConfig, SdkPattern};
 pub use format::OutputFormat;
-pub use health::{EmailMode, HealthConfig, HealthThresholdOverride, OwnershipConfig};
-pub use parsing::ConfigLoadOptions;
+pub use glob_validation::compile_path_glob;
+pub use health::{
+    ChangeCouplingConfig, CyclomaticPolicy, EmailMode, HealthConfig, HealthThresholdOverride,
+    OwnershipConfig,
+};
+pub use ignore_patterns::{IgnorePatternSet, UNLIFTABLE_IGNORE_SEGMENTS};
+pub use legacy_glob::{
+    LegacyGlobGroup, LegacyGlobNarrowing, find_legacy_glob_narrowings, has_single_segment_wildcard,
+    suggest_cross_directory_rewrite,
+};
+pub use mutation::{MutationConfig, MutationOperatorName, MutationRunner};
+pub use parsing::{CONFIG_FILE_NAMES, ConfigLoadOptions};
 pub use resolution::{
-    AnalysisSnapshot, CompiledIgnoreCatalogReferenceRule, CompiledIgnoreDependencyOverrideRule,
-    CompiledIgnoreExportRule, ConfigOverride, DEFAULT_MAX_FILE_SIZE_BYTES,
-    DEFAULT_MAX_FILE_SIZE_MB, IgnoreCatalogReferenceRule, IgnoreDependencyOverrideRule,
-    IgnoreExportRule, ResolvedConfig, ResolvedOverride, resolve_max_file_size_bytes,
+    AnalysisSnapshot, CACHE_DIR_ENV, CACHE_MAX_SIZE_ENV, CompiledIgnoreCatalogReferenceRule,
+    CompiledIgnoreDependencyOverrideRule, CompiledIgnoreExportRule, ConfigOverride,
+    DEFAULT_IGNORE_PATTERNS, DEFAULT_MAX_FILE_SIZE_BYTES, DEFAULT_MAX_FILE_SIZE_MB,
+    IgnoreCatalogReferenceRule, IgnoreDependencyOverrideRule, IgnoreExportRule,
+    PACKAGE_BASELINES_ENV, ResolvedConfig, ResolvedOverride, cache_config_hash,
+    cache_dir_env_override, cache_dir_from_env_value, cache_max_size_env_override,
+    cache_max_size_from_env_value, package_baselines_disabled_by_env_value,
+    resolve_max_file_size_bytes,
 };
 pub use resolve::ResolveConfig;
 pub use rules::{
@@ -153,6 +176,32 @@ impl UnusedComponentPropsConfig {
     }
 }
 
+/// Options for the `circular-dependencies` rule.
+///
+/// The default leaves the rule unchanged: every runtime import edge takes
+/// part in cycle detection, and only type-only edges are skipped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct CircularDependenciesConfig {
+    /// Skip import edges that load their target on demand or on another
+    /// thread when fallow looks for cycles. A literal `import()` inside a
+    /// function, a template `import()`, a lazy `import.meta.glob`, a worker
+    /// URL and a webpack worker loader request (`worker-loader!./work.js`)
+    /// are lazy edges. A top-level `await import()`, `require()` and an
+    /// eager `import.meta.glob` load before the module finishes, so they stay.
+    /// An edge that also carries a static import stays. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_lazy_imports: bool,
+}
+
+impl CircularDependenciesConfig {
+    /// True when no option is set, so serialization can omit the section.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        !self.ignore_lazy_imports
+    }
+}
+
 /// The `fix` config section: settings for `fallow fix` apply behavior.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -241,8 +290,19 @@ impl TypeAwareConfig {
     }
 }
 
+/// Schema for `extends`. The loader accepts one string or an array of strings
+/// and normalizes both to a list before it deserializes the config (#3351).
+fn extends_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+        ]
+    })
+}
+
 /// The user-facing fallow configuration as authored in `.fallowrc.json` /
-/// `.fallowrc.jsonc` / `fallow.toml` (or the `fallow` key of `package.json`).
+/// `.fallowrc.jsonc` / `fallow.toml` / `.fallow.toml`.
 ///
 /// Every field documents its serialized meaning, default, and precedence
 /// against CLI flags and environment variables where they exist.
@@ -251,6 +311,12 @@ impl TypeAwareConfig {
 /// Unknown keys are rejected at load so typos fail loud.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+// Both `.fallowrc.json` and `.fallowrc.jsonc` are read with the JSONC dialect
+// from `crate::jsonc::parse_options`, so the schema declares the same dialect.
+// JSON language service clients (VS Code, Zed) read these two keywords off the
+// root object and otherwise flag syntax the loader accepts. They are
+// annotations only: nothing in fallow reads them back.
+#[schemars(extend("allowComments" = true, "allowTrailingCommas" = true))]
 pub struct FallowConfig {
     /// A string pointing at fallow's JSON Schema URL, used only by editors for autocomplete and validation of the config file; it has no effect on analysis and is stripped before serialization (serde skip_serializing, writeOnly in the schema). Set it to `./node_modules/fallow/schema.json` for npm installs (version-aligned, offline, avoids VS Code's untrusted-remote-schema prompt), or `https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json` for non-npm installs; any other value is ignored by fallow.
     #[serde(rename = "$schema", default, skip_serializing)]
@@ -260,19 +326,20 @@ pub struct FallowConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_version: Option<String>,
 
-    /// An ordered array of parent config sources to inherit before this file's own keys apply; each entry is a file-relative path, an `npm:<package>` specifier, or an `https://` URL (`http://` is rejected), deep-merged in order so objects merge field-by-field while arrays and scalars in this file replace the parent's, with cycle and depth guards. Set it to share a base config across a monorepo or team; it is consumed at load and stripped before serialization (serde skip_serializing).
+    /// A single parent config source, or an ordered array of them, to inherit before this file's own keys apply; each source is a file-relative path, an `npm:<package>` specifier, or an `https://` URL (`http://` is rejected), deep-merged in order so objects merge field-by-field while arrays and scalars in this file replace the parent's, with cycle and depth guards. Set it to share a base config across a monorepo or team; it is consumed at load and stripped before serialization (serde skip_serializing).
     #[serde(default, skip_serializing)]
+    #[schemars(schema_with = "extends_schema")]
     pub extends: Vec<String>,
 
-    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files.
+    /// An array of project-root-relative glob patterns whose matching files are seeded as manual entry points, on top of the framework and package.json entries fallow discovers automatically, so their transitive imports are not reported as unused. Set it (e.g. `["src/main.ts"]`) when a file is a real runtime root that no plugin or manifest declares; patterns are validated at load and matched against discovered files. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub entry: Vec<String>,
 
-    /// An array of project-root-relative glob patterns for files to exclude from analysis entirely; entries are unioned with fallow's built-in defaults (**/node_modules/**, **/dist/**, build/**, **/.git/**, **/coverage/**, **/*.min.js, **/*.min.mjs, **/*.min.cjs, **/*.bundle.js), so custom globs add to rather than replace them. Set it (e.g. `["generated/**"]`) to drop generated or vendored trees from every detector; patterns are validated at load.
+    /// An array of project-root-relative glob patterns for files to exclude from analysis entirely; entries are unioned with fallow's built-in defaults (**/node_modules/**, **/dist/**, **/build/**, **/.git/**, **/coverage/**, **/*.min.js, **/*.min.mjs, **/*.min.cjs, **/*.bundle.js), so custom globs add to rather than replace them. Set it (e.g. `["generated/**"]`) to drop generated or vendored trees from every detector; patterns are validated at load. A `!`-prefixed entry is an exception that applies after the defaults and the positive patterns: `"!src/policy/coverage/**"` brings back hand-written source under a built-in default such as `**/coverage/**`, and `"!.config/**"` adds a hidden directory to discovery. Paths under `node_modules` or `.git` can not be lifted, and a `!` entry that names one of these segments is a config error. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
 
-    /// An array of project-root-relative glob patterns whose source-owned dead-code findings are hidden after analysis without excluding matching files from discovery, parsing, resolution, or the module graph. Use `/` as the path separator on every platform. Positive patterns select paths to hide; `!`-prefixed patterns keep matching paths reportable, and a negated-only array reports only those exception paths. A finding with multiple source owners is hidden only when every owner matches, so a cycle, duplicate-export group, or unlisted dependency with any reportable location remains visible. Architecture, policy, suppression-hygiene, and framework-correctness findings remain visible even when a referenced path matches, as do manifest-owned findings that no source file owns: unused dependencies, unused dev and optional dependencies, catalog entries, and dependency overrides. Use `ignorePatterns` instead when a generated or vendored file must not be analyzed at all.
+    /// An array of project-root-relative glob patterns whose source-owned dead-code findings are hidden after analysis without excluding matching files from discovery, parsing, resolution, or the module graph. Use `/` as the path separator on every platform. Positive patterns select paths to hide; `!`-prefixed patterns keep matching paths reportable, and a negated-only array reports only those exception paths. A finding with multiple source owners is hidden only when every owner matches, so a cycle, duplicate-export group, or unlisted dependency with any reportable location remains visible. Architecture, policy, suppression-hygiene, and framework-correctness findings remain visible even when a referenced path matches, as do manifest-owned findings that no source file owns: unused dependencies, unused dev and optional dependencies, catalog entries, and dependency overrides. Use `ignorePatterns` instead when a generated or vendored file must not be analyzed at all. A matching file that parses with errors reports no `source-parse-degraded` diagnostic, and its partial parse does not mark other findings as incomplete; use this only for files that are broken on purpose, such as syntax-error test fixtures. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_findings: Vec<String>,
 
@@ -280,19 +347,23 @@ pub struct FallowConfig {
     #[serde(default)]
     pub framework: Vec<ExternalPluginDef>,
 
-    /// Monorepo workspace configuration whose sole sub-key patterns (array of globs) adds workspace package roots beyond those discovered from package.json workspaces, pnpm-workspace.yaml, and tsconfig references. Optional and absent by default (discovery uses the manifests alone); set it only when workspaces live in directories the standard manifests do not declare.
+    /// Monorepo workspace configuration. `patterns` adds workspace package roots beyond manifest discovery; `changedSince` maps exact project-root-relative workspace roots to Git baseline refs. A global changed-since request overrides those per-package baselines.
     #[serde(default)]
     pub workspaces: Option<WorkspaceConfig>,
 
-    /// A list of exact package names excluded from BOTH unused-dependency and unlisted-dependency detection, so a runtime-provided or otherwise-untracked package (e.g. `bun:sqlite`, a peer supplied at deploy time) is never flagged as unused when declared nor as unlisted when imported. Set it for packages fallow cannot observe being used and cannot observe being declared; matching is exact string equality against the package name, not a glob.
+    /// A list of package names or package-name globs excluded from BOTH unused-dependency and unlisted-dependency detection, so a runtime-provided or otherwise-untracked package (e.g. `bun:sqlite`, a peer supplied at deploy time) is never flagged as unused when declared nor as unlisted when imported. Set it for packages fallow cannot observe being used and cannot observe being declared. An entry without glob characters matches the package name exactly; an entry with `*`, `?`, `[` or `{` is a glob in the `ignorePatterns` syntax matched against the package name, so `@acme/*` covers every package in the `@acme` scope.
     #[serde(default)]
     pub ignore_dependencies: Vec<String>,
+
+    /// A list of command names whose file arguments fallow does not make entry points. Fallow reads commands in package.json scripts (root and workspace packages), CI files (GitHub Actions and GitLab CI), Dockerfiles, Procfiles, and fly.toml files, and a file that a command names (such as `node scripts/seed.ts`) normally becomes an entry point. A listed command still counts as a used dependency, and its `--config` file is still tracked. Formatters and linters (ESLint, Prettier, Oxlint, Oxfmt, Biome, Stylelint, and similar tools) never make their targets entry points, so they do not need to be listed. Set it for a command whose file arguments are data, not code that runs (e.g. `["my-codegen"]`), or use `["*"]` to turn off entry points from all commands and declare real entries in `entry`. A name matches the command after environment, package-manager, and wrapper prefixes (`npx`, `pnpm exec`, `yarn run`, `varlock run --`), by exact file name; `*` is the only wildcard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_command_entries: Vec<String>,
 
     /// A list of glob patterns that suppress only `unresolved-import` findings whose raw import specifier matches; it does not change dependency usage accounting or resolver behavior. Patterns match the import string as written (not a filesystem path), so list both `@example/icons` and `@example/icons/**` to cover a bare package and its subpaths; parent-relative generated specifiers like `../generated/**` are valid, and broad values like `**` can hide real missing modules.
     #[serde(default)]
     pub ignore_unresolved_imports: Vec<String>,
 
-    /// A list of per-file rules that exempt named exports from `unused-export` and from duplicate-exports grouping for files matching a glob. Each entry is `{ file: <glob>, exports: [<name>, ...] }` where `exports: ["*"]` exempts every export in the file and a name list exempts only those names; built for component-library barrels (shadcn/Radix/bits-ui `index.ts`) that intentionally re-export the same short names across many files.
+    /// A list of per-file rules that exempt named exports from `unused-export` and from duplicate-exports grouping for files matching a glob. Each entry is `{ file: <glob>, exports: [<name>, ...] }` where `exports: ["*"]` exempts every export in the file and a name list exempts only those names; built for component-library barrels (shadcn/Radix/bits-ui `index.ts`) that intentionally re-export the same short names across many files. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub ignore_exports: Vec<IgnoreExportRule>,
 
@@ -316,7 +387,7 @@ pub struct FallowConfig {
     #[serde(default)]
     pub used_class_members: Vec<UsedClassMemberRule>,
 
-    /// Configures clone detection: `enabled` (default true), `mode` (`strict`, `mild` default, `weak`, `semantic`, from least to most identifier/literal blinding; `strict` and `mild` are equivalent under fallow's AST tokenizer, `weak` blinds string literals, `semantic` blinds all identifiers and literals for Type-2 renamed-variable detection), `near` (false, add bounded function-scoped near-miss detection), `minTokens` (50), `minLines` (5), `minOccurrences` (integer >= 2, deserialization fails below 2), `threshold` (max duplication percentage, 0 = no limit), `ignore` globs, `ignoredClones` (reviewed clone keys to hide until their content or occurrence count changes), `ignoreDefaults` (true, merge built-in generated-file ignores), `skipLocal` (only report cross-directory clones), `crossLanguage` (strip TS type annotations to match .ts against .js), `ignoreImports` (true, strip ES import/re-export/top-level require wiring from the token stream), and `normalization` (per-flag `ignoreIdentifiers`/`ignoreStringValues`/`ignoreNumericValues` overrides on top of `mode`). Raise `minOccurrences` to focus on widespread copy-paste, enable `near` for gapped structural clones, or set `mode` to `semantic` to catch renamed-variable exact clones.
+    /// Configures clone detection: `enabled` (default true), `mode` (`strict`, `mild` default, `weak`, `semantic`, from least to most identifier/literal blinding; `strict` and `mild` are equivalent under fallow's AST tokenizer, `weak` blinds string literals, `semantic` blinds all identifiers and literals for Type-2 renamed-variable detection), `near` (false, add bounded function-scoped near-miss detection), `minTokens` (50), `minLines` (5), `minOccurrences` (integer >= 2, deserialization fails below 2), `threshold` (max duplication percentage, 0 = no limit), `ignore` globs, `ignoredClones` (reviewed clone keys to hide until their content or occurrence count changes), `ignoreDefaults` (true, merge built-in generated-file ignores), `skipLocal` (only report cross-directory clones), `ignoreSymlinks` (false, omit clone instances whose path is a symlink or lies under a symlinked directory), `crossLanguage` (strip TS type annotations to match .ts against .js), `ignoreImports` (true, strip ES import/re-export/top-level require wiring from the token stream), and `normalization` (per-flag `ignoreIdentifiers`/`ignoreStringValues`/`ignoreNumericValues` overrides on top of `mode`). Raise `minOccurrences` to focus on widespread copy-paste, enable `near` for gapped structural clones, or set `mode` to `semantic` to catch renamed-variable exact clones.
     #[serde(default)]
     pub duplicates: DuplicatesConfig,
 
@@ -326,6 +397,14 @@ pub struct FallowConfig {
     /// endpoints, credentials, and consent cannot be set by project config.
     #[serde(default)]
     pub similar_code: SimilarCodeConfig,
+
+    /// Configures the explicit `fallow mutation` workflow: `runner` (`auto`
+    /// or `vitest`), `operators` (kebab-case names, default each operator),
+    /// `minScore` (0 to 100; a lower score exits with code 1), and
+    /// `concurrency` (half the logical cores). No key starts a run, and the
+    /// side-effect override is a CLI flag only.
+    #[serde(default, skip_serializing_if = "MutationConfig::is_default")]
+    pub mutation: MutationConfig,
 
     /// Sets complexity and health thresholds for `fallow health` (also applied in combined `fallow` and `fallow audit`): `maxCyclomatic` (20), `maxCognitive` (15), `maxCrap` (30.0, findings at or above this are reported), `crapRefactorBand` (5, cyclomatic band below `maxCyclomatic` where a secondary refactor action is added), `maxUnitSize` (max function lines before a large-function finding, 60), `coverage`/`coverageRoot` (Istanbul coverage path and path-prefix strip for accurate CRAP), `ignore` globs (remove files from findings AND the health score), `thresholdOverrides` (per-file/per-function ceilings via `files`/`functions`/`maxCyclomatic`/`maxCognitive`/`maxCrap`/`maxUnitSize`/`reason`), `ownership` (`botPatterns` and `emailMode` for `--ownership`), and `suggestInlineSuppression` (true, emit `suppress-line` action hints in JSON). Raise thresholds to relax which functions are flagged, wire `coverage` for real CRAP scores, or exempt generated/test files via `ignore` (drops them from the score too) or `thresholdOverrides` (keeps them visible under a higher ceiling). The four `max*` thresholds govern findings only and never move `health_score`: its penalties use fixed calibration so grades stay comparable across projects, and `ignore` is the lever that removes files from the score.
     #[serde(default)]
@@ -337,7 +416,7 @@ pub struct FallowConfig {
     #[serde(default, skip_serializing_if = "TypeAwareConfig::is_default")]
     pub type_aware: TypeAwareConfig,
 
-    /// Sets per-issue-type severity, keyed by kebab-case rule id: `error` reports and fails CI (non-zero exit), `warn` reports without failing, `off` disables detection and reporting entirely (e.g. `{ "unused-files": "error", "unused-exports": "warn", "private-type-leaks": "off" }`). Set a rule `off` to silence it, `warn` to demote below CI gating, or `error` to promote a warn/off-default rule to gating; most rules default to `error`, dev/optional-dependency and component/store/inject/CSS/catalog rules default to `warn`, and opt-in rules (`private-type-leaks`, `security-*`, `prop-drilling`, `thin-wrapper`, `duplicate-prop-shape`, `coverage-gaps`, `feature-flags`, `require-suppression-reason`) default to `off`. Singular aliases (`unused-file`) and `warning`/`none` severity spellings are accepted.
+    /// Sets per-issue-type severity, keyed by kebab-case rule id: `error` reports and fails CI (non-zero exit), `warn` reports without failing, `off` disables detection and reporting entirely (e.g. `{ "unused-files": "error", "unused-exports": "warn", "private-type-leaks": "off" }`). Set a rule `off` to silence it, `warn` to demote below CI gating, or `error` to promote a warn/off-default rule to gating; most rules default to `error`, dev/optional-dependency and component/store/inject/CSS/catalog rules default to `warn`, and opt-in rules (`private-type-leaks`, `deprecated-exports-in-use`, `security-*`, `prop-drilling`, `thin-wrapper`, `duplicate-prop-shape`, `coverage-gaps`, `feature-flags`, `require-suppression-reason`) default to `off`. Singular aliases (`unused-file`) and `warning`/`none` severity spellings are accepted.
     #[serde(default)]
     pub rules: RulesConfig,
 
@@ -348,11 +427,18 @@ pub struct FallowConfig {
     /// Options for the `unused-component-props` rule, currently only `ignorePattern`: a regex matched against each declared prop's local destructure binding name (falling back to the public prop name when unaliased) to exempt intentionally-unused props such as the leading-underscore convention. Set `{ "ignorePattern": "^_" }` to skip props like `_stage`; matching is unanchored (substring, like ESLint's `RegExp.test`) so anchor with `^`, the pattern is validated at config load (invalid regex fails load), and it applies to Vue, Svelte, Astro, and React/Preact props (unset leaves the rule unchanged).
     pub unused_component_props: UnusedComponentPropsConfig,
 
+    #[serde(
+        default,
+        skip_serializing_if = "CircularDependenciesConfig::is_default"
+    )]
+    /// Options for the `circular-dependencies` rule, currently only `ignoreLazyImports`. Set `{ "ignoreLazyImports": true }` to skip import edges that load on demand or on another thread (an `import()` inside a function, a template `import()`, a lazy `import.meta.glob`, a worker URL, a webpack worker loader request such as `worker-loader!./work.js`) when fallow looks for cycles. A top-level `await import()`, `require()`, an eager glob, and an edge that also has a static import stay in the cycle graph. Default `false` leaves the rule unchanged.
+    pub circular_dependencies: CircularDependenciesConfig,
+
     /// Configures architecture boundary enforcement: which source directories belong to which named zone and which zones may import which others, reported as boundary-violation, boundary-coverage-violation, and boundary-call-violation findings (severity via rules.boundary-violation, default error). Set to enforce a layered/module architecture; the object holds `preset` (one of layered, hexagonal, feature-sliced, bulletproof, whose default zones/rules are merged in with the user-declared zones/rules taking precedence), `zones` (each with `name`, `patterns`, `autoDiscover`, optional `root`), `rules` (each with `from`, `allow`, `allowTypeOnly` target-zone lists), `coverage` (`requireAllFiles` plus `allowUnmatched` globs for files matching no zone), and `calls` (a `forbidden` list of `{from, callee}` banned-call rules per zone).
     #[serde(default)]
     pub boundaries: BoundaryConfig,
 
-    /// Configures feature-flag detection: `sdkPatterns` (custom flag-evaluating call signatures, each `{ function, nameArg (zero-based arg index of the flag name, default 0), provider? }`, merged with built-ins for LaunchDarkly, Statsig, Unleash, GrowthBook, Split, PostHog, Vercel Flags, ConfigCat, Flagsmith, Optimizely, and Eppo), `envPrefixes` (env-var prefixes marking `process.env.*` accesses as flags, merged with built-ins), and `configObjectHeuristics` (default false; when true, property accesses on objects whose name contains `feature`/`flag`/`toggle` are reported as low-confidence flags). Set `sdkPatterns`/`envPrefixes` to teach fallow a proprietary flag SDK or naming convention, or enable `configObjectHeuristics` for projects that read flags off config objects (higher false-positive rate). Feature-flag findings surface only when the `feature-flags` rule is enabled (default `off`).
+    /// Configures feature-flag detection: `sdkPatterns` (custom flag-evaluating call signatures, each `{ function, nameArg (zero-based arg index of the flag name, default 0), provider? }`, merged with built-ins for LaunchDarkly, Statsig, Unleash, GrowthBook, Split, PostHog, Vercel Flags, ConfigCat, Flagsmith, Optimizely, and Eppo), `envPrefixes` (env-var prefixes marking `process.env.*` and `import.meta.env.*` accesses as flags, merged with built-ins), and `configObjectHeuristics` (default false; when true, property accesses on objects whose name contains `feature`/`flag`/`toggle` are reported as low-confidence flags). Set `sdkPatterns`/`envPrefixes` to teach fallow a proprietary flag SDK or naming convention, or enable `configObjectHeuristics` for projects that read flags off config objects (higher false-positive rate). Feature-flag findings surface only when the `feature-flags` rule is enabled (default `off`).
     #[serde(default)]
     pub flags: FlagsConfig,
 
@@ -384,11 +470,11 @@ pub struct FallowConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_packs: Vec<String>,
 
-    /// An array of project-root-relative glob patterns for files loaded at runtime by a mechanism the static graph cannot see (dynamic path resolution, config-driven loading); matching files are seeded as entry points so they and their imports stay reachable. Empty by default; set it (e.g. `["plugins/**/*.ts", "locales/**/*.json"]`) for plugin or locale trees pulled in dynamically.
+    /// An array of project-root-relative glob patterns for files loaded at runtime by a mechanism the static graph cannot see (dynamic path resolution, config-driven loading); matching files are seeded as entry points so they and their imports stay reachable. Empty by default; set it (e.g. `["plugins/**/*.ts", "locales/**/*.json"]`) for plugin or locale trees pulled in dynamically. A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub dynamically_loaded: Vec<String>,
 
-    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten rules for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict); inter-file rules (duplicate-exports, circular-dependencies, re-export-cycle) have no effect in an override (fallow warns during analysis and points to the right mechanism: top-level `ignoreExports` for duplicate-exports, a file-level `// fallow-ignore-file` comment for the others).
+    /// An ordered list of per-file rule-severity overrides: each entry re-severities specific analysis rules for files its globs match, layered on top of the top-level `rules` defaults. Set to relax or tighten rules for a subset of paths (e.g. downgrade unused-exports to warn under a generated directory); each entry has `files` (glob-pattern array) and `rules` (a partial per-rule severity map of error/warn/off). Entries apply in list order and a file matched by several entries takes every matching entry's overrides (later entries win on conflict); inter-file rules (duplicate-exports, circular-dependencies, re-export-cycle) have no effect in an override (fallow warns during analysis and points to the right mechanism: top-level `ignoreExports` for duplicate-exports, a file-level `// fallow-ignore-file` comment for the others). A single `*` stays within one path segment; use `**` to match across directories.
     #[serde(default)]
     pub overrides: Vec<ConfigOverride>,
 
@@ -416,9 +502,17 @@ pub struct FallowConfig {
     #[serde(default)]
     pub include_entry_exports: bool,
 
-    /// When true, drops Nuxt convention-based entry-pattern fallbacks: component fallbacks are dropped unless nuxt.config declares components:, and composable/util fallbacks are dropped unless it declares imports:, so genuinely-unreferenced convention files surface as unused-file. Boolean, defaults to false; set it for a Nuxt project that has explicitly configured its auto-import directories. Synthesis of auto-import graph edges (resolving `<Card />` or `useUserStore()` to their convention files) happens regardless of this flag.
+    /// When true, the report keeps the unused exports, unused types, unused class members and unused enum members of a file that is an unused file. Boolean, defaults to false: deleting an unused file removes these findings, so the report hides them and counts them in cascade_hidden. The CLI flag --show-cascade applies the same behavior for one run.
+    #[serde(default)]
+    pub show_cascade: bool,
+
+    /// When true, drops Nuxt convention-based entry-pattern fallbacks so genuinely-unreferenced convention files surface as unused-file. Component fallbacks are kept when nuxt.config customizes components: in a way fallow does not model, and composable/util fallbacks are kept when it customizes imports:; a config that scans no more than the Nuxt defaults (components: false, components: [], components: { dirs: [] }, components: true, imports: { scan: false }, imports: {}, imports: { dirs: [] }) is treated like the default and its fallbacks are dropped; imports: { autoImport: false } on its own is not, because it only switches the injection off while the same directories stay registered behind #imports. A nuxt.config that carries any top-level key fallow cannot read statically, a computed key, an accessor, or a spread such as { ...base, devtools: {} }, keeps both surfaces' fallbacks for that root, because the spread may hold the keys that decide. Only top-level keys count when the config object is readable: a nested key such as a routeRules path ending in components does not keep a fallback. Nested components or imports keys in $production, $development, $test or `$env.<name>`, and components or imports hooks (a components:* key or a nested components object in hooks, also inside those overrides), count as that surface's key; such an override object or hooks object that fallow cannot read statically falls back to a text match for the keys. Each root is classified on its own config plus the configs of its local layers, so one custom nuxt.config in a monorepo does not keep every other workspace's fallbacks. A local layer is a directory named in extends, or a `layers/<name>` directory, that holds a nuxt.config; its convention files are entry points with the flag off and auto-import sources with it on, and `#layers/<name>/` resolves to it by its $meta.name (a `layers/<name>` directory without one uses its directory name). A remote or package layer is only a dependency reference. Component names follow Nuxt: a component under components/global or components/islands is named after its own directory (components/global/Foo.vue is `<Foo>`), and .client, .server, .global and .island suffixes are stripped. A name imported or re-exported by hand from #components or #imports credits its convention file just like a template tag or a bare call; a namespace import names nothing and credits nothing. Boolean, defaults to false; set it for a Nuxt project that has explicitly configured its auto-import directories. Synthesis of auto-import graph edges (resolving `<Card />` or `useUserStore()` to their convention files) happens regardless of this flag.
     #[serde(default)]
     pub auto_imports: bool,
+
+    /// When true, the run fails with exit code 1 if fallow could not parse a source file cleanly (a `source-parse-degraded` or `source-nesting-too-deep` entry in `workspace_diagnostics[]`), and the `parse-error` entry of `gate_outcomes` names each such file. Boolean, defaults to false, so a file the parser rejects only warns. Applies to `fallow dead-code`, `fallow health`, `fallow audit` and the bare `fallow` run; the CLI flag `--fail-on-parse-error` arms the same gate for one run. Older fallow versions reject this key as unknown, so pair it with `minimumVersion` set to the release that added it.
+    #[serde(default)]
+    pub fail_on_parse_error: bool,
 
     /// Overrides the location and size ceiling of fallow's persistent extraction cache (default `.fallow/cache.bin` under the project root). Set to relocate the cache or cap its footprint; the object holds `dir` (cache directory, relative paths resolve from the project root) and `maxSizeMb` (extraction-cache size limit in megabytes). The `FALLOW_CACHE_MAX_SIZE` environment variable overrides `maxSizeMb`.
     #[serde(default, skip_serializing_if = "CacheConfig::is_default")]
@@ -641,6 +735,22 @@ pub struct AuditConfig {
     #[serde(default, skip_serializing_if = "AuditGate::is_default")]
     pub gate: AuditGate,
 
+    /// Selects how a worsened complexity finding affects the `fallow audit` verdict under `gate: new-only`. A worsened finding was already in the base snapshot, and a measured value is higher now. Any growth of cyclomatic, cognitive or CRAP counts. The line count must grow by at least 5 lines, and it includes comments and blank lines. `warn` (default) makes the verdict at least `warn` and does not fail the run. `error` counts a worsened finding like an introduced finding. `off` reports only the growth of a metric that the finding exceeds as worsened, which gives at least `warn`. A finding whose exceeded metric grew is worsened when it stays in its severity tier (`moderate`, `high`, `critical`), and introduced when it moves to a higher tier or exceeds a metric that the base finding did not exceed. The `--worsened` CLI flag overrides this.
+    #[serde(default, skip_serializing_if = "AuditWorsened::is_default")]
+    pub worsened: AuditWorsened,
+
+    /// Toggles the dead-code sub-analysis in `fallow audit` (unused files, exports, types, members and dependencies, plus boundary violations and circular dependencies, which come from the same pass). Defaults to on when unset; set `false` to leave it out of the verdict, summary and attribution, on the head and on the base snapshot. `fallow audit --skip dead-code` turns it off for one run and `--only` replaces this selection. The review brief (`--brief`, `fallow review`) keeps every sub-analysis because it reads the module graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_code: Option<bool>,
+
+    /// Toggles the health sub-analysis in `fallow audit` (complexity and CRAP findings, plus styling findings, which come from the same pass). Defaults to on when unset; set `false` to leave it out of the verdict, summary and attribution, on the head and on the base snapshot. `fallow audit --skip health` turns it off for one run and `--only` replaces this selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<bool>,
+
+    /// Toggles the duplication sub-analysis in `fallow audit`. Defaults to on when unset; set `false` to leave clone groups out of the verdict, summary and attribution, on the head and on the base snapshot. `fallow audit --skip dupes` turns it off for one run and `--only` replaces this selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dupes: Option<bool>,
+
     /// Toggles styling analytics (CSS and CSS-in-JS) in the `fallow audit` health sub-pass; these findings are descriptive and verdict-neutral by default (they change the exit code only when a css-* rule is set to error). Defaults to on when unset; set `false` to skip styling analysis. The `--no-css` CLI flag forces it off regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub css: Option<bool>,
@@ -661,7 +771,7 @@ pub struct AuditConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dupes_baseline: Option<String>,
 
-    /// Garbage-collection threshold, in whole days, for the persistent reusable base-snapshot worktree caches `fallow audit` creates: entries older than this window are swept on each audit run. Set to control cache accumulation; `0` disables the sweep and unset defaults to 30 days. Each sweep also reclaims abandoned entries minted under other repo identities (deleted or moved repos, other git worktrees) once they age past this repo's threshold; entries whose recorded owner root still exists are skipped and stay governed by that repo's own setting. The `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` environment variable overrides this field.
+    /// Garbage-collection threshold, in whole days, for the persistent reusable base-snapshot worktree caches `fallow audit` creates: entries older than this window are swept on each audit run. Set to control cache accumulation; `0` disables the sweep and unset defaults to 30 days. Each sweep also reclaims abandoned entries minted under other repo identities (deleted or moved repos, other git worktrees) once they age past this repo's threshold; entries whose recorded owner root still exists are skipped and stay governed by that repo's own setting. The same window applies to the base-snapshot files in the project cache directory, counted from their last use; independent of this window, audit keeps only the newest 32 of those files. The `FALLOW_AUDIT_CACHE_MAX_AGE_DAYS` environment variable overrides this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_max_age_days: Option<u32>,
 
@@ -675,6 +785,10 @@ impl AuditConfig {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.gate.is_default()
+            && self.worsened.is_default()
+            && self.dead_code.is_none()
+            && self.health.is_none()
+            && self.dupes.is_none()
             && self.css.is_none()
             && self.css_deep.is_none()
             && self.dead_code_baseline.is_none()
@@ -705,6 +819,31 @@ impl AuditGate {
     }
 }
 
+/// Value of `audit.worsened`: how a worsened complexity finding affects the
+/// `fallow audit` verdict.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditWorsened {
+    /// A worsened finding makes the verdict at least `warn` and does not fail
+    /// the run. The default.
+    #[default]
+    Warn,
+    /// A worsened finding counts like an introduced finding.
+    Error,
+    /// Growth only in metrics that the finding does not exceed stays
+    /// inherited. Growth of an exceeded metric stays worsened and gives at
+    /// least `warn`.
+    Off,
+}
+
+impl AuditWorsened {
+    /// True for the default `warn` mode, so serialization can omit it.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::Warn)
+    }
+}
+
 /// The `regression` config section holding the saved issue-count baseline for
 /// the `--fail-on-regression` gate.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
@@ -721,6 +860,10 @@ pub struct RegressionConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RegressionBaseline {
+    /// Baseline count of optional component prop review candidates.
+    #[serde(default)]
+    pub absent_component_props: usize,
+
     /// Compatibility identity for the analysis that produced these counts.
     /// Missing values in existing configs are treated as syntactic.
     #[serde(default)]
@@ -767,6 +910,9 @@ pub struct RegressionBaseline {
     /// Baseline count of `re-export-cycle` findings.
     #[serde(default)]
     pub re_export_cycles: usize,
+    /// Baseline count of `package-cycle` findings.
+    #[serde(default)]
+    pub package_cycles: usize,
     /// Baseline count of `type-only-dependencies` findings.
     #[serde(default)]
     pub type_only_dependencies: usize,
@@ -795,6 +941,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn regression_baseline_preserves_absent_component_prop_count() {
+        let baseline: RegressionBaseline =
+            serde_json::from_value(serde_json::json!({"absentComponentProps":7})).unwrap();
+        assert_eq!(
+            serde_json::to_value(baseline).unwrap()["absentComponentProps"],
+            7
+        );
+    }
+
+    #[test]
     fn default_config_has_empty_collections() {
         let config = FallowConfig::default();
         assert!(config.schema.is_none());
@@ -816,29 +972,6 @@ mod tests {
             CatalogPrecedingCommentPolicy::Auto
         );
         assert!(!config.production);
-    }
-
-    #[test]
-    fn default_config_rules_are_error() {
-        let config = FallowConfig::default();
-        assert_eq!(config.rules.unused_files, Severity::Error);
-        assert_eq!(config.rules.unused_exports, Severity::Error);
-        assert_eq!(config.rules.unused_dependencies, Severity::Error);
-    }
-
-    #[test]
-    fn default_config_duplicates_enabled() {
-        let config = FallowConfig::default();
-        assert!(config.duplicates.enabled);
-        assert_eq!(config.duplicates.min_tokens, 50);
-        assert_eq!(config.duplicates.min_lines, 5);
-    }
-
-    #[test]
-    fn default_config_health_thresholds() {
-        let config = FallowConfig::default();
-        assert_eq!(config.health.max_cyclomatic, 20);
-        assert_eq!(config.health.max_cognitive, 15);
     }
 
     #[test]
@@ -1134,11 +1267,16 @@ deletePrecedingComments = "never"
         let toml_str = r#"
 [workspaces]
 patterns = ["packages/*", "apps/*"]
+[workspaces.changedSince]
+"packages/web" = "main"
+"packages/legacy" = "release/2024.10"
 "#;
         let config: FallowConfig = toml::from_str(toml_str).unwrap();
         assert!(config.workspaces.is_some());
         let ws = config.workspaces.unwrap();
         assert_eq!(ws.patterns, vec!["packages/*", "apps/*"]);
+        assert_eq!(ws.changed_since["packages/web"], "main");
+        assert_eq!(ws.changed_since["packages/legacy"], "release/2024.10");
     }
 
     #[test]

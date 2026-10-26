@@ -2,20 +2,22 @@
 
 use std::path::{Path, PathBuf};
 
+use fallow_engine::changed_files::ChangedFilesError;
 pub use fallow_output::{
     ContainmentEvent, CrossRepoImpactReport, CrossRepoImpactSchemaVersion, CrossRepoProjectEntry,
-    CrossRepoTotals, EnabledSource, ImpactCounts, ImpactReport, ImpactReportSchemaVersion,
-    ImpactTrendDirection, ResolutionEvent, TrendSummary,
+    CrossRepoTotals, EnabledSource, GateRunCounts, ImpactCounts, ImpactReport,
+    ImpactReportSchemaVersion, ImpactTrendDirection, ResolutionEvent, TrendSummary,
 };
 use fallow_types::results::{ActiveSuppression, AnalysisResults};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditSummary, AuditVerdict};
-use crate::report::ci::fingerprint::fingerprint_hash;
 use crate::report::format_display_path;
 
-const STORE_SCHEMA_VERSION: u32 = 6;
+/// Version 7 replaced the per-record `gate: bool` with `gate_source`; older
+/// stores migrate on read (see [`StoredImpactRecord`]).
+const STORE_SCHEMA_VERSION: u32 = 7;
 
 const MAX_RECORDS: usize = 200;
 
@@ -50,16 +52,85 @@ fn impact_counts_from_summary(summary: &AuditSummary) -> ImpactCounts {
     }
 }
 
+/// Which gate produced a recorded run. The store is local and never leaves the
+/// machine, so this is run provenance ("where do my gate runs come from"), not
+/// an adoption signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateSource {
+    /// The agent gate hook (`--gate-marker agent`).
+    Agent,
+    /// The generated git pre-commit hook (`--gate-marker pre-commit`).
+    PreCommit,
+    /// A CI gate (`--gate-marker ci`).
+    Ci,
+    /// A gate run whose marker this build does not recognise, plus every gate
+    /// run recorded before the store kept its source.
+    Unknown,
+}
+
+impl GateSource {
+    /// Classify the `--gate-marker` string the installers pass. An unrecognised
+    /// marker is still a gate run, recorded as [`GateSource::Unknown`].
+    #[must_use]
+    pub fn from_marker(marker: &str) -> Self {
+        match marker {
+            "agent" => Self::Agent,
+            "pre-commit" => Self::PreCommit,
+            "ci" => Self::Ci,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "StoredImpactRecord")]
 pub struct ImpactRecord {
     pub timestamp: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,
     pub verdict: String,
-    #[serde(default)]
-    pub gate: bool,
+    /// The gate this run came from, `None` for a run no gate produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_source: Option<GateSource>,
     pub counts: ImpactCounts,
+}
+
+/// On-disk shape of [`ImpactRecord`], carrying both the schema 6 `gate: bool`
+/// and the schema 7 `gate_source`. Every read goes through it, so a store an
+/// older fallow wrote keeps its gate runs instead of silently losing them.
+#[derive(Deserialize)]
+struct StoredImpactRecord {
+    timestamp: String,
+    version: String,
+    #[serde(default)]
+    git_sha: Option<String>,
+    verdict: String,
+    #[serde(default)]
+    gate: bool,
+    #[serde(default)]
+    gate_source: Option<GateSource>,
+    counts: ImpactCounts,
+}
+
+impl From<StoredImpactRecord> for ImpactRecord {
+    fn from(stored: StoredImpactRecord) -> Self {
+        // Migration arm, store schema 6 -> 7: a legacy `gate: true` was a gate
+        // run whose source was never stored, so it becomes `Unknown`; `false`
+        // was not a gate run at all, so it becomes `None`.
+        let gate_source = stored
+            .gate_source
+            .or_else(|| stored.gate.then_some(GateSource::Unknown));
+        Self {
+            timestamp: stored.timestamp,
+            version: stored.version,
+            git_sha: stored.git_sha,
+            verdict: stored.verdict,
+            gate_source,
+            counts: stored.counts,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,7 +314,7 @@ fn hash_path_identity(path: &Path) -> String {
     } else {
         raw.into_owned()
     };
-    fingerprint_hash(&[normalized.as_str()])
+    fallow_output::codeclimate_fingerprint_hash(&[normalized.as_str()])
 }
 
 /// Resolve `resolved` to an existing absolute path, falling back to the
@@ -254,6 +325,32 @@ fn resolve_or_root(resolved: Option<PathBuf>, root: &Path) -> PathBuf {
     resolved
         .or_else(|| dunce::canonicalize(root).ok())
         .unwrap_or_else(|| root.to_path_buf())
+}
+
+/// The git common dir and toplevel for `root`, from the result of the combined
+/// probe.
+///
+/// One git call answers both in a work tree. Outside a repository, or without
+/// git, each single probe fails in the same way, so both paths fall back to
+/// the root and no more git processes start. After another git error, for
+/// example in a bare repository, each single probe decides on its own.
+fn identity_paths_from(
+    root: &Path,
+    combined: Result<(PathBuf, PathBuf), ChangedFilesError>,
+    common_dir: impl FnOnce() -> Option<PathBuf>,
+    toplevel: impl FnOnce() -> Option<PathBuf>,
+) -> (PathBuf, PathBuf) {
+    match combined {
+        Ok(paths) => paths,
+        Err(ChangedFilesError::NotARepository | ChangedFilesError::GitMissing(_)) => {
+            let fallback = resolve_or_root(None, root);
+            (fallback.clone(), fallback)
+        }
+        Err(_) => (
+            resolve_or_root(common_dir(), root),
+            resolve_or_root(toplevel(), root),
+        ),
+    }
 }
 
 /// The repo's display name for cross-repo rows: the folder that owns the shared
@@ -284,13 +381,11 @@ fn project_identity(root: &Path) -> ProjectIdentity {
     {
         return found.clone();
     }
-    let common = resolve_or_root(
-        fallow_engine::changed_files::resolve_git_common_dir(root).ok(),
+    let (common, toplevel) = identity_paths_from(
         root,
-    );
-    let toplevel = resolve_or_root(
-        fallow_engine::changed_files::resolve_git_toplevel(root).ok(),
-        root,
+        fallow_engine::changed_files::resolve_git_common_dir_and_toplevel(root),
+        || fallow_engine::changed_files::resolve_git_common_dir(root).ok(),
+        || fallow_engine::changed_files::resolve_git_toplevel(root).ok(),
     );
     let identity = (
         hash_path_identity(&common),
@@ -313,7 +408,7 @@ thread_local! {
 
     /// Per-test CI signal for the record gate. Defaults to `false` so the unit
     /// tests record into their isolated store EVEN when the suite itself runs on
-    /// CI (GitHub Actions sets `CI` / `GITHUB_ACTIONS`, which `telemetry::is_ci`
+    /// CI (GitHub Actions sets `CI` / `GITHUB_ACTIONS`, which `ci_env::is_ci`
     /// reads); without this, every record-dependent test fails on CI because the
     /// real `is_ci()` short-circuits `record_*` before any store write. A test
     /// can flip it true to exercise the CI no-op gate. Thread-local, so it is
@@ -336,7 +431,7 @@ fn impact_config_dir() -> Option<PathBuf> {
 }
 
 /// Whether this run should be treated as CI for the Impact record gate. In
-/// production it is `telemetry::is_ci()`; under test it reads the per-test
+/// production it is `fallow_engine::ci_env::is_ci()`; under test it reads the per-test
 /// `TEST_FORCE_CI` override (default `false`) so the suite records into its
 /// isolated store regardless of the ambient CI env. The store path is ALWAYS
 /// the per-test temp dir under `#[cfg(test)]` (see [`impact_config_dir`]), so
@@ -348,7 +443,7 @@ fn record_gate_is_ci() -> bool {
     }
     #[cfg(not(test))]
     {
-        crate::telemetry::is_ci()
+        fallow_engine::ci_env::is_ci()
     }
 }
 
@@ -443,7 +538,7 @@ fn parse_store(content: &str, path: &Path) -> ImpactStore {
         Ok(store) => {
             if store.schema_version > STORE_SCHEMA_VERSION {
                 tracing::warn!(
-                    "fallow impact: store at {} has schema_version {} but this build understands up to {}; reading it as best-effort, fields this build does not know are dropped on the next write. Upgrade fallow to read it fully.",
+                    "fallow impact: store at {} has schema_version {} but this build understands up to {}; reading it as best-effort. This build does not write to it, so the store stays unchanged. Upgrade fallow to read it fully.",
                     path.display(),
                     store.schema_version,
                     STORE_SCHEMA_VERSION,
@@ -452,13 +547,92 @@ fn parse_store(content: &str, path: &Path) -> ImpactStore {
             store
         }
         Err(err) => {
-            tracing::warn!(
-                "fallow impact: ignoring unreadable store at {} ({err}); run `fallow impact enable` to reset it",
-                path.display()
-            );
+            if let Some(newer) = newer_schema_in(content, path) {
+                tracing::warn!("{}", newer.message());
+            } else {
+                tracing::warn!(
+                    "fallow impact: ignoring unreadable store at {} ({err}); run `fallow impact enable` to reset it",
+                    path.display()
+                );
+            }
             ImpactStore::default()
         }
     }
+}
+
+/// An Impact store written by a newer Fallow. This build refuses to write it,
+/// because a typed round trip through the older [`ImpactStore`] drops every
+/// field and every record shape that this build does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerStoreSchema {
+    path: PathBuf,
+    schema_version: u32,
+    writer_version: Option<String>,
+}
+
+impl NewerStoreSchema {
+    /// The user-facing explanation, with the next step.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let writer = self
+            .writer_version
+            .as_deref()
+            .map_or_else(String::new, |version| {
+                format!(" (newest record by fallow {version})")
+            });
+        format!(
+            "fallow impact: the store at {} has schema_version {}{writer}, but this build supports up to schema_version {}. The store is unchanged. Upgrade fallow, or use the newer fallow binary, to change or record Impact data for this project.",
+            self.path.display(),
+            self.schema_version,
+            STORE_SCHEMA_VERSION,
+        )
+    }
+}
+
+/// Read only the schema marker and the newest writer version of a raw store.
+/// This works when the typed parse fails, because a newer schema can change
+/// the shape of a known field. Returns `None` for a supported or corrupt store.
+fn newer_schema_in(content: &str, path: &Path) -> Option<NewerStoreSchema> {
+    let raw: serde_json::Value = serde_json::from_str(content).ok()?;
+    let schema_version = raw.get("schema_version")?.as_u64()?;
+    if schema_version <= u64::from(STORE_SCHEMA_VERSION) {
+        return None;
+    }
+    Some(NewerStoreSchema {
+        path: path.to_path_buf(),
+        schema_version: u32::try_from(schema_version).unwrap_or(u32::MAX),
+        writer_version: newest_writer_version(&raw),
+    })
+}
+
+/// The fallow version on the newest record of either track, when present.
+fn newest_writer_version(raw: &serde_json::Value) -> Option<String> {
+    ["records", "project_records"]
+        .iter()
+        .filter_map(|track| raw.get(*track)?.as_array()?.last())
+        .filter_map(|record| {
+            let timestamp = record.get("timestamp")?.as_str()?;
+            let version = record.get("version")?.as_str()?;
+            Some((timestamp, version))
+        })
+        .max_by(|a, b| a.0.cmp(b.0))
+        .map(|(_, version)| version.to_owned())
+}
+
+/// Load the store for a load, mutate, and save cycle. Refuses a store that a
+/// newer Fallow wrote, so the caller leaves the file unchanged. Every write
+/// path must use this instead of [`load`].
+fn load_for_write(root: &Path) -> Result<ImpactStore, NewerStoreSchema> {
+    let Some(path) = store_path(root) else {
+        return Ok(ImpactStore::default());
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(migrate_legacy_store(root));
+    };
+    if let Some(newer) = newer_schema_in(&content, &path) {
+        return Err(newer);
+    }
+    Ok(parse_store(&content, &path))
 }
 
 /// Persist the store best-effort using atomic replace. No-op when no config dir
@@ -615,8 +789,13 @@ fn migrate_legacy_store(root: &Path) -> ImpactStore {
 /// Enable Impact tracking for THIS project (an explicit per-repo decision that
 /// overrides the user-global default). Writes nothing into the repo: the store
 /// lives in the user config dir.
-pub fn enable(root: &Path) -> bool {
-    let mut store = load(root);
+///
+/// # Errors
+///
+/// Returns [`NewerStoreSchema`] and leaves the store unchanged when a newer
+/// Fallow wrote it.
+pub fn enable(root: &Path) -> Result<bool, NewerStoreSchema> {
+    let mut store = load_for_write(root)?;
     let was_enabled = store.enabled;
     store.enabled = true;
     store.explicit_decision = true;
@@ -624,15 +803,20 @@ pub fn enable(root: &Path) -> bool {
         store.schema_version = STORE_SCHEMA_VERSION;
     }
     save(&store, root);
-    !was_enabled
+    Ok(!was_enabled)
 }
 
 /// Disable Impact tracking. Retains existing history. Returns whether it was
 /// newly disabled (false if already off). Also records the explicit decision,
 /// so declining the impact opt-in on a never-enabled project (`impact
 /// disable`) persists "asked and said no" for the agent skill.
-pub fn disable(root: &Path) -> bool {
-    let mut store = load(root);
+///
+/// # Errors
+///
+/// Returns [`NewerStoreSchema`] and leaves the store unchanged when a newer
+/// Fallow wrote it. This keeps the retained-history promise for that store.
+pub fn disable(root: &Path) -> Result<bool, NewerStoreSchema> {
+    let mut store = load_for_write(root)?;
     let was_enabled = store.enabled;
     store.enabled = false;
     store.explicit_decision = true;
@@ -640,7 +824,7 @@ pub fn disable(root: &Path) -> bool {
         store.schema_version = STORE_SCHEMA_VERSION;
     }
     save(&store, root);
-    was_enabled
+    Ok(was_enabled)
 }
 
 /// A due periodic value digest: the headline counters for "what has fallow
@@ -662,7 +846,7 @@ const DIGEST_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 /// happened). Best-effort like the rest of the store: a clean run that drops
 /// the emitted step simply defers the digest to the next interval.
 pub fn take_due_digest(root: &Path) -> Option<ImpactDigest> {
-    let mut store = load(root);
+    let mut store = load_for_write(root).ok()?;
     if !resolve_enabled(&store).0 {
         return None;
     }
@@ -689,15 +873,20 @@ pub fn take_due_digest(root: &Path) -> Option<ImpactDigest> {
 
 /// Persist that the local user declined the agent onboarding prompt. Writes
 /// only to the user store; nothing is written into the repo.
-pub fn decline_onboarding(root: &Path) -> bool {
-    let mut store = load(root);
+///
+/// # Errors
+///
+/// Returns [`NewerStoreSchema`] and leaves the store unchanged when a newer
+/// Fallow wrote it.
+pub fn decline_onboarding(root: &Path) -> Result<bool, NewerStoreSchema> {
+    let mut store = load_for_write(root)?;
     let was_declined = store.onboarding_declined;
     store.onboarding_declined = true;
     if store.schema_version == 0 {
         store.schema_version = STORE_SCHEMA_VERSION;
     }
     save(&store, root);
-    !was_declined
+    Ok(!was_declined)
 }
 
 /// The user-global Impact default, stored at `<config-dir>/fallow/impact.json`
@@ -805,7 +994,7 @@ pub fn reset_all() -> bool {
 /// Record an audit run into the rolling store.
 pub struct AuditRunRecord<'a> {
     pub verdict: AuditVerdict,
-    pub gate: bool,
+    pub gate_source: Option<GateSource>,
     pub git_sha: Option<&'a str>,
     pub version: &'a str,
     pub timestamp: &'a str,
@@ -820,7 +1009,7 @@ pub fn record_audit_run(
 ) -> Result<(), String> {
     let AuditRunRecord {
         verdict,
-        gate,
+        gate_source,
         git_sha,
         version,
         timestamp,
@@ -837,7 +1026,11 @@ pub fn record_audit_run(
     // Serialise the load -> mutate -> save window so two worktrees of the same
     // repo (same store key) cannot lost-update each other's record.
     let _lock = ImpactStoreLock::acquire(root);
-    let mut store = load(root);
+    let mut store = load_for_write(root).map_err(|newer| {
+        let message = newer.message();
+        tracing::warn!("{message}");
+        message
+    })?;
     if !resolve_enabled(&store).0 {
         return Ok(());
     }
@@ -855,14 +1048,21 @@ pub fn record_audit_run(
         store.first_recorded = Some((*timestamp).to_owned());
     }
 
-    apply_containment(&mut store, *verdict, *gate, *git_sha, timestamp, &counts);
+    apply_containment(
+        &mut store,
+        *verdict,
+        gate_source.is_some(),
+        *git_sha,
+        timestamp,
+        &counts,
+    );
 
     store.records.push(ImpactRecord {
         timestamp: (*timestamp).to_owned(),
         version: (*version).to_owned(),
         git_sha: git_sha.map(ToOwned::to_owned),
         verdict: verdict_str.to_owned(),
-        gate: *gate,
+        gate_source: *gate_source,
         counts,
     });
     compact(&mut store);
@@ -897,7 +1097,11 @@ pub fn record_combined_run(
         return Ok(());
     }
     let _lock = ImpactStoreLock::acquire(root);
-    let mut store = load(root);
+    let mut store = load_for_write(root).map_err(|newer| {
+        let message = newer.message();
+        tracing::warn!("{message}");
+        message
+    })?;
     if !resolve_enabled(&store).0 {
         return Ok(());
     }
@@ -920,7 +1124,7 @@ pub fn record_combined_run(
         version: version.to_owned(),
         git_sha: git_sha.map(ToOwned::to_owned),
         verdict: verdict_str.to_owned(),
-        gate: false,
+        gate_source: None,
         counts,
     });
     if store.project_records.len() > MAX_RECORDS {
@@ -1029,7 +1233,7 @@ pub struct AttributionInput<'a> {
 }
 
 fn finding_id(kind: &str, rel_path: &str, symbol: Option<&str>) -> String {
-    fingerprint_hash(&[kind, rel_path, symbol.unwrap_or("")])
+    fallow_output::codeclimate_fingerprint_hash(&[kind, rel_path, symbol.unwrap_or("")])
 }
 
 fn covered_by(present: &FxHashSet<String>, kind: &str) -> bool {
@@ -1506,6 +1710,13 @@ fn collect_file_and_export_findings(
             )),
         );
     }
+    for f in &results.deprecated_exports_in_use {
+        push(
+            &f.export.path,
+            "deprecated-export-in-use",
+            Some(f.export.export_name.clone()),
+        );
+    }
 }
 
 /// Push unused enum/class/store member and unprovided-inject findings.
@@ -1562,6 +1773,16 @@ fn collect_component_findings(
             &f.component.path,
             "unrendered-component",
             Some(f.component.component_name.clone()),
+        );
+    }
+    for finding in &results.absent_component_props {
+        push(
+            &finding.prop.path,
+            "absent-component-prop",
+            Some(format!(
+                "{}.{}",
+                finding.prop.component_name, finding.prop.prop_name
+            )),
         );
     }
     for f in &results.unused_component_props {
@@ -1775,13 +1996,28 @@ fn trend_for(records: &[ImpactRecord]) -> Option<TrendSummary> {
     let previous = &records[records.len() - 2];
     let current_total = current.counts.total_issues;
     let previous_total = previous.counts.total_issues;
-    let total_delta = current_total as i64 - previous_total as i64;
+    let total_delta = crate::count_delta::signed_delta(current_total, previous_total);
     Some(TrendSummary {
         direction: direction_for(total_delta),
         total_delta,
         previous_total,
         current_total,
     })
+}
+
+/// Tally recorded gate runs by source. `None` when the store holds no gate run
+/// at all, so the report field stays absent on the unchanged path.
+fn gate_run_counts(records: &[ImpactRecord]) -> Option<GateRunCounts> {
+    let mut counts = GateRunCounts::default();
+    for source in records.iter().filter_map(|record| record.gate_source) {
+        match source {
+            GateSource::Agent => counts.agent += 1,
+            GateSource::PreCommit => counts.pre_commit += 1,
+            GateSource::Ci => counts.ci += 1,
+            GateSource::Unknown => counts.unknown += 1,
+        }
+    }
+    (!counts.is_empty()).then_some(counts)
 }
 
 pub fn build_report(store: &ImpactStore) -> ImpactReport {
@@ -1827,6 +2063,7 @@ pub fn build_report(store: &ImpactStore) -> ImpactReport {
         trend,
         project_surfacing,
         project_trend,
+        gate_runs: gate_run_counts(&store.records),
         containment_count: store.containment.len(),
         recent_containment,
         resolved_total: store.resolved_total,
@@ -2230,6 +2467,21 @@ fn render_human_resolved_section(out: &mut String, report: &ImpactReport) {
     }
 }
 
+/// Join the non-zero gate sources into one `agent 12, pre-commit 3` phrase.
+fn gate_run_summary(counts: &GateRunCounts) -> String {
+    [
+        ("agent", counts.agent),
+        ("pre-commit", counts.pre_commit),
+        ("ci", counts.ci),
+        ("unknown", counts.unknown),
+    ]
+    .into_iter()
+    .filter(|(_, runs)| *runs > 0)
+    .map(|(label, runs)| format!("{label} {runs}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// Render the trailing provenance/footer lines of the human report.
 #[expect(
     clippy::format_push_string,
@@ -2254,6 +2506,12 @@ fn render_human_footer(out: &mut String, report: &ImpactReport) {
             "Tracking since {since}. Local-only; never uploaded.\n",
         ));
     }
+    if let Some(gate_runs) = &report.gate_runs {
+        out.push_str(&format!(
+            "Where your gate runs come from: {}. Local provenance, not adoption.\n",
+            gate_run_summary(gate_runs),
+        ));
+    }
     out.push_str(
         "Resolution tracking is a local-developer signal: it accrues on your\n\
          machine across runs, not in CI (fallow never records there).\n",
@@ -2272,7 +2530,6 @@ pub fn render_json_with_style(
 ) -> String {
     let value = fallow_output::serialize_impact_json_output(
         report.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .unwrap_or_else(|_| serde_json::json!({"error":"failed to serialize impact report"}));
@@ -2419,7 +2676,6 @@ pub fn render_cross_repo_json_with_style(
 ) -> String {
     let value = fallow_output::serialize_cross_repo_impact_json_output(
         report.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .unwrap_or_else(
@@ -2722,6 +2978,9 @@ mod tests {
         AuditSummary {
             dead_code_issues: dead,
             dead_code_has_errors: dead > 0,
+            dead_code_skipped: false,
+            complexity_skipped: false,
+            duplication_skipped: false,
             complexity_findings: complexity,
             max_cyclomatic: None,
             duplication_clone_groups: dupes,
@@ -2747,7 +3006,7 @@ mod tests {
             summary,
             &AuditRunRecord {
                 verdict,
-                gate,
+                gate_source: gate.then_some(GateSource::Unknown),
                 git_sha,
                 version,
                 timestamp,
@@ -2809,7 +3068,7 @@ mod tests {
             &summary(0, 0, 0),
             &AuditRunRecord {
                 verdict: AuditVerdict::Pass,
-                gate: true,
+                gate_source: Some(GateSource::Unknown),
                 git_sha: Some("sha"),
                 version: "2.0.0",
                 timestamp: ts,
@@ -2845,7 +3104,7 @@ mod tests {
         assert!(!load(root).explicit_decision, "fresh store: never asked");
 
         // Declining on a never-enabled project is an explicit decision too.
-        disable(root);
+        disable(root).unwrap();
         let store = load(root);
         assert!(!store.enabled);
         assert!(store.explicit_decision);
@@ -2859,7 +3118,7 @@ mod tests {
 
         // Disabled, or enabled with zero value: never due.
         assert!(take_due_digest(root).is_none());
-        enable(root);
+        enable(root).unwrap();
         assert!(take_due_digest(root).is_none(), "zero counters never nag");
 
         let mut store = load(root);
@@ -2892,8 +3151,8 @@ mod tests {
         let (_config, dir) = test_env();
         let root = dir.path();
 
-        assert!(decline_onboarding(root));
-        assert!(!decline_onboarding(root));
+        assert!(decline_onboarding(root).unwrap());
+        assert!(!decline_onboarding(root).unwrap());
 
         let store = load(root);
         assert!(store.onboarding_declined);
@@ -2908,8 +3167,8 @@ mod tests {
     fn enable_then_record_accrues_history() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        assert!(enable(root));
-        assert!(!enable(root)); // second enable is a no-op-ish (already on)
+        assert!(enable(root).unwrap());
+        assert!(!enable(root).unwrap()); // second enable is a no-op-ish (already on)
         record_v1(
             root,
             &summary(2, 1, 0),
@@ -2937,7 +3196,7 @@ mod tests {
         // record on every CI run.
         let (_config, dir) = test_env();
         let root = dir.path();
-        assert!(enable(root));
+        assert!(enable(root).unwrap());
         TEST_FORCE_CI.with(|c| c.set(true));
         record_v1(
             root,
@@ -2957,7 +3216,7 @@ mod tests {
     fn enable_writes_nothing_into_the_repo() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         // The user-store relocation means enable never touches the repo: no
         // .gitignore mutation and no in-repo .fallow/ dir.
         assert!(
@@ -2986,7 +3245,7 @@ mod tests {
             version: "2.0.0".into(),
             git_sha: None,
             verdict: "warn".into(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts {
                 total_issues: 5,
                 dead_code: 5,
@@ -3146,7 +3405,7 @@ mod tests {
                 version: "2.0.0".into(),
                 git_sha: None,
                 verdict: "warn".into(),
-                gate: false,
+                gate_source: None,
                 counts: ImpactCounts {
                     total_issues: total,
                     dead_code: total,
@@ -3165,7 +3424,7 @@ mod tests {
     fn containment_blocked_then_cleared_records_one_event() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         record_v1(
             root,
             &summary(2, 0, 0),
@@ -3199,7 +3458,7 @@ mod tests {
     fn non_gate_run_never_creates_containment() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         record_v1(
             root,
             &summary(2, 0, 0),
@@ -3245,7 +3504,7 @@ mod tests {
                 version: "2.0.0".into(),
                 git_sha: None,
                 verdict: "pass".into(),
-                gate: false,
+                gate_source: None,
                 counts: ImpactCounts::default(),
             });
         }
@@ -3274,7 +3533,7 @@ mod tests {
             version: "2.0.0".into(),
             git_sha: None,
             verdict: "pass".into(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::default(),
         });
         assert_eq!(
@@ -3302,7 +3561,7 @@ mod tests {
             version: "2.0.0".into(),
             git_sha: None,
             verdict: "pass".into(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::default(),
         });
         let report = build_report(&store);
@@ -3335,11 +3594,121 @@ mod tests {
         );
     }
 
+    /// A store written by a newer Fallow, with a field and a record shape that
+    /// this build does not know.
+    fn future_store_json() -> String {
+        format!(
+            r#"{{"schema_version":{},"enabled":true,"explicit_decision":false,"records":[{{"timestamp":"2026-10-01T00:00:00Z","version":"99.1.0","verdict":"pass","counts":{{"total_issues":0,"dead_code":0,"complexity":0,"duplication":0}},"future_record_field":1}}],"project_records":[{{"timestamp":"2026-09-01T00:00:00Z","version":"99.0.0","verdict":"pass","counts":{{"total_issues":0,"dead_code":0,"complexity":0,"duplication":0}}}}],"containment":[],"future_field":{{"sentinel":"preserve"}}}}"#,
+            STORE_SCHEMA_VERSION + 1
+        )
+    }
+
+    fn raw_store(root: &Path) -> String {
+        std::fs::read_to_string(store_path(root).expect("test config dir set")).unwrap()
+    }
+
+    #[test]
+    fn future_schema_store_survives_every_write_path_unchanged() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        let future = future_store_json();
+        seed_store_raw(root, future.as_bytes());
+
+        assert!(disable(root).is_err(), "disable must refuse a newer store");
+        assert!(enable(root).is_err(), "enable must refuse a newer store");
+        assert!(decline_onboarding(root).is_err());
+        assert!(take_due_digest(root).is_none());
+        let audit = record_audit_run(
+            root,
+            &summary(1, 0, 0),
+            &AuditRunRecord {
+                verdict: AuditVerdict::Fail,
+                gate_source: Some(GateSource::Unknown),
+                git_sha: Some("abc1234"),
+                version: "2.0.0",
+                timestamp: "2026-10-02T00:00:00Z",
+                attribution: None,
+                analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity::default(),
+            },
+        );
+        assert!(
+            audit.is_err(),
+            "an audit record must not rewrite a newer store"
+        );
+        let combined = record_combined_run(
+            root,
+            ImpactCounts::default(),
+            Some("abc1234"),
+            "2.0.0",
+            "2026-10-02T00:00:00Z",
+            None,
+            &fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        assert!(
+            combined.is_err(),
+            "a combined record must not rewrite a newer store"
+        );
+
+        let after = raw_store(root);
+        assert_eq!(
+            after, future,
+            "a newer store must stay byte-for-byte unchanged"
+        );
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["future_field"]["sentinel"], "preserve");
+        assert_eq!(value["records"][0]["future_record_field"], 1);
+        assert!(load(root).enabled, "reads stay best-effort");
+    }
+
+    #[test]
+    fn newer_store_refusal_names_schema_and_newest_writer_version() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        seed_store_raw(root, future_store_json().as_bytes());
+
+        let message = disable(root).unwrap_err().message();
+        assert!(
+            message.contains(&format!("schema_version {}", STORE_SCHEMA_VERSION + 1)),
+            "{message}"
+        );
+        assert!(
+            message.contains("fallow 99.1.0"),
+            "newest record wins: {message}"
+        );
+        assert!(message.contains("The store is unchanged"), "{message}");
+    }
+
+    #[test]
+    fn future_schema_store_with_unknown_shape_is_not_reset() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        // A newer schema may change the type of a known field. The typed
+        // parse then fails, but the store must not be reset to defaults.
+        let future = format!(
+            r#"{{"schema_version":{},"enabled":"per-worktree","records":{{"v2":[]}}}}"#,
+            STORE_SCHEMA_VERSION + 1
+        );
+        seed_store_raw(root, future.as_bytes());
+
+        assert!(enable(root).is_err());
+        assert!(disable(root).is_err());
+        assert_eq!(raw_store(root), future);
+    }
+
+    #[test]
+    fn corrupt_supported_store_is_still_reset_by_enable() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        seed_store_raw(root, b"{not json");
+        assert!(enable(root).unwrap());
+        assert!(load(root).enabled);
+    }
+
     #[test]
     fn removed_finding_is_credited_as_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3368,7 +3737,7 @@ mod tests {
     fn suppressed_finding_is_not_a_win() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3398,7 +3767,7 @@ mod tests {
     fn fix_and_suppress_same_kind_credits_zero_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3428,7 +3797,7 @@ mod tests {
     fn within_file_move_is_not_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3455,7 +3824,7 @@ mod tests {
     fn cross_file_move_in_same_run_is_not_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         run(
@@ -3485,7 +3854,7 @@ mod tests {
     fn cross_run_move_uncredits_the_prior_resolution() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         run(
@@ -3525,7 +3894,7 @@ mod tests {
     fn resolved_complexity_finding_and_suppressed_complexity() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3557,7 +3926,7 @@ mod tests {
     fn resolved_duplication_clone_group() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         let clone = CloneInput {
@@ -3575,7 +3944,7 @@ mod tests {
     fn blanket_suppression_covers_any_kind() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3596,6 +3965,112 @@ mod tests {
         let store = load(root);
         assert_eq!(store.resolved_total, 0);
         assert_eq!(store.suppressed_total, 1);
+    }
+
+    // ----- gate source: recorded provenance and the schema 6 migration -----
+
+    /// Record one gate run with an explicit marker, no attribution.
+    fn record_gate(root: &Path, marker: Option<&str>, timestamp: &str) {
+        record_audit_run(
+            root,
+            &summary(0, 0, 0),
+            &AuditRunRecord {
+                verdict: AuditVerdict::Pass,
+                gate_source: marker.map(GateSource::from_marker),
+                git_sha: None,
+                version: "3.0.0",
+                timestamp,
+                attribution: None,
+                analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity::default(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gate_marker_is_recorded_and_counted_per_source() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        enable(root).unwrap();
+
+        record_gate(root, Some("agent"), "t0");
+        record_gate(root, Some("agent"), "t1");
+        record_gate(root, Some("pre-commit"), "t2");
+        record_gate(root, Some("ci"), "t3");
+        record_gate(root, Some("nightly-robot"), "t4");
+        record_gate(root, None, "t5");
+
+        let counts = build_report(&load(root))
+            .gate_runs
+            .expect("gate runs must be reported once a gate recorded a run");
+        assert_eq!(counts.agent, 2);
+        assert_eq!(counts.pre_commit, 1);
+        assert_eq!(counts.ci, 1);
+        assert_eq!(
+            counts.unknown, 1,
+            "an unrecognised marker is still a gate run"
+        );
+    }
+
+    #[test]
+    fn report_omits_gate_runs_when_no_gate_recorded() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        enable(root).unwrap();
+        record_gate(root, None, "t0");
+
+        let report = build_report(&load(root));
+        assert!(
+            report.gate_runs.is_none(),
+            "a store without gate runs must keep the field off the wire"
+        );
+        let json = render_json(&report);
+        assert!(
+            !json.contains("gate_runs"),
+            "gate_runs must be absent on the unchanged path: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_gate_bool_migrates_to_unknown_source() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        let counts = r#"{"total_issues":0,"dead_code":0,"complexity":0,"duplication":0}"#;
+        let v6 = format!(
+            r#"{{"schema_version":6,"enabled":true,"first_recorded":"t0","records":[
+                {{"timestamp":"t0","version":"3.0.0","verdict":"pass","gate":true,"counts":{counts}}},
+                {{"timestamp":"t1","version":"3.0.0","verdict":"pass","gate":false,"counts":{counts}}}
+            ],"containment":[]}}"#
+        );
+        seed_store_raw(root, v6.as_bytes());
+
+        let store = load(root);
+        assert_eq!(store.records[0].gate_source, Some(GateSource::Unknown));
+        assert_eq!(
+            store.records[1].gate_source, None,
+            "a legacy non-gate run must not become a gate run"
+        );
+
+        let counts = build_report(&store)
+            .gate_runs
+            .expect("a legacy gate run must survive the migration");
+        assert_eq!(counts.unknown, 1);
+        assert_eq!(counts.agent + counts.pre_commit + counts.ci, 0);
+    }
+
+    #[test]
+    fn human_report_names_where_gate_runs_come_from() {
+        let (_config, dir) = test_env();
+        let root = dir.path();
+        enable(root).unwrap();
+        record_gate(root, Some("agent"), "t0");
+        record_gate(root, Some("pre-commit"), "t1");
+
+        let human = render_human(&build_report(&load(root)));
+        assert!(
+            human.contains("Where your gate runs come from: agent 1, pre-commit 1."),
+            "human report must name the gate sources: {human}"
+        );
     }
 
     #[test]
@@ -3646,7 +4121,7 @@ mod tests {
     fn frontier_prunes_deleted_files() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         run(
             root,
@@ -3672,7 +4147,7 @@ mod tests {
                 version: "2.0.0".into(),
                 git_sha: None,
                 verdict: "warn".into(),
-                gate: false,
+                gate_source: None,
                 counts: ImpactCounts::default(),
             }],
             ..Default::default()
@@ -3698,6 +4173,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -3767,7 +4243,7 @@ mod tests {
     fn whole_project_run_does_not_double_credit_after_audit() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         run(
@@ -3796,7 +4272,7 @@ mod tests {
     fn whole_project_run_credits_suppressed_not_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let util = touch(root, "src/util.ts");
         run(
             root,
@@ -3824,7 +4300,7 @@ mod tests {
     fn clone_reshape_three_to_two_not_credited_as_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         let c = touch(root, "src/c.ts");
@@ -3865,8 +4341,8 @@ mod tests {
 
     fn rtrend(prev: usize, cur: usize) -> TrendSummary {
         TrendSummary {
-            direction: direction_for(cur as i64 - prev as i64),
-            total_delta: cur as i64 - prev as i64,
+            direction: direction_for(crate::count_delta::signed_delta(cur, prev)),
+            total_delta: crate::count_delta::signed_delta(cur, prev),
             previous_total: prev,
             current_total: cur,
         }
@@ -3898,6 +4374,7 @@ mod tests {
             trend,
             project_surfacing,
             project_trend,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -4117,7 +4594,7 @@ mod tests {
     fn reset_removes_only_this_project() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         record_v1(
             root,
             &summary(1, 0, 0),
@@ -4138,7 +4615,7 @@ mod tests {
         let (_config, dir) = test_env();
         let root = dir.path();
         set_global_default(true);
-        enable(root);
+        enable(root).unwrap();
         assert!(load(root).enabled);
         assert!(reset_all());
         // The global default toggle survives a data wipe.
@@ -4184,7 +4661,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(latest_issues, 0, 0),
         });
         for _ in 0..contained {
@@ -4341,7 +4818,7 @@ mod tests {
     fn record_audit_run_captures_basename_label() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         record_v1(
             root,
             &summary(1, 0, 0),
@@ -4372,7 +4849,7 @@ mod tests {
     fn store_lock_acquire_drop_then_record_roundtrips() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         // Acquiring + dropping the lock around a record must not deadlock and
         // the record must persist.
         {
@@ -4524,7 +5001,7 @@ mod tests {
                 version: "2.0.0".into(),
                 git_sha: None,
                 verdict: "warn".into(),
-                gate: false,
+                gate_source: None,
                 counts: ImpactCounts {
                     total_issues: total,
                     dead_code: total,
@@ -4553,7 +5030,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::default(),
         });
         store.project_records.push(ImpactRecord {
@@ -4561,7 +5038,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::default(),
         });
         assert_eq!(
@@ -4578,7 +5055,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "pass".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::default(),
         });
         assert_eq!(
@@ -4599,7 +5076,7 @@ mod tests {
     fn containment_events_are_bounded_at_max_containment() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         // Directly pre-fill the store with MAX_CONTAINMENT events.
         let mut store = load(root);
         for i in 0..MAX_CONTAINMENT {
@@ -4651,8 +5128,8 @@ mod tests {
     fn disable_from_enabled_state_sets_schema_version() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
-        let was_newly_disabled = disable(root);
+        enable(root).unwrap();
+        let was_newly_disabled = disable(root).unwrap();
         assert!(
             was_newly_disabled,
             "disable returns true when previously enabled"
@@ -4663,7 +5140,7 @@ mod tests {
         assert_eq!(store.schema_version, STORE_SCHEMA_VERSION);
 
         // A second disable is a no-op (already off).
-        let again = disable(root);
+        let again = disable(root).unwrap();
         assert!(!again, "disable returns false when already off");
     }
 
@@ -4674,7 +5151,7 @@ mod tests {
     fn record_combined_run_is_noop_in_ci() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         TEST_FORCE_CI.with(|c| c.set(true));
         record_combined_run(
             root,
@@ -4720,7 +5197,7 @@ mod tests {
     fn record_combined_run_rejects_incompatible_analysis_history() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         record_combined_run(
             root,
             ImpactCounts::from_combined(1, 0, 0),
@@ -4760,7 +5237,7 @@ mod tests {
     fn record_combined_run_project_records_bounded_at_max() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         // Pre-fill to MAX_RECORDS.
         let mut store = load(root);
         for i in 0..MAX_RECORDS {
@@ -4769,7 +5246,7 @@ mod tests {
                 version: "2.0.0".to_owned(),
                 git_sha: None,
                 verdict: "warn".to_owned(),
-                gate: false,
+                gate_source: None,
                 counts: ImpactCounts::default(),
             });
         }
@@ -4805,7 +5282,7 @@ mod tests {
     fn suppressed_clone_disappearance_credits_suppressed_not_resolved() {
         let (_config, dir) = test_env();
         let root = dir.path();
-        enable(root);
+        enable(root).unwrap();
         let a = touch(root, "src/a.ts");
         let b = touch(root, "src/b.ts");
         let clone = CloneInput {
@@ -4868,7 +5345,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(5, 0, 0),
         });
         // Add a project_records entry so project_surfacing is non-None.
@@ -4877,7 +5354,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(20, 0, 0),
         });
 
@@ -4892,7 +5369,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(2, 0, 0),
         });
         s2.project_records.push(ImpactRecord {
@@ -4900,7 +5377,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(30, 0, 0),
         });
 
@@ -5025,7 +5502,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(42, 0, 0),
         });
         seed_store("proj", &s);
@@ -5053,6 +5530,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 1,
@@ -5093,6 +5571,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5129,6 +5608,7 @@ mod tests {
             }),
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5165,6 +5645,7 @@ mod tests {
                 previous_total: 10,
                 current_total: 10,
             }),
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5199,6 +5680,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5229,6 +5711,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 4,
@@ -5267,6 +5750,7 @@ mod tests {
             trend: None,
             project_surfacing: Some(ImpactCounts::from_combined(3, 2, 1)),
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5298,7 +5782,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(99, 0, 0),
         });
         seed_store("proj", &s);
@@ -5453,7 +5937,7 @@ mod tests {
             version: "2.0.0".to_owned(),
             git_sha: None,
             verdict: "warn".to_owned(),
-            gate: false,
+            gate_source: None,
             counts: ImpactCounts::from_combined(1, 0, 0),
         });
         seed_store("abcdefghijklmnop", &s);
@@ -5485,6 +5969,7 @@ mod tests {
             }),
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5511,6 +5996,7 @@ mod tests {
             trend: None,
             project_surfacing: None,
             project_trend: None,
+            gate_runs: None,
             containment_count: 0,
             recent_containment: vec![],
             resolved_total: 0,
@@ -5603,5 +6089,50 @@ mod tests {
             md.contains("skipped") && md.contains("unreadable store"),
             "must report corrupt stores: {md}"
         );
+    }
+
+    /// Outside a repository, and without git, each single probe fails in the
+    /// same way as the combined probe. The identity then uses the root and
+    /// starts no more git processes.
+    #[test]
+    fn identity_paths_skip_the_single_probes_outside_a_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = dunce::canonicalize(root.path()).unwrap();
+        for error in [
+            ChangedFilesError::NotARepository,
+            ChangedFilesError::GitMissing("not found".to_owned()),
+        ] {
+            let probes = std::cell::Cell::new(0_u32);
+            let paths = identity_paths_from(
+                root.path(),
+                Err(error),
+                || {
+                    probes.set(probes.get() + 1);
+                    None
+                },
+                || {
+                    probes.set(probes.get() + 1);
+                    None
+                },
+            );
+            assert_eq!(probes.get(), 0, "no single probe runs");
+            assert_eq!(paths, (canonical.clone(), canonical.clone()));
+        }
+    }
+
+    /// A bare repository, or an old git that does not know a flag, fails the
+    /// combined probe with a git error. Each single probe then decides.
+    #[test]
+    fn identity_paths_use_the_single_probes_after_a_git_error() {
+        let root = tempfile::tempdir().unwrap();
+        let common = root.path().join("common.git");
+        let paths = identity_paths_from(
+            root.path(),
+            Err(ChangedFilesError::GitFailed("fatal".to_owned())),
+            || Some(common.clone()),
+            || None,
+        );
+        let canonical = dunce::canonicalize(root.path()).unwrap();
+        assert_eq!(paths, (common, canonical));
     }
 }

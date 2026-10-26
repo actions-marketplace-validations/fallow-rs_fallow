@@ -82,6 +82,7 @@ fn ignore_exports_wildcard() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![fallow_config::IgnoreExportRule {
             file: "src/utils.ts".to_string(),
@@ -91,8 +92,10 @@ fn ignore_exports_wildcard() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -111,7 +114,9 @@ fn ignore_exports_wildcard() {
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -150,6 +155,7 @@ fn ignore_exports_specific() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![fallow_config::IgnoreExportRule {
             file: "src/utils.ts".to_string(),
@@ -159,8 +165,10 @@ fn ignore_exports_specific() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -179,7 +187,9 @@ fn ignore_exports_specific() {
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -290,6 +300,40 @@ fn ignore_exports_used_in_file_kind_form_can_target_types_only() {
     );
 }
 
+/// Issue #3347: a type used by a Vue compiler macro in the same SFC is a
+/// same-file use.
+#[test]
+fn ignore_exports_used_in_file_covers_vue_sfc_macro_type_arguments() {
+    let root = fixture_path("ignore-exports-used-in-file-vue");
+    let mut config = create_config(root);
+    config.ignore_exports_used_in_file = true.into();
+
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let unused_type_names: Vec<&str> = results
+        .unused_types
+        .iter()
+        .map(|e| e.export.export_name.as_str())
+        .collect();
+
+    for name in [
+        "ComponentProps",
+        "ComponentEmits",
+        "ModelValue",
+        "ComponentSlots",
+        "DefaultedProps",
+        "SplitProps",
+    ] {
+        assert!(
+            !unused_type_names.contains(&name),
+            "{name} is used by a macro in the same SFC, found: {unused_type_names:?}"
+        );
+    }
+    assert!(
+        unused_type_names.contains(&"DeadProps"),
+        "DeadProps has no same-file use and must still be reported, found: {unused_type_names:?}"
+    );
+}
+
 #[test]
 fn ignore_exports_used_in_file_does_not_suppress_export_specifier_self_references() {
     let root = fixture_path("ignore-exports-used-in-file");
@@ -336,14 +380,17 @@ fn ignore_dependencies_config() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec!["unused-dep".to_string()],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_exports_used_in_file: fallow_config::IgnoreExportsUsedInFileConfig::default(),
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: fallow_config::DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: fallow_config::HealthConfig::default(),
         rules: RulesConfig::default(),
         boundaries: fallow_config::BoundaryConfig::default(),
@@ -362,7 +409,9 @@ fn ignore_dependencies_config() {
         resolve: fallow_config::ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);

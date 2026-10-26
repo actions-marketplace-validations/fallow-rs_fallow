@@ -1,4 +1,6 @@
 target/
+# Crash and timeout inputs from local fuzz runs
+fuzz/artifacts/
 # Public smoke conformance artifacts live under target/public-smoke-conformance/
 # Ignore everything in .cargo/ (credentials, local overrides) but track
 # the committed workspace config so target-specific rustflags (e.g.
@@ -10,6 +12,24 @@ node_modules/
 !tests/fixtures/css-package-subpath-import/node_modules/
 !tests/fixtures/scss-node-modules-resolution/node_modules/
 !tests/fixtures/issue-754-eslint-meta-preset/node_modules/
+!tests/fixtures/node-modules-bin-path/node_modules/
+!tests/fixtures/optional-peer-of-used-dependency/node_modules/
+!tests/fixtures/peer-chain-through-ignored-workspace/node_modules/
+!tests/fixtures/peer-of-plugin-referenced-host/node_modules/
+!tests/fixtures/peer-of-script-used-host/node_modules/
+!tests/fixtures/peer-chain-through-root-peer/node_modules/
+!tests/fixtures/peer-chain-through-required-peer/node_modules/
+!tests/fixtures/peer-chain-through-unlisted-peer/node_modules/
+!tests/fixtures/peer-chain-through-workspace-peer/node_modules/
+!tests/fixtures/runtime-peer-classification/node_modules/
+!tests/fixtures/runtime-peer-workspace-classification/packages/app/node_modules/
+!tests/fixtures/script-runtime-peer-classification/node_modules/
+!tests/fixtures/script-runtime-peer-classification/packages/app/node_modules/
+!tests/fixtures/script-runtime-peer-classification/packages/dev/node_modules/
+!tests/fixtures/script-runtime-peer-classification/packages/tests/node_modules/
+!tests/fixtures/script-runtime-peer-classification/packages/build/node_modules/
+!tests/fixtures/tsconfig-paths-into-node-modules/node_modules/
+!tests/fixtures/tsconfig-paths-into-uninstalled-package/node_modules/
 .DS_Store
 # macOS Spotlight index control markers (written into build output dirs)
 .metadata_never_index
@@ -79,6 +99,9 @@ editors/vscode/LICENSE
 .playwright-mcp/
 
 # Claude
+# Re-include .claude/ first: a global .claude/ ignore would otherwise hide
+# the tracked adapters below from git add.
+!.claude/
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
@@ -115,10 +138,6 @@ docs/superpowers/
 
 decisions
 decisions/
-
-# Runtime scratch the review app writes (human notes feed, captured framing).
-# App-subtree .gitignore already ignores it; this keeps a root `git add -A` safe.
-.fallow-review/
 
 # trigger-tree keeps telemetry local while sharing its project configuration.
 .trigger-tree/*

@@ -5,14 +5,15 @@
 use std::collections::BTreeSet;
 
 use fallow_api::{
-    CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, SECURITY_RULES, bare_rule_id,
+    AUDIT_RULES, CHECK_RULES, DUPES_RULES, FLAGS_RULES, HEALTH_RULES, SECURITY_RULES, bare_rule_id,
 };
 use fallow_types::mcp_manifest::MCP_RESOURCES;
 use rmcp::model::{ErrorCode, ResourceContents, Role};
 
+use super::super::FallowMcp;
 use crate::resources::{list_resource_templates, list_resources, read_resource};
 
-const STATIC_URIS: [&str; 7] = [
+const STATIC_URIS: [&str; 8] = [
     "fallow://tools",
     "fallow://issue-types",
     "fallow://explain",
@@ -20,6 +21,7 @@ const STATIC_URIS: [&str; 7] = [
     "fallow://schema/config",
     "fallow://schema/plugin",
     "fallow://schema/rule-pack",
+    "fallow://schema/similar-code-snapshot",
 ];
 
 fn read_text(uri: &str) -> String {
@@ -54,7 +56,10 @@ fn catalogue_order_and_uris_are_pinned() {
         .iter()
         .map(|t| t.uri_template.clone())
         .collect();
-    assert_eq!(templates, ["fallow://explain/{issue_type}"]);
+    assert_eq!(
+        templates,
+        ["fallow://tools/{name}", "fallow://explain/{issue_type}"]
+    );
 }
 
 #[test]
@@ -134,8 +139,22 @@ fn tools_resource_mirrors_the_shared_manifest() {
         analyze["cli_command"],
         "fallow dead-code --format json --quiet"
     );
-    assert_eq!(analyze["read_only"], true);
+    assert_eq!(analyze["read_only"], false);
     assert_eq!(analyze["license"], "free");
+
+    for row in tools {
+        let name = row["name"].as_str().expect("tool name");
+        let manifest = fallow_types::mcp_manifest::MCP_TOOLS
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} in the shared manifest"));
+        assert_eq!(
+            row["code_mode_alias"].as_str(),
+            manifest.code_mode_alias,
+            "the fallow://tools resource must carry {name}'s Code Mode reachability so agents \
+             never have to parse the code_execute description"
+        );
+    }
 }
 
 #[test]
@@ -148,6 +167,7 @@ fn issue_types_resource_carries_severity_fixable_and_explain_uri() {
         DUPES_RULES,
         FLAGS_RULES,
         SECURITY_RULES,
+        AUDIT_RULES,
     ]
     .iter()
     .map(|rules| rules.len())
@@ -177,7 +197,7 @@ fn issue_types_resource_carries_severity_fixable_and_explain_uri() {
         assert!(
             row["docs_url"]
                 .as_str()
-                .is_some_and(|url| url.starts_with("https://docs.fallow.tools/")),
+                .is_some_and(|url| url.starts_with("https://fallow.tools/docs/")),
             "{} docs_url must be a docs site URL",
             row["id"]
         );
@@ -255,10 +275,254 @@ fn schema_resources_equal_the_cli_schema_documents_plus_version() {
             "fallow://schema/rule-pack",
             fallow_api::schemas::rule_pack_schema(),
         ),
+        (
+            "fallow://schema/similar-code-snapshot",
+            fallow_api::schemas::similar_code_snapshot_schema(),
+        ),
     ] {
         let json = read_json(uri);
         assert_eq!(json, expected, "{uri} must be the CLI schema document");
     }
+}
+
+/// The guide template carries the per-flag prose the wire description no
+/// longer does, so every section that moved must still be reachable.
+#[test]
+fn tool_guide_template_serves_the_prose_kept_out_of_tools_list() {
+    let json = read_json("fallow://tools/check_health");
+    assert_eq!(json["tool"], "check_health");
+    let sections = json["sections"].as_array().expect("sections array");
+    let topics: BTreeSet<&str> = sections
+        .iter()
+        .filter_map(|section| section["topic"].as_str())
+        .collect();
+    for topic in [
+        "css",
+        "complexity_breakdown",
+        "react_hook_profile",
+        "vital_signs.render_fan_in",
+        "threshold_overrides",
+    ] {
+        assert!(topics.contains(topic), "guide missing {topic}: {topics:?}");
+    }
+    // The guide exists because the detail did not fit on the wire beside the
+    // summary. Assert that relationship rather than a character count, which a
+    // wording pass moves without changing what the resource is for.
+    for section in sections {
+        let summary = section["summary"].as_str().expect("section summary");
+        let detail = section["detail"].as_str().expect("section detail");
+        assert!(
+            detail.len() > summary.len(),
+            "a guide section must say more than the summary it expands: {section}"
+        );
+    }
+}
+
+/// The `analyze` guide holds the per-flag prose that left its wire
+/// description. The description keeps the `finding_id` contract and names
+/// the guide, so an agent can still reach the moved detail.
+#[test]
+fn analyze_guide_serves_the_prose_kept_out_of_tools_list() {
+    let json = read_json("fallow://tools/analyze");
+    assert_eq!(json["tool"], "analyze");
+    let sections = json["sections"].as_array().expect("sections array");
+    let detail = |topic: &str| {
+        sections
+            .iter()
+            .find(|section| section["topic"] == topic)
+            .and_then(|section| section["detail"].as_str())
+            .unwrap_or_else(|| panic!("analyze guide missing {topic}: {sections:?}"))
+            .to_owned()
+    };
+    assert!(detail("boundary_violations").contains("check only architecture boundary violations"));
+    assert!(detail("group_by").contains("`[Section]` headers"));
+    assert!(detail("next_steps").contains("dispatch on `id`"));
+
+    let server = FallowMcp::new();
+    let tools = server.tool_router.list_all();
+    let analyze = tools
+        .iter()
+        .find(|tool| tool.name == "analyze")
+        .and_then(|tool| tool.description.as_deref())
+        .expect("analyze description");
+    assert!(analyze.contains("fallow://tools/analyze"));
+    assert!(analyze.contains("stable `finding_id`"));
+    assert!(analyze.contains("means unknown, not resolved"));
+    assert!(!analyze.contains("`[Section]` headers"));
+}
+
+/// The `audit` guide holds the per-flag prose that left its wire description
+/// and names every diff-risk rule. The description names the guide, so an
+/// agent can still reach the moved detail.
+#[test]
+fn audit_guide_serves_the_prose_kept_out_of_tools_list() {
+    let json = read_json("fallow://tools/audit");
+    assert_eq!(json["tool"], "audit");
+    let sections = json["sections"].as_array().expect("sections array");
+    let detail = |topic: &str| {
+        sections
+            .iter()
+            .find(|section| section["topic"] == topic)
+            .and_then(|section| section["detail"].as_str())
+            .unwrap_or_else(|| panic!("audit guide missing {topic}: {sections:?}"))
+            .to_owned()
+    };
+    let diff_risk = detail("diff_risk");
+    for rule in [
+        "weakened-tests",
+        "added-suppression",
+        "test-only-branch",
+        "diverged-clone-sibling",
+        "added-dependency",
+    ] {
+        assert!(
+            diff_risk.contains(&format!("`{rule}`")),
+            "the diff_risk section must name {rule}: {diff_risk}"
+        );
+    }
+    assert!(detail("styling").contains("css_deep"));
+    assert!(detail("baselines").contains("dead_code_baseline"));
+    assert!(detail("runtime_coverage").contains("min_invocations_hot"));
+    assert!(detail("FALLOW_DIFF_FILE").contains("added hunk"));
+
+    let server = FallowMcp::new();
+    let tools = server.tool_router.list_all();
+    let audit = tools
+        .iter()
+        .find(|tool| tool.name == "audit")
+        .and_then(|tool| tool.description.as_deref())
+        .expect("audit description");
+    assert!(audit.contains("fallow://tools/audit"));
+    assert!(audit.contains("diff_risk"));
+    assert!(!audit.contains("min_invocations_hot"));
+    assert!(!audit.contains("FALLOW_CHANGED_SINCE"));
+}
+
+/// The shortest run of guide words whose verbatim appearance in the terse
+/// catalogue is evidence of a paste rather than of two texts describing the
+/// same subject. Short runs collide honestly ("the fallow config file"); this
+/// many words in a row, in this order, do not.
+const GUIDE_PROSE_RUN_WORDS: usize = 8;
+
+/// Every string leaf of a resource payload, whitespace-normalized. The
+/// catalogue is JSON, so a pasted sentence lands inside a field with its
+/// quotes escaped; comparing against the decoded leaves rather than the raw
+/// document is what makes the paste visible.
+fn normalized_string_leaves(value: &serde_json::Value) -> Vec<String> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::String(text) => {
+                leaves.push(text.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => stack.extend(map.values()),
+            _ => {}
+        }
+    }
+    leaves
+}
+
+/// The first run of `GUIDE_PROSE_RUN_WORDS` consecutive words of `prose` that
+/// appears verbatim in one of `haystack`, or `None` when none does.
+fn leaked_prose_run(haystack: &[String], prose: &str) -> Option<String> {
+    let words: Vec<&str> = prose.split_whitespace().collect();
+    words
+        .windows(GUIDE_PROSE_RUN_WORDS)
+        .map(|run| run.join(" "))
+        .find(|run| haystack.iter().any(|line| line.contains(run.as_str())))
+}
+
+/// The terse `fallow://tools` catalogue and the long-form guide are different
+/// channels; reading the catalogue must not start returning guide prose.
+///
+/// Every section of every guide is checked, and by word run rather than by
+/// whole-string equality: asserting `!contains(detail)` on one section of one
+/// guide rejected exactly one byte-exact paste of exactly one paragraph, so a
+/// catalogue line could absorb most of a guide section and stay green.
+#[test]
+fn tool_guide_prose_stays_out_of_the_tools_catalogue() {
+    let catalogue = normalized_string_leaves(&read_json("fallow://tools"));
+    for guide in crate::tool_guides::TOOL_GUIDES {
+        let json = read_json(&format!("fallow://tools/{}", guide.tool));
+        for section in json["sections"].as_array().expect("sections array") {
+            let topic = section["topic"].as_str().expect("section topic");
+            for channel in ["summary", "detail"] {
+                let prose = section[channel].as_str().expect("section prose");
+                assert_eq!(
+                    leaked_prose_run(&catalogue, prose),
+                    None,
+                    "fallow://tools repeats {}'s {topic} {channel}; it must stay the \
+                     one-line-per-tool catalogue, with long prose in the guide",
+                    guide.tool
+                );
+            }
+        }
+    }
+}
+
+/// The guard above is only worth having if it fires. A catalogue line that
+/// absorbed a slice of guide prose (not the whole section, which is what the
+/// earlier whole-string check demanded) must be caught.
+#[test]
+fn a_partial_guide_paste_is_caught_in_the_catalogue() {
+    let guide = read_json("fallow://tools/check_health");
+    let detail = guide["sections"][0]["detail"]
+        .as_str()
+        .expect("first section detail");
+    let pasted: String = detail.chars().take(200).collect();
+    assert!(
+        pasted.split_whitespace().count() > GUIDE_PROSE_RUN_WORDS,
+        "the reproduction needs more words than one run: {pasted}"
+    );
+
+    let catalogue = vec![format!("check_health. {pasted} Reports project health.")];
+
+    assert!(
+        leaked_prose_run(&catalogue, detail).is_some(),
+        "200 bytes of guide prose pasted into a catalogue line must be caught"
+    );
+    assert_eq!(
+        leaked_prose_run(&catalogue, "an unrelated one-line catalogue summary"),
+        None,
+        "prose that was never pasted must not be reported as a leak"
+    );
+}
+
+#[test]
+fn misspelled_tool_guide_suggests_the_nearest_documented_tool() {
+    let error = read_resource("fallow://tools/check_helth").expect_err("unknown tool guide");
+    let data = error.data.expect("structured error data");
+    assert_eq!(data["code"], "unknown_tool");
+    assert_eq!(data["registered_tool"], false);
+    assert_eq!(
+        data["nearest_matches"],
+        serde_json::json!(["fallow://tools/check_health"])
+    );
+}
+
+/// A typo and a real tool that simply has no guide are different problems with
+/// different fixes. They used to return byte-identical bodies, so a caller
+/// could not tell "correct the name" from "stop looking, the description is
+/// the whole contract".
+#[test]
+fn a_typo_and_an_undocumented_tool_are_distinguishable() {
+    let undocumented =
+        read_resource("fallow://tools/fix_apply").expect_err("fix_apply has no guide");
+    let typo = read_resource("fallow://tools/totally_made_up").expect_err("not a tool");
+
+    let undocumented_data = undocumented.data.expect("structured error data");
+    let typo_data = typo.data.expect("structured error data");
+
+    assert_eq!(undocumented_data["code"], "no_tool_guide");
+    assert_eq!(undocumented_data["registered_tool"], true);
+    assert_eq!(typo_data["code"], "unknown_tool");
+    assert_eq!(typo_data["registered_tool"], false);
+    assert_ne!(
+        undocumented.message, typo.message,
+        "a registered tool with no guide must not read like a hallucinated name"
+    );
 }
 
 #[test]
@@ -286,12 +550,8 @@ fn every_registered_rule_resolves_through_the_explain_template() {
 #[test]
 fn explain_template_matches_the_fallow_explain_tool_payload() {
     let resource = read_json("fallow://explain/unused-export");
-    let tool = fallow_api::serialize_explain_programmatic_json(
-        "unused-export",
-        fallow_api::RootEnvelopeMode::Tagged,
-        None,
-    )
-    .expect("tool payload");
+    let tool = fallow_api::serialize_explain_programmatic_json("unused-export", None)
+        .expect("tool payload");
     assert_eq!(resource, tool);
 }
 
@@ -313,9 +573,31 @@ fn unknown_uri_is_a_structured_resource_not_found_error() {
         assert_eq!(data["known_uris"], serde_json::json!(STATIC_URIS));
         assert_eq!(
             data["templates"],
-            serde_json::json!(["fallow://explain/{issue_type}"])
+            serde_json::json!(["fallow://tools/{name}", "fallow://explain/{issue_type}"])
         );
     }
+}
+
+#[test]
+fn near_miss_uri_names_the_resource_the_caller_meant() {
+    let error = read_resource("fallow://task-matrx").expect_err("unknown uri must fail");
+    assert!(
+        error
+            .message
+            .contains("did you mean 'fallow://task-matrix'?"),
+        "near-miss uri should be named: {}",
+        error.message
+    );
+}
+
+#[test]
+fn novel_uri_stays_silent_rather_than_guessing() {
+    let error = read_resource("file:///etc/passwd").expect_err("unknown uri must fail");
+    assert!(
+        !error.message.contains("did you mean"),
+        "a completely novel uri must not get a misleading suggestion: {}",
+        error.message
+    );
 }
 
 #[test]
@@ -342,6 +624,30 @@ fn unknown_issue_type_lists_nearest_matches() {
     );
     let empty = read_resource("fallow://explain/").expect_err("empty issue type");
     assert_eq!(empty.code, ErrorCode::RESOURCE_NOT_FOUND);
+}
+
+/// The shared scorer answers an unknown issue type, and the only shaping this
+/// resource still does for it is the namespace a caller may have copied off a
+/// printed rule id or a CLI flag. `/` is not a word separator the scorer
+/// splits on, so `security/sql-injction` would otherwise align its first word
+/// against `security/sql` and match nothing; `_` and `-` it splits on itself,
+/// which is why no case folding is left here.
+#[test]
+fn an_issue_type_typo_resolves_through_any_spelling_of_the_id() {
+    for (token, expected) in [
+        ("security/sql-injction", "fallow://explain/sql-injection"),
+        ("--unused-exprt", "fallow://explain/unused-export"),
+        ("unused_exprt", "fallow://explain/unused-export"),
+    ] {
+        let error =
+            read_resource(&format!("fallow://explain/{token}")).expect_err("unknown issue type");
+        let data = error.data.expect("structured data");
+        let nearest = data["nearest_matches"].as_array().expect("nearest array");
+        assert!(
+            nearest.iter().any(|uri| uri == expected),
+            "{token} must reach {expected}: {nearest:?}"
+        );
+    }
 }
 
 #[test]

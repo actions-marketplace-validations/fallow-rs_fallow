@@ -45,10 +45,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cargoFallowBin } from "./cargo-target.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_MANIFEST = resolve(REPO_ROOT, "tests/coverage-producer-corpus/manifest.json");
-const DEFAULT_FALLOW_BIN = resolve(REPO_ROOT, "target/debug/fallow");
+const DEFAULT_FALLOW_BIN = cargoFallowBin(REPO_ROOT);
 
 /**
  * Config the census runs under, committed next to the manifest.
@@ -153,6 +154,25 @@ const loadInvariants = (manifest) => {
   }
   return invariants;
 };
+
+/**
+ * Compare each `producers[].version` with the version that the producer
+ * lockfile pins for that package. Returns one message per mismatch, and an
+ * empty list when every row agrees.
+ */
+export const producerVersionDrift = (producers, lock) =>
+  producers.flatMap((producer, index) => {
+    const pinned = lock.packages?.[`node_modules/${producer.package}`]?.version;
+    if (pinned === producer.version) {
+      return [];
+    }
+    const label = `producers[${index}] (${producer.id}) records ${producer.package} ${producer.version}`;
+    return [
+      pinned === undefined
+        ? `${label}, but the lockfile pins no version`
+        : `${label}, but the lockfile pins ${pinned}`,
+    ];
+  });
 
 const loadProducers = (manifest, root) => {
   if (!Array.isArray(manifest.producers) || manifest.producers.length < 2) {
@@ -326,6 +346,13 @@ export const loadManifest = (manifestPath) => {
 
   const invariants = loadInvariants(manifest);
   const producers = loadProducers(manifest, root);
+  const drift = producerVersionDrift(manifest.producers, JSON.parse(lockContents.toString("utf8")));
+  if (drift.length > 0) {
+    fail(
+      `producer version mismatch: ${drift.join("; ")}. ` +
+        "Re-record with npm run refresh:coverage-producers, which reads each version from the installed package.",
+    );
+  }
   const fixtures = loadFixtures(manifest, root, invariants);
 
   const maps = new Map();

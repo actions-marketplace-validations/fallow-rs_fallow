@@ -21,7 +21,7 @@ define_plugin! {
     config_patterns: CONFIG_PATTERNS,
     always_used: ALWAYS_USED,
     tooling_dependencies: TOOLING_DEPENDENCIES,
-    resolve_config(config_path, source, _root) {
+    resolve_config(config_path, source, root) {
         let mut result = PluginResult::default();
 
         let imports = config_parser::extract_imports(source, config_path);
@@ -30,12 +30,13 @@ define_plugin! {
             result.referenced_dependencies.push(dep);
         }
 
-        let entries = config_parser::extract_config_string_or_array(
+        let base = super::webpack::apply_entries(
+            &mut result,
             source,
-            config_path,
+            super::webpack::ConfigFile { path: config_path, root },
             &["source", "entry"],
+            "root",
         );
-        result.extend_entry_patterns(entries);
 
         let plugin_requires =
             config_parser::extract_config_require_strings(source, config_path, "plugins");
@@ -44,6 +45,18 @@ define_plugin! {
                 .referenced_dependencies
                 .push(crate::resolve::extract_package_name(dep));
         }
+
+        super::module_federation::apply_bundler_plugin_options(
+            &mut result,
+            source,
+            config_path,
+            root,
+            super::module_federation::FederationBase {
+                context: base.as_deref(),
+                package_dir: None,
+            },
+            "rsbuild",
+        );
 
         result
     }
@@ -101,6 +114,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_entry_module_request_is_credited_as_dependency() {
+        let source = r#"
+            export default {
+                source: {
+                    entry: {
+                        index: ["react-hot-loader/patch", "./src/index.tsx"],
+                    },
+                },
+            };
+        "#;
+        let plugin = RsbuildPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/rsbuild.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["src/index.tsx"]);
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"react-hot-loader".to_string())
+        );
+    }
+
+    #[test]
     fn resolve_config_imports() {
         let source = r#"
             import { defineConfig } from '@rsbuild/core';
@@ -143,5 +181,50 @@ mod tests {
             std::path::Path::new("/project"),
         );
         assert_eq!(result.entry_patterns, vec!["src/index.ts"]);
+    }
+
+    #[test]
+    fn resolve_config_reads_inline_module_federation_options() {
+        let source = r#"
+            import { defineConfig } from "@rsbuild/core";
+            import { pluginModuleFederation } from "@module-federation/rsbuild-plugin";
+
+            export default defineConfig({
+                plugins: [
+                    pluginModuleFederation({
+                        name: "host",
+                        remotes: { checkout: "checkout@https://example.test/remoteEntry.js" },
+                        shared: ["react"],
+                    }),
+                ],
+            });
+        "#;
+        let plugin = RsbuildPlugin;
+        let result = plugin.resolve_config(
+            std::path::Path::new("/project/rsbuild.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+
+        assert_eq!(result.provided_dependencies.len(), 1);
+        assert!(result.provided_dependencies[0].covers_specifier("checkout"));
+    }
+
+    #[test]
+    fn resolve_config_root_roots_relative_entries() {
+        let source = r#"
+            import path from "node:path";
+            import { defineConfig } from "@rsbuild/core";
+            export default defineConfig({
+                root: path.resolve(__dirname, "app"),
+                source: { entry: { index: "./main.ts" } },
+            });
+        "#;
+        let result = RsbuildPlugin.resolve_config(
+            std::path::Path::new("/project/rsbuild.config.ts"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        assert_eq!(result.entry_patterns, vec!["app/main.ts"]);
     }
 }

@@ -3,7 +3,7 @@
 //! Removes unused pnpm catalog entries from `pnpm-workspace.yaml`. The
 //! strategy is line-aware deletion rather than full YAML parse-and-reprint:
 //! there is no comment-preserving YAML writer in the workspace, and a
-//! full reprint via `serde_yaml_ng` would obliterate comments, anchors,
+//! full reprint via a YAML serializer would obliterate comments, anchors,
 //! and stylistic choices. Each entry's start line is taken from the
 //! finding's `line` field; the end line is computed by scanning forward
 //! for lines whose indentation is strictly greater than the entry line's
@@ -219,11 +219,11 @@ fn commit_catalog_entry_removals(input: &mut CatalogEntryCommitInput<'_, '_>) {
         new_content.push_str(input.meta.line_ending);
     }
 
-    if serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&new_content).is_err() {
+    if fallow_config::yaml::parse(&new_content).is_err() {
         input.summary.write_error = true;
         eprintln!(
             "Error: refusing to write {}: post-edit content failed YAML reparse. The file was not modified.",
-            input.relative_path.display(),
+            input.relative_path.to_string_lossy().replace('\\', "/"),
         );
         return;
     }
@@ -321,7 +321,7 @@ fn record_catalog_removal_dry_run(
         if !matches!(output, OutputFormat::Json) {
             eprintln!(
                 "Would remove catalog entry from {}:{} `{}` (catalog: {})",
-                relative_path.display(),
+                relative_path.to_string_lossy().replace('\\', "/"),
                 range.start + 1,
                 entry.entry_name,
                 entry.catalog_name,
@@ -649,11 +649,11 @@ fn commit_empty_catalog_group_removals(input: &mut EmptyCatalogGroupCommitInput<
         new_content.push_str(input.meta.line_ending);
     }
 
-    if serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&new_content).is_err() {
+    if fallow_config::yaml::parse(&new_content).is_err() {
         input.summary.write_error = true;
         eprintln!(
             "Error: refusing to write {}: post-edit content failed YAML reparse. The file was not modified.",
-            input.relative_path.display(),
+            input.relative_path.to_string_lossy().replace('\\', "/"),
         );
         return;
     }
@@ -722,7 +722,7 @@ fn record_empty_catalog_group_dry_run(
         if !matches!(output, OutputFormat::Json) {
             eprintln!(
                 "Would remove empty catalog group from {}:{} `{}`",
-                relative_path.display(),
+                relative_path.to_string_lossy().replace('\\', "/"),
                 line_idx + 1,
                 group.catalog_name,
             );
@@ -969,7 +969,7 @@ fn skip_record(
     if !matches!(output, OutputFormat::Json) {
         eprintln!(
             "Skipped catalog entry {}:{} `{}` ({skip_reason})",
-            relative_path.display(),
+            relative_path.to_string_lossy().replace('\\', "/"),
             entry.line,
             entry.entry_name,
         );
@@ -1037,7 +1037,7 @@ fn skip_group_record(
     if !matches!(output, OutputFormat::Json) {
         eprintln!(
             "Skipped empty catalog group {}:{} `{}` ({skip_reason})",
-            relative_path.display(),
+            relative_path.to_string_lossy().replace('\\', "/"),
             group.line,
             group.catalog_name,
         );
@@ -1074,17 +1074,18 @@ fn remove_group_record(
 }
 
 fn format_consumer_summary(consumers: &[std::path::PathBuf]) -> String {
+    let display = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
     match consumers.len() {
         0 => String::new(),
-        1 => format!("`{}`", consumers[0].display()),
+        1 => format!("`{}`", display(&consumers[0])),
         2 => format!(
             "`{}` and `{}`",
-            consumers[0].display(),
-            consumers[1].display()
+            display(&consumers[0]),
+            display(&consumers[1])
         ),
         _ => format!(
             "`{}` and {} other consumer(s)",
-            consumers[0].display(),
+            display(&consumers[0]),
             consumers.len() - 1,
         ),
     }
@@ -1130,6 +1131,28 @@ mod tests {
         })
     }
 
+    #[test]
+    fn format_consumer_summary_normalizes_backslash_separators() {
+        let one = format_consumer_summary(&[PathBuf::from("packages\\a\\package.json")]);
+        assert_eq!(one, "`packages/a/package.json`");
+
+        let two = format_consumer_summary(&[
+            PathBuf::from("packages\\a\\package.json"),
+            PathBuf::from("packages\\b\\package.json"),
+        ]);
+        assert_eq!(
+            two,
+            "`packages/a/package.json` and `packages/b/package.json`"
+        );
+
+        let many = format_consumer_summary(&[
+            PathBuf::from("packages\\a\\package.json"),
+            PathBuf::from("packages\\b\\package.json"),
+            PathBuf::from("packages\\c\\package.json"),
+        ]);
+        assert_eq!(many, "`packages/a/package.json` and 2 other consumer(s)");
+    }
+
     fn make_group(name: &str, line: u32) -> EmptyCatalogGroupFinding {
         EmptyCatalogGroupFinding::with_actions(EmptyCatalogGroup {
             catalog_name: name.to_string(),
@@ -1168,7 +1191,7 @@ mod tests {
         dry_run: bool,
         fixes: &mut Vec<serde_json::Value>,
     ) -> CatalogFixSummary {
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = CapturedHashes::default();
         let mut summary = apply_catalog_entry_fixes(
             root,
@@ -1195,7 +1218,7 @@ mod tests {
         dry_run: bool,
         fixes: &mut Vec<serde_json::Value>,
     ) -> CatalogFixSummary {
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(root).unwrap();
         let hashes = CapturedHashes::default();
         let mut summary = apply_empty_catalog_group_fixes(EmptyCatalogGroupFixInput {
             root,
@@ -1435,7 +1458,7 @@ mod tests {
         seed_workspace_file(dir.path(), content);
         let entries = vec![make_entry("react", "react17", 3)];
         let hashes = CapturedHashes::default();
-        let mut plan = FixPlan::new();
+        let mut plan = FixPlan::for_root(dir.path()).unwrap();
         let mut fixes = Vec::new();
         let summary = apply_catalog_entry_fixes(
             dir.path(),
@@ -1838,12 +1861,12 @@ mod tests {
 
         let result = std::fs::read_to_string(dir.path().join("pnpm-workspace.yaml")).unwrap();
         assert_eq!(result, "catalog: {}\n");
-        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&result).unwrap();
+        let doc = fallow_config::yaml::parse(&result).unwrap();
         assert!(
-            parsed
+            doc.root()
                 .get("catalog")
-                .and_then(serde_yaml_ng::Value::as_mapping)
-                .is_some_and(serde_yaml_ng::Mapping::is_empty),
+                .and_then(fallow_config::yaml::YamlNode::as_mapping)
+                .is_some_and(fallow_config::yaml::YamlMapping::is_empty),
             "catalog must be `{{}}`, not null"
         );
     }
@@ -1873,13 +1896,13 @@ mod tests {
             result,
             "catalogs:\n  react17: {}\n  legacy:\n    is-odd: ^3.0.0\n",
         );
-        let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(&result).unwrap();
-        let react17 = parsed.get("catalogs").and_then(|c| c.get("react17"));
+        let doc = fallow_config::yaml::parse(&result).unwrap();
+        let react17 = doc.root().get("catalogs").and_then(|c| c.get("react17"));
         assert!(
             react17
-                .and_then(serde_yaml_ng::Value::as_mapping)
-                .is_some_and(serde_yaml_ng::Mapping::is_empty),
-            "react17 must be `{{}}`, not null. Got: {react17:?}"
+                .and_then(fallow_config::yaml::YamlNode::as_mapping)
+                .is_some_and(fallow_config::yaml::YamlMapping::is_empty),
+            "react17 must be `{{}}`, not null. Got: {result}"
         );
     }
 

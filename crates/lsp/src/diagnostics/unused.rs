@@ -5,47 +5,104 @@ use ls_types::{
 };
 
 use fallow_api::EditorAnalysisResults as AnalysisResults;
+use fallow_types::output_dead_code::{MutationEvidence, ReachabilityCaveat, caveat_suffix};
 
-use super::{FIRST_LINE_RANGE, doc_link_for_code};
-use crate::position::PositionMapper;
+use super::{FIRST_LINE_RANGE, doc_link_for_code, finding_data};
+use crate::position::{NamedAnchor, PositionMapper};
+
+/// Append the run's caveat parenthetical to a diagnostic message.
+///
+/// The editor is the surface where the caveat matters most: the user is one
+/// keystroke from the quick fix, and the workspace diagnostic that explains
+/// why the evidence is thin lives in a JSON envelope they never see. The
+/// suffix goes in the MESSAGE rather than in `relatedInformation` because a
+/// related-information entry needs a second location to point at, and the one
+/// location worth pointing at (the file the run could not read) is not part of
+/// the editor results at all. The wording is the shared `caveat_suffix`, so the
+/// editor, the human report, and the SARIF result message all read alike.
+fn with_caveats(message: String, caveats: &[ReachabilityCaveat]) -> String {
+    match caveat_suffix(caveats) {
+        Some(suffix) => format!("{message}{suffix}"),
+        None => message,
+    }
+}
 
 pub fn push_export_diagnostics(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     results: &AnalysisResults,
     mapper: &mut PositionMapper,
 ) {
-    let exports_iter = results.unused_exports.iter().map(|f| &f.export);
-    let types_iter = results.unused_types.iter().map(|f| &f.export);
+    let exports_iter = results
+        .unused_exports
+        .iter()
+        .map(|f| (&f.export, f.reachability_caveats(), f.finding_id.as_deref()));
+    let types_iter = results
+        .unused_types
+        .iter()
+        .map(|f| (&f.export, f.reachability_caveats(), f.finding_id.as_deref()));
     for (exports, code, msg_prefix) in [
         (
             Box::new(exports_iter)
-                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedExport>>,
+                as Box<
+                    dyn Iterator<
+                        Item = (
+                            &fallow_api::editor_results::UnusedExport,
+                            &[ReachabilityCaveat],
+                            Option<&str>,
+                        ),
+                    >,
+                >,
             "unused-export",
             "Export" as &str,
         ),
         (
             Box::new(types_iter)
-                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedExport>>,
+                as Box<
+                    dyn Iterator<
+                        Item = (
+                            &fallow_api::editor_results::UnusedExport,
+                            &[ReachabilityCaveat],
+                            Option<&str>,
+                        ),
+                    >,
+                >,
             "unused-type",
             "Type export",
         ),
     ] {
-        for export in exports {
-            push_unused_export_diagnostic(map, export, code, msg_prefix, mapper);
+        for (export, caveats, finding_id) in exports {
+            let row = ExportRow {
+                export,
+                caveats,
+                finding_id,
+            };
+            push_unused_export_diagnostic(map, &row, code, msg_prefix, mapper);
         }
     }
 
     push_private_type_leak_diagnostics(map, results, mapper);
 }
 
+/// One unused export or type export with the parts its diagnostic needs.
+struct ExportRow<'a> {
+    export: &'a fallow_api::editor_results::UnusedExport,
+    caveats: &'a [ReachabilityCaveat],
+    finding_id: Option<&'a str>,
+}
+
 /// Push one HINT diagnostic for an unused export or type export.
 fn push_unused_export_diagnostic(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
-    export: &fallow_api::editor_results::UnusedExport,
+    row: &ExportRow<'_>,
     code: &str,
     msg_prefix: &str,
     mapper: &mut PositionMapper,
 ) {
+    let ExportRow {
+        export,
+        caveats,
+        finding_id,
+    } = *row;
     let Some(uri) = Uri::from_file_path(&export.path) else {
         return;
     };
@@ -57,8 +114,12 @@ fn push_unused_export_diagnostic(
         source: Some("fallow".to_string()),
         code: Some(NumberOrString::String(code.to_string())),
         code_description: doc_link_for_code(code),
-        message: format!("{msg_prefix} '{}' is unused", export.export_name),
+        message: with_caveats(
+            format!("{msg_prefix} '{}' is unused", export.export_name),
+            caveats,
+        ),
         tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+        data: finding_data(finding_id),
         ..Default::default()
     });
 }
@@ -89,6 +150,7 @@ fn push_private_type_leak_diagnostics(
                     "Export '{}' references private type '{}'",
                     leak.leak.export_name, leak.leak.type_name
                 ),
+                data: finding_data(leak.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -104,8 +166,12 @@ pub fn push_file_diagnostics(map: &mut FxHashMap<Uri, Vec<Diagnostic>>, results:
                 source: Some("fallow".to_string()),
                 code: Some(NumberOrString::String("unused-file".to_string())),
                 code_description: doc_link_for_code("unused-file"),
-                message: "File is not reachable from any entry point".to_string(),
+                message: with_caveats(
+                    "File is not reachable from any entry point".to_string(),
+                    file.reachability_caveats(),
+                ),
                 tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                data: finding_data(file.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -139,6 +205,7 @@ pub fn push_import_diagnostics(
                 code: Some(NumberOrString::String("unresolved-import".to_string())),
                 code_description: doc_link_for_code("unresolved-import"),
                 message: format!("Cannot find module '{}'", import.import.specifier),
+                data: finding_data(import.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -151,28 +218,49 @@ pub fn push_dep_diagnostics(
     package_json_uri: Option<&Uri>,
     root: &std::path::Path,
 ) {
-    type DepIter<'a> =
-        Box<dyn Iterator<Item = &'a fallow_api::editor_results::UnusedDependency> + 'a>;
+    type DepIter<'a> = Box<
+        dyn Iterator<
+                Item = (
+                    &'a fallow_api::editor_results::UnusedDependency,
+                    Option<&'a str>,
+                ),
+            > + 'a,
+    >;
     let groups: [(DepIter<'_>, &str, &str); 3] = [
         (
-            Box::new(results.unused_dependencies.iter().map(|f| &f.dep)),
+            Box::new(
+                results
+                    .unused_dependencies
+                    .iter()
+                    .map(|f| (&f.dep, f.finding_id.as_deref())),
+            ),
             "unused-dependency",
             "Unused dependency",
         ),
         (
-            Box::new(results.unused_dev_dependencies.iter().map(|f| &f.dep)),
+            Box::new(
+                results
+                    .unused_dev_dependencies
+                    .iter()
+                    .map(|f| (&f.dep, f.finding_id.as_deref())),
+            ),
             "unused-dev-dependency",
             "Unused devDependency",
         ),
         (
-            Box::new(results.unused_optional_dependencies.iter().map(|f| &f.dep)),
+            Box::new(
+                results
+                    .unused_optional_dependencies
+                    .iter()
+                    .map(|f| (&f.dep, f.finding_id.as_deref())),
+            ),
             "unused-optional-dependency",
             "Unused optionalDependency",
         ),
     ];
     for (deps, code, msg_prefix) in groups {
-        for dep in deps {
-            push_unused_dependency_diagnostic(map, dep, code, msg_prefix);
+        for (dep, finding_id) in deps {
+            push_unused_dependency_diagnostic(map, dep, finding_id, code, msg_prefix);
         }
     }
 
@@ -193,6 +281,7 @@ pub fn push_dep_diagnostics(
 fn push_unused_dependency_diagnostic(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     dep: &fallow_api::editor_results::UnusedDependency,
+    finding_id: Option<&str>,
     code: &str,
     msg_prefix: &str,
 ) {
@@ -207,6 +296,7 @@ fn push_unused_dependency_diagnostic(
         code: Some(NumberOrString::String(code.to_string())),
         code_description: doc_link_for_code(code),
         message: format!("{msg_prefix}: {}", dep.package_name),
+        data: finding_data(finding_id),
         ..Default::default()
     });
 }
@@ -232,6 +322,7 @@ fn push_unlisted_dependency_diagnostics(
                 "Unlisted dependency: {} (used but not in package.json)",
                 dep.dep.package_name
             ),
+            data: finding_data(dep.finding_id.as_deref()),
             ..Default::default()
         });
     }
@@ -254,6 +345,7 @@ fn push_type_only_dependency_diagnostics(
                     "Type-only dependency: {} (only used via type imports, could be a devDependency)",
                     dep.dep.package_name
                 ),
+                data: finding_data(dep.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -277,6 +369,7 @@ fn push_test_only_dependency_diagnostics(
                     "Production dependency '{}' is only imported by test files; consider moving to devDependencies",
                     dep.dep.package_name
                 ),
+                data: finding_data(dep.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -302,6 +395,7 @@ fn push_dev_dependency_in_production_diagnostics(
                     "devDependency '{}' is imported by production code at runtime; consider moving to dependencies",
                     dep.dep.package_name
                 ),
+                data: finding_data(dep.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -313,8 +407,8 @@ fn push_unused_catalog_entry_diagnostics(
     results: &AnalysisResults,
     root: &std::path::Path,
 ) {
-    for entry in &results.unused_catalog_entries {
-        let entry = &entry.entry;
+    for finding in &results.unused_catalog_entries {
+        let entry = &finding.entry;
         if let Some(entry_uri) = Uri::from_file_path(root.join(&entry.path)) {
             let line = entry.line.saturating_sub(1);
             map.entry(entry_uri).or_default().push(Diagnostic {
@@ -324,6 +418,7 @@ fn push_unused_catalog_entry_diagnostics(
                 code: Some(NumberOrString::String("unused-catalog-entry".to_string())),
                 code_description: doc_link_for_code("unused-catalog-entry"),
                 message: unused_catalog_entry_message(entry),
+                data: finding_data(finding.finding_id.as_deref()),
                 ..Default::default()
             });
         }
@@ -359,8 +454,8 @@ fn push_empty_catalog_group_diagnostics(
     results: &AnalysisResults,
     root: &std::path::Path,
 ) {
-    for group in &results.empty_catalog_groups {
-        let group = &group.group;
+    for finding in &results.empty_catalog_groups {
+        let group = &finding.group;
         let Some(uri) = Uri::from_file_path(root.join(&group.path)) else {
             continue;
         };
@@ -381,6 +476,7 @@ fn push_empty_catalog_group_diagnostics(
                 "Empty catalog group: '{}' has no entries",
                 group.catalog_name
             ),
+            data: finding_data(finding.finding_id.as_deref()),
             ..Default::default()
         });
     }
@@ -396,6 +492,7 @@ fn push_unresolved_catalog_reference_diagnostics(
 ) {
     use std::fmt::Write as _;
     for finding in &results.unresolved_catalog_references {
+        let finding_id = finding.finding_id.as_deref();
         let finding = &finding.reference;
         let Some(uri) = Uri::from_file_path(&finding.path) else {
             continue;
@@ -432,6 +529,7 @@ fn push_unresolved_catalog_reference_diagnostics(
             )),
             code_description: doc_link_for_code("unresolved-catalog-reference"),
             message,
+            data: finding_data(finding_id),
             ..Default::default()
         });
     }
@@ -458,6 +556,7 @@ fn push_unused_dependency_override_diagnostics(
 ) {
     use std::fmt::Write as _;
     for finding in &results.unused_dependency_overrides {
+        let finding_id = finding.finding_id.as_deref();
         let finding = &finding.entry;
         let Some(uri) = Uri::from_file_path(&finding.path) else {
             continue;
@@ -479,6 +578,7 @@ fn push_unused_dependency_override_diagnostics(
             )),
             code_description: doc_link_for_code("unused-dependency-override"),
             message,
+            data: finding_data(finding_id),
             ..Default::default()
         });
     }
@@ -490,6 +590,7 @@ fn push_misconfigured_dependency_override_diagnostics(
     results: &AnalysisResults,
 ) {
     for finding in &results.misconfigured_dependency_overrides {
+        let finding_id = finding.finding_id.as_deref();
         let finding = &finding.entry;
         let Some(uri) = Uri::from_file_path(&finding.path) else {
             continue;
@@ -510,6 +611,7 @@ fn push_misconfigured_dependency_override_diagnostics(
             )),
             code_description: doc_link_for_code("misconfigured-dependency-override"),
             message,
+            data: finding_data(finding_id),
             ..Default::default()
         });
     }
@@ -520,31 +622,55 @@ pub fn push_member_diagnostics(
     results: &AnalysisResults,
     mapper: &mut PositionMapper,
 ) {
-    let enum_iter = results.unused_enum_members.iter().map(|f| &f.member);
-    let class_iter = results.unused_class_members.iter().map(|f| &f.member);
-    let store_iter = results.unused_store_members.iter().map(|f| &f.member);
+    // All three member kinds carry caveats off the same reachability-free
+    // access walk, so all three render the same qualifier. A store member has
+    // no quick fix to withhold, which makes the caveat disclosure only: the
+    // reader deciding by hand still has to be told what the run did not see.
+    let enum_iter = results
+        .unused_enum_members
+        .iter()
+        .map(|f| (&f.member, f.reachability_caveats(), f.finding_id.as_deref()));
+    let class_iter = results
+        .unused_class_members
+        .iter()
+        .map(|f| (&f.member, f.reachability_caveats(), f.finding_id.as_deref()));
+    let store_iter = results
+        .unused_store_members
+        .iter()
+        .map(|f| (&f.member, f.reachability_caveats(), f.finding_id.as_deref()));
+    type MemberRows<'a> = Box<
+        dyn Iterator<
+                Item = (
+                    &'a fallow_api::editor_results::UnusedMember,
+                    &'a [ReachabilityCaveat],
+                    Option<&'a str>,
+                ),
+            > + 'a,
+    >;
     for (members, code, kind_label) in [
         (
-            Box::new(enum_iter)
-                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedMember>>,
+            Box::new(enum_iter) as MemberRows<'_>,
             "unused-enum-member",
             "Enum member" as &str,
         ),
         (
-            Box::new(class_iter)
-                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedMember>>,
+            Box::new(class_iter) as MemberRows<'_>,
             "unused-class-member",
             "Class member",
         ),
         (
-            Box::new(store_iter)
-                as Box<dyn Iterator<Item = &fallow_api::editor_results::UnusedMember>>,
+            Box::new(store_iter) as MemberRows<'_>,
             "unused-store-member",
             "Store member",
         ),
     ] {
-        for member in members {
-            push_unused_member_diagnostic(map, member, code, kind_label, mapper);
+        for (member, caveats, finding_id) in members {
+            let row = MemberRow {
+                member,
+                caveats,
+                finding_id,
+            };
+            push_unused_member_diagnostic(map, &row, code, kind_label, mapper);
         }
     }
 
@@ -554,36 +680,45 @@ pub fn push_member_diagnostics(
     push_unused_component_input_diagnostics(map, results, mapper);
     push_unused_component_output_diagnostics(map, results, mapper);
     push_unused_svelte_event_diagnostics(map, results, mapper);
+    push_effect_diagnostics(map, results, mapper);
     push_unused_server_action_diagnostics(map, results, mapper);
     push_unused_load_data_key_diagnostics(map, results, mapper);
+}
+
+/// One unused enum, class or store member with the parts its diagnostic needs.
+struct MemberRow<'a> {
+    member: &'a fallow_api::editor_results::UnusedMember,
+    caveats: &'a [ReachabilityCaveat],
+    finding_id: Option<&'a str>,
 }
 
 /// Push one HINT diagnostic for an unused enum / class / store member.
 fn push_unused_member_diagnostic(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
-    member: &fallow_api::editor_results::UnusedMember,
+    row: &MemberRow<'_>,
     code: &str,
     kind_label: &str,
     mapper: &mut PositionMapper,
 ) {
-    let Some(uri) = Uri::from_file_path(&member.path) else {
-        return;
+    let MemberRow {
+        member,
+        caveats,
+        finding_id,
+    } = *row;
+    let anchor = NamedAnchor {
+        path: &member.path,
+        line: member.line,
+        col: member.col,
+        name: &member.member_name,
     };
-    let line = member.line.saturating_sub(1);
-    let range = identifier_range(mapper, &member.path, line, member.col, &member.member_name);
-    map.entry(uri).or_default().push(Diagnostic {
-        range,
-        severity: Some(DiagnosticSeverity::HINT),
-        source: Some("fallow".to_string()),
-        code: Some(NumberOrString::String(code.to_string())),
-        code_description: doc_link_for_code(code),
-        message: format!(
+    let message = with_caveats(
+        format!(
             "{kind_label} '{}.{}' is unused",
             member.parent_name, member.member_name
         ),
-        tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-        ..Default::default()
-    });
+        caveats,
+    );
+    push_anchor_diagnostic(map, mapper, &anchor, code, message, finding_id);
 }
 
 fn identifier_range(
@@ -606,6 +741,33 @@ fn identifier_range(
     }
 }
 
+/// Push one HINT diagnostic on the identifier of a named anchor.
+fn push_anchor_diagnostic(
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
+    mapper: &mut PositionMapper,
+    anchor: &NamedAnchor<'_>,
+    code: &str,
+    message: String,
+    finding_id: Option<&str>,
+) {
+    let Some(uri) = Uri::from_file_path(anchor.path) else {
+        return;
+    };
+    let line = anchor.line.saturating_sub(1);
+    let range = identifier_range(mapper, anchor.path, line, anchor.col, anchor.name);
+    map.entry(uri).or_default().push(Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::HINT),
+        source: Some("fallow".to_string()),
+        code: Some(NumberOrString::String(code.to_string())),
+        code_description: doc_link_for_code(code),
+        message,
+        tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+        data: finding_data(finding_id),
+        ..Default::default()
+    });
+}
+
 fn push_unrendered_component_diagnostics(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     results: &AnalysisResults,
@@ -613,23 +775,24 @@ fn push_unrendered_component_diagnostics(
 ) {
     for finding in &results.unrendered_components {
         let c = &finding.component;
-        if let Some(uri) = Uri::from_file_path(&c.path) {
-            let line = c.line.saturating_sub(1);
-            let range = identifier_range(mapper, &c.path, line, c.col, &c.component_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unrendered-component".to_string())),
-                code_description: doc_link_for_code("unrendered-component"),
-                message: format!(
-                    "Component '{}' is reachable but rendered nowhere in this project",
-                    c.component_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &c.path,
+            line: c.line,
+            col: c.col,
+            name: &c.component_name,
+        };
+        let message = format!(
+            "Component '{}' is reachable but rendered nowhere in this project",
+            c.component_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unrendered-component",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -640,23 +803,24 @@ fn push_unused_component_prop_diagnostics(
 ) {
     for finding in &results.unused_component_props {
         let p = &finding.prop;
-        if let Some(uri) = Uri::from_file_path(&p.path) {
-            let line = p.line.saturating_sub(1);
-            let range = identifier_range(mapper, &p.path, line, p.col, &p.prop_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-component-prop".to_string())),
-                code_description: doc_link_for_code("unused-component-prop"),
-                message: format!(
-                    "Prop '{}' is declared but referenced nowhere in this component",
-                    p.prop_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &p.path,
+            line: p.line,
+            col: p.col,
+            name: &p.prop_name,
+        };
+        let message = format!(
+            "Prop '{}' is declared but referenced nowhere in this component",
+            p.prop_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-component-prop",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -667,23 +831,24 @@ fn push_unused_component_emit_diagnostics(
 ) {
     for finding in &results.unused_component_emits {
         let e = &finding.emit;
-        if let Some(uri) = Uri::from_file_path(&e.path) {
-            let line = e.line.saturating_sub(1);
-            let range = identifier_range(mapper, &e.path, line, e.col, &e.emit_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-component-emit".to_string())),
-                code_description: doc_link_for_code("unused-component-emit"),
-                message: format!(
-                    "Emit '{}' is declared but emitted nowhere in this component",
-                    e.emit_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &e.path,
+            line: e.line,
+            col: e.col,
+            name: &e.emit_name,
+        };
+        let message = format!(
+            "Emit '{}' is declared but emitted nowhere in this component",
+            e.emit_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-component-emit",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -694,23 +859,24 @@ fn push_unused_component_input_diagnostics(
 ) {
     for finding in &results.unused_component_inputs {
         let i = &finding.input;
-        if let Some(uri) = Uri::from_file_path(&i.path) {
-            let line = i.line.saturating_sub(1);
-            let range = identifier_range(mapper, &i.path, line, i.col, &i.input_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-component-input".to_string())),
-                code_description: doc_link_for_code("unused-component-input"),
-                message: format!(
-                    "Input '{}' is declared but read nowhere in this component",
-                    i.input_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &i.path,
+            line: i.line,
+            col: i.col,
+            name: &i.input_name,
+        };
+        let message = format!(
+            "Input '{}' is declared but read nowhere in this component",
+            i.input_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-component-input",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -721,25 +887,98 @@ fn push_unused_component_output_diagnostics(
 ) {
     for finding in &results.unused_component_outputs {
         let o = &finding.output;
-        if let Some(uri) = Uri::from_file_path(&o.path) {
-            let line = o.line.saturating_sub(1);
-            let range = identifier_range(mapper, &o.path, line, o.col, &o.output_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String(
-                    "unused-component-output".to_string(),
-                )),
-                code_description: doc_link_for_code("unused-component-output"),
-                message: format!(
-                    "Output '{}' is declared but emitted nowhere in this component",
-                    o.output_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &o.path,
+            line: o.line,
+            col: o.col,
+            name: &o.output_name,
+        };
+        let message = format!(
+            "Output '{}' is declared but emitted nowhere in this component",
+            o.output_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-component-output",
+            message,
+            finding.finding_id.as_deref(),
+        );
+    }
+}
+
+/// Push HINT diagnostics for the Effect rules: layers composed only into
+/// unused layers, tagged errors that no code produces, and `catchTag`
+/// handlers for a tag that no code produces.
+fn push_effect_diagnostics(
+    map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
+    results: &AnalysisResults,
+    mapper: &mut PositionMapper,
+) {
+    for finding in &results.unused_effect_layers {
+        let layer = &finding.layer;
+        let anchor = NamedAnchor {
+            path: &layer.path,
+            line: layer.line,
+            col: layer.col,
+            name: layer.name.rsplit('.').next().unwrap_or(&layer.name),
+        };
+        let message = format!(
+            "Layer '{}' is composed only into layers that nothing uses: {}",
+            layer.name,
+            layer.dead_consumers.join(", ")
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-effect-layer",
+            message,
+            finding.finding_id.as_deref(),
+        );
+    }
+    for finding in &results.unused_tagged_errors {
+        let error = &finding.error;
+        let anchor = NamedAnchor {
+            path: &error.path,
+            line: error.line,
+            col: error.col,
+            name: &error.name,
+        };
+        let message = format!(
+            "Tagged error '{}' is never constructed or failed with in this project",
+            error.name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-tagged-error",
+            message,
+            finding.finding_id.as_deref(),
+        );
+    }
+    for finding in &results.unproduced_catch_tags {
+        let catch_tag = &finding.catch_tag;
+        let anchor = NamedAnchor {
+            path: &catch_tag.path,
+            line: catch_tag.line,
+            col: catch_tag.col,
+            name: &catch_tag.tag,
+        };
+        let message = format!(
+            "catchTag handler for '{}' never runs: no code in this project produces the tag",
+            catch_tag.tag
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unproduced-catch-tag",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -750,23 +989,24 @@ fn push_unused_svelte_event_diagnostics(
 ) {
     for finding in &results.unused_svelte_events {
         let e = &finding.event;
-        if let Some(uri) = Uri::from_file_path(&e.path) {
-            let line = e.line.saturating_sub(1);
-            let range = identifier_range(mapper, &e.path, line, e.col, &e.event_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-svelte-event".to_string())),
-                code_description: doc_link_for_code("unused-svelte-event"),
-                message: format!(
-                    "Event '{}' is dispatched but listened to nowhere in this project",
-                    e.event_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &e.path,
+            line: e.line,
+            col: e.col,
+            name: &e.event_name,
+        };
+        let message = format!(
+            "Event '{}' is dispatched but listened to nowhere in this project",
+            e.event_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-svelte-event",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -779,23 +1019,24 @@ fn push_unused_load_data_key_diagnostics(
 ) {
     for finding in &results.unused_load_data_keys {
         let k = &finding.key;
-        if let Some(uri) = Uri::from_file_path(&k.path) {
-            let line = k.line.saturating_sub(1);
-            let range = identifier_range(mapper, &k.path, line, k.col, &k.key_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-load-data-key".to_string())),
-                code_description: doc_link_for_code("unused-load-data-key"),
-                message: format!(
-                    "load() return key '{}' is read by no consumer (sibling +page.svelte data.<key> or project-wide page.data.<key>)",
-                    k.key_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &k.path,
+            line: k.line,
+            col: k.col,
+            name: &k.key_name,
+        };
+        let message = format!(
+            "load() return key '{}' is read by no consumer (sibling +page.svelte data.<key> or project-wide page.data.<key>)",
+            k.key_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-load-data-key",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -808,23 +1049,24 @@ fn push_unused_server_action_diagnostics(
 ) {
     for finding in &results.unused_server_actions {
         let a = &finding.action;
-        if let Some(uri) = Uri::from_file_path(&a.path) {
-            let line = a.line.saturating_sub(1);
-            let range = identifier_range(mapper, &a.path, line, a.col, &a.action_name);
-            map.entry(uri).or_default().push(Diagnostic {
-                range,
-                severity: Some(DiagnosticSeverity::HINT),
-                source: Some("fallow".to_string()),
-                code: Some(NumberOrString::String("unused-server-action".to_string())),
-                code_description: doc_link_for_code("unused-server-action"),
-                message: format!(
-                    "Server action '{}' is exported from a \"use server\" file but no code in this project references it",
-                    a.action_name
-                ),
-                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                ..Default::default()
-            });
-        }
+        let anchor = NamedAnchor {
+            path: &a.path,
+            line: a.line,
+            col: a.col,
+            name: &a.action_name,
+        };
+        let message = format!(
+            "Server action '{}' is exported from a \"use server\" file but no code in this project references it",
+            a.action_name
+        );
+        push_anchor_diagnostic(
+            map,
+            mapper,
+            &anchor,
+            "unused-server-action",
+            message,
+            finding.finding_id.as_deref(),
+        );
     }
 }
 
@@ -870,12 +1112,245 @@ mod tests {
                 total_tokens: 0,
                 duplicated_tokens: 0,
                 clone_groups: 0,
+                clone_families: 0,
                 clone_instances: 0,
                 duplication_percentage: 0.0,
                 clone_groups_below_min_occurrences: 0,
                 clone_groups_ignored: 0,
                 near_candidates_skipped: 0,
             },
+        }
+    }
+
+    /// The Effect findings of [`named_anchor_results`], at line 3 and column 4.
+    fn push_effect_named_anchor_results(root: &std::path::Path, results: &mut AnalysisResults) {
+        use fallow_api::editor_results as r;
+        results
+            .unused_effect_layers
+            .push(r::UnusedEffectLayerFinding::with_actions(
+                r::UnusedEffectLayer {
+                    path: root.join("services.ts"),
+                    name: "Cache.layer".to_string(),
+                    kind: r::EffectLayerKind::StaticMember,
+                    line: 3,
+                    col: 4,
+                    dead_consumers: vec!["CacheLive".to_string()],
+                },
+            ));
+        results
+            .unused_tagged_errors
+            .push(r::UnusedTaggedErrorFinding::with_actions(
+                r::UnusedTaggedError {
+                    path: root.join("errors.ts"),
+                    name: "Expired".to_string(),
+                    tag: "Expired".to_string(),
+                    line: 3,
+                    col: 4,
+                    catch_sites: Vec::new(),
+                },
+            ));
+        results
+            .unproduced_catch_tags
+            .push(r::UnproducedCatchTagFinding::with_actions(
+                r::UnproducedCatchTag {
+                    path: root.join("main.ts"),
+                    tag: "Gone".to_string(),
+                    line: 3,
+                    col: 4,
+                    candidate_classes: vec!["Gone".to_string()],
+                },
+            ));
+    }
+
+    /// One finding per named-anchor kind, each in its own file, at 1-based
+    /// line 3 and column 4.
+    fn named_anchor_results(root: &std::path::Path) -> AnalysisResults {
+        use fallow_api::editor_results as r;
+        let mut results = AnalysisResults::default();
+        results
+            .unrendered_components
+            .push(r::UnrenderedComponentFinding::with_actions(
+                r::UnrenderedComponent {
+                    path: root.join("card-element.ts"),
+                    component_name: "my-card".to_string(),
+                    framework: "lit".to_string(),
+                    reachable_via: None,
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_component_props
+            .push(r::UnusedComponentPropFinding::with_actions(
+                r::UnusedComponentProp {
+                    path: root.join("Prop.vue"),
+                    component_name: "Prop".to_string(),
+                    prop_name: "size".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_component_emits
+            .push(r::UnusedComponentEmitFinding::with_actions(
+                r::UnusedComponentEmit {
+                    path: root.join("Emit.vue"),
+                    component_name: "Emit".to_string(),
+                    emit_name: "change".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_component_inputs
+            .push(r::UnusedComponentInputFinding::with_actions(
+                r::UnusedComponentInput {
+                    path: root.join("input.component.ts"),
+                    component_name: "InputComponent".to_string(),
+                    input_name: "label".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_component_outputs
+            .push(r::UnusedComponentOutputFinding::with_actions(
+                r::UnusedComponentOutput {
+                    path: root.join("output.component.ts"),
+                    component_name: "OutputComponent".to_string(),
+                    output_name: "closed".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_svelte_events
+            .push(r::UnusedSvelteEventFinding::with_actions(
+                r::UnusedSvelteEvent {
+                    path: root.join("Child.svelte"),
+                    component_name: "Child".to_string(),
+                    event_name: "dead".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_server_actions
+            .push(r::UnusedServerActionFinding::with_actions(
+                r::UnusedServerAction {
+                    path: root.join("app/actions.ts"),
+                    action_name: "createUser".to_string(),
+                    line: 3,
+                    col: 4,
+                },
+            ));
+        results
+            .unused_load_data_keys
+            .push(r::UnusedLoadDataKeyFinding::with_actions(
+                r::UnusedLoadDataKey {
+                    path: root.join("src/routes/+page.server.ts"),
+                    key_name: "posts".to_string(),
+                    line: 3,
+                    col: 4,
+                    route_dir: None,
+                },
+            ));
+        push_effect_named_anchor_results(root, &mut results);
+        results
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test string lengths are trivially small"
+    )]
+    fn named_anchor_diagnostics_keep_exact_message_code_and_range() {
+        let root = test_root();
+        let results = named_anchor_results(&root);
+        let diags = build_diagnostics_for_test(&results, &empty_duplication(), &root);
+        let cases = [
+            (
+                "card-element.ts",
+                "my-card",
+                "unrendered-component",
+                "Component 'my-card' is reachable but rendered nowhere in this project",
+            ),
+            (
+                "Prop.vue",
+                "size",
+                "unused-component-prop",
+                "Prop 'size' is declared but referenced nowhere in this component",
+            ),
+            (
+                "Emit.vue",
+                "change",
+                "unused-component-emit",
+                "Emit 'change' is declared but emitted nowhere in this component",
+            ),
+            (
+                "input.component.ts",
+                "label",
+                "unused-component-input",
+                "Input 'label' is declared but read nowhere in this component",
+            ),
+            (
+                "output.component.ts",
+                "closed",
+                "unused-component-output",
+                "Output 'closed' is declared but emitted nowhere in this component",
+            ),
+            (
+                "Child.svelte",
+                "dead",
+                "unused-svelte-event",
+                "Event 'dead' is dispatched but listened to nowhere in this project",
+            ),
+            (
+                "app/actions.ts",
+                "createUser",
+                "unused-server-action",
+                "Server action 'createUser' is exported from a \"use server\" file but no code in this project references it",
+            ),
+            (
+                "src/routes/+page.server.ts",
+                "posts",
+                "unused-load-data-key",
+                "load() return key 'posts' is read by no consumer (sibling +page.svelte data.<key> or project-wide page.data.<key>)",
+            ),
+            (
+                "services.ts",
+                "layer",
+                "unused-effect-layer",
+                "Layer 'Cache.layer' is composed only into layers that nothing uses: CacheLive",
+            ),
+            (
+                "errors.ts",
+                "Expired",
+                "unused-tagged-error",
+                "Tagged error 'Expired' is never constructed or failed with in this project",
+            ),
+            (
+                "main.ts",
+                "Gone",
+                "unproduced-catch-tag",
+                "catchTag handler for 'Gone' never runs: no code in this project produces the tag",
+            ),
+        ];
+        for (file, name, code, message) in cases {
+            let uri = Uri::from_file_path(root.join(file)).unwrap();
+            let file_diags = diags.get(&uri).unwrap_or_else(|| panic!("{file}"));
+            assert_eq!(file_diags.len(), 1, "{file}");
+            let d = &file_diags[0];
+            assert_eq!(d.message, message, "{file}");
+            assert_eq!(d.code, Some(NumberOrString::String(code.to_string())));
+            assert_eq!(d.code_description, super::doc_link_for_code(code), "{file}");
+            assert_eq!(d.severity, Some(DiagnosticSeverity::HINT), "{file}");
+            assert_eq!(d.source.as_deref(), Some("fallow"), "{file}");
+            assert_eq!(d.tags, Some(vec![DiagnosticTag::UNNECESSARY]), "{file}");
+            assert_eq!(d.range.start.line, 2, "{file}");
+            assert_eq!(d.range.end.line, 2, "{file}");
+            assert_eq!(d.range.start.character, 4, "{file}");
+            assert_eq!(d.range.end.character, 4 + name.len() as u32, "{file}");
         }
     }
 
@@ -897,6 +1372,8 @@ mod tests {
                 col: 7,
                 span_start: 40,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let duplication = empty_duplication();
@@ -920,6 +1397,122 @@ mod tests {
         assert_eq!(d.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
     }
 
+    /// Withholding the quick fix without saying why turns a stated limit into
+    /// a missing feature, so the diagnostic has to carry the caveat. The
+    /// wording is the shared `caveat_suffix`, which is what the human report
+    /// and the SARIF result message already append.
+    #[test]
+    fn a_caveated_finding_says_so_in_its_diagnostic() {
+        use fallow_types::output_dead_code::{CaveatedFinding, ReachabilityCaveat};
+
+        let root = test_root();
+        let mut results = AnalysisResults::default();
+
+        let mut export = UnusedExportFinding::with_actions(UnusedExport {
+            path: root.join("src/utils.ts"),
+            export_name: "helper".to_string(),
+            is_type_only: false,
+            line: 5,
+            col: 7,
+            span_start: 40,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        });
+        export.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        results.unused_exports.push(export);
+
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/orphan.ts"),
+        });
+        file.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteFileAnalysis]);
+        results.unused_files.push(file);
+
+        let mut member = UnusedEnumMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/colors.ts"),
+            parent_name: "Color".to_string(),
+            member_name: "Blue".to_string(),
+            kind: MemberKind::EnumMember,
+            line: 3,
+            col: 2,
+        });
+        member.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        results.unused_enum_members.push(member);
+
+        let mut class_member = UnusedClassMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/widget.ts"),
+            parent_name: "Widget".to_string(),
+            member_name: "render".to_string(),
+            kind: MemberKind::ClassMethod,
+            line: 4,
+            col: 2,
+        });
+        class_member.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        results.unused_class_members.push(class_member);
+
+        let mut store_member = UnusedStoreMemberFinding::with_actions(UnusedMember {
+            path: root.join("src/cart.ts"),
+            parent_name: "useCart".to_string(),
+            member_name: "subtotal".to_string(),
+            kind: MemberKind::StoreMember,
+            line: 6,
+            col: 2,
+        });
+        store_member.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        results.unused_store_members.push(store_member);
+
+        let duplication = empty_duplication();
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
+
+        let message = |relative: &str| {
+            let uri = Uri::from_file_path(root.join(relative)).unwrap();
+            diags[&uri][0].message.clone()
+        };
+
+        assert_eq!(
+            message("src/utils.ts"),
+            "Export 'helper' is unused (caveat: incomplete import graph)"
+        );
+        assert_eq!(
+            message("src/orphan.ts"),
+            "File is not reachable from any entry point (caveat: incomplete file analysis)"
+        );
+        assert_eq!(
+            message("src/colors.ts"),
+            "Enum member 'Color.Blue' is unused (caveat: incomplete import graph)"
+        );
+        assert_eq!(
+            message("src/widget.ts"),
+            "Class member 'Widget.render' is unused (caveat: incomplete import graph)"
+        );
+        assert_eq!(
+            message("src/cart.ts"),
+            "Store member 'useCart.subtotal' is unused (caveat: incomplete import graph)"
+        );
+    }
+
+    /// A clean run must render exactly as it did: the caveat is additive, and
+    /// an editor consumer diffing messages should see no change.
+    #[test]
+    fn an_uncaveated_finding_keeps_its_exact_message() {
+        let root = test_root();
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/orphan.ts"),
+            }));
+
+        let duplication = empty_duplication();
+        let diags = build_diagnostics_for_test(&results, &duplication, &root);
+        let uri = Uri::from_file_path(root.join("src/orphan.ts")).unwrap();
+
+        assert_eq!(
+            diags[&uri][0].message,
+            "File is not reachable from any entry point"
+        );
+    }
+
     #[test]
     fn unused_type_produces_hint_diagnostic() {
         let root = test_root();
@@ -934,6 +1527,8 @@ mod tests {
                 col: 0,
                 span_start: 100,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let duplication = empty_duplication();
@@ -1027,6 +1622,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let duplication = empty_duplication();
@@ -1054,6 +1650,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
 
         let duplication = empty_duplication();
@@ -1211,6 +1808,7 @@ mod tests {
                     path: root.join("package.json"),
                     line: 12,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
 
@@ -1319,6 +1917,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let duplication = empty_duplication();

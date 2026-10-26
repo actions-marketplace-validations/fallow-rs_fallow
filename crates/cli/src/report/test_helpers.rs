@@ -36,6 +36,8 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             col: 4,
             span_start: 120,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         }));
     r.unused_types
         .push(UnusedTypeFinding::with_actions(UnusedExport {
@@ -46,6 +48,8 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             col: 0,
             span_start: 60,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         }));
     r.unused_dependencies
         .push(UnusedDependencyFinding::with_actions(UnusedDependency {
@@ -54,6 +58,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             path: root.join("package.json"),
             line: 5,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         }));
     r.unused_dev_dependencies
         .push(UnusedDevDependencyFinding::with_actions(UnusedDependency {
@@ -62,6 +67,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             path: root.join("package.json"),
             line: 5,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         }));
     r.unused_optional_dependencies
         .push(UnusedOptionalDependencyFinding::with_actions(
@@ -71,6 +77,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
                 path: root.join("package.json"),
                 line: 15,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             },
         ));
     r.unused_enum_members
@@ -171,6 +178,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             import_specifier: "src/db/query.ts".to_string(),
             line: 2,
             col: 0,
+            via_path: None,
         }));
     r.unprovided_injects
         .push(UnprovidedInjectFinding::with_actions(UnprovidedInject {
@@ -257,6 +265,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
             route_dir: Some("src/routes/blog".to_string()),
         }));
     r.stale_suppressions.push(StaleSuppression {
+        finding_id: None,
         path: root.join("src/utils.ts"),
         line: 5,
         col: 0,
@@ -268,6 +277,7 @@ pub fn sample_results(root: &Path) -> AnalysisResults {
         },
         missing_reason: false,
         actions: StaleSuppression::actions_for(false),
+        effective_severity: None,
     });
 
     r

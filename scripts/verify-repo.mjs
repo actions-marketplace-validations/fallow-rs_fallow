@@ -4,7 +4,13 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
+import { assertLocalResolution } from "./assert-local-resolution.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// The ref that CI compares a pull request with. A checkout without it, for
+// example a fork clone with another remote name, skips the steps that need it.
+const BASE_REF = "origin/main";
 
 const FAST_COMMANDS = [
   {
@@ -18,6 +24,21 @@ const FAST_COMMANDS = [
     args: ["run", "check:agent-adapters"],
   },
   {
+    // CI runs the same rule in the "JS Lint and Format" job.
+    label: "Large file growth",
+    command: "node",
+    args: ["scripts/check-file-size.mjs", "--base", BASE_REF],
+    requiresRef: BASE_REF,
+  },
+  {
+    // CI runs the same rule in the "Changelog fragments" step. Entries go to
+    // changelog.d/, never to the [Unreleased] section of CHANGELOG.md.
+    label: "Changelog fragments",
+    command: "node",
+    args: ["scripts/changelog-fragments.mjs", "check", "--base", BASE_REF],
+    requiresRef: BASE_REF,
+  },
+  {
     label: "Rust formatting",
     command: "cargo",
     args: ["fmt", "--all", "--", "--check"],
@@ -26,6 +47,23 @@ const FAST_COMMANDS = [
     label: "Rust linting",
     command: "cargo",
     args: ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+  },
+  {
+    // The workspace run leaves out the feature-gated CLI targets, such as
+    // the schema-emit binary and its tests. CI lints them in a separate step.
+    label: "Rust linting (feature-gated CLI targets)",
+    command: "cargo",
+    args: [
+      "clippy",
+      "-p",
+      "fallow-cli",
+      "--features",
+      "test-sidecar-key,schema-emit",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings",
+    ],
   },
   {
     label: "JavaScript linting",
@@ -43,14 +81,41 @@ const FAST_COMMANDS = [
     args: ["run", "generate:contracts:check"],
   },
   {
+    label: "Cargo feature unification",
+    command: "npm",
+    args: ["run", "check:cargo-features"],
+  },
+  {
     label: "Crate boundaries",
     command: "npm",
     args: ["run", "check:crate-boundaries"],
   },
   {
+    label: "Miri cfg gates",
+    command: "npm",
+    args: ["run", "check:miri-cfg"],
+  },
+  {
+    label: "Bounded parse sites",
+    command: "npm",
+    args: ["run", "check:parse-sites"],
+  },
+  {
     label: "Emitted version drift",
     command: "npm",
     args: ["run", "check:emitted-versions"],
+  },
+  {
+    label: "Conformance fixtures",
+    command: "npm",
+    args: ["run", "check:conformance-fixtures"],
+  },
+  {
+    // Fast, and it catches a Rust file with Windows-only code that no
+    // Windows CI job lints.
+    label: "Workflow policy",
+    command: "node",
+    args: ["--test", "scripts/workflow-policy.test.mjs"],
   },
 ];
 
@@ -59,6 +124,11 @@ const FULL_ONLY_COMMANDS = [
     label: "Repository script tests",
     command: "node",
     args: ["--test", "scripts/*.test.mjs"],
+  },
+  {
+    label: "Workflow script tests",
+    command: "node",
+    args: ["--test", ".github/scripts/*.test.mjs"],
   },
   {
     label: "npm wrapper tests",
@@ -86,6 +156,11 @@ const FULL_ONLY_COMMANDS = [
     args: ["run", "check:semantic-clone-conformance"],
   },
   {
+    label: "Duplication accuracy floor",
+    command: "npm",
+    args: ["run", "check:dupes-accuracy"],
+  },
+  {
     label: "Benchmark compilation",
     command: "cargo",
     args: ["check", "--workspace", "--benches"],
@@ -105,6 +180,28 @@ const FULL_ONLY_COMMANDS = [
     label: "Local NAPI tests",
     command: "npm",
     args: ["--prefix", "crates/napi", "test"],
+  },
+];
+
+const ROOT_INSTALL = "npm ci";
+
+// Local installs that the gates need. The preflight checks all of them before
+// the first gate, so one run names every missing or stale install.
+const FAST_INSTALLS = [
+  { dependency: "oxlint", resolveFrom: "package.json", installCommand: ROOT_INSTALL },
+  { dependency: "oxfmt", resolveFrom: "package.json", installCommand: ROOT_INSTALL },
+  {
+    dependency: "json-schema-to-typescript",
+    resolveFrom: "editors/vscode/scripts/codegen-contracts.mjs",
+    installCommand: "pnpm --dir editors/vscode install",
+  },
+];
+
+const FULL_ONLY_INSTALLS = [
+  {
+    dependency: "@napi-rs/cli",
+    resolveFrom: "crates/napi/package.json",
+    installCommand: "npm ci --prefix crates/napi",
   },
 ];
 
@@ -141,6 +238,31 @@ export const commandsForMode = (mode) => {
   throw new Error(`Unknown verification mode: ${mode}`);
 };
 
+export const installsForMode = (mode) => {
+  if (mode === "fast") {
+    return FAST_INSTALLS;
+  }
+  if (mode === "full") {
+    return [...FAST_INSTALLS, ...FULL_ONLY_INSTALLS];
+  }
+  throw new Error(`Unknown verification mode: ${mode}`);
+};
+
+/**
+ * Check every local install that `mode` needs and collect all failures.
+ *
+ * @returns {string[]} One message per missing or stale install.
+ */
+export const findInstallProblems = (mode, assertInstall = assertLocalResolution) =>
+  installsForMode(mode).flatMap(({ dependency, resolveFrom, installCommand }) => {
+    try {
+      assertInstall({ dependency, resolveFrom: path.join(ROOT, resolveFrom), installCommand });
+      return [];
+    } catch (error) {
+      return [error instanceof Error ? error.message : String(error)];
+    }
+  });
+
 export const parseArgs = (args) => {
   const requested = new Set(args);
   const unknown = args.find((arg) => !VALID_ARGS.has(arg));
@@ -161,10 +283,12 @@ export const parseArgs = (args) => {
 export const helpText = () => `Usage: node scripts/verify-repo.mjs [--fast | --full]
 
 Canonical local repository verification:
-  --fast  Knowledge routing, adapter drift, formatting, linting, generated
-          contracts, and crate boundaries (default)
+  --fast  Knowledge routing, adapter drift, large file growth against
+          origin/main, formatting, linting, generated
+          contracts, crate boundaries, and the conformance fixtures (default)
   --full  Fast checks plus repository script tests, npm wrapper tests, workspace
-          tests, benchmark compilation, rustdoc, and the local NAPI build and tests
+          tests, the duplication accuracy floor, benchmark compilation, rustdoc,
+          and the local NAPI build and tests
 
 Prerequisites:
   - Node.js 22 or newer and root dependencies installed with npm install
@@ -192,17 +316,45 @@ const defaultRunCommand = ({ command, args, env = {} }) => {
   return result.status ?? 1;
 };
 
+const defaultHasRef = (ref) =>
+  spawnSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+    cwd: ROOT,
+    shell: false,
+    stdio: "ignore",
+  }).status === 0;
+
 const formatCommand = ({ command, args }) =>
   [command, ...args].map((part) => JSON.stringify(part)).join(" ");
 
 export const runVerification = (
   mode,
-  { runCommand = defaultRunCommand, write = (message) => process.stdout.write(message) } = {},
+  {
+    runCommand = defaultRunCommand,
+    write = (message) => process.stdout.write(message),
+    assertInstall = assertLocalResolution,
+    hasRef = defaultHasRef,
+  } = {},
 ) => {
   const commands = commandsForMode(mode);
   write(`Running ${mode} repository verification.\n`);
 
+  const problems = findInstallProblems(mode, assertInstall);
+  if (problems.length > 0) {
+    write(`\n[verify] Local installs are missing or stale:\n`);
+    for (const problem of problems) {
+      write(`  - ${problem}\n`);
+    }
+    return 1;
+  }
+
   for (const command of commands) {
+    if (command.requiresRef !== undefined && !hasRef(command.requiresRef)) {
+      write(
+        `\n[verify] ${command.label}: skipped, because ${command.requiresRef} does not exist. ` +
+          "Run `git fetch origin main` to run this step.\n",
+      );
+      continue;
+    }
     write(`\n[verify] ${command.label}: ${formatCommand(command)}\n`);
     const exitCode = runCommand(command);
     if (exitCode !== 0) {

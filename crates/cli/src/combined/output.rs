@@ -21,7 +21,9 @@ use crate::regression;
 use crate::report;
 
 use super::CombinedOptions;
-use super::orientation::{is_test_path, print_entry_point_summary, print_orientation_header};
+use super::orientation::{
+    is_non_production_path, print_entry_point_summary, print_orientation_header,
+};
 
 /// Build ownership resolver, dispatch to format-specific printer, and return
 /// the accumulated max exit code. Returns `Err(ExitCode)` for fatal output errors.
@@ -32,13 +34,19 @@ pub(super) fn print_combined_report(
     health_result: Option<&HealthResult>,
     total_elapsed: std::time::Duration,
 ) -> Result<u8, ExitCode> {
-    let codeowners_cfg = check_result
+    let config = check_result
         .map(|r| &r.config)
         .or_else(|| health_result.map(|r| &r.config))
-        .or_else(|| dupes_result.map(|r| &r.config))
-        .and_then(|c| c.codeowners.as_deref());
-    let resolver =
-        crate::build_ownership_resolver(opts.group_by, opts.root, codeowners_cfg, opts.output)?;
+        .or_else(|| dupes_result.map(|r| &r.config));
+    let codeowners_cfg = config.and_then(|c| c.codeowners.as_deref());
+    let workspace_patterns = config.map_or(&[][..], |c| c.workspace_patterns.as_slice());
+    let resolver = crate::build_ownership_resolver(
+        opts.group_by,
+        opts.root,
+        codeowners_cfg,
+        workspace_patterns,
+        opts.output,
+    )?;
 
     if let Some(code) = print_machine_combined_report(
         opts,
@@ -47,7 +55,19 @@ pub(super) fn print_combined_report(
         health_result,
         total_elapsed,
     )? {
-        return Ok(code);
+        let code = machine_combined_code_with_stale_baseline_gate(
+            opts,
+            check_result,
+            dupes_result,
+            health_result,
+            code,
+        );
+        return Ok(code.max(machine_combined_fail_on_issues_code(
+            opts,
+            check_result,
+            dupes_result,
+            health_result,
+        )));
     }
 
     Ok(print_human_sections(
@@ -59,6 +79,82 @@ pub(super) fn print_combined_report(
     ))
 }
 
+/// Apply the opt-in stale-baseline gate to a machine-rendered combined run.
+///
+/// Without `--fail-on-issues`, the machine renderers collapse the findings
+/// gates to zero: the bare run exits 0 for issues in `--format json`, `sarif`,
+/// `codeclimate`, the GitHub formats and the comment and review formats.
+/// `--fail-on-stale-baseline` is opt-in, so it fails the run in every format:
+/// a CI job that asked for the gate and renders JSON, which is the documented
+/// machine-readable shape, would otherwise be green forever. The gate prints
+/// its line on stderr, so stdout is byte-identical with and without the flag.
+///
+/// The human path reaches the same gate through each section's own print
+/// function, so only one of the two evaluates it on any given run. Every
+/// sub-pass baseline is judged, and each tripped one prints its own line.
+fn machine_combined_code_with_stale_baseline_gate(
+    opts: &CombinedOptions<'_>,
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
+    code: u8,
+) -> u8 {
+    let dead_code = crate::baseline_gate::gate_failed(
+        check_result.and_then(|result| result.baseline_staleness.as_ref()),
+        opts.fail_on_stale_baseline,
+        fallow_engine::baseline::BaselineKind::DeadCode,
+    );
+    let dupes = crate::baseline_gate::gate_failed(
+        dupes_result.and_then(|result| result.baseline_staleness.as_ref()),
+        opts.fail_on_stale_baseline,
+        fallow_engine::baseline::BaselineKind::Dupes,
+    );
+    let health = health_result
+        .and_then(|result| result.report.summary.baseline_staleness.as_ref())
+        .is_some_and(|staleness| {
+            crate::baseline_gate::gate_failed_from_envelope(
+                staleness,
+                opts.health_baseline,
+                opts.fail_on_stale_baseline,
+                fallow_engine::baseline::BaselineKind::Health,
+            )
+        });
+    code.max(crate::exit_codes::gate_failed_exit_code(
+        fallow_output::GateName::StaleBaseline,
+        dead_code || dupes || health,
+    ))
+}
+
+/// Apply `--fail-on-issues` (or `--ci`) to a machine-rendered combined run.
+///
+/// Without the flag, the machine renderers exit 0 for findings. With it, the
+/// findings rules and the duplication threshold are enforced in
+/// `gate_outcomes`, and the exit code follows the entries that fail. The code
+/// reads the same object that `--format json` prints, so the published verdict
+/// and the process status cannot disagree.
+fn machine_combined_fail_on_issues_code(
+    opts: &CombinedOptions<'_>,
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
+) -> u8 {
+    if !opts.fail_on_issues {
+        return 0;
+    }
+    crate::gates::fail_on_issues_exit_code(
+        combined_gate_outcomes(
+            check_result,
+            dupes_result,
+            health_result,
+            CombinedGateFlags {
+                fail_on_stale_baseline: opts.fail_on_stale_baseline,
+                fail_on_issues: true,
+            },
+        )
+        .as_ref(),
+    )
+}
+
 fn print_machine_combined_report(
     opts: &CombinedOptions<'_>,
     check_result: Option<&CheckResult>,
@@ -66,21 +162,34 @@ fn print_machine_combined_report(
     health_result: Option<&HealthResult>,
     total_elapsed: std::time::Duration,
 ) -> Result<Option<u8>, ExitCode> {
+    // A closure, so the config-file probe runs only for the formats that
+    // serialize the envelope.
+    let json_input = || CombinedJsonPrintInput {
+        check_result,
+        dupes_result,
+        health_result,
+        root: opts.root,
+        elapsed: total_elapsed,
+        explain: opts.explain,
+        config_fixable: opts.config_path.is_some()
+            || fallow_config::FallowConfig::find_config_path(opts.root).is_some(),
+        gate_flags: CombinedGateFlags {
+            fail_on_stale_baseline: opts.fail_on_stale_baseline,
+            fail_on_issues: opts.fail_on_issues,
+        },
+    };
+    if let Some(check) = check_result
+        && combined_machine_format(opts.output)
+    {
+        report::config_pattern_text::print_stderr_notes(
+            &check.workspace_diagnostics,
+            opts.output,
+            opts.quiet,
+        );
+    }
     match opts.output {
         OutputFormat::Json => {
-            let code = print_combined_json(
-                CombinedJsonPrintInput {
-                    check_result,
-                    dupes_result,
-                    health_result,
-                    root: opts.root,
-                    elapsed: total_elapsed,
-                    explain: opts.explain,
-                    config_fixable: opts.config_path.is_some()
-                        || fallow_config::FallowConfig::find_config_path(opts.root).is_some(),
-                },
-                opts.json_style,
-            );
+            let code = print_combined_json(json_input(), opts.json_style);
             combined_machine_success(code)
         }
         OutputFormat::Sarif => {
@@ -91,36 +200,43 @@ fn print_machine_combined_report(
             let code = print_combined_codeclimate(check_result, dupes_result, health_result);
             combined_machine_success(code)
         }
-        OutputFormat::PrCommentGithub => {
-            print_combined_pr_comment(opts, check_result, dupes_result, health_result, true)
-        }
-        OutputFormat::PrCommentGitlab => {
-            print_combined_pr_comment(opts, check_result, dupes_result, health_result, false)
-        }
-        OutputFormat::ReviewGithub => {
-            print_combined_review(check_result, dupes_result, health_result, true)
-        }
-        OutputFormat::ReviewGitlab => {
-            print_combined_review(check_result, dupes_result, health_result, false)
-        }
+        OutputFormat::PrCommentGithub | OutputFormat::PrCommentGitlab => print_combined_pr_comment(
+            opts,
+            json_input(),
+            matches!(opts.output, OutputFormat::PrCommentGithub),
+        ),
+        OutputFormat::ReviewGithub | OutputFormat::ReviewGitlab => print_combined_review(
+            opts,
+            json_input(),
+            matches!(opts.output, OutputFormat::ReviewGithub),
+        ),
         OutputFormat::GithubAnnotations | OutputFormat::GithubSummary => {
             let code = print_combined_github_format(
-                CombinedJsonPrintInput {
-                    check_result,
-                    dupes_result,
-                    health_result,
-                    root: opts.root,
-                    elapsed: total_elapsed,
-                    explain: opts.explain,
-                    config_fixable: opts.config_path.is_some()
-                        || fallow_config::FallowConfig::find_config_path(opts.root).is_some(),
-                },
+                json_input(),
                 matches!(opts.output, OutputFormat::GithubSummary),
             );
             combined_machine_success(code)
         }
         _ => Ok(None),
     }
+}
+
+/// Whether [`print_machine_combined_report`] renders `format` itself. The
+/// other formats go through the dead-code printer, which prints its own
+/// config pattern notes.
+const fn combined_machine_format(format: OutputFormat) -> bool {
+    matches!(
+        format,
+        OutputFormat::Json
+            | OutputFormat::Sarif
+            | OutputFormat::CodeClimate
+            | OutputFormat::PrCommentGithub
+            | OutputFormat::PrCommentGitlab
+            | OutputFormat::ReviewGithub
+            | OutputFormat::ReviewGitlab
+            | OutputFormat::GithubAnnotations
+            | OutputFormat::GithubSummary
+    )
 }
 
 /// Render the combined run in a GitHub-native format from the same combined
@@ -164,25 +280,37 @@ fn combined_provider(github: bool) -> report::ci::pr_comment::Provider {
 
 fn print_combined_pr_comment(
     opts: &CombinedOptions<'_>,
-    check_result: Option<&CheckResult>,
-    dupes_result: Option<&DupesResult>,
-    health_result: Option<&HealthResult>,
+    input: CombinedJsonPrintInput<'_>,
     github: bool,
 ) -> Result<Option<u8>, ExitCode> {
+    let CombinedJsonPrintInput {
+        check_result,
+        dupes_result,
+        health_result,
+        ..
+    } = input;
+    let status_note = combined_status_note(input, opts.output)?;
     let envelope = build_combined_pr_summary(
         opts.fail_on_issues,
         check_result,
         dupes_result,
         health_result,
         combined_provider(github),
+        status_note.as_deref(),
     );
-    let decision = build_combined_pr_decision(
+    let mut decision = build_combined_pr_decision(
         opts.fail_on_issues,
+        opts.fail_on_stale_baseline,
         check_result,
         dupes_result,
         health_result,
         &envelope,
     );
+    // The Check Run summary carries the note too, as the saved render's does.
+    if let Some(note) = status_note.as_deref() {
+        decision.details.summary_markdown =
+            format!("{}\n\n> {note}", decision.details.summary_markdown);
+    }
     let details = build_combined_pr_details(check_result, dupes_result, health_result);
     report::ci::pr_comment::write_pr_comment_envelope_sidecar(&envelope);
     report::ci::pr_comment::write_pr_decision_sidecar(&decision);
@@ -191,12 +319,39 @@ fn print_combined_pr_comment(
     combined_machine_success(ExitCode::SUCCESS)
 }
 
+/// The status note of the combined comment, read from the envelope that
+/// `--format json` prints for this run.
+///
+/// The saved render reads the note from the same envelope through the same
+/// function, so `fallow report --from` and the live comment state the same
+/// clauses in the same order.
+fn combined_status_note(
+    input: CombinedJsonPrintInput<'_>,
+    output: OutputFormat,
+) -> Result<Option<String>, ExitCode> {
+    let envelope = build_combined_json_output(input)?;
+    crate::cli_report::envelope_status_note(
+        report::github_annotations::EnvelopeKind::Combined,
+        &envelope,
+        None,
+    )
+    .map_err(|error| {
+        crate::emit_known_failure(
+            &error,
+            2,
+            output,
+            crate::telemetry::FailureReason::Validation,
+        )
+    })
+}
+
 fn build_combined_pr_summary(
     fail_on_issues: bool,
     check_result: Option<&CheckResult>,
     dupes_result: Option<&DupesResult>,
     health_result: Option<&HealthResult>,
     provider: report::ci::pr_comment::Provider,
+    status_note: Option<&str>,
 ) -> PrCommentEnvelope {
     let codeclimate = build_combined_codeclimate_issues(check_result, dupes_result, health_result);
     let findings = combined_pr_summary_findings(&codeclimate);
@@ -213,11 +368,18 @@ fn build_combined_pr_summary(
         max_findings: report::ci::pr_comment::max_comments(),
         details_url: None,
         layout: report::ci::pr_comment::pr_comment_layout_from_env(),
+        status_note,
+        trailing_section: check_result
+            .and_then(|check| {
+                report::config_pattern_text::markdown_section(&check.workspace_diagnostics)
+            })
+            .as_deref(),
     })
 }
 
 fn build_combined_pr_decision(
     fail_on_issues: bool,
+    fail_on_stale_baseline: bool,
     check_result: Option<&CheckResult>,
     dupes_result: Option<&DupesResult>,
     health_result: Option<&HealthResult>,
@@ -227,13 +389,29 @@ fn build_combined_pr_decision(
     let issues = report::ci::diff_filter::filter_issues_for_summary(
         issues_from_codeclimate_issues(&codeclimate),
     );
-    let gates =
+    let mut gates =
         combined_pr_summary_areas(fail_on_issues, check_result, dupes_result, health_result)
             .into_iter()
             .map(pr_decision_gate_from_summary_area)
             .collect::<Vec<_>>();
+    // Both derived from the per-area rows alone, and both before the gate rows
+    // join them: the check-run `conclusion` is a documented non-blocker, and a
+    // failing gate row appended first would silently turn every combined run
+    // that armed a gate into a merge blocker.
     let conclusion = combined_decision_conclusion(&gates);
     let summary_markdown = combined_decision_summary(conclusion, issues.len(), &gates);
+    gates.extend(report::gate_outcome_text::gate_rows_for_gates(
+        combined_gate_outcomes(
+            check_result,
+            dupes_result,
+            health_result,
+            CombinedGateFlags {
+                fail_on_stale_baseline,
+                fail_on_issues,
+            },
+        )
+        .as_ref(),
+    ));
 
     PrDecisionSurface {
         schema: PR_DECISION_SCHEMA.to_owned(),
@@ -419,8 +597,10 @@ fn health_pr_summary_area(result: &HealthResult) -> PrSummaryArea {
         name: "Health".to_owned(),
         status: if count == 0 {
             PrSummaryStatus::Pass
-        } else {
+        } else if result.report.findings.iter().any(|f| f.blocks()) {
             PrSummaryStatus::Fail
+        } else {
+            PrSummaryStatus::Warn
         },
         result: count_label(count, "finding", "findings"),
         threshold: Some("configured complexity gates".to_owned()),
@@ -449,17 +629,31 @@ fn dupes_threshold_label(threshold: f64) -> Option<String> {
     (threshold > 0.0).then(|| format!("<= {threshold:.1}% duplicated lines"))
 }
 
+/// Render the combined review envelope. Its summary body carries the status
+/// note and the unmatched config patterns, as the combined sticky comment and
+/// `fallow report --from` on the saved envelope do.
 fn print_combined_review(
-    check_result: Option<&CheckResult>,
-    dupes_result: Option<&DupesResult>,
-    health_result: Option<&HealthResult>,
+    opts: &CombinedOptions<'_>,
+    input: CombinedJsonPrintInput<'_>,
     github: bool,
 ) -> Result<Option<u8>, ExitCode> {
+    let CombinedJsonPrintInput {
+        check_result,
+        dupes_result,
+        health_result,
+        ..
+    } = input;
+    let status_note = combined_status_note(input, opts.output)?;
     let issues = build_combined_codeclimate_issues(check_result, dupes_result, health_result);
     let code = report::ci::review::print_review_envelope_from_codeclimate_issues(
         "combined",
         combined_provider(github),
         &issues,
+        report::ci::review::ReviewSummaryNotes {
+            message: status_note.as_deref(),
+            config_patterns: check_result
+                .map_or(&[], |check| check.workspace_diagnostics.as_slice()),
+        },
     );
     combined_machine_success(code)
 }
@@ -481,6 +675,26 @@ fn print_human_sections(
         } else if let Some(result) = check_result {
             print_entry_point_summary(&result.results);
         }
+    }
+
+    // The stage's own list, never the process registry: a combined run walks
+    // once per analysis and a registry read answers "whichever walk wrote
+    // last" (issue #2366).
+    if let Some(result) = check_result {
+        crate::discovery_note::print_all_source_excluded_warning(
+            &result.workspace_diagnostics,
+            result.discovered_file_count,
+            result.explain_skipped,
+            opts.quiet,
+            opts.output,
+        );
+        crate::discovery_note::print_default_ignore_exclusion_note(
+            opts.root,
+            &result.workspace_diagnostics,
+            result.explain_skipped,
+            opts.quiet,
+            opts.output,
+        );
     }
 
     let has_any_findings = check_result.is_some_and(|result| result.results.total_issues() > 0)
@@ -554,7 +768,10 @@ fn print_check_section(
     let Some(result) = check_result else {
         return 0;
     };
-    if show_headers {
+    // `--only architecture` reports no dead-code finding type, so the section
+    // has no "Dead Code" heading and starts at the "Architecture" category.
+    let only_architecture = opts.architecture == crate::check::ArchitectureSelection::Only;
+    if show_headers && !only_architecture {
         eprintln!();
         eprintln!("── Dead Code ──────────────────────────────────────");
     }
@@ -571,6 +788,14 @@ fn print_check_section(
             show_explain_tip: false,
             type_aware_scope: Some("dead-code"),
             json_style: crate::json_style::JsonStyle::Compact,
+            fail_on_parse_error: false,
+            exit_reason: false,
+            // The same "Architecture" category with and without `--quiet`.
+            architecture_layout: if only_architecture {
+                report::ArchitectureLayout::Only
+            } else {
+                report::ArchitectureLayout::Split
+            },
         },
     );
     exit_code_to_u8(code)
@@ -620,7 +845,13 @@ fn print_health_section(
         crate::health::HealthPrintOptions {
             quiet: opts.quiet,
             explain: opts.explain,
-            gates: fallow_engine::health::HealthGateOptions::default(),
+            gates: fallow_engine::health::HealthGateOptions {
+                fail_on_stale_baseline: opts.fail_on_stale_baseline,
+                // The analysis already promoted `warn` findings, so the print
+                // has no use for the flag.
+                ..fallow_engine::health::HealthGateOptions::default()
+            },
+            baseline_path: opts.health_baseline,
             summary: opts.summary,
             summary_heading: !show_headers,
             show_explain_tip: false,
@@ -628,44 +859,183 @@ fn print_health_section(
             skip_score_and_trend: true,
             css_requested: false,
             json_style: opts.json_style,
+            exit_reason: false,
         },
     );
     exit_code_to_u8(code)
 }
 
-/// Handle regression outcome and print failure summary.
-pub(super) fn handle_regression_and_summary(
-    max_exit: &mut u8,
-    quiet: bool,
-    root: &std::path::Path,
+/// Print one exit-reason line for the whole bare run, after every gate of the
+/// run has set `code`.
+///
+/// The sections print no line of their own, so a run with a failed dead-code
+/// section and a failed health section gets one line that names both gates,
+/// in every output format.
+pub(super) fn print_combined_exit_reason(
+    opts: &CombinedOptions<'_>,
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
+    code: u8,
+) {
+    let machine = combined_machine_format(opts.output);
+    if code == 0 {
+        if machine && !opts.fail_on_issues {
+            print_unenforced_gates_line(opts, check_result, dupes_result, health_result);
+        }
+        return;
+    }
+    let mut gates = combined_gate_outcomes(
+        check_result,
+        dupes_result,
+        health_result,
+        CombinedGateFlags {
+            fail_on_stale_baseline: opts.fail_on_stale_baseline,
+            fail_on_issues: opts.fail_on_issues,
+        },
+    );
+    if !machine && let Some(gates) = gates.as_mut() {
+        enforce_human_section_rules(gates);
+    }
+    let own_lines = combined_own_lines(machine, opts.quiet, check_result);
+    crate::gates::print_exit_reason(&crate::gates::ExitReason {
+        gates: gates.as_ref(),
+        code,
+        fail_on_issues: opts.fail_on_issues,
+        quiet: opts.quiet,
+        output: opts.output,
+        own_lines: &own_lines,
+    });
+}
+
+/// Print the line that names the failing findings gates a bare machine run
+/// exits 0 on. Printed also under `--quiet`, like the exit-reason line: an
+/// agent that runs `--format json --quiet` is the reader who sees only the
+/// exit code.
+fn print_unenforced_gates_line(
+    opts: &CombinedOptions<'_>,
     check_result: Option<&CheckResult>,
     dupes_result: Option<&DupesResult>,
     health_result: Option<&HealthResult>,
 ) {
+    let gates = combined_gate_outcomes(
+        check_result,
+        dupes_result,
+        health_result,
+        CombinedGateFlags {
+            fail_on_stale_baseline: opts.fail_on_stale_baseline,
+            fail_on_issues: false,
+        },
+    );
+    if let Some(line) = crate::report::gate_outcome_text::unenforced_gates_line(
+        gates.as_ref(),
+        opts.output.flag_label(),
+    ) {
+        eprintln!(
+            "{}",
+            crate::report::human_status_line(crate::report::HumanStatus::Warning, line)
+        );
+    }
+}
+
+/// The section prints of the human path fail the run on the findings rules
+/// and on the duplication threshold also without `--fail-on-issues`. The
+/// envelope of the machine path keeps `enforced: false` for them, so the
+/// exit-reason line of the human path marks them enforced here.
+fn enforce_human_section_rules(gates: &mut fallow_output::GateOutcomes) {
+    use fallow_output::GateName;
+    for name in [
+        GateName::ErrorSeverityFindings,
+        GateName::HealthFindings,
+        GateName::HealthCoverageGaps,
+        GateName::DuplicationThreshold,
+    ] {
+        if let Some(outcome) = gates.get(name).cloned() {
+            gates.insert(
+                name,
+                fallow_output::GateOutcome {
+                    enforced: true,
+                    ..outcome
+                },
+            );
+        }
+    }
+}
+
+/// The gates of a bare run that already printed their own failure line.
+///
+/// The regression outcome prints when the run is not quiet. On the human path,
+/// the dupes section prints the threshold line in every mode, and the
+/// dead-code section prints the type-aware completeness line when the run is
+/// not quiet.
+fn combined_own_lines(
+    machine: bool,
+    quiet: bool,
+    check_result: Option<&CheckResult>,
+) -> Vec<fallow_output::GateName> {
+    use fallow_output::GateName;
+    let mut own = Vec::new();
+    if !quiet {
+        own.push(GateName::Regression);
+    }
+    if !machine {
+        own.push(GateName::DuplicationThreshold);
+        if !quiet && check_result.is_some_and(crate::check::type_aware_completeness_incomplete) {
+            own.push(GateName::TypeAwareRequire);
+        }
+    }
+    own
+}
+
+/// Handle regression outcome and print failure summary.
+pub(super) fn handle_regression_and_summary(
+    max_exit: &mut u8,
+    opts: &CombinedOptions<'_>,
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
+) {
+    let quiet = opts.quiet;
     if let Some(result) = check_result
         && let Some(ref outcome) = result.regression
     {
-        if !quiet {
+        // The dead-code section of the human path already printed the outcome.
+        if !quiet && combined_machine_format(opts.output) {
             regression::print_regression_outcome(outcome);
         }
-        if outcome.is_failure() {
-            *max_exit = (*max_exit).max(1);
-        }
+        *max_exit = (*max_exit).max(crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::Regression,
+            outcome.is_failure(),
+        ));
     }
 
     if *max_exit > 0 && !quiet {
-        print_failure_summary(root, check_result, dupes_result, health_result);
+        // `--only architecture` reports no dead-code finding type, so the
+        // failure line names the section after the architecture findings.
+        let check_section = if opts.architecture == crate::check::ArchitectureSelection::Only {
+            "architecture"
+        } else {
+            "dead-code"
+        };
+        print_failure_summary(
+            opts.root,
+            check_section,
+            check_result,
+            dupes_result,
+            health_result,
+        );
     }
 }
 
 /// Print a summary line listing which analyses had failures.
 fn print_failure_summary(
     root: &Path,
+    check_section: &str,
     check_result: Option<&CheckResult>,
     dupes_result: Option<&DupesResult>,
     health_result: Option<&HealthResult>,
 ) {
-    let parts = failure_summary_parts(check_result, dupes_result, health_result);
+    let parts = failure_summary_parts(check_section, check_result, dupes_result, health_result);
     if parts.is_empty() {
         return;
     }
@@ -676,20 +1046,21 @@ fn print_failure_summary(
 }
 
 fn failure_summary_parts(
+    check_section: &str,
     check_result: Option<&CheckResult>,
     dupes_result: Option<&DupesResult>,
     health_result: Option<&HealthResult>,
 ) -> Vec<String> {
     let mut parts = Vec::new();
     if let Some(r) = check_result
-        && let Some(part) = check_failure_summary_part(r)
+        && let Some(part) = check_failure_summary_part(r, check_section)
     {
         parts.push(part);
     }
     if let Some(r) = dupes_result {
         let groups = r.report.clone_groups.len();
         if groups > 0 {
-            parts.push(format!("dupes ({groups} clone groups)"));
+            parts.push(dupes_failure_label(groups));
         }
     }
     if let Some(r) = health_result {
@@ -701,28 +1072,46 @@ fn failure_summary_parts(
     parts
 }
 
-fn check_failure_summary_part(result: &CheckResult) -> Option<String> {
+fn check_failure_summary_part(result: &CheckResult, section: &str) -> Option<String> {
     let issues = result.results.total_issues();
     if issues == 0 {
         return None;
     }
+    let total_delta = result.baseline_deltas.as_ref().map(|d| d.total_delta);
+    Some(check_failure_label(section, issues, total_delta))
+}
 
-    let delta_suffix = result
-        .baseline_deltas
-        .as_ref()
-        .map_or_else(String::new, |d| match d.total_delta.cmp(&0) {
-            std::cmp::Ordering::Greater => format!(", +{} since baseline", d.total_delta),
-            std::cmp::Ordering::Less => format!(", {} since baseline", d.total_delta),
-            std::cmp::Ordering::Equal => ", \u{00b1}0 since baseline".to_string(),
-        });
-    Some(format!("dead-code ({issues} issues{delta_suffix})"))
+/// `<section> (<n> issue[s][, <delta> since baseline])` for the `Failed:` line.
+fn check_failure_label(section: &str, issues: usize, total_delta: Option<i64>) -> String {
+    let delta_suffix = total_delta.map_or_else(String::new, |delta| match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => format!(", +{delta} since baseline"),
+        std::cmp::Ordering::Less => format!(", {delta} since baseline"),
+        std::cmp::Ordering::Equal => ", \u{00b1}0 since baseline".to_string(),
+    });
+    format!(
+        "{section} ({}{delta_suffix})",
+        count_label(issues, "issue", "issues")
+    )
+}
+
+/// `dupes (<n> clone group[s])` for the `Failed:` line.
+fn dupes_failure_label(groups: usize) -> String {
+    format!(
+        "dupes ({})",
+        count_label(groups, "clone group", "clone groups")
+    )
 }
 
 fn health_failure_nudge(root: &Path, health_result: Option<&HealthResult>) -> String {
     health_result
         .filter(|r| !r.report.targets.is_empty())
         .map(|r| {
-            if let Some(top) = r.report.targets.iter().find(|t| !is_test_path(&t.path)) {
+            if let Some(top) = r
+                .report
+                .targets
+                .iter()
+                .find(|t| !is_non_production_path(&t.path, root))
+            {
                 let name = report::format_display_path(&top.path, root);
                 format!(": start with {name}")
             } else {
@@ -768,6 +1157,17 @@ struct CombinedJsonPrintInput<'a> {
     elapsed: std::time::Duration,
     explain: bool,
     config_fixable: bool,
+    gate_flags: CombinedGateFlags,
+}
+
+/// The flags of a bare `fallow` run that arm or enforce a gate in
+/// `gate_outcomes`.
+#[derive(Clone, Copy)]
+struct CombinedGateFlags {
+    /// `--fail-on-stale-baseline`.
+    fail_on_stale_baseline: bool,
+    /// `--fail-on-issues` or `--ci`.
+    fail_on_issues: bool,
 }
 
 fn print_combined_json(
@@ -830,6 +1230,21 @@ fn build_combined_json_output(
     let workspace_diagnostics = combined_workspace_diagnostics(&input);
 
     fallow_api::serialize_combined_json(CombinedJsonOutputInput {
+        package_baselines: fallow_api::first_package_baselines([
+            input
+                .check_result
+                .map(|run| run.package_baselines.as_slice()),
+            input
+                .dupes_result
+                .map(|run| run.package_baselines.as_slice()),
+        ]),
+        gate_outcomes: combined_gate_outcomes(
+            input.check_result,
+            input.dupes_result,
+            input.health_result,
+            input.gate_flags,
+        ),
+        request_outcomes: crate::requests::request_outcomes(),
         check: input.check_result.map(|result| CombinedCheckJsonSection {
             results: &result.results,
             root: &result.config.root,
@@ -847,10 +1262,38 @@ fn build_combined_json_output(
             .and_then(|result| result.type_aware_meta.clone()),
         workspace_diagnostics,
         next_steps,
-        envelope_mode: crate::output_runtime::current_root_envelope_mode(),
         telemetry_analysis_run_id: crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     })
+    .map(|mut envelope| {
+        insert_dupes_baseline_staleness(&mut envelope, input.dupes_result);
+        envelope
+    })
     .map_err(|err| json_output_error(&err))
+}
+
+/// Publish the duplication sub-pass's view of its loaded baseline at the
+/// `dupes` section root, where the standalone `dupes` envelope carries the same
+/// key. The schema declares the key on `fallow_api::CombinedDupesSection`.
+///
+/// Inserted into the serialized value for the reason audit gives in
+/// `insert_duplication_baseline_staleness`: the section payload is flattened
+/// into the standalone envelope, which owns a `baseline_staleness` of its own.
+fn insert_dupes_baseline_staleness(
+    envelope: &mut serde_json::Value,
+    dupes_result: Option<&DupesResult>,
+) {
+    let Some(loaded) = dupes_result.and_then(|result| result.baseline_staleness.as_ref()) else {
+        return;
+    };
+    let Some(section) = envelope
+        .get_mut("dupes")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Ok(staleness) = serde_json::to_value(loaded.to_envelope(0)) {
+        section.insert("baseline_staleness".into(), staleness);
+    }
 }
 
 fn combined_next_steps(
@@ -886,6 +1329,157 @@ fn emit_combined_json_output(
     }
 }
 
+/// The combined run's type-aware completeness rule, shared by the exit path and
+/// the `gate_outcomes` entry.
+///
+/// The gate fails when one of these rules fails:
+///
+/// - The combined rule. It keys on the resolved config and on
+///   `identity.completeness`. The meta is selected `check` first and `health`
+///   second.
+/// - The rule of the dead-code section print,
+///   [`crate::check::type_aware_completeness_incomplete`].
+/// - The rule of the health section print,
+///   [`crate::health::type_aware_completeness_incomplete`].
+///
+/// The human path prints each section, and each section print applies its own
+/// rule to the exit code. The gate reads the same rules, so a section that
+/// exits 1 on type-aware completeness always gives a failed gate entry, and
+/// the exit-reason line names the gate.
+pub fn combined_type_aware_gate_failed(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&crate::health::HealthResult>,
+) -> bool {
+    combined_identity_incomplete(check_result, health_result)
+        || check_result.is_some_and(crate::check::type_aware_completeness_incomplete)
+        || health_result.is_some_and(crate::health::type_aware_completeness_incomplete)
+}
+
+fn combined_identity_incomplete(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&crate::health::HealthResult>,
+) -> bool {
+    combined_type_aware_requested(check_result, health_result)
+        && check_result
+            .and_then(|result| result.type_aware_meta.as_ref())
+            .or_else(|| health_result.and_then(|result| result.type_aware_meta.as_ref()))
+            .and_then(|meta| meta.identity.as_ref())
+            .is_some_and(|identity| {
+                identity.completeness != fallow_types::semantic::SemanticCompleteness::Complete
+            })
+}
+
+/// The combined run's verdicts, merged into one root-level object.
+///
+/// Root rather than per-section, matching where the combined envelope already
+/// carries `workspace_diagnostics`, so a consumer reads one place instead of
+/// three and the `.check.regression` versus `.regression` split stops mattering
+/// for the verdict.
+///
+/// Always present when any analysis ran. It carries the default exit rule of
+/// each section that ran: `error-severity-findings` for dead code and
+/// `health-findings` for health. Dupes has no default rule. With these rules
+/// in it, the `status` members say whether the human run of the same flags
+/// fails.
+///
+/// Without `--fail-on-issues`, `enforced` is not the standalone commands'
+/// answer. The combined machine renderers then collapse every gate to exit 0
+/// except the stale-baseline gate
+/// ([`machine_combined_code_with_stale_baseline_gate`]), the baseline-growth
+/// gate, the regression gate, the type-aware completeness gate and the
+/// parse-error gate. Every other gate here then publishes its verdict with
+/// `enforced: false` rather than claiming an exit it cannot produce. With
+/// `--fail-on-issues` (or `--ci`), the findings rules and the duplication
+/// threshold are enforced, and
+/// [`machine_combined_fail_on_issues_code`] exits on them in every format.
+///
+/// Combined mode accepts none of the health gate flags (`--min-score`,
+/// `--min-severity`, `--threshold`), so the health sub-analysis arms only its
+/// default rule and, when the `coverage-gaps` rule is `error`, the coverage-gap
+/// gate.
+fn combined_gate_outcomes(
+    check_result: Option<&CheckResult>,
+    dupes_result: Option<&DupesResult>,
+    health_result: Option<&HealthResult>,
+    flags: CombinedGateFlags,
+) -> Option<fallow_output::GateOutcomes> {
+    crate::gates::combined_gate_outcomes(&crate::gates::CombinedGateInputs {
+        regression: check_result.and_then(|result| result.regression.as_ref()),
+        baselines: [
+            check_result
+                .and_then(|result| result.baseline_staleness.as_ref())
+                .map(|loaded| loaded.to_envelope(0)),
+            dupes_result
+                .and_then(|result| result.baseline_staleness.as_ref())
+                .map(|loaded| loaded.to_envelope(0)),
+            health_result.and_then(|result| result.report.summary.baseline_staleness),
+        ],
+        fail_on_stale_baseline: flags.fail_on_stale_baseline,
+        type_aware_failed: combined_type_aware_gate_outcome(check_result, health_result),
+        duplication: dupes_result
+            .map(|result| (result.threshold, result.report.stats.duplication_percentage)),
+        clone_groups: dupes_result.map(|result| result.report.stats.clone_groups),
+        error_findings: check_result.map(|result| {
+            crate::check::rules::count_error_severity_issues(
+                &result.results,
+                &crate::check::effective_check_rules(result),
+                Some(&result.config),
+                result.fail_on_issues,
+            )
+        }),
+        health_blocking_findings: health_result
+            .map(|result| result.report.findings.iter().filter(|f| f.blocks()).count()),
+        health_coverage_gaps: health_result.and_then(|result| {
+            result
+                .should_fail_on_coverage_gaps
+                .then_some(result.coverage_gaps_has_findings)
+        }),
+        parse_error: combined_parse_error_outcome(check_result, health_result),
+        fail_on_issues: flags.fail_on_issues,
+    })
+}
+
+/// The combined run's `parse-error` gate over its dead-code and health
+/// sections, shared by the exit path and the `gate_outcomes` entry. `None`
+/// unless the flag or the config key armed it. The combined run applies this
+/// gate in every output format, so the entry keeps `enforced: true`.
+pub fn combined_parse_error_outcome(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&crate::health::HealthResult>,
+) -> Option<fallow_output::GateOutcome> {
+    let sections: Vec<_> = check_result
+        .map(|result| (&result.config, result.workspace_diagnostics.as_slice()))
+        .into_iter()
+        .chain(
+            health_result.map(|result| (&result.config, result.workspace_diagnostics.as_slice())),
+        )
+        .collect();
+    crate::gates::sections_parse_error_outcome(&sections)
+}
+
+/// The verdict of the type-aware completeness gate, `None` when the run did
+/// not arm the gate. A section print that fails the gate also arms it, so the
+/// run never exits 1 on a gate it does not publish.
+fn combined_type_aware_gate_outcome(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&HealthResult>,
+) -> Option<bool> {
+    let failed = combined_type_aware_gate_failed(check_result, health_result);
+    (failed || combined_type_aware_requested(check_result, health_result)).then_some(failed)
+}
+
+/// Whether the combined run asked for the type-aware completeness gate at all,
+/// read from the same config the exit path resolves it from.
+fn combined_type_aware_requested(
+    check_result: Option<&CheckResult>,
+    health_result: Option<&HealthResult>,
+) -> bool {
+    check_result
+        .map(|result| result.config.type_aware.require)
+        .or_else(|| health_result.map(|result| result.config.type_aware.require))
+        == Some(fallow_config::TypeAwareRequire::Complete)
+}
+
 fn check_json_extras_for_combined(result: &CheckResult) -> fallow_api::CheckJsonExtraOutputs {
     let baseline_deltas = result.baseline_deltas.as_ref().map(|deltas| {
         report::build_baseline_deltas_output(
@@ -900,6 +1494,10 @@ fn check_json_extras_for_combined(result: &CheckResult) -> fallow_api::CheckJson
         result.regression.as_ref(),
         baseline_deltas,
         result.baseline_matched,
+        result
+            .baseline_staleness
+            .as_ref()
+            .map(|loaded| loaded.to_envelope(0)),
     )
 }
 
@@ -923,6 +1521,7 @@ fn print_combined_sarif(
         let mut sarif =
             report::api_sarif_document(&result.results, &result.config.root, &result.config.rules);
         report::sarif::annotate_type_aware_sarif(&mut sarif, result.type_aware_meta.as_ref());
+        report::sarif::annotate_config_pattern_sarif(&mut sarif, &result.workspace_diagnostics);
         if let Some(runs) = sarif.get("runs").and_then(|r| r.as_array()) {
             all_runs.extend(runs.iter().cloned());
         }
@@ -1103,6 +1702,7 @@ mod tests {
             None,
             None,
             crate::report::ci::pr_comment::Provider::Github,
+            None,
         );
 
         assert!(envelope.is_clean);
@@ -1137,6 +1737,98 @@ mod tests {
         assert!(health.is_none());
     }
 
+    /// A health result whose type-aware metadata asks for the `complete`
+    /// policy and holds a partial query. The resolved config keeps the
+    /// default `best-effort` policy, so the two sources disagree.
+    fn health_result_with_incomplete_type_aware_meta() -> crate::health::HealthResult {
+        crate::health::HealthResult {
+            branching_by_file: fallow_engine::health::BranchingByFile::default(),
+            report: fallow_output::HealthReport::default(),
+            grouping: None,
+            group_resolver: None,
+            config: fallow_config::FallowConfig::default().resolve(
+                std::path::PathBuf::from("/project"),
+                fallow_config::OutputFormat::Json,
+                1,
+                true,
+                true,
+                None,
+            ),
+            workspace_diagnostics: Vec::new(),
+            elapsed: std::time::Duration::default(),
+            timings: None,
+            type_aware_meta: Some(fallow_types::envelope::TypeAwareMeta {
+                required_completeness: Some(
+                    fallow_types::semantic::SemanticCompletenessRequirement::Complete,
+                ),
+                queries: vec![fallow_types::semantic::SemanticQuerySummary {
+                    query_id: 0,
+                    capability: fallow_types::semantic::SemanticCapability::TypeCoupling,
+                    assertion: "type coupling".to_string(),
+                    status: fallow_types::semantic::SemanticCompleteness::Partial,
+                    reason_code: None,
+                    total_evidence_count: 0,
+                    truncated: false,
+                    omissions: Vec::new(),
+                    actions: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            coverage_gaps_has_findings: false,
+            should_fail_on_coverage_gaps: false,
+            changed_files_analyzed: None,
+        }
+    }
+
+    /// The health section of the bare run applies the type-aware gate, and
+    /// the run publishes a `type-aware-require` entry. When the section exits
+    /// 1 on that gate, the entry fails too and the exit-reason line names it.
+    #[test]
+    fn the_type_aware_gate_entry_agrees_with_the_health_section_exit() {
+        let health = health_result_with_incomplete_type_aware_meta();
+        let section_code = crate::health::print_health_result(
+            &health,
+            crate::health::HealthPrintOptions {
+                quiet: true,
+                explain: false,
+                gates: fallow_engine::health::HealthGateOptions::default(),
+                baseline_path: None,
+                summary: false,
+                summary_heading: true,
+                show_explain_tip: false,
+                type_aware_scope: Some("health"),
+                skip_score_and_trend: true,
+                css_requested: false,
+                json_style: crate::json_style::JsonStyle::Compact,
+                exit_reason: false,
+            },
+        );
+        assert_eq!(section_code, ExitCode::from(1));
+
+        assert!(super::combined_type_aware_gate_failed(None, Some(&health)));
+        let gates = super::combined_gate_outcomes(
+            None,
+            None,
+            Some(&health),
+            super::CombinedGateFlags {
+                fail_on_stale_baseline: false,
+                fail_on_issues: false,
+            },
+        );
+        let entry = gates
+            .as_ref()
+            .and_then(|gates| gates.get(fallow_output::GateName::TypeAwareRequire))
+            .expect("the run publishes the type-aware gate entry");
+        assert_eq!(entry.status, fallow_output::GateStatus::Fail);
+        let line =
+            crate::report::gate_outcome_text::exit_reason_line(gates.as_ref(), 1, false, &[]);
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.contains("type-aware-require")),
+            "{line:?}"
+        );
+    }
+
     #[test]
     fn emit_combined_json_output_can_attach_empty_meta() {
         let combined = serde_json::json!({
@@ -1150,5 +1842,37 @@ mod tests {
             emit_combined_json_output(&combined, crate::json_style::JsonStyle::Compact),
             ExitCode::SUCCESS
         );
+    }
+
+    #[test]
+    fn check_failure_label_names_the_section_and_counts_in_the_right_number() {
+        use super::check_failure_label;
+        assert_eq!(
+            check_failure_label("dead-code", 1, None),
+            "dead-code (1 issue)"
+        );
+        assert_eq!(
+            check_failure_label("architecture", 3, None),
+            "architecture (3 issues)"
+        );
+        assert_eq!(
+            check_failure_label("dead-code", 2, Some(1)),
+            "dead-code (2 issues, +1 since baseline)"
+        );
+        assert_eq!(
+            check_failure_label("dead-code", 1, Some(0)),
+            "dead-code (1 issue, \u{00b1}0 since baseline)"
+        );
+        assert_eq!(
+            check_failure_label("dead-code", 4, Some(-2)),
+            "dead-code (4 issues, -2 since baseline)"
+        );
+    }
+
+    #[test]
+    fn dupes_failure_label_counts_in_the_right_number() {
+        use super::dupes_failure_label;
+        assert_eq!(dupes_failure_label(1), "dupes (1 clone group)");
+        assert_eq!(dupes_failure_label(2), "dupes (2 clone groups)");
     }
 }

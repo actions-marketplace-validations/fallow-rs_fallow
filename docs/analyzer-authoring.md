@@ -51,7 +51,7 @@ Use this as the default map for a new finding:
 - `crates/types/src/suppress.rs`: add an `IssueKind` only when the finding is suppressible or must persist in cache-facing data.
 - `crates/types/src/issue_meta.rs`: add shared code, aliases, labels, config key, filter flag, result key, count policy, MCP selector, suppression token, and LSP exposure.
 - `crates/config/src/config/rules.rs`: add the rule severity field, aliases, defaults, and unknown-key suggestions.
-- `crates/cli/src/explain.rs`: add the `RuleDef`, docs path, guide text, and aliases for `fallow explain`.
+- `crates/api/src/explain.rs`: add the `RuleDef`, docs path, guide text, and aliases for `fallow explain`.
 - Analyzer code: keep extraction, graph facts, and reporting changes in the narrowest crate that already owns that stage.
 - Output formats: verify human, JSON, SARIF, Code Climate, compact, markdown, GitHub, and GitLab consumers when the finding is user visible.
 - Total counts: if a new serialized `AnalysisResults` array contributes to `total_issues()`, add it to `TOTAL_ISSUE_RESULT_KEYS` and set the metadata row's `counts_in_total`. If the array is advisory, keep `counts_in_total` false so schema consumers know not to gate PR summary surfaces on it.
@@ -69,6 +69,16 @@ Prefer the smallest fact that makes the finding correct:
 - Framework features should abstain when the framework is absent or the config cannot be resolved confidently.
 - Opt-in or warning defaults are appropriate when the public API is open-ended or reflective.
 - File-level suppressions fit findings where one source file represents a whole group. Line-level suppressions fit one declaration or usage.
+
+Fallow does not copy file-local rule catalogs from ESLint or framework lint
+plugins. Framework linters already own file-local style, formatting, naming,
+and accessibility rules. A copy of these rules adds output noise and gives no
+new project knowledge. Add a framework signal only when it uses cross-file
+facts, or when project data such as graph reachability, render fan-in, churn,
+or coverage ranks it. A linter can say that one value is unstable. Fallow can
+say which unstable value sits in the most reused and most changed component.
+Start such a signal as descriptive health output. Make it a CI gate only after
+validation on a real-project corpus.
 
 Do not add a new broad abstraction just to group fields by topic. A split is
 worth it when it encodes lifecycle or optionality, for example when a plain

@@ -21,8 +21,8 @@ use super::{Edge, ModuleGraph};
 
 use propagate::{
     EffectiveDeclarationRouteCache, ImportBindingUsageIndex, NamedPropagationScratch,
-    NamedReExportPropagation, StarReExportPropagation, propagate_named_re_export,
-    propagate_star_re_export,
+    NamedReExportPropagation, NamedStarRefCache, StarReExportPropagation,
+    propagate_named_re_export, propagate_star_re_export,
 };
 
 #[cfg(test)]
@@ -109,6 +109,7 @@ struct ReExportContext<'a> {
     declaration_routes: &'a mut EffectiveDeclarationRouteCache,
     scratch: &'a mut NamedPropagationScratch,
     reference_paths: &'a mut ReferencePathInterner,
+    named_star_refs: &'a mut NamedStarRefCache,
 }
 
 /// How much of a closure member the consumers that cannot be enumerated see.
@@ -610,9 +611,16 @@ impl ModuleGraph {
     }
 
     /// Flatten every module's re-export edges into a single tuple list.
+    ///
+    /// A module that only asset references load (a `raw-loader!` resource)
+    /// never runs, so its re-exports forward nothing. The edge that loads it
+    /// already credits its own exports, and its sources stay out of reach,
+    /// the same as its imports.
     fn collect_re_export_tuples(&self) -> Vec<ReExportTuple> {
+        let asset_only = self.asset_only_modules();
         self.modules
             .iter()
+            .filter(|m| !asset_only.contains(m.file_id.0 as usize))
             .flat_map(|m| {
                 m.re_exports.iter().map(move |re| ReExportTuple {
                     barrel: m.file_id,
@@ -623,6 +631,32 @@ impl ModuleGraph {
                 })
             })
             .collect()
+    }
+
+    /// The modules that are not entry points and that only edges which do not
+    /// run their target load.
+    fn asset_only_modules(&self) -> FixedBitSet {
+        let total = self.modules.len();
+        let mut asset_loaded = FixedBitSet::with_capacity(total);
+        let mut run_loaded = FixedBitSet::with_capacity(total);
+        for edge in &self.edges {
+            let target = edge.target.0 as usize;
+            if target >= total {
+                continue;
+            }
+            if edge.runs_target_code() {
+                run_loaded.insert(target);
+            } else {
+                asset_loaded.insert(target);
+            }
+        }
+        asset_loaded.difference_with(&run_loaded);
+        for module in &self.modules {
+            if module.is_entry_point() {
+                asset_loaded.set(module.file_id.0 as usize, false);
+            }
+        }
+        asset_loaded
     }
 
     /// Compute the transitive closure of `export *` source files whose every
@@ -881,6 +915,7 @@ impl ModuleGraph {
         let binding_usage = ImportBindingUsageIndex::build(module_by_id);
         let mut declaration_routes = EffectiveDeclarationRouteCache::default();
         let mut scratch = NamedPropagationScratch::default();
+        let mut named_star_refs = NamedStarRefCache::default();
 
         while let Some(entry_idx) = plan.pop_front() {
             if processed >= safety_cap {
@@ -906,6 +941,7 @@ impl ModuleGraph {
                 declaration_routes: &mut declaration_routes,
                 scratch: &mut scratch,
                 reference_paths,
+                named_star_refs: &mut named_star_refs,
             };
 
             let entry = &re_export_info[entry_idx];
@@ -919,15 +955,19 @@ impl ModuleGraph {
 
         #[cfg(test)]
         if let Some(legacy_modules) = legacy_modules.as_mut() {
-            Self::run_re_export_full_scan(LegacyReExportFullScan {
-                modules: legacy_modules,
-                edges: &self.edges,
-                re_export_info,
-                entry_star_targets,
-                edges_by_target,
-                module_by_id,
-                effective_exports: &self.effective_exports,
-                reference_paths,
+            // The oracle checks every name against every star source, so it
+            // also proves that the source-name filter drops nothing.
+            propagate::without_star_source_filter(|| {
+                Self::run_re_export_full_scan(LegacyReExportFullScan {
+                    modules: legacy_modules,
+                    edges: &self.edges,
+                    re_export_info,
+                    entry_star_targets,
+                    edges_by_target,
+                    module_by_id,
+                    effective_exports: &self.effective_exports,
+                    reference_paths,
+                });
             });
             assert_eq!(
                 serde_json::to_value(legacy_modules)
@@ -1014,6 +1054,7 @@ impl ModuleGraph {
                 triggering_is_type_only: entry.is_type_only,
                 synthetic_stubs: context.synthetic_stubs,
                 reference_paths: context.reference_paths,
+                named_star_refs: context.named_star_refs,
             })
         } else {
             propagate_named_re_export(NamedReExportPropagation {
@@ -1066,6 +1107,9 @@ impl ModuleGraph {
                     declaration_routes: &mut declaration_routes,
                     scratch: &mut scratch,
                     reference_paths,
+                    // A fresh cache per entry keeps the reference scan
+                    // independent of the per-barrel cache it checks.
+                    named_star_refs: &mut NamedStarRefCache::default(),
                 };
                 changed |= Self::propagate_re_export_entry(modules, edges, entry, &mut context);
             }
@@ -1101,9 +1145,6 @@ fn find_re_export_cycles(
     let sccs = tarjan_scc(n, &adj);
 
     for scc in &sccs {
-        if scc.len() < 2 {
-            continue;
-        }
         cycles.push(build_multi_node_cycle(scc, &nodes, modules));
     }
 
@@ -1196,6 +1237,7 @@ fn build_multi_node_cycle(
         .collect::<Vec<_>>()
         .join(" <-> ");
     tracing::warn!(
+        target: fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET,
         cycle_size = scc.len(),
         members = members.as_str(),
         "Re-export cycle detected: chain propagation may be incomplete \
@@ -1287,19 +1329,28 @@ impl TarjanState {
         }
     }
 
-    /// Finish the current frame: emit its SCC if it is a root, then propagate
-    /// its lowlink to the parent frame.
+    /// Finish the current frame: emit its SCC if it is a multi-node root, then
+    /// propagate its lowlink to the parent frame.
+    ///
+    /// Single-node components are popped without an allocation. An acyclic
+    /// barrel chain has one component per node, and callers only report
+    /// components with two or more nodes.
     fn finish_frame(&mut self, v: usize, parent: Option<usize>) {
         if self.lowlinks[v] == self.indices[v] {
-            let mut scc = Vec::new();
-            while let Some(w) = self.stack.pop() {
-                self.on_stack.remove(w);
-                scc.push(w);
-                if w == v {
-                    break;
+            if self.stack.last() == Some(&v) {
+                self.stack.pop();
+                self.on_stack.remove(v);
+            } else {
+                let mut scc = Vec::new();
+                while let Some(w) = self.stack.pop() {
+                    self.on_stack.remove(w);
+                    scc.push(w);
+                    if w == v {
+                        break;
+                    }
                 }
+                self.sccs.push(scc);
             }
-            self.sccs.push(scc);
         }
         if let Some(pv) = parent {
             self.lowlinks[pv] = self.lowlinks[pv].min(self.lowlinks[v]);
@@ -1307,8 +1358,8 @@ impl TarjanState {
     }
 }
 
-/// Iterative Tarjan's strongly connected components, returns SCCs that
-/// contain at least one node. The graph is given as adjacency-by-index;
+/// Iterative Tarjan's strongly connected components, returns the SCCs that
+/// contain two or more nodes. The graph is given as adjacency-by-index;
 /// the caller maps node indices back to FileIds.
 fn tarjan_scc(n: usize, adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     let mut state = TarjanState::new(n);

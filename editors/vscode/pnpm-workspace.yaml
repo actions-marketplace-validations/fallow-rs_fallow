@@ -1,11 +1,14 @@
 allowBuilds:
   '@vscode/vsce-sign': false
   keytar: false
-minimumReleaseAgeExclude:
-  - brace-expansion@5.0.9
 
 overrides:
-  "brace-expansion@5": 5.0.9
+  # Azure Identity still requests MSAL 6; the auth-code fix starts at 7.1.0.
+  "@azure/msal-node": 7.1.1
+  "brace-expansion@5": 5.0.12
+  # Mocha 11 supports the VS Code host but still requests these older majors.
+  "diff@7": 8.0.4
+  "serialize-javascript@6": 7.1.4
 
 supportedArchitectures:
   os:

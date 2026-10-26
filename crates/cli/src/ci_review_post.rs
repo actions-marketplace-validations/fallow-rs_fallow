@@ -11,9 +11,10 @@ use crate::error::emit_error_with_style;
 
 use super::{
     ApplyResult, CiProvider, PlannedReconcile, ReconcileOptions, apply_provider_reconcile,
-    emit_ci_command_json, github_create_json, github_token, gitlab_create_json,
-    load_provider_state, read_envelope, require_target, url_encode_path_segment,
-    validate_envelope_review_scope,
+    emit_ci_command_json, envelope_comments_len, envelope_fingerprints,
+    envelope_legacy_fingerprints, github_create_json, github_repo, github_token, gitlab_api_url,
+    gitlab_create_json, gitlab_project_id, gitlab_token, load_provider_state, read_envelope,
+    require_target, url_encode_path_segment, validate_envelope_review_scope,
 };
 
 #[derive(Clone, Copy)]
@@ -47,6 +48,10 @@ struct PostReviewResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     apply_errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    failed_fingerprints: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unapplied_fingerprints: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     post_errors: Vec<String>,
 }
 
@@ -77,16 +82,13 @@ pub(super) fn post_review(
         }
     };
     let current = envelope_fingerprints(&envelope);
-    let planned = PlannedReconcile::new(&current, &provider_state);
+    let legacy = envelope_legacy_fingerprints(&envelope);
+    let planned = PlannedReconcile::new(&current, &legacy, &provider_state);
 
     let mut result = match input.provider {
         CiProvider::Github => post_github_review(input, &envelope, &provider_state.fingerprints),
         CiProvider::Gitlab => post_gitlab_review(input, &envelope, &provider_state.fingerprints),
     };
-    if !result.post_errors.is_empty() {
-        return emit_post_review_result(&result, output, json_style);
-    }
-
     let applied = if input.dry_run {
         ApplyResult::default()
     } else {
@@ -105,7 +107,7 @@ fn post_github_review(
         Ok(pr) => pr,
         Err(e) => return result_with_error(input, e),
     };
-    let repo = match github_repo(input.repo) {
+    let repo = match github_repo(input.repo, "review") {
         Ok(repo) => repo,
         Err(e) => return result_with_error(input, e),
     };
@@ -160,11 +162,11 @@ fn post_gitlab_review(
         Ok(mr) => mr,
         Err(e) => return result_with_error(input, e),
     };
-    let project_id = match gitlab_project_id(input.project_id) {
+    let project_id = match gitlab_project_id(input.project_id, "review") {
         Ok(project_id) => project_id,
         Err(e) => return result_with_error(input, e),
     };
-    let token = match gitlab_token() {
+    let token = match gitlab_token("review") {
         Ok(token) => token,
         Err(e) => return result_with_error(input, e),
     };
@@ -281,41 +283,32 @@ fn attach_reconcile_result(result: &mut PostReviewResult, stale: &[String], appl
     result.resolution_comments_posted = applied.resolution_comments_posted;
     result.threads_resolved = applied.threads_resolved;
     result.apply_hint = applied.hint();
+    result.failed_fingerprints = applied.failed_fingerprints.into_iter().collect();
+    result.unapplied_fingerprints = applied.unapplied_fingerprints.into_iter().collect();
     result.apply_errors = applied.errors;
 }
 
+/// The envelope comments that have no open lifecycle on the provider.
+///
+/// A comment is open when its `fingerprint` is open, or, for one release,
+/// when its `legacy_fingerprint` is open in a thread that an older release
+/// wrote with a v2 marker.
 fn new_comments(envelope: &Value, existing: &BTreeSet<String>) -> Vec<Value> {
+    let is_open = |comment: &Value, field: &str| {
+        comment
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| existing.contains(fingerprint))
+    };
     envelope
         .get("comments")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter(|comment| {
-            comment
-                .get("fingerprint")
-                .and_then(Value::as_str)
-                .is_none_or(|fingerprint| !existing.contains(fingerprint))
+            !is_open(comment, "fingerprint") && !is_open(comment, "legacy_fingerprint")
         })
         .cloned()
-        .collect()
-}
-
-fn envelope_comments_len(envelope: &Value) -> usize {
-    envelope
-        .get("comments")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
-}
-
-fn envelope_fingerprints(envelope: &Value) -> BTreeSet<String> {
-    envelope
-        .get("comments")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|comment| comment.get("fingerprint").and_then(Value::as_str))
-        .filter(|fingerprint| !fingerprint.trim().is_empty())
-        .map(str::to_owned)
         .collect()
 }
 
@@ -355,37 +348,6 @@ fn emit_post_review_result(
     emit_ci_command_json(result, "review post result", output, json_style)
 }
 
-fn github_repo(explicit: Option<&str>) -> Result<String, String> {
-    explicit
-        .map(str::to_owned)
-        .or_else(|| std::env::var("GH_REPO").ok())
-        .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
-        .ok_or_else(|| {
-            "GitHub review posting requires --repo, GH_REPO, or GITHUB_REPOSITORY".to_owned()
-        })
-}
-
-fn gitlab_project_id(explicit: Option<&str>) -> Result<String, String> {
-    explicit
-        .map(str::to_owned)
-        .or_else(|| std::env::var("CI_PROJECT_ID").ok())
-        .ok_or_else(|| "GitLab review posting requires --project-id or CI_PROJECT_ID".to_owned())
-}
-
-fn gitlab_token() -> Result<String, String> {
-    std::env::var("GITLAB_TOKEN")
-        .map_err(|_| "GitLab review posting requires GITLAB_TOKEN".to_owned())
-}
-
-fn gitlab_api_url(explicit: Option<&str>) -> String {
-    explicit
-        .map(str::to_owned)
-        .or_else(|| std::env::var("CI_API_V4_URL").ok())
-        .unwrap_or_else(|| "https://gitlab.com/api/v4".to_owned())
-        .trim_end_matches('/')
-        .to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +361,32 @@ mod tests {
                 { "path": "src/b.ts", "line": 2, "side": "RIGHT", "body": "B", "fingerprint": "b" }
             ]
         })
+    }
+
+    /// After an upgrade, an open thread carries the v2 marker with the legacy
+    /// fingerprint. The comment for the same finding is not posted again.
+    #[test]
+    fn new_comments_skips_a_comment_whose_legacy_fingerprint_is_open() {
+        let envelope = serde_json::json!({
+            "comments": [
+                {
+                    "path": "src/a.ts", "line": 9, "side": "RIGHT", "body": "A",
+                    "fingerprint": "0123456789abcdef",
+                    "legacy_fingerprint": "fedcba9876543210"
+                },
+                {
+                    "path": "src/b.ts", "line": 2, "side": "RIGHT", "body": "B",
+                    "fingerprint": "1111111111111111",
+                    "legacy_fingerprint": "2222222222222222"
+                }
+            ]
+        });
+        let existing = BTreeSet::from(["fedcba9876543210".to_owned()]);
+
+        let comments = new_comments(&envelope, &existing);
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["fingerprint"], "1111111111111111");
     }
 
     #[test]

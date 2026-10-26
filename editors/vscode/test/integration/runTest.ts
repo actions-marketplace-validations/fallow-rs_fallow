@@ -5,13 +5,14 @@ import { runTests } from "@vscode/test-electron";
 
 const extensionDevelopmentPath = path.resolve(__dirname, "../../..");
 const extensionTestsPath = path.resolve(__dirname, "suite/index.js");
+const activationTestsPath = path.resolve(__dirname, "activation/index.js");
 const vscodeTestCachePath = path.resolve(
   process.env["FALLOW_VSCODE_TEST_CACHE_PATH"] ??
     path.join(os.tmpdir(), "fallow-vscode-test-cache"),
 );
 const fixtureWorkspacePath = path.resolve(
   extensionDevelopmentPath,
-  "test/integration/fixtures/workspace/package.json"
+  "test/integration/fixtures/workspace/package.json",
 );
 
 const writeExecutable = (filePath: string, contents: string): void => {
@@ -21,60 +22,11 @@ const writeExecutable = (filePath: string, contents: string): void => {
 
 const createFakeLsp = (binDir: string): string => {
   const lspPath = path.join(binDir, "fallow-lsp");
-  writeExecutable(
-    lspPath,
-    `#!/usr/bin/env node
-process.stdin.setEncoding("utf8");
-let buffer = "";
-const send = (message) => {
-  const payload = JSON.stringify(message);
-  process.stdout.write(\`Content-Length: \${Buffer.byteLength(payload, "utf8")}\\r\\n\\r\\n\${payload}\`);
-};
-const handle = (message) => {
-  if (message.method === "initialize") {
-    send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
-    return;
-  }
-  if (message.method === "shutdown") {
-    send({ jsonrpc: "2.0", id: message.id, result: null });
-    return;
-  }
-  if (message.id !== undefined) {
-    send({
-      jsonrpc: "2.0",
-      id: message.id,
-      error: { code: -32601, message: "Method not found" },
-    });
-    return;
-  }
-  if (message.method === "exit") {
-    process.exit(0);
-  }
-};
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  while (true) {
-    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");
-    if (headerEnd === -1) {
-      return;
-    }
-    const header = buffer.slice(0, headerEnd);
-    const match = header.match(/Content-Length: (\\d+)/i);
-    if (!match) {
-      process.exit(1);
-    }
-    const contentLength = Number(match[1]);
-    const messageStart = headerEnd + 4;
-    if (buffer.length < messageStart + contentLength) {
-      return;
-    }
-    const payload = buffer.slice(messageStart, messageStart + contentLength);
-    buffer = buffer.slice(messageStart + contentLength);
-    handle(JSON.parse(payload));
-  }
-});
-`
+  const fixturePath = path.join(
+    extensionDevelopmentPath,
+    "test/integration/fixtures/fallow-lsp.cjs",
   );
+  writeExecutable(lspPath, fs.readFileSync(fixturePath, "utf8"));
   return lspPath;
 };
 
@@ -102,6 +54,27 @@ const logPath = ${JSON.stringify(logPath)};
 fs.appendFileSync(logPath, JSON.stringify({ command, args }) + "\\n");
 
 const outputs = {
+  "security": {
+    schema_version: "3",
+    version: "3.15.0",
+    elapsed_ms: 0,
+    config: { rules: {} },
+    security_findings: [{
+      kind: "tainted-sink",
+      category: "dangerous-html",
+      cwe: 79,
+      path: "src/index.ts",
+      line: 1,
+      col: 0,
+      severity: "low",
+      finding_id: "security:fixture",
+      evidence: "untrusted input reaches innerHTML",
+      trace: [],
+      actions: [],
+    }],
+    unresolved_edge_files: 0,
+    unresolved_callee_sites: 0,
+  },
   "combined": {
     schema_version: 3,
     version: "2.45.0",
@@ -227,12 +200,12 @@ if (!output) {
 }
 
 process.stdout.write(JSON.stringify(output));
-`
+`,
   );
 };
 
 const createWorkspace = (): string => {
-  const workspaceDir = fs.mkdtempSync("/tmp/fv-");
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "fallow vscode 漢字-"));
   const vscodeDir = path.join(workspaceDir, ".vscode");
   const binDir = path.join(workspaceDir, "bin");
   const srcDir = path.join(workspaceDir, "src");
@@ -240,16 +213,10 @@ const createWorkspace = (): string => {
   fs.mkdirSync(vscodeDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(srcDir, { recursive: true });
-  fs.copyFileSync(
-    fixtureWorkspacePath,
-    path.join(workspaceDir, "package.json")
-  );
+  fs.copyFileSync(fixtureWorkspacePath, path.join(workspaceDir, "package.json"));
   fs.writeFileSync(path.join(srcDir, "index.ts"), "export const unusedExport = 1;\n");
   fs.writeFileSync(path.join(srcDir, "first.ts"), "export const duplicateName = 1;\n");
-  fs.writeFileSync(
-    path.join(srcDir, "second.ts"),
-    "\n\n\n\n\n\nexport const duplicateName = 2;\n"
-  );
+  fs.writeFileSync(path.join(srcDir, "second.ts"), "\n\n\n\n\n\nexport const duplicateName = 2;\n");
   fs.writeFileSync(path.join(srcDir, "orphan.ts"), "export const orphan = true;\n");
 
   const lspPath = createFakeLsp(binDir);
@@ -263,16 +230,50 @@ const createWorkspace = (): string => {
         "fallow.lspPath": lspPath,
       },
       null,
-      2
+      2,
     ),
-    "utf8"
+    "utf8",
   );
 
   return workspaceDir;
 };
 
-const main = async (): Promise<void> => {
-  const workspaceDir = createWorkspace();
+/**
+ * A monorepo folder with no root `package.json`. Only a nested package has a
+ * manifest, so a root-only activation event does not match it, and the
+ * extension must wait until a source file opens.
+ */
+const createActivationWorkspace = (): string => {
+  const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "fallow-act-"));
+  const vscodeDir = path.join(workspaceDir, ".vscode");
+  const binDir = path.join(workspaceDir, "bin");
+  const packageSrcDir = path.join(workspaceDir, "packages", "app", "src");
+
+  fs.mkdirSync(vscodeDir, { recursive: true });
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(packageSrcDir, { recursive: true });
+  fs.copyFileSync(
+    fixtureWorkspacePath,
+    path.join(workspaceDir, "packages", "app", "package.json"),
+  );
+  fs.writeFileSync(path.join(packageSrcDir, "index.ts"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(workspaceDir, "notes.md"), "# Notes\n");
+
+  const lspPath = createFakeLsp(binDir);
+  createFakeCli(binDir);
+  fs.writeFileSync(
+    path.join(vscodeDir, "settings.json"),
+    JSON.stringify({ "fallow.autoDownload": false, "fallow.lspPath": lspPath }, null, 2),
+    "utf8",
+  );
+
+  return workspaceDir;
+};
+
+const runSuite = async (
+  workspaceDir: string,
+  testsPath: string,
+): Promise<void> => {
   const extensionsDir = path.join(workspaceDir, ".vscode-test", "extensions");
   const userDataDir = path.join(workspaceDir, ".vscode-test", "user-data");
 
@@ -280,7 +281,7 @@ const main = async (): Promise<void> => {
     await runTests({
       cachePath: vscodeTestCachePath,
       extensionDevelopmentPath,
-      extensionTestsPath,
+      extensionTestsPath: testsPath,
       launchArgs: [
         workspaceDir,
         "--disable-extensions",
@@ -295,6 +296,11 @@ const main = async (): Promise<void> => {
   } finally {
     fs.rmSync(workspaceDir, { recursive: true, force: true });
   }
+};
+
+const main = async (): Promise<void> => {
+  await runSuite(createWorkspace(), extensionTestsPath);
+  await runSuite(createActivationWorkspace(), activationTestsPath);
 };
 
 void main();

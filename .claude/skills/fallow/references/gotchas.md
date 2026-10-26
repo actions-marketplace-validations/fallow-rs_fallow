@@ -55,19 +55,21 @@ fallow dead-code | grep "unused"
 fallow dead-code --format json --quiet
 ```
 
-The `--quiet` flag suppresses progress bars on stderr. Without it, stderr output may interfere with stdout parsing.
+The `--quiet` flag suppresses progress bars on stderr. Keep stderr separate from stdout when parsing JSON.
 
 ---
 
-## `--changed-since` Shows Only New Issues
+<a id="--changed-since-shows-only-new-issues"></a>
 
-The `--changed-since` flag limits analysis to files modified since a git ref. It only reports issues in those files, not all issues in the project. Works with both `dead-code` and `dupes`.
+## `--changed-since` Scopes Findings to Changed Files
+
+The `--changed-since` flag scopes findings to files modified since a git ref. It works with both `dead-code` and `dupes`. Existing findings in those files can remain; dead-code dependency findings remain project-wide. Use `fallow audit --gate new-only` to distinguish introduced findings from inherited ones.
 
 ```bash
-# This only shows issues in files changed since main
+# File-scoped findings are limited to files changed since main
 fallow dead-code --format json --quiet --changed-since main
 
-# Same for duplication — only clone groups involving changed files
+# Same for duplication, only clone groups involving changed files
 fallow dupes --format json --quiet --changed-since main
 
 # This shows ALL issues in the project
@@ -75,6 +77,18 @@ fallow dead-code --format json --quiet
 ```
 
 Don't use `--changed-since` when auditing the full project. Use it for PR checks and incremental CI.
+
+---
+
+## Svelte Event Findings Are Project-Wide Listener Checks
+
+`unused-svelte-event` reports a Svelte `createEventDispatcher` event that has no reachable listener in the project. This is different from `unused-component-emit`, which checks whether a Vue component ever emits its declared event.
+
+```bash
+fallow dead-code --format json --quiet --unused-svelte-events
+```
+
+Dynamic event names, dispatcher values that escape the component, and projects without a declared Svelte dependency are abstained to avoid false positives.
 
 ---
 
@@ -97,10 +111,10 @@ fallow dead-code --format json --quiet
 
 ## Syntactic Analysis: No TypeScript Compiler
 
-Fallow uses Oxc for pure syntactic analysis. It does not run the TypeScript compiler. This means:
+Default analysis uses Oxc for syntactic references. The optional `--type-aware` mode adds TypeScript checker evidence. Syntactic analysis has these limits:
 
 - **Fully dynamic imports** (`import(variable)`) are not resolved. Only static strings, template literals with static prefixes, `import.meta.glob`, and `require.context` patterns
-- **Value-level type narrowing** is not performed. Fallow can't know that `if (x instanceof Foo)` means `Foo` is "used"
+- **General type narrowing** is outside syntactic analysis. Fallow does recognize `if (x instanceof Foo)` guards and credits member calls on `x` as uses of `Foo` members
 - **Conditional exports** based on runtime values are not analyzed
 - **Function overload signatures are deduplicated**: TypeScript function overloads (multiple signatures for the same function name) are merged into a single export. They are not reported as separate unused exports
 
@@ -139,7 +153,7 @@ export * from './utils';
 import { helper } from './index';  // Resolves through the chain
 ```
 
-If an export IS flagged as unused despite being in a barrel file, it means no downstream consumer actually imports it. The barrel file re-exports it, but nobody uses it from there.
+A re-export alone does not prove that an export is used. If Fallow reports an export from a barrel, trace its consumers before removal. Dynamic imports and external callers may be outside static analysis.
 
 ---
 
@@ -151,10 +165,10 @@ If an export IS flagged as unused despite being in a barrel file, it means no do
 | 1 | Error-severity issues found | Review findings |
 | 2 | Runtime error (`fix` without `--yes` in non-TTY, invalid config) | Fix config or add `--yes` |
 
-Exit code 1 is triggered by issues with `"error"` severity in the rules config. Without a rules section, all issue types default to `"error"`. Use the rules system to control which issues fail CI:
+Error-severity findings can trigger exit code 1. Default severity varies by rule: some rules default to `"warn"` or `"off"`. Use the rules system to control which findings fail CI:
 
 ```jsonc
-// Only fail on unused files and deps, warn on everything else
+// Warn on unused exports and types; other rules keep their defaults
 {
   "rules": {
     "unused-files": "error",
@@ -164,6 +178,10 @@ Exit code 1 is triggered by issues with `"error"` severity in the rules config. 
   }
 }
 ```
+
+Exit code 1 always means that an enforced gate failed. A load warning or a workspace diagnostic (for example `node-modules-missing` or a tsconfig `extends` that does not resolve) never changes the exit code. The only exceptions are `source-parse-degraded` and `source-nesting-too-deep` with `--fail-on-parse-error`. To find the gate, read `gate_outcomes` in the JSON output and look for an entry with `status: "fail"` and `enforced: true`. Under `--quiet` and in every machine format, fallow also prints one stderr line that names the failed gates, for example `[X] Exit code 1: gate health-findings (3 at or above error) failed.` On `health`, the `complexity-*` rules default to `error`, so each complexity finding fails the run. Set them to `warn` or pass `--report-only` to report without a failure.
+
+Bare `fallow` in a machine format (`json`, `sarif`, `codeclimate`, the GitHub formats, and the comment and review formats) exits 0 on findings. `fallow dead-code --format json` exits 1 on the same findings. The bare machine run reports only, because the GitHub Action and the GitLab template read its JSON output and not its exit code. Its `gate_outcomes` entries then have `status: "fail"` and `enforced: false`, and stderr has one line, also under `--quiet`, for example `[W] Exit code 0: gate error-severity-findings (2 at or above error) failed, but bare fallow does not enforce it in --format json. To exit 1 on it, pass --fail-on-issues.` To gate on a bare machine run, pass `--fail-on-issues` or `--ci`.
 
 ---
 
@@ -197,13 +215,13 @@ fallow dead-code --format json --quiet --save-baseline fallow-baselines/dead-cod
 fallow dead-code --format json --quiet --baseline fallow-baselines/dead-code.json --fail-on-issues
 ```
 
-Commit the baseline file to your repo. Update it periodically as you fix existing issues.
+Commit the baseline file to your repo. When a fix removes a finding, its entry stays in the file until you prune it. `fallow baselines prune` removes the entries that match no current finding and never adds an entry, so it is safe to run after each fix. It reads the paths in `audit.deadCodeBaseline`, `audit.healthBaseline` and `audit.dupesBaseline`.
 
 ---
 
 ## Duplication Modes Affect What's Detected
 
-The detection mode significantly affects results. Choose based on your needs:
+Each detection mode normalizes different syntax. Choose the mode that fits the comparison:
 
 ```bash
 # strict: exact token match only
@@ -325,7 +343,11 @@ If you use utility decorators that DO NOT imply reflective use (Playwright's `@s
 
 Conservative semantics: a method carrying any decorator NOT in the list still gets skipped. So `@step` + `@Inject` on the same method stays treated as framework-managed. Matching rule: entries containing `.` (`"decorators.log"`) match the full dotted path; bare entries (`"step"` or `"decorators"`) match the leftmost segment, so a single bare `"decorators"` entry collapses an entire `@decorators.*` namespace. Both `"@step"` and `"step"` round-trip equivalently. Unmatched entries (a decorator name in the config that never appears in your codebase) surface as a one-time warning at end of run.
 
-The default empty list preserves today's skip-all behavior, so existing NestJS / Angular / TypeORM projects see no change.
+With the default empty list every decorated method is treated as framework-managed, which is what NestJS, Angular, and TypeORM projects need.
+
+### Angular `@Input()` / `@Output()` are still covered by the component rules
+
+The skip above applies only to generic `unused-class-member` detection. The dedicated Angular component rules (`unused-component-input` for `@Input()` / signal `input()` / `model()`, and `unused-component-output` for `@Output()` / signal `output()`, both default `warn`, gated on `@angular/core`) scope usage to the component itself: an input is dead when it is read by no code in its own class body or template (inline `template` or external `templateUrl`), and an output is dead when it is emitted (`.emit()`) nowhere in its own component. The scope is the component, not the project: an input that a parent binds via `[input]="..."` but the component itself never reads IS flagged, because the parent binding is satisfied while the value goes unused inside the component. These rules abstain on the whole component for any `extends` clause, a `{...this}` spread, JS-reserved-word names, accessor (`get` / `set`) inputs, and observable-stream `@Output`s (only `new EventEmitter()` initializers are harvested); `model()` is treated as input-only. Suppress an individual finding with `// fallow-ignore-next-line unused-component-input` or `-output`.
 
 ---
 
@@ -424,6 +446,30 @@ Fallow treats `Config` and `Result` in `./types.ts` as used. Works with `@param`
 
 ---
 
+## Command File Arguments Are Entry Points
+
+A file that a command names in a `package.json` script, a CI file (GitHub Actions, GitLab CI), a Dockerfile, a Procfile, or `fly.toml` becomes an entry point: `node scripts/seed.ts` keeps `scripts/seed.ts` and its imports reachable.
+
+Formatters, linters, and checkers are the exception. They read their file arguments but do not run them, so `eslint src/a.ts`, `prettier --check "**/*.ts"`, `oxlint src/`, `biome check`, `stylelint`, `textlint`, and similar tools make no entry points. This applies to the common package-manager and wrapper forms (`npx`, `pnpm exec`, `pnpm --filter web exec`, `pnpm -r exec`, `yarn run`, `cross-env`, `dotenv -e .env --`, `varlock run --`), and to a call of a script that runs the tool (`npm run lint -- src/a.ts`, `npm run lint src/a.ts`, `yarn lint src/a.ts`). The tool stays a used dependency, its `--config` file stays tracked, and a module that it loads through a flag (`eslint -f ./fmt.js`, `prettier --plugin=./plugin.mjs`) stays reachable.
+
+A command in a workspace package that the command selects resolves its file arguments against the directory of that package. `yarn workspace web node scripts/a.ts`, `pnpm --filter web exec tsx scripts/a.ts`, `npm exec -w web -- tsx scripts/a.ts`, and a call of a script of that package (`npm run -w web gen -- scripts/a.ts`) make `scripts/a.ts` of the `web` package an entry point. A pnpm filter can be a name, a name glob (`'@acme/*'`), a directory (`./packages/*`, `{packages/web}`), or an exclusion (`'!web'`). A selection of several packages resolves the file in each package where the file exists. This includes every package: `pnpm -r exec tsx scripts/a.ts`, `yarn workspaces foreach -A exec tsx scripts/a.ts` (narrowed by `--include` and `--exclude`), `yarn workspaces run gen scripts/a.ts`, and `npm --workspaces run gen -- scripts/a.ts`. `yarn workspaces foreach -A` also runs in the root package, as yarn berry does, and its `--include` and `--exclude` match a workspace name or directory (`.` is the root). `pnpm -w` also selects the root package. `--include-workspace-root` adds the root package: in pnpm to `-r` and to a filter that only excludes packages (`--filter '!web'`), and in npm to every workspace selection (`-w web`, `--workspaces`). Without it, `pnpm -r`, `yarn workspaces run`, and `npm --workspaces` leave out the root package. From a workspace package, `npm --workspaces` selects only that package. A `start` script that calls a script in selected packages (`pnpm -r run serve`, `pnpm -C packages/web run serve`) makes that script a runtime script of each package. A script call in the directory of a workspace package (`pnpm -C packages/web run gen scripts/a.ts`, `npm --prefix packages/web run gen -- scripts/a.ts`, `yarn --cwd packages/web gen scripts/a.ts`) runs the script of that package with the forwarded arguments. The formatter and linter rule above still applies in each selected package.
+
+A command that runs in workspace packages that Fallow cannot resolve makes no entry points, because those packages resolve the paths against their own directories. This covers the pnpm dependency and changed-package filters (`web...`, `[origin/main]`), the other `yarn workspaces foreach` selections (`--since`, `--recursive`, `--from`, `--worktree`, `--no-private`), and task runners (`turbo run lint -- src/a.ts`, `nx`, `lerna`). The binary stays a used dependency. A command in another directory (`pnpm -C docs exec tsx scripts/a.ts`, `npm --prefix`, `yarn --cwd`) resolves its file arguments against that directory. `yarn node <file>` runs the file with Node.js, also after `yarn --cwd <dir>` and `yarn workspace <name>`.
+
+A declared script with the name of a tool runs instead of the tool. With `"eslint": "node tools/check.js"`, `yarn eslint src/a.ts` keeps `src/a.ts` as an entry point.
+
+For another command whose file arguments are data, list it in `ignoreCommandEntries`:
+
+```jsonc
+{
+  "ignoreCommandEntries": ["my-codegen"]
+}
+```
+
+`["*"]` turns off entry points from all commands, including modules that a linter loads through a flag (`eslint -f ./fmt.js`); declare the real entries in `entry` instead.
+
+---
+
 ## JSX `<script src>` and `<link href>` Are Asset References
 
 Inside JSX/TSX files, lowercase intrinsic `<script src="...">` and `<link rel="stylesheet|modulepreload" href="...">` are tracked as asset references, same as in plain HTML files. This is needed for SSR frameworks like Hono where layout components emit HTML via JSX.
@@ -463,6 +509,24 @@ query CurrentUser {
 ```
 
 Fallow marks `src/fragments/user-fields.graphql` or `src/fragments/user-fields.gql` as reachable when either file exists. A typo in the relative path is reported as an unresolved import instead of silently dropping the edge.
+
+---
+
+## Tailwind v4 `@theme` Tokens Are Conservative Cleanup Candidates
+
+When `fallow health --css` reports `css_analytics.unused_theme_tokens`, treat the rows as dead-design-token candidates, not as auto-fix instructions. A Tailwind v4 `@theme` token such as `--color-brand` is considered used when fallow sees a generated utility suffix such as `bg-brand` or `text-brand`, a `var(--color-brand)` read, an `@apply` utility, a Tailwind arbitrary value such as `rounded-[--radius-card]`, or another `@theme` token that references it.
+
+The detector intentionally abstains when a Tailwind plugin or published CSS surface could consume tokens invisibly. Always run the row's `actions[].command` verification before deleting a token, and do not run `fallow fix` for these rows.
+
+The same Tailwind v4 projects also get `css_analytics.token_consumers`, the reverse index: per `@theme` token, where it is consumed (a `consumer_count` plus a located `consumers[]` sample tagged `theme-var` / `css-var` / `utility` / `apply`), so you can read a token's blast radius before changing it. Treat `consumer_count` as a static lower bound: a computed class name such as `bg-${color}` is invisible to the scan, so a `0` here is the same "nothing fallow can see consumes this" population as `unused_theme_tokens`, not a deletion proof. `token_consumers` is descriptive context with no `actions[]`; drive any deletion off `unused_theme_tokens` and its verification command.
+
+`token_consumers` also covers CSS-in-JS token DEFINITIONS (StyleX `defineVars` / `unstable_defineVarsNested`, vanilla-extract `createTheme` / `createThemeContract` / `createGlobalTheme`, and PandaCSS `defineTokens`). Member reads use `kind` `js-member`; StyleX `createTheme` / `unstable_createThemeNested` calls apply the complete resolved variable group and use `kind` `js-call`, including partial overrides and empty reset themes. `token` is the binding-qualified dotted access path (`vars.color.primary`) and `namespace` is the defining binding (`vars`). PandaCSS entries use the defining binding plus token path (`tokens.colors.brand`) and `token(...)` consumers are also tagged `js-call`. The cross-file scan uses fallow's shared import resolver, so direct named token-contract imports through relative paths, tsconfig `paths` aliases, and workspace packages can resolve to the token definition. Same-file StyleX reads are included. Dynamic import strings, unresolved aliases, generated package state, dynamic computed token access, and dynamic token-object structure still keep `consumer_count` a lower bound, and unlike Tailwind there is no corroborating dead-token finding, so a CSS-in-JS `consumer_count` of `0` is a weaker signal. Detection is gated on imports in the analyzed source files, including workspace packages whose root manifest does not declare the styling library. StyleX's built-in `@stylexjs/stylex` and `stylex` sources are recognized, with named aliases plus namespace/default imports supported for calls to the StyleX API itself. Barrel re-exports and default or namespace imports of token contracts conservatively abstain. Compiler-configured `importSources`, custom package aliases, CommonJS, and `stylex.env`-backed token structures are outside the current support boundary.
+
+## CSS Health Candidates Are Advisory
+
+`fallow health --css` also emits advisory cleanup and typo candidates in `css_analytics.unreferenced_css_classes` (a plain-CSS class defined but matched by no `class`/`className` in project markup), `css_analytics.unresolved_class_references` (the reverse: a markup class one edit away from a defined class, a likely typo), `css_analytics.unused_font_faces`, `css_analytics.undefined_keyframes`, and `css_analytics.font_size_unit_mix`. Treat them like review prompts, not confirmed defects. Run each row's `actions[].command` before changing CSS, because fonts, classes, animations, and type scales can be driven by inline styles, JavaScript, CMS templates, or preprocessor expansion that static analysis intentionally does not execute.
+
+`fallow health --css` also derives `styling_health`, a descriptive A-F grade (and 0-100 `score`) for CSS quality, scored SEPARATELY from the code `health_score`. It is descriptive-only: it never gates an exit code, badge, or CI, and never affects the code score, so do NOT branch automation on it. Read it as a design-system credibility signal. It weights design-token DRIFT over byte-identical repetition: the `token_erosion` penalty includes a hardcoded-value-sprawl term over distinct `box-shadow` / `border-radius` / `line-height` values, but counts only HARDCODED literals: a system that references its scale via `var(--*)` scores 0 sprawl regardless of how many tokens it defines (so "tokenize repeated values" is the remedy the human output suggests). A grade from a thin CSS surface (or predominantly compile-time-atomic CSS-in-JS like StyleX/Panda) is marked `confidence: "low"` with a reason. `styling_health.formula_version` bumps when the rubric is recalibrated; if you diff the score/grade over time, gate on it and re-baseline at a bump rather than reading the step-change as a regression.
 
 ---
 
@@ -553,7 +617,7 @@ Fallow detects production dependencies that are only imported from test files (`
 // src/handlers.test.ts
 import { setupServer } from 'msw/node';  // Flagged as test-only dependency
 
-// src/app.ts — no imports of "msw" here
+// src/app.ts: no imports of "msw" here
 ```
 
 ```bash
@@ -572,8 +636,8 @@ The `test-only-dependencies` rule defaults to `warn`. Suppress with `"test-only-
 
 These are separate features and can be used independently or together:
 
-- **`FALLOW_COMMENT: "true"`** — posts a single summary comment on the MR with issue counts and a findings table
-- **`FALLOW_REVIEW: "true"`** — posts inline code review comments on the exact MR diff lines where issues were found
+- **`FALLOW_COMMENT: "true"`**: posts a single summary comment on the MR with issue counts and a findings table
+- **`FALLOW_REVIEW: "true"`**: posts inline code review comments on the exact MR diff lines where issues were found
 
 ```yaml
 # WRONG: expecting inline review comments from FALLOW_COMMENT
@@ -600,14 +664,14 @@ Both require a `GITLAB_TOKEN` CI/CD variable (project access token with `api` sc
 `fallow license refresh` and `fallow license activate --trial` can fail with a backend error. The CLI always appends the raw HTTP status and the backend error code after the human hint, so scripts can grep for the code without parsing prose:
 
 ```
-fallow license refresh: your stored license is too stale to refresh. Reactivate with: fallow license activate --trial --email <addr> (HTTP 401, code token_stale)
+fallow license refresh: your stored license is too stale to refresh: set FALLOW_API_KEY to a full-access key and run `fallow license refresh` again (generate one at https://fallow.cloud/settings#api-keys) (HTTP 401, code token_stale)
 ```
 
 Stable codes the CLI surfaces today:
 
 | Code | Operation | Meaning |
 |------|-----------|---------|
-| `token_stale` | `refresh` | Stored JWT is more than 45 days past its `exp`. Reactivate. |
+| `token_stale` | `refresh` | Stored JWT is more than 45 days past its `exp`. Surfaced only when no full-access API key was available to retry with. |
 | `invalid_token` | `refresh` | Stored JWT is missing required claims (e.g. `sub`). Reactivate. |
 | `unauthorized` | `refresh` or `trial` | Auth failed. Reactivate. |
 | `rate_limit_exceeded` | `trial` | Trial endpoint is capped at 5 per hour per IP. Wait or use a different network. |
@@ -634,7 +698,7 @@ variables:
   FALLOW_CHANGED_SINCE: "origin/main"
 
 # CORRECT: let the template auto-detect
-# (no FALLOW_CHANGED_SINCE needed — it reads the MR target branch)
+# (no FALLOW_CHANGED_SINCE needed, it reads the MR target branch)
 ```
 
 Override `FALLOW_CHANGED_SINCE` only when you need a specific ref (e.g., a release branch) or want to disable auto-detection by setting it to an empty string.
@@ -645,4 +709,4 @@ Override `FALLOW_CHANGED_SINCE` only when you need a specific ref (e.g., a relea
 
 The GitLab CI template auto-detects the project's package manager from lockfiles (`package-lock.json` for npm, `pnpm-lock.yaml` for pnpm, `yarn.lock` for yarn). MR comments and review comments use the correct commands for the detected manager.
 
-This means review comments will show `pnpm remove lodash` instead of `npm uninstall lodash` in a pnpm project. No configuration is needed — detection is automatic.
+This means review comments will show `pnpm remove lodash` instead of `npm uninstall lodash` in a pnpm project. No configuration is needed; detection is automatic.

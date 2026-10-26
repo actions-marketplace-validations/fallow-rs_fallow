@@ -117,6 +117,14 @@ pub struct FixAction {
     /// Filter on this bool of each individual action, not on `type`. See the
     /// [`IssueAction`] enum-level docs for the full list of per-instance
     /// flips.
+    ///
+    /// One flip is RUN-level rather than finding-level: a dead-code finding
+    /// carrying `reachability_caveats` reports `false` here, because a file
+    /// this run never fully read may hold the reference that credits it. Every
+    /// mutation surface honours the same gate, so a plan built from this flag
+    /// never expects a write `fallow fix`, the MCP fix tools, or the LSP quick
+    /// fix will refuse. The action stays in the array at the same position and
+    /// names the reason in [`Self::note`].
     pub auto_fixable: bool,
     /// Human-readable description of the fix.
     pub description: String,
@@ -184,6 +192,9 @@ pub enum FixActionType {
     /// Convert an import statement to a type-only import (used by
     /// private-type-leak findings).
     ExportType,
+    /// Move the consumers of a `@deprecated` export to its replacement, then
+    /// remove the export. Manual: fallow does not rewrite consumers.
+    MigrateDeprecatedExport,
     /// Remove an unused catalog entry. Auto-fix only supports `pnpm-workspace.yaml`;
     /// Bun `package.json` catalogs are manual.
     RemoveCatalogEntry,
@@ -232,12 +243,23 @@ pub enum FixActionType {
     /// Use a declared component prop or remove it from the component API
     /// (manual; used by unused-component-prop findings).
     UseComponentProp,
+    /// Review caller evidence, defaults and component API intent manually.
+    ReviewComponentProp,
     /// Emit a declared component event or remove it from the component API
     /// (manual; used by unused-component-emit findings).
     EmitComponentEvent,
     /// Add or forward a Svelte custom-event listener, or remove the dispatch
     /// (manual; used by unused-svelte-event findings).
     WireSvelteEvent,
+    /// Compose an Effect layer into a layer that reaches a runtime, or remove
+    /// it (manual; used by unused-effect-layer findings).
+    ComposeEffectLayer,
+    /// Fail with an Effect tagged error from project code, or remove the class
+    /// and its handlers (manual; used by unused-tagged-error findings).
+    FailTaggedError,
+    /// Remove a `catchTag` handler for a tag that nothing produces, or add the
+    /// producer (manual; used by unproduced-catch-tag findings).
+    RemoveCatchTagHandler,
     /// Resolve a Next.js App Router route collision by moving or merging one of
     /// the files that own the same URL (manual; suppressing a guaranteed build
     /// error is never the right fix, so this is the primary action).

@@ -1,5 +1,7 @@
 name: Fuzz Smoke
 
+# Runs on main, on a weekly schedule, and on demand, to keep pull request jobs
+# few. A crash found on main shows before a release can start.
 on:
   push:
     branches: [main]
@@ -14,30 +16,23 @@ on:
       - 'crates/graph/**'
       - 'crates/config/**'
       - 'crates/security/**'
-      - 'rust-toolchain.toml'
-      - '.github/workflows/fuzz-smoke.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'fuzz/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.cargo/**'
-      - 'crates/extract/**'
-      - 'crates/core/**'
-      - 'crates/types/**'
-      - 'crates/graph/**'
-      - 'crates/config/**'
-      - 'crates/security/**'
+      - 'crates/engine/src/codeowners.rs'
+      - 'scripts/fuzz-seed-extract.mjs'
       - 'rust-toolchain.toml'
       - '.github/workflows/fuzz-smoke.yml'
   schedule:
     - cron: '30 5 * * 0'
   workflow_dispatch:
 
+# Pull requests and ordinary pushes to main share one group per ref, so a
+# newer run cancels the older one. Main gets many merges a day, and only the
+# newest main commit needs a result. The release commit ("chore: release v")
+# and manual or scheduled runs get a group of their own and are never
+# cancelled: scripts/verify-release-ci.mjs reads the result for the release
+# commit before a release can start.
 concurrency:
-  group: fuzz-smoke-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: "fuzz-smoke-${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore: release v'))) && github.ref || github.run_id }}"
+  cancel-in-progress: "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.event.head_commit.message, 'chore: release v')) }}"
 
 permissions: {}
 
@@ -49,7 +44,7 @@ env:
 jobs:
   fuzz-smoke:
     name: Fuzz harness smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -68,7 +63,7 @@ jobs:
           key: fuzz-smoke-nightly-2026-07-20-cargo-fuzz-0.13.2
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2.86.6
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz@0.13.2
           fallback: cargo-install
@@ -80,11 +75,15 @@ jobs:
         shell: bash
         run: |
           set -u
-          targets=(fuzz_sfc fuzz_mdx fuzz_astro fuzz_css fuzz_scripts)
+          targets=(fuzz_sfc fuzz_mdx fuzz_astro fuzz_css fuzz_scripts fuzz_extract fuzz_config_glob fuzz_workspace_manifests fuzz_config_files fuzz_extract_cache fuzz_codeowners)
           failed=0
           for target in "${targets[@]}"; do
             echo "::group::Fuzz ${target}"
-            if ! cargo +nightly-2026-07-20 fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" -- -max_total_time="$FUZZ_TIME_SECONDS" -timeout=10; then
+            dict_args=()
+            if [ -f "fuzz/dicts/${target}.dict" ]; then
+              dict_args=(-dict="$PWD/fuzz/dicts/${target}.dict")
+            fi
+            if ! cargo +nightly-2026-07-20 fuzz run --target "$FUZZ_TARGET_TRIPLE" "$target" -- -max_total_time="$FUZZ_TIME_SECONDS" -timeout=10 "${dict_args[@]}"; then
               failed=1
             fi
             echo "::endgroup::"
@@ -93,7 +92,7 @@ jobs:
 
       - name: Upload fuzz crash artifacts
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
           path: fuzz/artifacts/

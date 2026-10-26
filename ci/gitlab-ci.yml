@@ -31,7 +31,7 @@
 #   - Automatic cleanup of previous fallow comments on re-runs
 #   - Auto --changed-since in MR context (scopes to changed files)
 #   - Incremental caching of parse results
-#   - All fallow commands: dead-code, dupes, health, audit, security, fix
+#   - All fallow commands: dead-code, architecture, dupes, health, audit, security, fix
 #   - Configurable failure thresholds
 #
 # Examples:
@@ -77,7 +77,7 @@ variables:
   # Core
   FALLOW_VERSION: ""             # Empty reads package.json fallow dependency, then falls back to latest
   FALLOW_SKIP_INSTALL: ""        # "true" skips `npm install -g fallow` and uses the fallow already on PATH (e.g. a pnpm-catalog pin installed by a prior `pnpm install`). Fails fast if no fallow is found.
-  FALLOW_COMMAND: ""            # dead-code, dupes, health, audit, security, fix, or empty (runs all)
+  FALLOW_COMMAND: ""            # dead-code, architecture, dupes, health, audit, security, fix, or empty (runs all)
   FALLOW_ROOT: "."
   FALLOW_CONFIG: ""             # Path to .fallowrc.json, .fallowrc.jsonc, fallow.toml, or .fallow.toml
   FALLOW_PRODUCTION: ""                # "true"/"false" enables production for every analysis. Empty defers to config.
@@ -85,8 +85,19 @@ variables:
   FALLOW_PRODUCTION_HEALTH: ""         # Combined/audit mode: "true"/"false" overrides FALLOW_PRODUCTION for health. Empty defers to it.
   FALLOW_PRODUCTION_DUPES: ""          # Combined/audit mode: "true"/"false" overrides FALLOW_PRODUCTION for duplication. Empty defers to it.
   FALLOW_FAIL_ON_ISSUES: "true"
-  FALLOW_MIN_SEVERITY: ""       # Only fail at or above this complexity severity ('moderate'|'high'|'critical'); empty applies all severities
-  FALLOW_INCLUDE_ENTRY_EXPORTS: "false"  # Report unused exports in entry files instead of auto-marking them as used; mirrors --include-entry-exports
+  # health command only: fail when a complexity finding reaches this severity
+  # ('moderate'|'high'|'critical'). FALLOW_FAIL_ON_ISSUES is a separate count
+  # gate and still counts every finding.
+  FALLOW_MIN_SEVERITY: ""
+  # health command only: fail when the health score drops below this threshold
+  # (0-100). Implies --score, so the template also passes --complexity unless a
+  # health section variable is set, keeping the Code Quality report populated.
+  FALLOW_MIN_SCORE: ""
+  # Fail the pipeline when the run analyzed no source file at all, so every
+  # count it reports is zero because nothing was measured. Warns and passes by
+  # default, because a scope that legitimately holds no source should not break.
+  FALLOW_FAIL_ON_EMPTY_ANALYSIS: "false"
+  FALLOW_INCLUDE_ENTRY_EXPORTS: "false"  # Report unused exports in entry files instead of auto-marking them as used; mirrors --include-entry-exports (not applied to architecture)
   FALLOW_TYPE_AWARE: ""                  # true/false overrides repository typeAware.enabled; empty defers to config
   FALLOW_TYPE_AWARE_PROJECTS: ""         # Comma-separated tsconfig paths; empty uses automatic project discovery
   FALLOW_TYPE_AWARE_REQUIRE: ""           # best-effort or complete; empty defers to repository typeAware.require
@@ -116,15 +127,18 @@ variables:
 
   # Diff-based filtering
   FALLOW_CHANGED_SINCE: ""      # Git ref for incremental analysis (auto-set in MR context)
-  FALLOW_BASELINE: ""
-  FALLOW_SAVE_BASELINE: ""
+  FALLOW_BASELINE: ""           # Path to a baseline file; only findings absent from it are reported. FALLOW_COMMAND fix, audit and security reject it (exit 2)
+  FALLOW_SAVE_BASELINE: ""      # Save this run's findings as a baseline file for future comparisons. FALLOW_COMMAND fix, audit and security reject it (exit 2)
+  FALLOW_HEALTH_BASELINE: ""    # Bare run only (empty FALLOW_COMMAND): a baseline from fallow health --save-baseline. On the bare run FALLOW_BASELINE holds the dead-code baseline only. Other commands ignore it; audit uses FALLOW_AUDIT_HEALTH_BASELINE
+  FALLOW_DUPES_BASELINE: ""     # Bare run only (empty FALLOW_COMMAND): a baseline from fallow dupes --save-baseline. Other commands ignore it; audit uses FALLOW_AUDIT_DUPES_BASELINE
+  FALLOW_FAIL_ON_STALE_BASELINE: "false"  # Fail the pipeline when FALLOW_BASELINE has entries that match nothing this run. On the bare run it also judges FALLOW_HEALTH_BASELINE and FALLOW_DUPES_BASELINE. The staleness warning needs no variable: any run that loads a baseline reports it, and a run scoped to changed files re-reads the baseline over the whole project first, because a scoped run cannot judge a whole-project baseline. This variable only decides whether that verdict fails the pipeline. Independent of FALLOW_FAIL_ON_ISSUES.
 
   # Workspace / monorepo
   FALLOW_WORKSPACE: ""
   FALLOW_CHANGED_WORKSPACES: ""  # Git-derived monorepo scoping: set to a git ref (e.g. "origin/main") to scope analysis to workspaces containing any changed file. Requires full git history. Mutually exclusive with FALLOW_WORKSPACE.
 
   # Dead-code specific
-  FALLOW_ISSUE_TYPES: ""        # Comma-separated: unused-files,unused-exports,...
+  FALLOW_ISSUE_TYPES: ""        # Comma-separated. dead-code: unused-files,unused-exports,... architecture: cycles,boundaries,policy
   FALLOW_FAIL_ON_REGRESSION: "false"
   FALLOW_TOLERANCE: "0"
   FALLOW_REGRESSION_BASELINE: ""
@@ -163,6 +177,7 @@ variables:
 
   # Audit specific
   FALLOW_AUDIT_GATE: ""                 # new-only or all
+  FALLOW_AUDIT_WORSENED: ""             # warn, error or off: effect of an inherited complexity finding that got worse
   FALLOW_AUDIT_DEAD_CODE_BASELINE: ""   # Baseline from fallow dead-code --save-baseline
   FALLOW_AUDIT_HEALTH_BASELINE: ""      # Baseline from fallow health --save-baseline
   FALLOW_AUDIT_DUPES_BASELINE: ""       # Baseline from fallow dupes --save-baseline
@@ -178,8 +193,8 @@ variables:
   FALLOW_THREADS: ""
 
   # Bare invocation selectors
-  FALLOW_ONLY: ""               # Comma-separated: check,dupes,health
-  FALLOW_SKIP: ""
+  FALLOW_ONLY: ""               # Bare run and audit. Comma-separated: dead-code,architecture,dupes,health
+  FALLOW_SKIP: ""               # Bare run and audit. Same values as FALLOW_ONLY. With audit, a FALLOW_AUDIT_*_BASELINE for a skipped analysis fails the run
 
   # Advanced: pin remote MR-integration scripts to a specific tag or commit.
   # Leave empty to prefer vendored local ci/ + action/ scripts when present.
@@ -193,9 +208,12 @@ variables:
   image: node:22-alpine
   stage: test
   cache:
-    key: "fallow-${CI_COMMIT_REF_SLUG}"
+    # Scoped per job so a matrix over FALLOW_ROOT does not overwrite itself.
+    # GitLab rejects "/" inside a cache key, so the root cannot be interpolated
+    # directly; every matrix arm already gets a distinct job name slug.
+    key: "fallow-${CI_COMMIT_REF_SLUG}-${CI_JOB_NAME_SLUG}"
     paths:
-      - .fallow/
+      - ${FALLOW_ROOT}/.fallow/
     policy: pull-push
   before_script:
     # Install dependencies: detect Alpine (apk) vs Debian/Ubuntu (apt-get)
@@ -268,7 +286,7 @@ variables:
           echo "ERROR: FALLOW_SKIP_INSTALL=true but no 'fallow' binary is on PATH. Install fallow before this job (e.g. 'pnpm install' so a pinned fallow lands on PATH), or unset FALLOW_SKIP_INSTALL to let the template run 'npm install -g fallow'."
           exit 2
         fi
-        installed_version="$(fallow --version 2>/dev/null || echo 'unknown version')"
+        installed_version="$(fallow --version || echo 'unknown version')"
         echo "Skipping install; using pre-installed ${installed_version} ($(command -v fallow))"
         # Let the MR-integration script-prep block pin remote scripts to the
         # matching release tag when the binary reports an exact semver (parity
@@ -282,7 +300,7 @@ variables:
 
       requested_version="$(trim "${FALLOW_VERSION:-}")"
       root="${FALLOW_ROOT:-.}"
-      project_spec="$(project_fallow_spec "$root" 2>/dev/null || true)"
+      project_spec="$(project_fallow_spec "$root" || true)"
       project_spec="$(trim "$project_spec")"
       install_spec=""
 
@@ -323,7 +341,7 @@ variables:
 
       npm install -g --ignore-scripts "$install_arg" || { echo "ERROR: Failed to install ${install_arg}"; exit 2; }
 
-      installed_version="$(fallow --version 2>/dev/null || echo 'unknown version')"
+      installed_version="$(fallow --version || echo 'unknown version')"
       echo "Installed fallow ${installed_version}"
 
       if [ -z "$requested_version" ] && [ -n "$project_spec" ] && is_exact_version "$project_spec"; then
@@ -344,6 +362,8 @@ variables:
         if [ -d "ci/scripts" ]; then
           echo "Using vendored MR integration scripts from the repository checkout..."
 
+          # The stderr of `cp` is discarded because the `else` branch names the
+          # file that failed, and the counter below decides the job outcome.
           for f in comment.sh review.sh gitlab_common.sh; do
             if cp "ci/scripts/${f}" "${FALLOW_SCRIPTS_DIR}/${f}" 2>/dev/null; then
               chmod +x "${FALLOW_SCRIPTS_DIR}/${f}"
@@ -353,7 +373,7 @@ variables:
             fi
           done
         else
-          FALLOW_RESOLVED_VERSION="$(cat /tmp/fallow-version-spec 2>/dev/null || printf '%s' "${FALLOW_VERSION:-}")"
+          FALLOW_RESOLVED_VERSION="$(cat /tmp/fallow-version-spec || printf '%s' "${FALLOW_VERSION:-}")"
           if [ -z "$FALLOW_SCRIPTS_REF" ] && echo "$FALLOW_RESOLVED_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-.][a-zA-Z0-9.]+)?$'; then
             FALLOW_SCRIPTS_REF="v${FALLOW_RESOLVED_VERSION}"
           fi
@@ -370,6 +390,8 @@ variables:
           FALLOW_SCRIPTS_BASE="https://raw.githubusercontent.com/fallow-rs/fallow/${FALLOW_SCRIPTS_REF}"
           echo "Downloading MR integration scripts pinned to ${FALLOW_SCRIPTS_REF}..."
 
+          # The stderr of `curl` is discarded because the `else` branch names the
+          # file that failed, and the counter below decides the job outcome.
           for f in comment.sh review.sh gitlab_common.sh; do
             if curl -sf --retry 3 --retry-connrefused --retry-delay 2 "${FALLOW_SCRIPTS_BASE}/ci/scripts/${f}" -o "${FALLOW_SCRIPTS_DIR}/${f}" 2>/dev/null; then
               chmod +x "${FALLOW_SCRIPTS_DIR}/${f}"
@@ -396,15 +418,78 @@ variables:
 
       # ── Validate inputs ──────────────────────────────────────────────
       case "$FALLOW_COMMAND" in
-        ""|dead-code|check|dupes|health|audit|security|fix) ;;
-        *) echo "ERROR: Invalid command: ${FALLOW_COMMAND}"; exit 2 ;;
+        ""|dead-code|check|architecture|dupes|health|audit|security|fix) ;;
+        *) echo "ERROR: Invalid command: ${FALLOW_COMMAND}. Must be dead-code, architecture, dupes, health, audit, security, fix, or empty (runs all)."; exit 2 ;;
       esac
       if [ "$FALLOW_COMMAND" = "audit" ] && { [ -n "$FALLOW_BASELINE" ] || [ -n "$FALLOW_SAVE_BASELINE" ]; }; then
         echo "ERROR: The audit command does not support FALLOW_BASELINE/FALLOW_SAVE_BASELINE. Use FALLOW_AUDIT_DEAD_CODE_BASELINE, FALLOW_AUDIT_HEALTH_BASELINE, or FALLOW_AUDIT_DUPES_BASELINE instead."
         exit 2
       fi
+      # audit cannot judge a whole-project baseline, and FALLOW_BASELINE is
+      # already rejected for it above, so the pair is unreachable through the
+      # variables. It is still reachable through FALLOW_ARGS, where it buys a
+      # green pipeline plus a note --quiet removes.
+      if [ "$FALLOW_COMMAND" = "audit" ] \
+        && printf '%s' "$FALLOW_ARGS" | grep -q -- '--fail-on-stale-baseline'; then
+        echo "ERROR: --fail-on-stale-baseline in FALLOW_ARGS cannot apply to command: audit, which analyzes only the files that changed against its base and cannot judge a whole-project baseline. Run the gate on dead-code, dupes or health."
+        exit 2
+      fi
+      # The stale-baseline gate reads the analysis envelope, so it needs a
+      # baseline to judge and a command that reports one.
+      # True when the bare run reads a health or duplication baseline beside
+      # FALLOW_BASELINE, which holds the dead-code baseline only there.
+      # A flag in FALLOW_ARGS counts too: the run then loads the baseline,
+      # although the template never sees its path.
+      bare_run_has_section_baseline() {
+        [ -z "$FALLOW_COMMAND" ] || return 1
+        [ -n "${FALLOW_HEALTH_BASELINE:-}" ] || [ -n "${FALLOW_DUPES_BASELINE:-}" ] \
+          || bare_section_flag_in_args health || bare_section_flag_in_args dupes
+      }
+      # True when FALLOW_ARGS passes --<label>-baseline itself.
+      bare_section_flag_in_args() {
+        printf '%s' " ${FALLOW_ARGS:-}" | grep -qE -- " --${1}-baseline([ =]|\$)"
+      }
+      if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ]; then
+        if [ -z "$FALLOW_BASELINE" ] && ! bare_run_has_section_baseline; then
+          if [ -z "$FALLOW_COMMAND" ]; then
+            echo "ERROR: FALLOW_FAIL_ON_STALE_BASELINE has no baseline to judge. Set FALLOW_BASELINE, FALLOW_HEALTH_BASELINE or FALLOW_DUPES_BASELINE, or turn the gate off."
+          else
+            echo "ERROR: FALLOW_FAIL_ON_STALE_BASELINE has no baseline to judge. Set FALLOW_BASELINE, or turn the gate off."
+          fi
+          exit 2
+        fi
+        case "$FALLOW_COMMAND" in
+          fix|security)
+            echo "ERROR: The ${FALLOW_COMMAND} command reports no baseline staleness, so FALLOW_FAIL_ON_STALE_BASELINE cannot apply. Run the gate on dead-code, dupes or health."
+            exit 2
+            ;;
+        esac
+      fi
+      if [ "$FALLOW_COMMAND" = "fix" ] && { [ -n "$FALLOW_BASELINE" ] || [ -n "$FALLOW_SAVE_BASELINE" ]; }; then
+        echo "ERROR: The fix command does not load or save a baseline, so FALLOW_BASELINE and FALLOW_SAVE_BASELINE have no effect. Remove them, or set FALLOW_COMMAND to dead-code, dupes, health, or empty (runs all)."
+        exit 2
+      fi
+      # FALLOW_SAVE_BASELINE runs before the comparison, so a baseline re-saved
+      # to the path it is loaded from can never be stale and no gate on it can
+      # ever fire.
+      if [ -n "$FALLOW_BASELINE" ] && [ "$FALLOW_BASELINE" = "$FALLOW_SAVE_BASELINE" ]; then
+        echo "WARNING: FALLOW_BASELINE and FALLOW_SAVE_BASELINE name the same file (${FALLOW_BASELINE}). The run saves before it compares, so the baseline is rewritten from this run and can never report stale entries. Save to a different path, or drop FALLOW_SAVE_BASELINE from the job that reads the baseline."
+      fi
+      # On the bare run FALLOW_SAVE_BASELINE writes the dead-code baseline.
+      # When it names the file that a health or duplication baseline variable
+      # reads, the run replaces that baseline with one it cannot read.
+      if [ -z "$FALLOW_COMMAND" ] && [ -n "$FALLOW_SAVE_BASELINE" ]; then
+        for section_var in FALLOW_HEALTH_BASELINE FALLOW_DUPES_BASELINE; do
+          if [ "${!section_var:-}" = "$FALLOW_SAVE_BASELINE" ]; then
+            echo "WARNING: FALLOW_SAVE_BASELINE and ${section_var} name the same file (${FALLOW_SAVE_BASELINE}). On the bare run FALLOW_SAVE_BASELINE writes the dead-code baseline, so this run replaces that file with a baseline it cannot read. Save to a different path."
+          fi
+        done
+      fi
       if [ -n "$FALLOW_AUDIT_GATE" ] && [ "$FALLOW_AUDIT_GATE" != "new-only" ] && [ "$FALLOW_AUDIT_GATE" != "all" ]; then
         echo "ERROR: FALLOW_AUDIT_GATE must be 'new-only' or 'all', got: ${FALLOW_AUDIT_GATE}"; exit 2
+      fi
+      if [ -n "$FALLOW_AUDIT_WORSENED" ] && [ "$FALLOW_AUDIT_WORSENED" != "warn" ] && [ "$FALLOW_AUDIT_WORSENED" != "error" ] && [ "$FALLOW_AUDIT_WORSENED" != "off" ]; then
+        echo "ERROR: FALLOW_AUDIT_WORSENED must be 'warn', 'error' or 'off', got: ${FALLOW_AUDIT_WORSENED}"; exit 2
       fi
       if [ -n "$FALLOW_SECURITY_GATE" ] && [ "$FALLOW_SECURITY_GATE" != "new" ] && [ "$FALLOW_SECURITY_GATE" != "newly-reachable" ]; then
         echo "ERROR: FALLOW_SECURITY_GATE must be 'new' or 'newly-reachable', got: ${FALLOW_SECURITY_GATE}"; exit 2
@@ -449,7 +534,7 @@ variables:
       # variable is visible to the saved-envelope comment/review renderers.
       # They derive the diff themselves only when FALLOW_DIFF_FILE is unset.
       if [ -n "$FALLOW_CHANGED_SINCE" ] && [ -z "$FALLOW_DIFF_FILE" ]; then
-        if git diff --unified=0 "${FALLOW_CHANGED_SINCE}..HEAD" > fallow-mr.diff 2>/dev/null && [ -s fallow-mr.diff ]; then
+        if git diff --unified=0 "${FALLOW_CHANGED_SINCE}..HEAD" > fallow-mr.diff && [ -s fallow-mr.diff ]; then
           export FALLOW_DIFF_FILE="$PWD/fallow-mr.diff"
         else
           rm -f fallow-mr.diff
@@ -461,6 +546,9 @@ variables:
       # Analyze once as JSON. Secondary CI formats are rendered from that
       # artifact so semantic and syntactic findings cannot drift between runs.
       ARGS=()
+      # Issue-type filter flags this template added, recorded so the
+      # stale-baseline gate's unscoped re-run can remove exactly those.
+      ISSUE_TYPE_FLAGS=()
       [ -n "$FALLOW_COMMAND" ] && ARGS+=("$FALLOW_COMMAND")
       ARGS+=(--root "$FALLOW_ROOT" --quiet --format json)
 
@@ -527,9 +615,39 @@ variables:
             for t in "${TYPES[@]}"; do
               t="$(echo "$t" | xargs)"
               ARGS+=("--${t}")
+              # An issue-type filter narrows the run and stands the
+              # stale-baseline gate down; remember it so the gate's own
+              # unscoped re-run can drop exactly what the template added.
+              ISSUE_TYPE_FLAGS+=("--${t}")
             done
           fi
           [ "$FALLOW_INCLUDE_ENTRY_EXPORTS" = "true" ] && ARGS+=(--include-entry-exports)
+          [ "$FALLOW_FAIL_ON_REGRESSION" = "true" ] && ARGS+=(--fail-on-regression)
+          [ -n "$FALLOW_TOLERANCE" ] && [ "$FALLOW_TOLERANCE" != "0" ] && ARGS+=(--tolerance "$FALLOW_TOLERANCE")
+          [ -n "$FALLOW_REGRESSION_BASELINE" ] && ARGS+=(--regression-baseline "$FALLOW_REGRESSION_BASELINE")
+          [ -n "$FALLOW_SAVE_REGRESSION_BASELINE" ] && ARGS+=(--save-regression-baseline "$FALLOW_SAVE_REGRESSION_BASELINE")
+          ;;
+        architecture)
+          # Same analysis as dead-code, with its own `architecture` envelope.
+          # FALLOW_ISSUE_TYPES takes
+          # the architecture filters (cycles, boundaries, policy). The command
+          # has no unused-export filter, so FALLOW_INCLUDE_ENTRY_EXPORTS does
+          # not apply.
+          if [ -n "$FALLOW_ISSUE_TYPES" ]; then
+            IFS=',' read -ra TYPES <<< "$FALLOW_ISSUE_TYPES"
+            for t in "${TYPES[@]}"; do
+              t="$(echo "$t" | xargs)"
+              case "$t" in
+                cycles|boundaries|policy) ;;
+                *)
+                  echo "ERROR: Invalid FALLOW_ISSUE_TYPES value for the architecture command: '${t}'. Valid values: cycles, boundaries, policy."
+                  exit 2
+                  ;;
+              esac
+              ARGS+=("--${t}")
+              ISSUE_TYPE_FLAGS+=("--${t}")
+            done
+          fi
           [ "$FALLOW_FAIL_ON_REGRESSION" = "true" ] && ARGS+=(--fail-on-regression)
           [ -n "$FALLOW_TOLERANCE" ] && [ "$FALLOW_TOLERANCE" != "0" ] && ARGS+=(--tolerance "$FALLOW_TOLERANCE")
           [ -n "$FALLOW_REGRESSION_BASELINE" ] && ARGS+=(--regression-baseline "$FALLOW_REGRESSION_BASELINE")
@@ -565,6 +683,15 @@ variables:
           [ -n "$FALLOW_SINCE" ]              && ARGS+=(--since "$FALLOW_SINCE")
           [ -n "$FALLOW_MIN_COMMITS" ]        && ARGS+=(--min-commits "$FALLOW_MIN_COMMITS")
           [ -n "$FALLOW_MIN_SEVERITY" ]       && ARGS+=(--min-severity "$FALLOW_MIN_SEVERITY")
+          if [ -n "$FALLOW_MIN_SCORE" ]; then
+            ARGS+=(--min-score "$FALLOW_MIN_SCORE")
+            # --min-score implies --score, a section selector: without this the
+            # envelope carries the score and nothing else, and the Code Quality
+            # report and the merge-request note both render empty.
+            if [ "$FALLOW_COMPLEXITY" != "true" ] && [ "$FALLOW_FILE_SCORES" != "true" ]; then
+              ARGS+=(--complexity)
+            fi
+          fi
           if [ -n "$FALLOW_SAVE_SNAPSHOT" ]; then
             if [ "$FALLOW_SAVE_SNAPSHOT" = "true" ]; then
               ARGS+=(--save-snapshot)
@@ -585,7 +712,10 @@ variables:
           [ -n "$FALLOW_COVERAGE" ]           && ARGS+=(--coverage "$FALLOW_COVERAGE")
           [ -n "$FALLOW_COVERAGE_ROOT" ]      && ARGS+=(--coverage-root "$FALLOW_COVERAGE_ROOT")
           [ -n "$FALLOW_AUDIT_GATE" ]         && ARGS+=(--gate "$FALLOW_AUDIT_GATE")
+          [ -n "$FALLOW_AUDIT_WORSENED" ]     && ARGS+=(--worsened "$FALLOW_AUDIT_WORSENED")
           [ "$FALLOW_INCLUDE_ENTRY_EXPORTS" = "true" ] && ARGS+=(--include-entry-exports)
+          [ -n "$FALLOW_ONLY" ]               && ARGS+=(--only "$FALLOW_ONLY")
+          [ -n "$FALLOW_SKIP" ]               && ARGS+=(--skip "$FALLOW_SKIP")
           ;;
         security)
           [ -n "$FALLOW_SECURITY_GATE" ] && ARGS+=(--gate "$FALLOW_SECURITY_GATE")
@@ -607,6 +737,10 @@ variables:
               ARGS+=(--save-snapshot "$FALLOW_SAVE_SNAPSHOT")
             fi
           fi
+          # On the bare run --baseline holds the dead-code baseline only. Health
+          # and duplication read their baselines through their own flags.
+          [ -n "${FALLOW_HEALTH_BASELINE:-}" ] && ARGS+=(--health-baseline "$FALLOW_HEALTH_BASELINE")
+          [ -n "${FALLOW_DUPES_BASELINE:-}" ]  && ARGS+=(--dupes-baseline "$FALLOW_DUPES_BASELINE")
           ;;
       esac
 
@@ -670,6 +804,512 @@ variables:
         exit "$EXIT_CODE"
       fi
 
+      # ── Baseline staleness and the opt-in stale-baseline gate ───────
+      # The CLI reports both on stderr only, which --quiet removes, so neither
+      # reached a template user (issue #2673). Read them from the envelope:
+      # gate_trips is the same boolean --fail-on-stale-baseline exits on, so
+      # the rule stays in Rust instead of being restated in jq here.
+      #
+      # Reading the advisory is independent of the gate. A merge-request
+      # pipeline is scoped and a scoped run cannot judge a whole-project
+      # baseline, so the unscoped re-read below happens for any run that loaded
+      # one; FALLOW_FAIL_ON_STALE_BASELINE only decides whether the verdict
+      # fails the pipeline. Every branch that cannot read an answer warns and
+      # continues, and none of them looks at $FALLOW_EXIT_CODE: the case this
+      # gate exists for exits 0.
+      STALE_BASELINE_GATE_FAILED=false
+      BASELINE_STALENESS_JQ='.baseline_staleness // .summary.baseline_staleness // .check.baseline_staleness // empty'
+
+      # `section` selects which staleness object to read: empty for the
+      # single-analysis commands, whose object the // chain finds, or one section
+      # prefix for audit, which carries up to three and whose first-match chain
+      # would report one of them under every label.
+      read_staleness_field() {
+        local file=$1 field=$2 section=${3:-}
+        local selector="${BASELINE_STALENESS_JQ}"
+        if [ -n "$section" ]; then
+          selector="${section}.baseline_staleness // empty"
+        fi
+        # `// empty` cannot be used here: jq treats `false` as absent, which
+        # would silently blank `change_scoped: false` and `gate_trips: false`.
+        jq -r --arg field "$field" \
+          "(${selector}) | if has(\$field) then .[\$field] else empty end" \
+          "$file" || true
+      }
+
+      # scope_reasons needs its own reader: it is an array, and the scalar
+      # reader above returns the raw jq rendering of one, not a log line.
+      read_staleness_scope_reasons() {
+        local file=$1 section=${2:-} selector="${BASELINE_STALENESS_JQ}"
+        if [ -n "$section" ]; then
+          selector="${section}.baseline_staleness // empty"
+        fi
+        jq -r "(${selector}) | (.scope_reasons // []) | join(\", \")" \
+          "$file" || true
+      }
+
+      # saved_by names the command that wrote a baseline another command
+      # saved. The value set is open, so any kebab-case token passes. Any other
+      # value reads as absent, so a log line never quotes unexpected text. The
+      # jq selector keeps only a string, so a literal null is absent here and
+      # never the text "null".
+      read_staleness_saved_by() {
+        local file=$1 section=${2:-} selector="${BASELINE_STALENESS_JQ}" value
+        if [ -n "$section" ]; then
+          selector="${section}.baseline_staleness // empty"
+        fi
+        value=$(jq -r "(${selector}) | .saved_by? | strings" "$file" || true)
+        case "$value" in
+          ""|*[!a-z-]*) ;;
+          *) printf '%s' "$value" ;;
+        esac
+      }
+
+      read_all_staleness_fields() {
+        local file=$1
+        BASELINE_ENTRIES=$(read_staleness_field "$file" baseline_entries)
+        BASELINE_STALE_ENTRIES=$(read_staleness_field "$file" stale_entries)
+        BASELINE_ADVISORY=$(read_staleness_field "$file" warning)
+        BASELINE_GATE_TRIPS=$(read_staleness_field "$file" gate_trips)
+        BASELINE_CHANGE_SCOPED=$(read_staleness_field "$file" change_scoped)
+        BASELINE_UNRECOGNISED=$(read_staleness_field "$file" unrecognised_format)
+        BASELINE_SAVED_BY=$(read_staleness_saved_by "$file")
+        BASELINE_SCOPE_REASONS=$(read_staleness_scope_reasons "$file")
+      }
+
+      read_all_staleness_fields fallow-results.json
+
+      # Production mode and workspace scoping are the user's own choice about
+      # what to analyze, so they are never removed and a run narrowed by them
+      # stands down instead.
+      #
+      # Driven by the run's own scope_reasons when the binary reports them, so
+      # scoping smuggled through FALLOW_ARGS is visible here instead of sending
+      # the template into a re-read that comes back narrowed anyway. A binary
+      # that predates the member falls back to the variable-based guess.
+      BASELINE_REMOVABLE_SCOPE_REASONS="diff changed-since package-baselines changed-files scope file issue-type-filter"
+
+      # An argument replaces the reasons of FALLOW_BASELINE, for a bare-run
+      # section baseline that carries its own staleness object.
+      template_can_rerun_unscoped() {
+        local reasons="${BASELINE_SCOPE_REASONS:-}"
+        if [ $# -gt 0 ]; then
+          reasons=$1
+        fi
+        if [ -n "$reasons" ]; then
+          local reason
+          for reason in $(printf '%s' "$reasons" | tr ',' ' '); do
+            case " ${BASELINE_REMOVABLE_SCOPE_REASONS} " in
+              *" ${reason} "*) ;;
+              *) return 1 ;;
+            esac
+          done
+          return 0
+        fi
+        if [ "$FALLOW_PRODUCTION" = "true" ]; then return 1; fi
+        if [ "$FALLOW_PRODUCTION_DEAD_CODE" = "true" ]; then return 1; fi
+        if [ "$FALLOW_PRODUCTION_HEALTH" = "true" ]; then return 1; fi
+        if [ "$FALLOW_PRODUCTION_DUPES" = "true" ]; then return 1; fi
+        if [ -n "$FALLOW_WORKSPACE" ]; then return 1; fi
+        if [ -n "$FALLOW_CHANGED_WORKSPACES" ]; then return 1; fi
+        return 0
+      }
+
+      # An element-wise copy of the analysis argv with every narrowing flag and
+      # every workspace-writing flag removed. Never rebuilt from $FALLOW_ARGS:
+      # re-splitting user input would reintroduce word splitting.
+      build_stale_gate_args() {
+        GATE_ARGS=()
+        local skip_next=false skip_next_if_value=false arg dropped flag
+        for arg in "${RUN_ARGS[@]}"; do
+          if [ "$skip_next" = "true" ]; then
+            skip_next=false
+            continue
+          fi
+          # --save-snapshot takes an optional value, so its argument is only
+          # the next element when that element is not itself a flag.
+          if [ "$skip_next_if_value" = "true" ]; then
+            skip_next_if_value=false
+            case "$arg" in
+              --*) ;;
+              *) continue ;;
+            esac
+          fi
+          case "$arg" in
+            --changed-since|--scope|--file)
+              skip_next=true
+              continue
+              ;;
+            --changed-since=*|--scope=*|--file=*)
+              continue
+              ;;
+            --save-baseline|--save-regression-baseline)
+              skip_next=true
+              continue
+              ;;
+            --save-baseline=*|--save-regression-baseline=*|--save-snapshot=*)
+              continue
+              ;;
+            --save-snapshot)
+              skip_next_if_value=true
+              continue
+              ;;
+            --fail-on-regression|--yes)
+              continue
+              ;;
+          esac
+          dropped=false
+          for flag in ${ISSUE_TYPE_FLAGS[@]+"${ISSUE_TYPE_FLAGS[@]}"}; do
+            if [ "$arg" = "$flag" ]; then
+              dropped=true
+              break
+            fi
+          done
+          if [ "$dropped" = "true" ]; then
+            continue
+          fi
+          GATE_ARGS+=("$arg")
+        done
+        # The package map comes from the config, so dropping flags does not
+        # remove it; the re-read turns it off. Only a binary that reports the
+        # reason receives the flag, so an older binary never sees it.
+        case ", ${BASELINE_SCOPE_REASONS:-}, " in
+          *", package-baselines, "*) GATE_ARGS+=("--no-package-baselines") ;;
+        esac
+      }
+
+      # Re-read the baseline over the whole project. Report-discarding: the
+      # envelope feeds nothing but the staleness read and is removed after, so
+      # no consumer can mistake it for the run the MR note was built from.
+      run_stale_gate_analysis() {
+        build_stale_gate_args
+        echo "Re-reading the baseline over the whole project, which a scoped run cannot judge"
+        local started ended
+        started=$SECONDS
+        set +e
+        env -u FALLOW_DIFF_FILE fallow "${GATE_ARGS[@]}" \
+          > fallow-stale-baseline-gate-raw.json 2> fallow-stale-baseline-gate-stderr.log
+        set -e
+        ended=$SECONDS
+        echo "Unscoped baseline re-read finished in $((ended - started))s"
+        if [ -s fallow-stale-baseline-gate-stderr.log ]; then
+          echo "--- baseline re-read stderr ---"
+          cat fallow-stale-baseline-gate-stderr.log
+          echo "---"
+        fi
+        if [ ! -s fallow-stale-baseline-gate-raw.json ] \
+            || ! jq -e '.' fallow-stale-baseline-gate-raw.json > /dev/null 2>&1; then
+          return 1
+        fi
+        jq -s 'last' fallow-stale-baseline-gate-raw.json > fallow-stale-baseline-gate.json || return 1
+        if jq -e '.error == true' fallow-stale-baseline-gate.json > /dev/null 2>&1; then
+          return 1
+        fi
+        return 0
+      }
+
+      # Name the gate only when it was asked for, so a pipeline that wanted no
+      # gate does not read as if one failed.
+      # A run that asked for the gate and did not get one has a problem worth a
+      # warning. A run that asked for nothing does not: production mode plus a
+      # baseline is an ordinary configuration, and warning on every merge
+      # request about a judgement nobody requested is noise the project cannot
+      # turn off. The CLI itself is silent there, so the level matches it.
+      # The channels that narrowed the run, as a parenthetical for a log line.
+      # Empty when the binary does not report them.
+      baseline_scope_clause() {
+        if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+          printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+        fi
+      }
+
+      # Why a narrowed run cannot be re-read unscoped. Falls back to the two
+      # variables the guess is built from, for a binary that reports no
+      # scope_reasons.
+      baseline_unremovable_scope_clause() {
+        if [ -n "${BASELINE_SCOPE_REASONS:-}" ]; then
+          printf ' (%s)' "$BASELINE_SCOPE_REASONS"
+        else
+          printf ' (production mode or workspace scoping)'
+        fi
+      }
+
+      stale_baseline_stand_down() {
+        if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ]; then
+          echo "WARNING: baseline staleness could not be judged on this run because ${1}. FALLOW_FAIL_ON_STALE_BASELINE stood down. ${2}"
+        else
+          echo "NOTE: baseline staleness could not be judged on this run because ${1}. ${2}"
+        fi
+      }
+
+      # ── Bare-run section baselines ──
+      # The bare run reads FALLOW_BASELINE as the dead-code baseline, and
+      # FALLOW_HEALTH_BASELINE and FALLOW_DUPES_BASELINE through their own
+      # flags. The // chain above reads the dead-code object only. These two
+      # baselines get their own lines and arm the same gate. Each row is
+      # label:jq-section:command:variable.
+      BARE_SECTION_ROWS=(
+        'health:.health.summary:health:FALLOW_HEALTH_BASELINE'
+        'dupes:.dupes:dupes:FALLOW_DUPES_BASELINE'
+      )
+      BARE_SECTION_GATE_FAILURES=()
+
+      # True when a bare-run section baseline covers only part of the project
+      # and every channel that narrowed it is one the unscoped re-read removes.
+      bare_sections_need_rerun() {
+        local file=$1 row section input
+        bare_run_has_section_baseline || return 1
+        for row in "${BARE_SECTION_ROWS[@]}"; do
+          section=$(printf '%s' "$row" | cut -d: -f2)
+          input=${row##*:}
+          [ -n "${!input:-}" ] || bare_section_flag_in_args "${row%%:*}" || continue
+          [ "$(read_staleness_field "$file" change_scoped "$section")" = "true" ] || continue
+          if template_can_rerun_unscoped "$(read_staleness_scope_reasons "$file" "$section")"; then
+            return 0
+          fi
+        done
+        return 1
+      }
+
+      # The bare-run variable that reads a baseline the named command saved.
+      bare_variable_for_writer() {
+        case "$1" in
+          dead-code) printf 'FALLOW_BASELINE' ;;
+          dupes) printf 'FALLOW_DUPES_BASELINE' ;;
+          health) printf 'FALLOW_HEALTH_BASELINE' ;;
+        esac
+      }
+
+      # Report each bare-run section baseline the way the block below reports
+      # FALLOW_BASELINE, and collect a gate failure for each one that trips.
+      bare_section_baseline_report() {
+        local file=$1 row label section command input path entries stale
+        local advisory trips scoped reasons unrecognised saved_by home resave where
+        bare_run_has_section_baseline || return 0
+        for row in "${BARE_SECTION_ROWS[@]}"; do
+          label=${row%%:*}
+          section=$(printf '%s' "$row" | cut -d: -f2)
+          command=$(printf '%s' "$row" | cut -d: -f3)
+          input=${row##*:}
+          path=${!input:-}
+          if [ -n "$path" ]; then
+            where="at ${path}"
+            resave="Re-save it with \`fallow ${command} --save-baseline ${path}\`."
+          elif bare_section_flag_in_args "$label"; then
+            where="passed through FALLOW_ARGS"
+            resave="Re-save it with \`fallow ${command} --save-baseline\`."
+          else
+            continue
+          fi
+          entries=$(read_staleness_field "$file" baseline_entries "$section")
+          if [ -z "$entries" ]; then
+            if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ]; then
+              stale_baseline_stand_down "it reported no staleness for the ${label} baseline" "A fallow that predates this feature cannot report it: pin a current version."
+            fi
+            continue
+          fi
+          trips=$(read_staleness_field "$file" gate_trips "$section")
+          unrecognised=$(read_staleness_field "$file" unrecognised_format "$section")
+          if [ "$unrecognised" = "true" ]; then
+            saved_by=$(read_staleness_saved_by "$file" "$section")
+            home=$(bare_variable_for_writer "$saved_by")
+            if [ -n "$saved_by" ] && [ -n "$home" ]; then
+              echo "WARNING: \`fallow ${saved_by}\` saved the ${label} baseline ${where}, so this run reads nothing from it and it suppresses nothing. Pass that file with ${home} instead."
+            else
+              echo "WARNING: the ${label} baseline ${where} has no entries this run recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+            fi
+            if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ] && [ "$trips" = "true" ]; then
+              BARE_SECTION_GATE_FAILURES+=("Fallow baseline gate failed: the ${label} baseline ${where} suppresses nothing, because this run cannot read it as a \`fallow ${command}\` baseline. Point ${input} at a \`fallow ${command} --save-baseline\` file, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+            fi
+            continue
+          fi
+          scoped=$(read_staleness_field "$file" change_scoped "$section")
+          if [ "$scoped" = "true" ]; then
+            reasons=$(read_staleness_scope_reasons "$file" "$section")
+            stale_baseline_stand_down "the ${label} analysis covered only part of the project${reasons:+ (${reasons})}" "Run an unscoped pipeline to judge the ${label} baseline."
+            continue
+          fi
+          stale=$(read_staleness_field "$file" stale_entries "$section")
+          advisory=$(read_staleness_field "$file" warning "$section")
+          case "$advisory" in
+            partial)
+              echo "WARNING: the ${label} baseline ${where} is partially stale: ${stale} of ${entries} entries matched nothing this run, so it protects less than what was saved. ${resave}"
+              ;;
+            zero-overlap)
+              echo "WARNING: the ${label} baseline ${where} has ${entries} entries but matched nothing this run. Paths may have changed, or the baseline was saved elsewhere. ${resave}"
+              ;;
+            *)
+              if [ "$trips" = "true" ]; then
+                echo "WARNING: ${stale} of ${entries} entries in the ${label} baseline ${where} matched nothing this run. The project may be clean, or the baseline may no longer describe it. ${resave}"
+              fi
+              ;;
+          esac
+          if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ] && [ "$trips" = "true" ]; then
+            BARE_SECTION_GATE_FAILURES+=("Fallow baseline gate failed: ${stale} of ${entries} entries in the ${label} baseline ${where} matched nothing this run. Re-save it with \`fallow ${command} --save-baseline\`, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+          fi
+        done
+      }
+
+      STALE_REREAD=false
+      if [ -n "$FALLOW_BASELINE" ] && [ -z "$BASELINE_ENTRIES" ]; then
+        if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ]; then
+          stale_baseline_stand_down "it reported no baseline staleness" "A fallow that predates this feature cannot report it: pin a current version, or run the gate on dead-code, dupes or health."
+        fi
+      elif [ "$BASELINE_CHANGE_SCOPED" = "true" ]; then
+        if template_can_rerun_unscoped; then
+          STALE_REREAD=true
+        else
+          stale_baseline_stand_down "it analyzed only part of the project$(baseline_unremovable_scope_clause)" "Run an unscoped pipeline to judge the baseline."
+        fi
+      fi
+
+      # Each bare-run section baseline has its own staleness object, so a run
+      # that loads only those still needs the unscoped re-read in an MR.
+      if [ "$STALE_REREAD" = "false" ] && bare_sections_need_rerun fallow-results.json; then
+        STALE_REREAD=true
+      fi
+
+      SECTION_STALENESS_FILE=fallow-results.json
+      if [ "$STALE_REREAD" = "true" ]; then
+        if run_stale_gate_analysis; then
+          read_all_staleness_fields fallow-stale-baseline-gate.json
+          if [ "$BASELINE_CHANGE_SCOPED" = "true" ]; then
+            stale_baseline_stand_down "the unscoped re-read was still narrowed to part of the project$(baseline_scope_clause)" "Remove the positional path from FALLOW_ARGS to judge the baseline."
+          fi
+          SECTION_STALENESS_FILE=fallow-stale-baseline-gate.json
+        else
+          stale_baseline_stand_down "the unscoped baseline re-read produced no readable result" "The primary analysis is unaffected; its stderr is printed above."
+          # The line above covers every baseline of the run.
+          SECTION_STALENESS_FILE=""
+        fi
+      fi
+
+      if [ -n "$SECTION_STALENESS_FILE" ]; then
+        bare_section_baseline_report "$SECTION_STALENESS_FILE"
+      fi
+      if [ "$STALE_REREAD" = "true" ]; then
+        rm -f fallow-stale-baseline-gate-raw.json fallow-stale-baseline-gate.json fallow-stale-baseline-gate-stderr.log
+      fi
+
+      # fallow audit loads up to three baselines and judges none of them:
+      # every audit narrows to the files that changed against its base. It says
+      # so once on stderr, which --quiet removes, so an audit user never learned
+      # that the baseline they pass is inert (issue #2677).
+      #
+      # Read each section separately rather than lengthening the
+      # single-analysis // chain: that chain is first-match, so an audit with
+      # three baselines would report one and hide the other two.
+      audit_baseline_notices() {
+        local file=$1 row label command input section entries unrecognised saved_by path
+        # label:jq-prefix:command:variable. The label names the envelope
+        # section a reader goes looking in; the command is what they have to
+        # run, and the two differ: duplication is served by fallow dupes and
+        # complexity by fallow health.
+        for row in \
+          'dead-code:.dead_code:dead-code:FALLOW_AUDIT_DEAD_CODE_BASELINE' \
+          'duplication:.duplication:dupes:FALLOW_AUDIT_DUPES_BASELINE' \
+          'complexity:.complexity.summary:health:FALLOW_AUDIT_HEALTH_BASELINE'
+        do
+          label=${row%%:*}
+          section=$(printf '%s' "$row" | cut -d: -f2)
+          command=$(printf '%s' "$row" | cut -d: -f3)
+          input=${row##*:}
+          # Through the shared reader, so this loop reads a member the same
+          # way the single-analysis path does. The reader guards with has, which
+          # keeps a literal false distinct from an absent member. The inline
+          # // empty it replaces collapsed the two. No consumer here saw a
+          # difference, because each one compares the value against true.
+          entries=$(read_staleness_field "$file" baseline_entries "$section")
+          if [ -z "$entries" ]; then
+            continue
+          fi
+          unrecognised=$(read_staleness_field "$file" unrecognised_format "$section")
+          saved_by=$(read_staleness_saved_by "$file" "$section")
+          path=$(eval "printf '%s' \"\${${input}:-}\"")
+          if [ "$unrecognised" = "true" ] && [ -n "$saved_by" ]; then
+            if [ -n "$path" ]; then
+              echo "WARNING: \`fallow ${saved_by}\` saved the ${label} baseline at ${path}, so this command reads nothing from it and it suppresses nothing."
+            else
+              echo "WARNING: \`fallow ${saved_by}\` saved the ${label} baseline, so this command reads nothing from it and it suppresses nothing."
+            fi
+            continue
+          fi
+          if [ "$unrecognised" = "true" ]; then
+            if [ -n "$path" ]; then
+              echo "WARNING: the ${label} baseline at ${path} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+            else
+              echo "WARNING: the ${label} baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+            fi
+            continue
+          fi
+          if [ -n "$path" ]; then
+            echo "NOTICE: the ${label} baseline (${path}) has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command} --baseline ${path}' over the whole project to check it."
+          else
+            echo "NOTICE: the ${label} baseline has ${entries} entries and was not judged on this run: fallow audit analyzes only the files that changed against its base. Run 'fallow ${command}' with that baseline over the whole project to check it."
+          fi
+        done
+      }
+
+      if [ "$FALLOW_COMMAND" = "audit" ]; then
+        audit_baseline_notices fallow-results.json
+      fi
+
+      # A baseline written by another command suppresses nothing, so the counts
+      # below are all zero and read exactly like a baseline saved on a project
+      # that had nothing to record. A project that pointed FALLOW_BASELINE at
+      # the wrong file would otherwise gate on it forever.
+      #
+      # Ahead of the advisory rather than beside it: the binary now trips the
+      # gate on such a file, so the *) arm below would add "0 of 0 baseline
+      # entries matched nothing this run" next to the line that says what is
+      # actually wrong.
+      #
+      # Keyed on the binary's own verdict rather than on a zero entry count,
+      # which a baseline saved on a green main with nothing to record carries
+      # too: warning on every pipeline about a correctly saved baseline is noise
+      # the project cannot turn off. Not gated on FALLOW_BASELINE either, so a
+      # baseline passed through FALLOW_ARGS earns the same line; the path is
+      # named only when the template knows it.
+      #
+      # The advisory and the gate answer different questions and legitimately
+      # disagree, so speak on either. A rotted baseline on a project with
+      # nothing left to report is warning "none" with gate_trips true, which is
+      # exactly the case issue #2673 was filed about.
+      if [ "${BASELINE_UNRECOGNISED:-}" = "true" ] && [ -n "${BASELINE_SAVED_BY:-}" ]; then
+        if [ -n "$FALLOW_BASELINE" ]; then
+          echo "WARNING: \`fallow ${BASELINE_SAVED_BY}\` saved the baseline at ${FALLOW_BASELINE}, so this command reads nothing from it and it suppresses nothing."
+        else
+          echo "WARNING: \`fallow ${BASELINE_SAVED_BY}\` saved the loaded baseline, so this command reads nothing from it and it suppresses nothing."
+        fi
+      elif [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+        if [ -n "$FALLOW_BASELINE" ]; then
+          echo "WARNING: the baseline at ${FALLOW_BASELINE} has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+        else
+          echo "WARNING: the loaded baseline has no entries this command recognises. It may be a baseline saved by another command, or an empty file. Either way it suppresses nothing."
+        fi
+      elif [ -n "$BASELINE_ENTRIES" ]; then
+        case "$BASELINE_ADVISORY" in
+          partial)
+            echo "WARNING: baseline is partially stale: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries matched nothing this run, so it protects less than what was saved. Re-save it with FALLOW_SAVE_BASELINE."
+            ;;
+          zero-overlap)
+            echo "WARNING: baseline has ${BASELINE_ENTRIES} entries but matched nothing this run. Paths may have changed, or the baseline was saved elsewhere. Re-save it with FALLOW_SAVE_BASELINE."
+            ;;
+          *)
+            if [ "$BASELINE_GATE_TRIPS" = "true" ]; then
+              echo "WARNING: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} baseline entries matched nothing this run. The project may be clean, or the baseline may no longer describe it. Re-save it with FALLOW_SAVE_BASELINE."
+            fi
+            ;;
+        esac
+      fi
+
+      if [ "$FALLOW_FAIL_ON_STALE_BASELINE" = "true" ] && [ "$BASELINE_GATE_TRIPS" = "true" ]; then
+        STALE_BASELINE_GATE_FAILED=true
+      fi
+      if [ "${#BARE_SECTION_GATE_FAILURES[@]}" -gt 0 ]; then
+        STALE_BASELINE_GATE_FAILED=true
+      fi
+
       TYPE_AWARE_COMPLETENESS_FAILED=false
       if [ "$FALLOW_EXIT_CODE" -ne 0 ] && jq -e '
         (
@@ -705,14 +1345,18 @@ variables:
         AUDIT_GATE=$(jq -r '.attribution.gate // ""' fallow-results.json)
       fi
 
+      # A loaded health baseline filters the findings, but
+      # summary.functions_above_threshold still counts the functions it
+      # accepts. remaining_findings is the count after the baseline and
+      # before --top, so it is the count when a baseline is loaded.
       case "$FALLOW_COMMAND" in
-        dead-code|check) ISSUES=$(jq -r '.total_issues // 0' fallow-results.json) ;;
+        dead-code|check|architecture) ISSUES=$(jq -r '.total_issues // 0' fallow-results.json) ;;
         dupes)           ISSUES=$(jq -r '.stats.clone_groups // 0' fallow-results.json) ;;
-        health)          ISSUES=$(jq -r '((.summary.functions_above_threshold // 0) + ((.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
-        audit)           ISSUES=$(jq -r 'if (.attribution.gate // "new-only") == "all" then ((.summary.dead_code_issues // 0) + (.summary.complexity_findings // 0) + (.summary.duplication_clone_groups // 0)) else ((.attribution.dead_code_introduced // 0) + (.attribution.complexity_introduced // 0) + (.attribution.duplication_introduced // 0)) end' fallow-results.json) ;;
+        health)          ISSUES=$(jq -r '((.summary.baseline_staleness.remaining_findings // .summary.functions_above_threshold // 0) + ((.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
+        audit)           ISSUES=$(jq -r 'if (.attribution.gate // "new-only") == "all" then ((.summary.dead_code_issues // 0) + (.summary.complexity_findings // 0) + (.summary.duplication_clone_groups // 0) + ((.complexity.styling_findings // []) | length) + (.attribution.diff_risk_introduced // 0)) else ((.attribution.dead_code_introduced // 0) + (.attribution.complexity_introduced // 0) + (if (.attribution.worsened // "warn") == "error" then (.attribution.complexity_worsened // 0) else 0 end) + (.attribution.duplication_introduced // 0) + (.attribution.styling_introduced // 0) + (.attribution.diff_risk_introduced // 0)) end' fallow-results.json) ;;
         security)        ISSUES=$(jq -r 'if .gate then (.gate.new_count // 0) else (.summary.security_findings // ((.security_findings // []) | length)) end' fallow-results.json) ;;
         fix)             ISSUES=$(jq -r '(.fixes | length)' fallow-results.json) ;;
-        "")              ISSUES=$(jq -r '((.check.total_issues // 0) + ((.dupes.clone_groups // []) | length) + (.health.summary.functions_above_threshold // 0) + ((.health.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
+        "")              ISSUES=$(jq -r '((.check.total_issues // 0) + (((.dupes.clone_groups // []) | length) + (.dupes.clone_groups_omitted // 0)) + (.health.summary.baseline_staleness.remaining_findings // .health.summary.functions_above_threshold // 0) + ((.health.runtime_coverage.findings // []) | map(select(.verdict == "safe_to_delete" or .verdict == "review_required" or .verdict == "low_traffic")) | length))' fallow-results.json) ;;
       esac
 
       if ! echo "$ISSUES" | grep -qE '^[0-9]+$'; then
@@ -739,7 +1383,7 @@ variables:
           [ "$CODEQUALITY_EXIT" -ne 0 ] || CODEQUALITY_EXIT=2
           exit "$CODEQUALITY_EXIT"
         fi
-        CQ_COUNT=$(jq '. | length' gl-code-quality-report.json 2>/dev/null || echo 0)
+        CQ_COUNT=$(jq '. | length' gl-code-quality-report.json || echo 0)
         echo "Code Quality report: ${CQ_COUNT} findings"
       else
         echo "[]" > gl-code-quality-report.json
@@ -769,12 +1413,373 @@ variables:
         fi
       fi
 
+      # ── Gate verdicts ────────────────────────────────────────────────
+      #
+      # Every gate the run armed publishes status and enforced in
+      # gate_outcomes at the envelope root, computed by the same rule that
+      # decides the exit code. The template reads that instead of
+      # FALLOW_EXIT_CODE, which it deliberately discards whenever stdout
+      # parses as JSON: the case these gates exist for exits 0.
+      #
+      # A gate fails the pipeline only when the variable that owns it asked
+      # for it, its status is fail, and the CLI marked it enforced. That is
+      # what keeps FALLOW_FAIL_ON_ISSUES: "false" authoritative for a flag
+      # that arrived through FALLOW_ARGS.
+      GATE_FAILURES=()
+      GATE_FAILED_NAMES=""
+      GATE_WARNED_NAMES=""
+      GATE_SKIPPED_NAMES=""
+      GATE_PASSED_NAMES=""
+      SECURITY_GATE_FAILED=false
+
+      gate_owning_value() {
+        case "$1" in
+          regression)            printf '%s' "$FALLOW_FAIL_ON_REGRESSION" ;;
+          duplication-threshold) printf '%s' "$FALLOW_THRESHOLD" ;;
+          health-min-severity)   printf '%s' "$FALLOW_MIN_SEVERITY" ;;
+          health-min-score)      printf '%s' "$FALLOW_MIN_SCORE" ;;
+          security)              printf '%s' "$FALLOW_SECURITY_GATE" ;;
+          stale-baseline)        printf '%s' "$FALLOW_FAIL_ON_STALE_BASELINE" ;;
+          type-aware-require)    printf '%s' "$FALLOW_TYPE_AWARE_REQUIRE" ;;
+          # No variable owns this gate. The CLI publishes the entry only when
+          # failOnParseError in config or --fail-on-parse-error in FALLOW_ARGS
+          # armed it, so an entry in the envelope is the repository's request.
+          parse-error)           printf '%s' "true" ;;
+          *)                     printf '%s' "" ;;
+        esac
+      }
+
+      gate_is_owned() {
+        local value
+        value=$(gate_owning_value "$1")
+        case "$value" in
+          ""|false|0) return 1 ;;
+          *) return 0 ;;
+        esac
+      }
+
+      # has() rather than // empty, because jq treats a false value as absent
+      # under the alternative operator. Never a bare jq -e in an assignment:
+      # this script runs under set -euo pipefail.
+      read_gate_member() {
+        jq -r --arg gate "$1" --arg member "$2" '
+          (.gate_outcomes // {}) as $gates
+          | if ($gates | has($gate)) and ($gates[$gate] | has($member))
+            then ($gates[$gate][$member] | tostring)
+            else "" end
+        ' fallow-results.json || true
+      }
+
+      # The envelope carries these as JSON numbers, so a whole value arrives
+      # as "3.0". Trim it for prose; the wire keeps the number.
+      trim_gate_number() {
+        case "$1" in
+          *.0) printf '%s' "${1%.0}" ;;
+          *) printf '%s' "$1" ;;
+        esac
+      }
+
+      gate_detail() {
+        case "$1" in
+          regression)
+            local delta
+            delta=$(jq -r '(.regression.delta // .check.regression.delta // "") | tostring' fallow-results.json || true)
+            [ -n "$delta" ] && printf 'issue count rose by %s (tolerance %s)' "$delta" "$FALLOW_TOLERANCE"
+            ;;
+          duplication-threshold)
+            local observed threshold
+            observed=$(read_gate_member duplication-threshold observed)
+            threshold=$(read_gate_member duplication-threshold threshold)
+            [ -n "$observed" ] && printf 'duplication %s%% exceeds the %s%% threshold' "$(trim_gate_number "$observed")" "$(trim_gate_number "$threshold")"
+            ;;
+          health-min-score)
+            local observed threshold
+            observed=$(read_gate_member health-min-score observed)
+            threshold=$(read_gate_member health-min-score threshold)
+            [ -n "$observed" ] && printf 'health score %s is below the minimum %s' "$(trim_gate_number "$observed")" "$(trim_gate_number "$threshold")"
+            ;;
+          health-min-severity)
+            local observed floor
+            observed=$(read_gate_member health-min-severity observed)
+            floor=$(read_gate_member health-min-severity threshold_label)
+            [ -n "$observed" ] && printf '%s finding(s) at or above %s' "$(trim_gate_number "$observed")" "$floor"
+            ;;
+          security)
+            local new_count
+            new_count=$(jq -r '(.gate.new_count // "") | tostring' fallow-results.json || true)
+            [ -n "$new_count" ] && printf '%s new security candidate(s) on changed lines (gate: %s)' "$new_count" "$FALLOW_SECURITY_GATE"
+            ;;
+          parse-error)
+            # Escape `%`, CR and LF so a file name keeps the ERROR line whole.
+            local files
+            files=$(jq -r '
+              [ (.gate_outcomes["parse-error"].files // [])[]
+                | (.path | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A")) as $path
+                | "\($path) (\(if .reason == "nesting-too-deep" then "nests too deep to parse" else "\(.error_count) parser error\(if .error_count == 1 then "" else "s" end), the parser \(if .panicked then "stopped" else "recovered" end)" end))" ]
+              | join(", ")
+            ' fallow-results.json || true)
+            [ -n "$files" ] && printf 'fallow could not parse %s' "$files"
+            ;;
+        esac
+        # An empty detail must not make this function return non-zero: the case
+        # branches end in `&&` lists, and the caller assigns the result under
+        # errexit.
+        return 0
+      }
+
+      record_gate_failure() {
+        local gate=$1 detail line
+        if [ "$gate" = "stale-baseline" ]; then
+          # A bare-run section baseline brings its own line, and the
+          # FALLOW_BASELINE line below joins it only when that baseline tripped
+          # the gate too.
+          if [ "${#BARE_SECTION_GATE_FAILURES[@]}" -gt 0 ]; then
+            GATE_FAILURES+=("${BARE_SECTION_GATE_FAILURES[@]}")
+            if [ "${BASELINE_GATE_TRIPS:-}" != "true" ]; then
+              return
+            fi
+          fi
+          # The gate also trips on a file this command cannot read as its own,
+          # whose counts are all zero: re-saving is not the remedy there, and
+          # "0 of 0 entries matched nothing" names nothing to act on.
+          if [ "${BASELINE_UNRECOGNISED:-}" = "true" ] && [ -n "${BASELINE_SAVED_BY:-}" ]; then
+            GATE_FAILURES+=("Fallow baseline gate failed: \`fallow ${BASELINE_SAVED_BY}\` saved the baseline ${FALLOW_BASELINE:-passed to this pipeline}, so it suppresses nothing. Point FALLOW_BASELINE at this command's own baseline, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+            return
+          fi
+          if [ "${BASELINE_UNRECOGNISED:-}" = "true" ]; then
+            GATE_FAILURES+=("Fallow baseline gate failed: the baseline ${FALLOW_BASELINE:-passed to this pipeline} has no entries this command recognises, so it suppresses nothing. Point FALLOW_BASELINE at this command's own baseline, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+            return
+          fi
+          GATE_FAILURES+=("Fallow baseline gate failed: ${BASELINE_STALE_ENTRIES} of ${BASELINE_ENTRIES} entries in ${FALLOW_BASELINE} matched nothing this run. Re-save the baseline, or set FALLOW_FAIL_ON_STALE_BASELINE to false.")
+          return
+        fi
+        if [ "$gate" = "type-aware-require" ]; then
+          GATE_FAILURES+=("Type-aware completeness gate failed because semantic analysis was unavailable or partial.")
+          return
+        fi
+        detail=$(gate_detail "$gate")
+        line="Fallow ${gate} gate failed"
+        if [ -n "$detail" ]; then
+          line="${line}: ${detail}"
+        fi
+        GATE_FAILURES+=("${line}.")
+        if [ "$gate" = "security" ]; then
+          SECURITY_GATE_FAILED=true
+        fi
+      }
+
+      # On the bare combined run, the CLI enforces duplication-threshold only
+      # through --fail-on-issues, and that flag can arrive through FALLOW_ARGS.
+      # FALLOW_FAIL_ON_ISSUES stays authoritative for it, so such a verdict
+      # fails the pipeline only when that variable is true.
+      combined_gate_needs_fail_on_issues() {
+        [ -z "$FALLOW_COMMAND" ] \
+          && [ "$1" = "duplication-threshold" ] \
+          && [ "$FALLOW_FAIL_ON_ISSUES" != "true" ]
+      }
+
+      classify_gate() {
+        local gate=$1 status=$2 enforced=$3 detail
+        case "$status" in
+          fail)
+            GATE_FAILED_NAMES="${GATE_FAILED_NAMES:+${GATE_FAILED_NAMES},}${gate}"
+            if gate_is_owned "$gate" && [ "$enforced" = "true" ] \
+              && ! combined_gate_needs_fail_on_issues "$gate"; then
+              record_gate_failure "$gate"
+            elif [ "$gate" = "error-severity-findings" ] || [ "$gate" = "health-findings" ] || [ "$gate" = "audit-verdict" ] || [ "$gate" = "duplication-findings" ]; then
+              # These four gates are governed by FALLOW_FAIL_ON_ISSUES rather
+              # than by a variable of their own. error-severity-findings,
+              # health-findings and audit-verdict are default exit rules, so
+              # every envelope carries them. duplication-findings is not a
+              # default rule: only --fail-on-issues or --ci in FALLOW_ARGS arms it.
+              # The two findings rules are the CLI's, which the count gate
+              # deliberately does not follow. The count gate below already
+              # applies the audit verdict and already counts clone groups for
+              # duplication-findings. An audit pipeline with
+              # FALLOW_FAIL_ON_ISSUES false is a deliberate reporting
+              # configuration. All four reach dotenv and never the log.
+              :
+            elif gate_is_owned "$gate" && [ "$enforced" = "true" ]; then
+              # Only the combined duplication-threshold entry reaches this
+              # branch: --fail-on-issues in FALLOW_ARGS enforced it, and
+              # FALLOW_FAIL_ON_ISSUES is not true.
+              detail=$(gate_detail "$gate")
+              echo "WARNING: Fallow ${gate} gate reports a failure${detail:+: ${detail}}. It does not fail this pipeline: the combined run enforces that gate through FALLOW_FAIL_ON_ISSUES, and that variable is not true."
+            elif gate_is_owned "$gate"; then
+              # The variable asked for the gate and the CLI still reports it
+              # unenforced, which is the CLI saying this run could not have
+              # exited on it: combined mode without --fail-on-issues collapses
+              # every gate but the baseline, regression, type-aware and
+              # parse-error ones. This is the default job, so say
+              # which it was rather than blaming the variable.
+              detail=$(gate_detail "$gate")
+              echo "WARNING: Fallow ${gate} gate reports a failure${detail:+: ${detail}}. It does not fail this pipeline: the combined run does not enforce that gate. Set FALLOW_COMMAND to the dedicated command to gate on it."
+            else
+              detail=$(gate_detail "$gate")
+              echo "WARNING: Fallow ${gate} gate reports a failure${detail:+: ${detail}}. It does not fail this pipeline, because its variable is not set."
+            fi
+            ;;
+          warn)
+            GATE_WARNED_NAMES="${GATE_WARNED_NAMES:+${GATE_WARNED_NAMES},}${gate}"
+            echo "WARNING: Fallow ${gate} gate reports a warning."
+            ;;
+          skipped)
+            GATE_SKIPPED_NAMES="${GATE_SKIPPED_NAMES:+${GATE_SKIPPED_NAMES},}${gate}"
+            if gate_is_owned "$gate"; then
+              echo "WARNING: Fallow ${gate} gate stood down, so the run it was asked to judge was not judged."
+            else
+              echo "NOTE: Fallow ${gate} gate stood down."
+            fi
+            ;;
+          pass)
+            GATE_PASSED_NAMES="${GATE_PASSED_NAMES:+${GATE_PASSED_NAMES},}${gate}"
+            ;;
+          *)
+            # The status set is open. A value this template does not recognise
+            # is reported rather than silently counted as a pass.
+            GATE_WARNED_NAMES="${GATE_WARNED_NAMES:+${GATE_WARNED_NAMES},}${gate}"
+            echo "WARNING: Fallow ${gate} gate reported an unrecognised status '${status}'. Upgrade the template, or read gate_outcomes directly."
+            ;;
+        esac
+      }
+
+      HAS_GATE_OUTCOMES=false
+      if jq -e 'has("gate_outcomes")' fallow-results.json > /dev/null 2>&1; then
+        HAS_GATE_OUTCOMES=true
+      fi
+
+      if [ "$HAS_GATE_OUTCOMES" = "true" ]; then
+        while IFS= read -r gate_key; do
+          [ -z "$gate_key" ] && continue
+          case "$gate_key" in
+            *[!a-z0-9-]*) continue ;;
+          esac
+          # The stale-baseline gate is owned by the #2674 machinery below, which
+          # judges the unscoped re-read rather than this envelope. A
+          # merge-request pipeline is change-scoped, so this envelope reports
+          # `skipped` and classifying it here would print a stand-down beside
+          # that block's own error.
+          if [ "$gate_key" = "stale-baseline" ] \
+            && { [ -n "$FALLOW_BASELINE" ] || bare_run_has_section_baseline; }; then
+            continue
+          fi
+          classify_gate "$gate_key" "$(read_gate_member "$gate_key" status)" "$(read_gate_member "$gate_key" enforced)"
+        done < <(jq -r '(.gate_outcomes // {}) | keys[]?' fallow-results.json || true)
+      else
+        # A pinned binary older than the gate index. Read the feature-local
+        # field each gate already published, and fail OPEN for the three that
+        # never had one, warning only when their variable was actually set.
+        if gate_is_owned regression; then
+          if jq -e '(.regression.exceeded // .check.regression.exceeded) == true' fallow-results.json > /dev/null 2>&1; then
+            classify_gate regression fail true
+          fi
+        fi
+        if gate_is_owned security; then
+          if jq -e '.gate.verdict == "fail"' fallow-results.json > /dev/null 2>&1; then
+            classify_gate security fail true
+          fi
+        fi
+        FALLBACK_UNAVAILABLE=""
+        for fallback_gate in duplication-threshold health-min-score health-min-severity; do
+          if gate_is_owned "$fallback_gate"; then
+            FALLBACK_UNAVAILABLE="${FALLBACK_UNAVAILABLE:+${FALLBACK_UNAVAILABLE}, }${fallback_gate}"
+          fi
+        done
+        if [ -n "$FALLBACK_UNAVAILABLE" ]; then
+          echo "WARNING: Fallow did not publish gate verdicts, so ${FALLBACK_UNAVAILABLE} could not be checked. Upgrade FALLOW_VERSION to 3.27.0 or later."
+        fi
+      fi
+
+      if [ "$STALE_BASELINE_GATE_FAILED" = "true" ]; then
+        case ",${GATE_FAILED_NAMES}," in
+          *,stale-baseline,*) ;;
+          *) GATE_FAILED_NAMES="${GATE_FAILED_NAMES:+${GATE_FAILED_NAMES},}stale-baseline"; record_gate_failure stale-baseline ;;
+        esac
+      fi
       if [ "$TYPE_AWARE_COMPLETENESS_FAILED" = "true" ]; then
-        echo "ERROR: Type-aware completeness gate failed because semantic analysis was unavailable or partial."
-        exit 1
+        case ",${GATE_FAILED_NAMES}," in
+          *,type-aware-require,*) ;;
+          *) GATE_FAILED_NAMES="${GATE_FAILED_NAMES:+${GATE_FAILED_NAMES},}type-aware-require"; record_gate_failure type-aware-require ;;
+        esac
+      fi
+
+      # ── Degraded analysis ────────────────────────────────────────────
+      ANALYSIS_DEGRADED=false
+      DEGRADED_SUMMARY=$(jq -r '
+        [ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.degrades_analysis == true) ]
+        | group_by(.kind)
+        | map("\(.[0].kind) (\(length))")
+        | join(", ")
+      ' fallow-results.json || true)
+      if [ -n "$DEGRADED_SUMMARY" ]; then
+        ANALYSIS_DEGRADED=true
+        echo "WARNING: Fallow ran with degraded inputs: ${DEGRADED_SUMMARY}. Some findings or scores were computed over less than the whole project, or from an input that did not load."
+      fi
+      # ── Requests the run could not apply ─────────────────────────────
+      #
+      # The CLI also writes this to stderr, and this job runs it with
+      # --quiet --format json, so the envelope is the only channel that
+      # reaches the pipeline. One aggregated line, for the same reason the
+      # degraded-analysis block aggregates.
+      # Selected on `affects == "scope"`, never on a name list: the object also
+      # carries requests that produce a file beside the report, whose failure
+      # says nothing about the report's scope, and a name added later carries
+      # its own class.
+      REQUESTS_UNAPPLIED=$(jq -r '
+        [ (.request_outcomes // {}) | to_entries[]
+          | select(.value.status != "applied" and .value.affects == "scope")
+          | if .value.reason then "\(.key) (\(.value.reason))" else .key end ]
+        | join(", ")
+      ' fallow-results.json || true)
+      if [ -n "$REQUESTS_UNAPPLIED" ]; then
+        echo "WARNING: Fallow could not apply: ${REQUESTS_UNAPPLIED}. The findings below cover more of the project than was requested, so do not read this run as scoped to the change."
+      fi
+      # The opposite shape: a narrowing request that DID apply, over a scope it
+      # measured as empty. Every finding filters out, so the clean report below
+      # covered nothing. A binary that publishes no `scope_size` says nothing
+      # here.
+      REQUESTS_EMPTY_SCOPE=$(jq -r '
+        [ (.request_outcomes // {}) | to_entries[]
+          | select(.value.status == "applied" and .value.affects == "scope" and .value.scope_size == 0)
+          | .key ]
+        | join(", ")
+      ' fallow-results.json || true)
+      if [ -n "$REQUESTS_EMPTY_SCOPE" ]; then
+        echo "WARNING: Fallow applied ${REQUESTS_EMPTY_SCOPE} over an empty scope, so no finding could survive it and the report below is clean because nothing was analyzable. Check the diff or ref this run was given before reading it as a clean result."
+      fi
+
+      # ── Config patterns that matched nothing ─────────────────────────
+      #
+      # An ignoreFindings pattern or an ignoreDependencies glob that matched
+      # nothing has no effect, which usually means a typo. The CLI prints
+      # this on stderr, which --quiet removes, and the MR comment and the
+      # review carry it only when they are posted. The envelope reaches
+      # every pipeline. Audit keeps the dead-code diagnostics under
+      # dead_code, so both places are read.
+      UNMATCHED_CONFIG_PATTERNS=$(jq -r '
+        [ ((.workspace_diagnostics // []), (.dead_code.workspace_diagnostics // []))[]
+          | select(.kind == "ignore-findings-pattern-unmatched" or .kind == "ignore-dependencies-glob-unmatched")
+          | "\(if .kind == "ignore-findings-pattern-unmatched" then "ignoreFindings" else "ignoreDependencies" end) \(.pattern // "" | gsub("[\r\n]"; " "))" ]
+        | unique
+        | join(", ")
+      ' fallow-results.json || true)
+      if [ -n "$UNMATCHED_CONFIG_PATTERNS" ]; then
+        echo "WARNING: Fallow config entries matched nothing in this run, so they have no effect: ${UNMATCHED_CONFIG_PATTERNS}. Fix a typo, or remove the entry from the config."
+      fi
+
+      if jq -e '[ (.workspace_diagnostics // .dead_code.workspace_diagnostics // [])[] | select(.kind == "no-source-files-analyzed") ] | length > 0' fallow-results.json > /dev/null 2>&1; then
+        EMPTY_ANALYSIS_MESSAGE="Fallow analyzed no source file at all, so every count this run reports is zero because nothing was measured, not because the project is clean. Check FALLOW_ROOT, ignorePatterns, and any path or workspace filter."
+        if [ "$FALLOW_FAIL_ON_EMPTY_ANALYSIS" = "true" ]; then
+          GATE_FAILURES+=("$EMPTY_ANALYSIS_MESSAGE")
+        else
+          echo "WARNING: ${EMPTY_ANALYSIS_MESSAGE} Set FALLOW_FAIL_ON_EMPTY_ANALYSIS to true to fail the pipeline on this."
+        fi
       fi
 
       # ── Fail check ───────────────────────────────────────────────────
+      #
+      # The count gate joins the same accumulator, so a run with both a tripped
+      # gate and findings reports both rather than exiting on the first.
       if [ "$FALLOW_FAIL_ON_ISSUES" = "true" ]; then
         if [ "$FALLOW_COMMAND" = "audit" ]; then
           # Audit gates on rule severity. Verdict encodes the gate decision:
@@ -782,26 +1787,44 @@ variables:
           # fail -> error-tier (fail). Counting introduced findings instead
           # would re-introduce the bug issue #302 was filed to fix.
           if [ "$VERDICT" = "fail" ]; then
-            echo "ERROR: Fallow audit failed (gate: ${AUDIT_GATE:-new-only}, ${ISSUES} finding(s) at error severity in changed files)"
-            exit 1
+            GATE_FAILURES+=("Fallow audit failed (gate: ${AUDIT_GATE:-new-only}, ${ISSUES} finding(s) at error severity in changed files)")
           fi
-        elif [ "$ISSUES" -gt 0 ]; then
+        elif [ "$ISSUES" -gt 0 ] && [ "$(read_gate_member health-findings status)" != "skipped" ]; then
+          # FALLOW_MIN_SCORE turns the CLI's findings rule off, and the envelope
+          # says so with `health-findings: skipped`. Counting them here would
+          # fail a run the CLI deliberately passed.
           case "$FALLOW_COMMAND" in
-            dead-code|check) echo "ERROR: Fallow found ${ISSUES} unused code issues" ;;
-            dupes)           echo "ERROR: Fallow found ${ISSUES} clone groups" ;;
-            health)          echo "ERROR: Fallow found ${ISSUES} health findings" ;;
-            security)
-              if [ -n "$FALLOW_SECURITY_GATE" ]; then
-                echo "ERROR: Fallow security gate failed (gate: ${FALLOW_SECURITY_GATE}, ${ISSUES} candidate(s))"
-                exit 8
-              fi
-              echo "ERROR: Fallow found ${ISSUES} security candidates"
-              ;;
-            fix)             echo "ERROR: Fallow found ${ISSUES} fixable issues" ;;
-            "")              echo "ERROR: Fallow found ${ISSUES} issues" ;;
+            dead-code|check) GATE_FAILURES+=("Fallow found ${ISSUES} unused code issues") ;;
+            architecture)    GATE_FAILURES+=("Fallow found ${ISSUES} architecture issues") ;;
+            dupes)           GATE_FAILURES+=("Fallow found ${ISSUES} clone groups") ;;
+            health)          GATE_FAILURES+=("Fallow found ${ISSUES} health findings") ;;
+            security)        GATE_FAILURES+=("Fallow found ${ISSUES} security candidates") ;;
+            fix)             GATE_FAILURES+=("Fallow found ${ISSUES} fixable issues") ;;
+            "")              GATE_FAILURES+=("Fallow found ${ISSUES} issues") ;;
           esac
-          exit 1
         fi
+      fi
+
+      # dotenv so a downstream job can branch on the verdict without re-reading
+      # the envelope.
+      {
+        echo "FALLOW_GATES_FAILED=${GATE_FAILED_NAMES}"
+        echo "FALLOW_GATES_WARNED=${GATE_WARNED_NAMES}"
+        echo "FALLOW_GATES_SKIPPED=${GATE_SKIPPED_NAMES}"
+        echo "FALLOW_GATES_PASSED=${GATE_PASSED_NAMES}"
+        echo "FALLOW_ANALYSIS_DEGRADED=${ANALYSIS_DEGRADED}"
+        echo "FALLOW_REQUESTS_UNAPPLIED=${REQUESTS_UNAPPLIED}"
+      } > fallow-gates.env
+
+      if [ ${#GATE_FAILURES[@]} -gt 0 ]; then
+        for failure in "${GATE_FAILURES[@]}"; do
+          echo "ERROR: ${failure}"
+        done
+        # 8 is the documented security-gate exit and outranks the generic 1.
+        if [ "$SECURITY_GATE_FAILED" = "true" ]; then
+          exit 8
+        fi
+        exit 1
       fi
       FALLOW_SCRIPT_EOF
       chmod +x /tmp/fallow-run.sh
@@ -827,9 +1850,14 @@ variables:
       # `false` vs `true` for dedup-lookup-failed). See issue #470.
       - fallow-skip-reason.txt
       - fallow-dedup-lookup-failed.txt
+      - fallow-gates.env
     reports:
       codequality:
         - gl-code-quality-report.json
+      # The gate verdict as dotenv, so a downstream job can branch on
+      # FALLOW_GATES_FAILED without re-reading the envelope. Same names as the
+      # action's step outputs.
+      dotenv: fallow-gates.env
     expire_in: 30 days
 
   rules:

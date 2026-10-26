@@ -6,6 +6,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use fallow_config::{ResolvedConfig, Severity};
 use fallow_types::envelope::AuditIntroduced;
+use fallow_types::identity::{IdentifiedFinding, IdentityPaths, dead_code_occurrence_keys};
+
+pub use crate::audit_complexity::{
+    ComplexityBaseline, ComplexityClass, ComplexityMetrics, classify_complexity_attribution,
+    classify_complexity_attribution_against_all, classify_complexity_findings,
+    classify_complexity_findings_against_all, complexity_baseline, complexity_baseline_keys,
+    complexity_ledger_keys, remap_complexity_baseline_for_renames,
+};
 
 /// One dead-code finding classified for audit comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,12 +65,17 @@ impl DeadCodeAuditLedger {
         self.introduced_keys.len()
     }
 
-    /// Number of findings whose effective severity is not off.
+    /// Number of counted findings whose effective severity is not off.
+    /// Advisory prop chains remain available in the records.
     #[must_use]
     pub fn visible_count(&self) -> usize {
         self.records
             .iter()
-            .filter(|record| record.effective_severity != Severity::Off)
+            .filter(|record| {
+                record.effective_severity != Severity::Off
+                    && (record.collection != "prop_drilling_chains"
+                        || record.effective_severity == Severity::Error)
+            })
             .count()
     }
 
@@ -88,14 +101,6 @@ impl DeadCodeAuditLedger {
             .any(|record| record.introduced && record.effective_severity == Severity::Warn)
     }
 
-    /// Whether any current finding has effective error severity.
-    #[must_use]
-    pub fn has_errors(&self) -> bool {
-        self.records
-            .iter()
-            .any(|record| record.effective_severity == Severity::Error)
-    }
-
     /// Demote introduced findings that have no syntactic counterpart in the
     /// current head run to inherited (advisory) status.
     ///
@@ -111,7 +116,10 @@ impl DeadCodeAuditLedger {
             if record.introduced && !head_syntactic.contains(&record.stable_key) {
                 record.introduced = false;
                 self.introduced_keys.remove(&record.stable_key);
-                if record.effective_severity != Severity::Off {
+                if record.effective_severity != Severity::Off
+                    && (record.collection != "prop_drilling_chains"
+                        || record.effective_severity == Severity::Error)
+                {
                     self.inherited_keys.insert(record.stable_key.clone());
                 }
             }
@@ -132,6 +140,7 @@ impl DeadCodeAuditLedger {
             unused_exports,
             unused_types,
             private_type_leaks,
+            deprecated_exports_in_use,
             unused_dependencies,
             unused_dev_dependencies,
             unused_optional_dependencies,
@@ -146,6 +155,7 @@ impl DeadCodeAuditLedger {
             dev_dependencies_in_production,
             circular_dependencies,
             re_export_cycles,
+            package_cycles,
             boundary_violations,
             boundary_coverage_violations,
             boundary_call_violations,
@@ -162,15 +172,21 @@ impl DeadCodeAuditLedger {
             unprovided_injects,
             unrendered_components,
             unused_component_props,
+            absent_component_props,
             unused_component_emits,
             unused_component_inputs,
             unused_component_outputs,
             unused_svelte_events,
+            unused_effect_layers,
+            unused_tagged_errors,
+            unproduced_catch_tags,
             unused_server_actions,
             unused_load_data_keys,
             unused_load_data_keys_global_abstain: _unused_load_data_keys_global_abstain,
             route_collisions,
             dynamic_segment_name_conflicts,
+            cascade_hidden: _cascade_hidden,
+            cascade: _cascade,
             suppression_count: _suppression_count,
             unused_component_props_exempted: _unused_component_props_exempted,
             active_suppressions: _active_suppressions,
@@ -179,7 +195,7 @@ impl DeadCodeAuditLedger {
             security_unresolved_edge_files: _security_unresolved_edge_files,
             security_unresolved_callee_sites: _security_unresolved_callee_sites,
             security_unresolved_callee_diagnostics: _security_unresolved_callee_diagnostics,
-            prop_drilling_chains: _prop_drilling_chains,
+            prop_drilling_chains,
             thin_wrappers: _thin_wrappers,
             duplicate_prop_shapes: _duplicate_prop_shapes,
             export_usages: _export_usages,
@@ -202,10 +218,12 @@ impl DeadCodeAuditLedger {
             };
         }
 
+        annotate!(prop_drilling_chains, "prop_drilling_chains");
         annotate!(unused_files, "unused_files");
         annotate!(unused_exports, "unused_exports");
         annotate!(unused_types, "unused_types");
         annotate!(private_type_leaks, "private_type_leaks");
+        annotate!(deprecated_exports_in_use, "deprecated_exports_in_use");
         annotate!(unused_dependencies, "unused_dependencies");
         annotate!(unused_dev_dependencies, "unused_dev_dependencies");
         annotate!(unused_optional_dependencies, "unused_optional_dependencies");
@@ -223,6 +241,7 @@ impl DeadCodeAuditLedger {
         );
         annotate!(circular_dependencies, "circular_dependencies");
         annotate!(re_export_cycles, "re_export_cycles");
+        annotate!(package_cycles, "package_cycles");
         annotate!(boundary_violations, "boundary_violations");
         annotate!(boundary_coverage_violations, "boundary_coverage_violations");
         annotate!(boundary_call_violations, "boundary_call_violations");
@@ -249,10 +268,14 @@ impl DeadCodeAuditLedger {
             "dynamic_segment_name_conflicts"
         );
         annotate!(unused_component_props, "unused_component_props");
+        annotate!(absent_component_props, "absent_component_props");
         annotate!(unused_component_emits, "unused_component_emits");
         annotate!(unused_component_inputs, "unused_component_inputs");
         annotate!(unused_component_outputs, "unused_component_outputs");
         annotate!(unused_svelte_events, "unused_svelte_events");
+        annotate!(unused_effect_layers, "unused_effect_layers");
+        annotate!(unused_tagged_errors, "unused_tagged_errors");
+        annotate!(unproduced_catch_tags, "unproduced_catch_tags");
         annotate!(unused_server_actions, "unused_server_actions");
         annotate!(unused_load_data_keys, "unused_load_data_keys");
     }
@@ -298,6 +321,30 @@ impl AuditDomainLedger {
             inherited_keys,
             demoted_keys: FxHashSet::default(),
         }
+    }
+
+    /// Build a ledger from keys that the caller already classified, in
+    /// typed output order. `has_base` is false when the run has no base
+    /// snapshot, so no finding counts as introduced or inherited.
+    #[must_use]
+    pub fn from_classified(
+        records: impl IntoIterator<Item = (String, bool)>,
+        has_base: bool,
+    ) -> Self {
+        let mut ledger = Self::default();
+        for (key, introduced) in records {
+            let introduced = has_base && introduced;
+            if has_base {
+                if introduced {
+                    ledger.introduced_keys.insert(key.clone());
+                } else {
+                    ledger.inherited_keys.insert(key.clone());
+                }
+            }
+            ledger.keys.insert(key.clone());
+            ledger.records.push((key, introduced));
+        }
+        ledger
     }
 
     /// Stable current-run key set.
@@ -369,76 +416,31 @@ pub struct AuditComparison {
     pub dead_code: DeadCodeAuditLedger,
     /// Complexity finding membership.
     pub health: AuditDomainLedger,
+    /// Attribution class of each complexity finding, in report order. Empty
+    /// without a base snapshot.
+    pub health_classes: Vec<crate::audit_complexity::ComplexityClass>,
     /// Duplication group membership.
     pub dupes: AuditDomainLedger,
     /// Styling finding membership.
     pub styling: AuditDomainLedger,
 }
 
-/// Inputs for building one [`AuditComparison`].
-pub struct AuditComparisonInput<'a> {
-    /// Current-run dead-code analysis results to classify.
-    pub results: &'a fallow_types::results::AnalysisResults,
-    /// Resolved config that drives effective severity routing.
-    pub config: &'a ResolvedConfig,
-    /// Project root that dead-code key paths are made relative to.
-    pub root: &'a Path,
-    /// Current-run health report whose findings are classified.
-    pub health: &'a fallow_output::HealthReport,
-    /// Root that health finding key paths are made relative to; may differ
-    /// from `root` when health runs over a different tree.
-    pub health_root: &'a Path,
-    /// Precomputed duplication group keys in typed output order.
-    pub dupe_keys: Vec<String>,
-    /// Precomputed styling finding keys in typed output order.
-    pub styling_keys: Vec<String>,
-    /// Base-snapshot dead-code keys; `None` disables attribution so no
-    /// finding is marked introduced.
-    pub base_dead_code: Option<&'a FxHashSet<String>>,
-    /// Base-snapshot complexity keys; `None` disables attribution so no
-    /// finding is marked introduced.
-    pub base_health: Option<&'a FxHashSet<String>>,
-    /// Base-snapshot duplication keys; `None` disables attribution so no
-    /// group is marked introduced.
-    pub base_dupes: Option<&'a FxHashSet<String>>,
-    /// Base-snapshot styling keys; `None` disables attribution so no
-    /// finding is marked introduced.
-    pub base_styling: Option<&'a FxHashSet<String>>,
-}
-
 impl AuditComparison {
-    /// Classify every audit finding once against the base snapshot.
+    /// Number of complexity findings whose attribution is `worsened`.
     #[must_use]
-    pub fn build(input: AuditComparisonInput<'_>) -> Self {
-        Self {
-            dead_code: dead_code_audit_ledger(
-                input.results,
-                input.root,
-                input.config,
-                input.base_dead_code,
-            ),
-            health: AuditDomainLedger::compare(
-                input
-                    .health
-                    .findings
-                    .iter()
-                    .map(|finding| health_finding_key(finding, input.health_root)),
-                input.base_health,
-            ),
-            dupes: AuditDomainLedger::compare(input.dupe_keys, input.base_dupes),
-            styling: AuditDomainLedger::compare(input.styling_keys, input.base_styling),
-        }
+    pub fn complexity_worsened_count(&self) -> usize {
+        self.health_classes
+            .iter()
+            .filter(|class| class.is_worsened())
+            .count()
     }
 
-    /// Persist introduced membership into typed dead-code and health findings.
-    pub fn annotate_typed_findings(
-        &self,
-        results: &mut fallow_types::results::AnalysisResults,
-        health: &mut fallow_output::HealthReport,
-    ) {
-        self.dead_code.annotate_results(results);
-        for (finding, introduced) in health.findings.iter_mut().zip(self.health.introduced()) {
-            finding.introduced = Some(introduced);
+    /// Reclassify worsened complexity findings as inherited, for
+    /// `audit.worsened: off`. Growth of an exceeded metric stays worsened, see
+    /// [`ComplexityClass::clear_worsened_for_off`].
+    pub fn clear_worsened(&mut self) {
+        for class in &mut self.health_classes {
+            class.clear_worsened_for_off();
         }
     }
 }
@@ -468,7 +470,7 @@ pub fn remap_keys_for_renames(
         .collect()
 }
 
-fn remap_key_for_renames(key: &str, renames: &FxHashMap<String, String>) -> String {
+pub(crate) fn remap_key_for_renames(key: &str, renames: &FxHashMap<String, String>) -> String {
     if !key
         .split([':', '|'])
         .any(|segment| renames.contains_key(segment))
@@ -497,393 +499,18 @@ fn remap_key_for_renames(key: &str, renames: &FxHashMap<String, String>) -> Stri
     segments.join(":")
 }
 
-/// Canonical path form used inside attribution keys: root-relative with
-/// forward slashes on every platform. Paths outside `root` keep their
-/// simplified absolute form so keys stay unique.
-pub fn relative_key_path(path: &Path, root: &Path) -> String {
-    let simple_path = dunce::simplified(path);
-    let simple_root = dunce::simplified(root);
-    simple_path
-        .strip_prefix(simple_root)
-        .unwrap_or(simple_path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
+/// Canonical path form used inside attribution keys. The engine owns the one
+/// implementation, because its module-graph maps use the same keys.
+pub use fallow_engine::module_graph::relative_key_path;
 
-fn dependency_location_key(location: &fallow_types::results::DependencyLocation) -> &'static str {
-    match location {
-        fallow_types::results::DependencyLocation::Dependencies => "unused-dependency",
-        fallow_types::results::DependencyLocation::DevDependencies => "unused-dev-dependency",
-        fallow_types::results::DependencyLocation::OptionalDependencies => {
-            "unused-optional-dependency"
-        }
-    }
-}
-
-fn unused_dependency_key(item: &fallow_types::results::UnusedDependency, root: &Path) -> String {
-    format!(
-        "{}:{}:{}",
-        dependency_location_key(&item.location),
-        relative_key_path(&item.path, root),
-        item.package_name
-    )
-}
-
-fn invalid_client_export_key(
-    item: &fallow_types::results::InvalidClientExport,
-    root: &Path,
-) -> String {
-    format!(
-        "invalid-client-export:{}:{}",
-        relative_key_path(&item.path, root),
-        item.export_name
-    )
-}
-
-fn mixed_client_server_barrel_key(
-    item: &fallow_types::results::MixedClientServerBarrel,
-    root: &Path,
-) -> String {
-    format!(
-        "mixed-client-server-barrel:{}:{}:{}",
-        relative_key_path(&item.path, root),
-        item.client_origin,
-        item.server_origin
-    )
-}
-
-fn misplaced_directive_key(
-    item: &fallow_types::results::MisplacedDirective,
-    root: &Path,
-) -> String {
-    format!(
-        "misplaced-directive:{}:{}:{}",
-        relative_key_path(&item.path, root),
-        item.line,
-        item.directive
-    )
-}
-
-fn unprovided_inject_key(item: &fallow_types::results::UnprovidedInject, root: &Path) -> String {
-    format!(
-        "unprovided-inject:{}:{}",
-        relative_key_path(&item.path, root),
-        item.key_name
-    )
-}
-
-fn unrendered_component_key(
-    item: &fallow_types::results::UnrenderedComponent,
-    root: &Path,
-) -> String {
-    format!(
-        "unrendered-component:{}:{}",
-        relative_key_path(&item.path, root),
-        item.component_name
-    )
-}
-
-fn unused_component_prop_key(
-    item: &fallow_types::results::UnusedComponentProp,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-component-prop:{}:{}",
-        relative_key_path(&item.path, root),
-        item.prop_name
-    )
-}
-
-fn unused_component_emit_key(
-    item: &fallow_types::results::UnusedComponentEmit,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-component-emit:{}:{}",
-        relative_key_path(&item.path, root),
-        item.emit_name
-    )
-}
-
-fn unused_component_input_key(
-    item: &fallow_types::results::UnusedComponentInput,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-component-input:{}:{}",
-        relative_key_path(&item.path, root),
-        item.input_name
-    )
-}
-
-fn unused_component_output_key(
-    item: &fallow_types::results::UnusedComponentOutput,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-component-output:{}:{}",
-        relative_key_path(&item.path, root),
-        item.output_name
-    )
-}
-
-fn unused_svelte_event_key(item: &fallow_types::results::UnusedSvelteEvent, root: &Path) -> String {
-    format!(
-        "unused-svelte-event:{}:{}",
-        relative_key_path(&item.path, root),
-        item.event_name
-    )
-}
-
-fn unused_server_action_key(
-    item: &fallow_types::results::UnusedServerAction,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-server-action:{}:{}",
-        relative_key_path(&item.path, root),
-        item.action_name
-    )
-}
-
-fn unused_load_data_key_key(
-    item: &fallow_types::results::UnusedLoadDataKey,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-load-data-key:{}:{}",
-        relative_key_path(&item.path, root),
-        item.key_name
-    )
-}
-
-fn route_collision_key(item: &fallow_types::results::RouteCollision, root: &Path) -> String {
-    format!(
-        "route-collision:{}:{}",
-        relative_key_path(&item.path, root),
-        item.url
-    )
-}
-
-fn dynamic_segment_name_conflict_key(
-    item: &fallow_types::results::DynamicSegmentNameConflict,
-    root: &Path,
-) -> String {
-    format!(
-        "dynamic-segment-name-conflict:{}:{}",
-        relative_key_path(&item.path, root),
-        item.position
-    )
-}
-
-fn unlisted_dependency_key(
-    item: &fallow_types::results::UnlistedDependency,
-    root: &Path,
-) -> String {
-    let mut sites = item
-        .imported_from
-        .iter()
-        .map(|site| {
-            format!(
-                "{}:{}:{}",
-                relative_key_path(&site.path, root),
-                site.line,
-                site.col
-            )
-        })
-        .collect::<Vec<_>>();
-    sites.sort();
-    sites.dedup();
-    format!(
-        "unlisted-dependency:{}:{}",
-        item.package_name,
-        sites.join("|")
-    )
-}
-
-fn unused_member_key(
-    rule_id: &str,
-    item: &fallow_types::results::UnusedMember,
-    root: &Path,
-) -> String {
-    format!(
-        "{}:{}:{}:{}",
-        rule_id,
-        relative_key_path(&item.path, root),
-        item.parent_name,
-        item.member_name
-    )
-}
-
-fn unused_catalog_entry_key(
-    item: &fallow_types::results::UnusedCatalogEntry,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-catalog-entry:{}:{}:{}:{}",
-        relative_key_path(&item.path, root),
-        item.line,
-        item.catalog_name,
-        item.entry_name
-    )
-}
-
-fn empty_catalog_group_key(item: &fallow_types::results::EmptyCatalogGroup, root: &Path) -> String {
-    format!(
-        "empty-catalog-group:{}:{}:{}",
-        relative_key_path(&item.path, root),
-        item.line,
-        item.catalog_name
-    )
-}
-
-fn sorted_relative_path_keys<'a>(
-    paths: impl Iterator<Item = &'a Path>,
-    root: &Path,
-) -> Vec<String> {
-    let mut keys = paths
-        .map(|path| relative_key_path(path, root))
-        .collect::<Vec<_>>();
-    keys.sort();
-    keys
-}
-
-fn duplicate_export_key(
-    item: &fallow_types::output_dead_code::DuplicateExportFinding,
-    root: &Path,
-) -> String {
-    let mut locations = sorted_relative_path_keys(
-        item.export.locations.iter().map(|loc| loc.path.as_path()),
-        root,
-    );
-    locations.dedup();
-    format!(
-        "duplicate-export:{}:{}",
-        item.export.export_name,
-        locations.join("|")
-    )
-}
-
-fn circular_dependency_key(
-    item: &fallow_types::output_dead_code::CircularDependencyFinding,
-    root: &Path,
-) -> String {
-    let files = sorted_relative_path_keys(
-        item.cycle.files.iter().map(std::path::PathBuf::as_path),
-        root,
-    );
-    format!("circular-dependency:{}", files.join("|"))
-}
-
-fn re_export_cycle_key(
-    item: &fallow_types::output_dead_code::ReExportCycleFinding,
-    root: &Path,
-) -> String {
-    let kind = match item.cycle.kind {
-        fallow_types::results::ReExportCycleKind::MultiNode => "multi-node",
-        fallow_types::results::ReExportCycleKind::SelfLoop => "self-loop",
-    };
-    let files = sorted_relative_path_keys(
-        item.cycle.files.iter().map(std::path::PathBuf::as_path),
-        root,
-    );
-    format!("re-export-cycle:{kind}:{}", files.join("|"))
-}
-
-fn boundary_violation_key(
-    item: &fallow_types::output_dead_code::BoundaryViolationFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "boundary-violation:{}:{}:{}",
-        relative_key_path(&item.violation.from_path, root),
-        relative_key_path(&item.violation.to_path, root),
-        item.violation.import_specifier
-    )
-}
-
-fn boundary_coverage_key(
-    item: &fallow_types::output_dead_code::BoundaryCoverageViolationFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "boundary-coverage:{}",
-        relative_key_path(&item.violation.path, root)
-    )
-}
-
-fn boundary_call_key(
-    item: &fallow_types::output_dead_code::BoundaryCallViolationFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "boundary-call:{}:{}",
-        relative_key_path(&item.violation.path, root),
-        item.violation.callee
-    )
-}
-
-fn policy_violation_key(
-    item: &fallow_types::output_dead_code::PolicyViolationFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "policy-violation:{}:{}/{}:{}",
-        relative_key_path(&item.violation.path, root),
-        item.violation.pack,
-        item.violation.rule_id,
-        item.violation.matched
-    )
-}
-
-fn stale_suppression_key(item: &fallow_types::results::StaleSuppression, root: &Path) -> String {
-    let rule_id = if item.missing_reason {
-        "missing-suppression-reason"
-    } else {
-        "stale-suppression"
-    };
-    format!(
-        "{rule_id}:{}:{}",
-        relative_key_path(&item.path, root),
-        item.description()
-    )
-}
-
-fn unresolved_catalog_reference_key(
-    item: &fallow_types::output_dead_code::UnresolvedCatalogReferenceFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "unresolved-catalog-reference:{}:{}:{}:{}",
-        relative_key_path(&item.reference.path, root),
-        item.reference.line,
-        item.reference.catalog_name,
-        item.reference.entry_name
-    )
-}
-
-fn unused_dependency_override_key(
-    item: &fallow_types::output_dead_code::UnusedDependencyOverrideFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "unused-dependency-override:{}:{}:{}",
-        relative_key_path(&item.entry.path, root),
-        item.entry.line,
-        item.entry.raw_key
-    )
-}
-
-fn misconfigured_dependency_override_key(
-    item: &fallow_types::output_dead_code::MisconfiguredDependencyOverrideFinding,
-    root: &Path,
-) -> String {
-    format!(
-        "misconfigured-dependency-override:{}:{}:{}",
-        relative_key_path(&item.entry.path, root),
-        item.entry.line,
-        item.entry.raw_key
-    )
+/// The audit keys of one finding collection, in collection order.
+///
+/// Each key is the canonical key of the finding (see
+/// [`fallow_types::identity`]), so a line shift does not change it. A repeated
+/// key gets an occurrence suffix, so the base and the head compare by count:
+/// a new second finding with an inherited key is introduced.
+fn collection_keys<T: IdentifiedFinding>(items: &[T], root: &Path) -> Vec<String> {
+    dead_code_occurrence_keys(items, &IdentityPaths::new(root))
 }
 
 /// Build the set of audit attribution keys for all dead-code findings in
@@ -932,11 +559,26 @@ struct FrameworkFindingSlices<'a> {
         &'a [fallow_types::output_dead_code::DynamicSegmentNameConflictFinding],
 }
 
+#[derive(Clone, Copy)]
+struct ComponentContractFindingSlices<'a> {
+    unused_component_props: &'a [fallow_types::output_dead_code::UnusedComponentPropFinding],
+    absent_component_props: &'a [fallow_types::output_dead_code::AbsentComponentPropFinding],
+    unused_component_emits: &'a [fallow_types::output_dead_code::UnusedComponentEmitFinding],
+    unused_component_inputs: &'a [fallow_types::output_dead_code::UnusedComponentInputFinding],
+    unused_component_outputs: &'a [fallow_types::output_dead_code::UnusedComponentOutputFinding],
+    unused_svelte_events: &'a [fallow_types::output_dead_code::UnusedSvelteEventFinding],
+    unused_effect_layers: &'a [fallow_types::output_dead_code::UnusedEffectLayerFinding],
+    unused_tagged_errors: &'a [fallow_types::output_dead_code::UnusedTaggedErrorFinding],
+    unproduced_catch_tags: &'a [fallow_types::output_dead_code::UnproducedCatchTagFinding],
+}
+
 /// `dead_code_keys`, `retain_introduced_dead_code`.
 /// Non-exhaustive siblings the compiler will NOT flag (wire manually when a
 /// finding type is added): `annotate_dead_code_json` (same key formats, this
-/// file) and the per-collection severity branches in
-/// `crates/cli/src/check/rules.rs` (`apply_rules`, `has_error_severity_issues`).
+/// file) and the per-collection `off` filter branches in
+/// `crates/engine/src/dead_code.rs` (`apply_rule_severities`). The severity of
+/// each record comes from the `RuleSeverity` table in
+/// `crates/engine/src/effective_severity.rs`, whose visitors are exhaustive.
 /// TypeScript mirror: `editors/vscode/scripts/codegen-contracts.mjs` derives
 /// backwards-compatible aliases from `fallow schema` `ts_alias` rows.
 pub fn dead_code_keys(
@@ -976,6 +618,7 @@ impl DeadCodeKeyCollector<'_> {
             unused_exports,
             unused_types,
             private_type_leaks,
+            deprecated_exports_in_use,
             unused_dependencies,
             unused_dev_dependencies,
             unused_optional_dependencies,
@@ -990,6 +633,7 @@ impl DeadCodeKeyCollector<'_> {
             dev_dependencies_in_production,
             circular_dependencies,
             re_export_cycles,
+            package_cycles,
             boundary_violations,
             boundary_coverage_violations,
             boundary_call_violations,
@@ -1006,16 +650,22 @@ impl DeadCodeKeyCollector<'_> {
             unprovided_injects,
             unrendered_components,
             unused_component_props,
+            absent_component_props,
             unused_component_emits,
             unused_component_inputs,
             unused_component_outputs,
             unused_svelte_events,
+            unused_effect_layers,
+            unused_tagged_errors,
+            unproduced_catch_tags,
             unused_server_actions,
             unused_load_data_keys,
             unused_load_data_keys_global_abstain: _unused_load_data_keys_global_abstain,
             route_collisions,
             dynamic_segment_name_conflicts,
             // Non-finding fields: counts and metadata, not attributable to a key.
+            cascade_hidden: _cascade_hidden,
+            cascade: _cascade,
             suppression_count: _suppression_count,
             unused_component_props_exempted: _unused_component_props_exempted,
             active_suppressions: _active_suppressions,
@@ -1026,9 +676,7 @@ impl DeadCodeKeyCollector<'_> {
             security_unresolved_edge_files: _security_unresolved_edge_files,
             security_unresolved_callee_sites: _security_unresolved_callee_sites,
             security_unresolved_callee_diagnostics: _security_unresolved_callee_diagnostics,
-            // Prop-drilling is a dormant multi-file health signal (rule defaults to
-            // `off`); like security findings it has no dead-code attribution key.
-            prop_drilling_chains: _prop_drilling_chains,
+            prop_drilling_chains,
             // Thin wrappers are a dormant health signal (rule defaults to `off`); a
             // candidate-for-inlining record, not a dead-code attribution key.
             thin_wrappers: _thin_wrappers,
@@ -1049,12 +697,14 @@ impl DeadCodeKeyCollector<'_> {
             semantic_framework_contracts: _semantic_framework_contracts,
         } = results;
 
+        self.add_items(AuditCollection::PropDrillingChains, prop_drilling_chains);
         self.add_core_findings(
             unused_files,
             unused_exports,
             unused_types,
             private_type_leaks,
         );
+        self.add_deprecated_exports_in_use(deprecated_exports_in_use);
         self.add_client_directive_findings(
             invalid_client_exports,
             mixed_client_server_barrels,
@@ -1078,18 +728,23 @@ impl DeadCodeKeyCollector<'_> {
             unused_class_members,
             unused_store_members,
         );
-        self.add_component_contract_findings(
+        self.add_component_contract_findings(&ComponentContractFindingSlices {
             unused_component_props,
+            absent_component_props,
             unused_component_emits,
             unused_component_inputs,
             unused_component_outputs,
             unused_svelte_events,
-        );
+            unused_effect_layers,
+            unused_tagged_errors,
+            unproduced_catch_tags,
+        });
         self.add_graph_findings(
             unresolved_imports,
             duplicate_exports,
             circular_dependencies,
             re_export_cycles,
+            package_cycles,
         );
         self.add_boundary_findings(
             boundary_violations,
@@ -1116,10 +771,12 @@ impl DeadCodeKeyCollector<'_> {
 
 #[derive(Clone, Copy)]
 enum AuditCollection {
+    PropDrillingChains,
     UnusedFiles,
     UnusedExports,
     UnusedTypes,
     PrivateTypeLeaks,
+    DeprecatedExportsInUse,
     UnusedDependencies,
     UnusedDevDependencies,
     UnusedOptionalDependencies,
@@ -1134,6 +791,7 @@ enum AuditCollection {
     DevDependenciesInProduction,
     CircularDependencies,
     ReExportCycles,
+    PackageCycles,
     BoundaryViolations,
     BoundaryCoverageViolations,
     BoundaryCallViolations,
@@ -1152,21 +810,80 @@ enum AuditCollection {
     RouteCollisions,
     DynamicSegmentNameConflicts,
     UnusedComponentProps,
+    AbsentComponentProps,
     UnusedComponentEmits,
     UnusedComponentInputs,
     UnusedComponentOutputs,
     UnusedSvelteEvents,
+    UnusedEffectLayers,
+    UnusedTaggedErrors,
+    UnproducedCatchTags,
     UnusedServerActions,
     UnusedLoadDataKeys,
 }
 
 impl AuditCollection {
+    #[cfg(test)]
+    const ALL: [Self; 49] = [
+        Self::PropDrillingChains,
+        Self::UnusedFiles,
+        Self::UnusedExports,
+        Self::UnusedTypes,
+        Self::PrivateTypeLeaks,
+        Self::DeprecatedExportsInUse,
+        Self::UnusedDependencies,
+        Self::UnusedDevDependencies,
+        Self::UnusedOptionalDependencies,
+        Self::UnusedEnumMembers,
+        Self::UnusedClassMembers,
+        Self::UnusedStoreMembers,
+        Self::UnresolvedImports,
+        Self::UnlistedDependencies,
+        Self::DuplicateExports,
+        Self::TypeOnlyDependencies,
+        Self::TestOnlyDependencies,
+        Self::DevDependenciesInProduction,
+        Self::CircularDependencies,
+        Self::ReExportCycles,
+        Self::PackageCycles,
+        Self::BoundaryViolations,
+        Self::BoundaryCoverageViolations,
+        Self::BoundaryCallViolations,
+        Self::PolicyViolations,
+        Self::StaleSuppressions,
+        Self::UnusedCatalogEntries,
+        Self::EmptyCatalogGroups,
+        Self::UnresolvedCatalogReferences,
+        Self::UnusedDependencyOverrides,
+        Self::MisconfiguredDependencyOverrides,
+        Self::InvalidClientExports,
+        Self::MixedClientServerBarrels,
+        Self::MisplacedDirectives,
+        Self::UnprovidedInjects,
+        Self::UnrenderedComponents,
+        Self::RouteCollisions,
+        Self::DynamicSegmentNameConflicts,
+        Self::UnusedComponentProps,
+        Self::AbsentComponentProps,
+        Self::UnusedComponentEmits,
+        Self::UnusedComponentInputs,
+        Self::UnusedComponentOutputs,
+        Self::UnusedSvelteEvents,
+        Self::UnusedEffectLayers,
+        Self::UnusedTaggedErrors,
+        Self::UnproducedCatchTags,
+        Self::UnusedServerActions,
+        Self::UnusedLoadDataKeys,
+    ];
+
     const fn json_key(self) -> &'static str {
         match self {
+            Self::PropDrillingChains => "prop_drilling_chains",
             Self::UnusedFiles => "unused_files",
             Self::UnusedExports => "unused_exports",
             Self::UnusedTypes => "unused_types",
             Self::PrivateTypeLeaks => "private_type_leaks",
+            Self::DeprecatedExportsInUse => "deprecated_exports_in_use",
             Self::UnusedDependencies => "unused_dependencies",
             Self::UnusedDevDependencies => "unused_dev_dependencies",
             Self::UnusedOptionalDependencies => "unused_optional_dependencies",
@@ -1181,6 +898,7 @@ impl AuditCollection {
             Self::DevDependenciesInProduction => "dev_dependencies_in_production",
             Self::CircularDependencies => "circular_dependencies",
             Self::ReExportCycles => "re_export_cycles",
+            Self::PackageCycles => "package_cycles",
             Self::BoundaryViolations => "boundary_violations",
             Self::BoundaryCoverageViolations => "boundary_coverage_violations",
             Self::BoundaryCallViolations => "boundary_call_violations",
@@ -1199,10 +917,14 @@ impl AuditCollection {
             Self::RouteCollisions => "route_collisions",
             Self::DynamicSegmentNameConflicts => "dynamic_segment_name_conflicts",
             Self::UnusedComponentProps => "unused_component_props",
+            Self::AbsentComponentProps => "absent_component_props",
             Self::UnusedComponentEmits => "unused_component_emits",
             Self::UnusedComponentInputs => "unused_component_inputs",
             Self::UnusedComponentOutputs => "unused_component_outputs",
             Self::UnusedSvelteEvents => "unused_svelte_events",
+            Self::UnusedEffectLayers => "unused_effect_layers",
+            Self::UnusedTaggedErrors => "unused_tagged_errors",
+            Self::UnproducedCatchTags => "unproduced_catch_tags",
             Self::UnusedServerActions => "unused_server_actions",
             Self::UnusedLoadDataKeys => "unused_load_data_keys",
         }
@@ -1281,7 +1003,10 @@ impl<'a> DeadCodeKeyCollector<'a> {
                 self.classifications += 1;
             }
             let introduced = self.base.is_some_and(|base| !base.contains(&key));
-            if effective_severity != Severity::Off && self.base.is_some() {
+            if effective_severity != Severity::Off
+                && self.base.is_some()
+                && (collection != "prop_drilling_chains" || effective_severity == Severity::Error)
+            {
                 if introduced {
                     self.introduced_keys.insert(key.clone());
                 } else {
@@ -1300,28 +1025,30 @@ impl<'a> DeadCodeKeyCollector<'a> {
         self.keys.insert(key);
     }
 
-    fn insert_file(
-        &mut self,
-        collection: AuditCollection,
-        key: String,
-        path: &Path,
-        severity: fn(&fallow_config::RulesConfig) -> Severity,
-    ) {
-        let effective = self.config.map_or(Severity::Off, |config| {
-            severity(&config.resolve_rules_for_path(path))
-        });
-        self.insert(collection, key, effective);
+    /// Insert every finding of one collection under its audit key.
+    fn add_items<T>(&mut self, collection: AuditCollection, items: &[T])
+    where
+        T: IdentifiedFinding + fallow_engine::dead_code::RuleSeverity,
+    {
+        let keys = collection_keys(items, self.root);
+        for (item, key) in items.iter().zip(keys) {
+            self.insert_rule(collection, key, item);
+        }
     }
 
-    fn insert_project(
+    /// Insert a finding with the severity that the shared rule table gives
+    /// it. The exit code and the CI formats read the same table.
+    fn insert_rule(
         &mut self,
         collection: AuditCollection,
         key: String,
-        severity: fn(&fallow_config::RulesConfig) -> Severity,
+        item: &impl fallow_engine::dead_code::RuleSeverity,
     ) {
-        let effective = self
-            .config
-            .map_or(Severity::Off, |config| severity(&config.rules));
+        let effective = self.config.map_or(Severity::Off, |config| {
+            item.rule_severity(&fallow_engine::dead_code::SeveritySource::from_config(
+                config,
+            ))
+        });
         self.insert(collection, key, effective);
     }
 
@@ -1388,19 +1115,30 @@ impl<'a> DeadCodeKeyCollector<'a> {
         self.add_unused_store_members(unused_store_members);
     }
 
-    fn add_component_contract_findings(
-        &mut self,
-        unused_component_props: &[fallow_types::output_dead_code::UnusedComponentPropFinding],
-        unused_component_emits: &[fallow_types::output_dead_code::UnusedComponentEmitFinding],
-        unused_component_inputs: &[fallow_types::output_dead_code::UnusedComponentInputFinding],
-        unused_component_outputs: &[fallow_types::output_dead_code::UnusedComponentOutputFinding],
-        unused_svelte_events: &[fallow_types::output_dead_code::UnusedSvelteEventFinding],
-    ) {
+    fn add_component_contract_findings(&mut self, components: &ComponentContractFindingSlices<'_>) {
+        let ComponentContractFindingSlices {
+            unused_component_props,
+            absent_component_props,
+            unused_component_emits,
+            unused_component_inputs,
+            unused_component_outputs,
+            unused_svelte_events,
+            unused_effect_layers,
+            unused_tagged_errors,
+            unproduced_catch_tags,
+        } = *components;
         self.add_unused_component_props(unused_component_props);
+        self.add_items(
+            AuditCollection::AbsentComponentProps,
+            absent_component_props,
+        );
         self.add_unused_component_emits(unused_component_emits);
         self.add_unused_component_inputs(unused_component_inputs);
         self.add_unused_component_outputs(unused_component_outputs);
         self.add_unused_svelte_events(unused_svelte_events);
+        self.add_unused_effect_layers(unused_effect_layers);
+        self.add_unused_tagged_errors(unused_tagged_errors);
+        self.add_unproduced_catch_tags(unproduced_catch_tags);
     }
 
     fn add_graph_findings(
@@ -1409,11 +1147,13 @@ impl<'a> DeadCodeKeyCollector<'a> {
         duplicate_exports: &[fallow_types::output_dead_code::DuplicateExportFinding],
         circular_dependencies: &[fallow_types::output_dead_code::CircularDependencyFinding],
         re_export_cycles: &[fallow_types::output_dead_code::ReExportCycleFinding],
+        package_cycles: &[fallow_types::output_dead_code::PackageCycleFinding],
     ) {
         self.add_unresolved_imports(unresolved_imports);
         self.add_duplicate_exports(duplicate_exports);
         self.add_circular_dependencies(circular_dependencies);
         self.add_re_export_cycles(re_export_cycles);
+        self.add_package_cycles(package_cycles);
     }
 
     fn add_boundary_findings(
@@ -1460,632 +1200,320 @@ impl<'a> DeadCodeKeyCollector<'a> {
     }
 
     fn add_unused_files(&mut self, items: &[fallow_types::output_dead_code::UnusedFileFinding]) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedFiles,
-                format!(
-                    "unused-file:{}",
-                    relative_key_path(&item.file.path, self.root)
-                ),
-                &item.file.path,
-                |rules| rules.unused_files,
-            );
-        }
+        self.add_items(AuditCollection::UnusedFiles, items);
     }
 
     fn add_unused_exports(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedExportFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedExports,
-                format!(
-                    "unused-export:{}:{}",
-                    relative_key_path(&item.export.path, self.root),
-                    item.export.export_name
-                ),
-                &item.export.path,
-                |rules| rules.unused_exports,
-            );
-        }
+        self.add_items(AuditCollection::UnusedExports, items);
     }
 
     fn add_unused_types(&mut self, items: &[fallow_types::output_dead_code::UnusedTypeFinding]) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedTypes,
-                format!(
-                    "unused-type:{}:{}",
-                    relative_key_path(&item.export.path, self.root),
-                    item.export.export_name
-                ),
-                &item.export.path,
-                |rules| rules.unused_types,
-            );
-        }
+        self.add_items(AuditCollection::UnusedTypes, items);
     }
 
     fn add_private_type_leaks(
         &mut self,
         items: &[fallow_types::output_dead_code::PrivateTypeLeakFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::PrivateTypeLeaks,
-                format!(
-                    "private-type-leak:{}:{}:{}",
-                    relative_key_path(&item.leak.path, self.root),
-                    item.leak.export_name,
-                    item.leak.type_name
-                ),
-                &item.leak.path,
-                |rules| rules.private_type_leaks,
-            );
-        }
+        self.add_items(AuditCollection::PrivateTypeLeaks, items);
+    }
+
+    fn add_deprecated_exports_in_use(
+        &mut self,
+        items: &[fallow_types::output_dead_code::DeprecatedExportInUseFinding],
+    ) {
+        self.add_items(AuditCollection::DeprecatedExportsInUse, items);
     }
 
     fn add_invalid_client_exports(
         &mut self,
         items: &[fallow_types::output_dead_code::InvalidClientExportFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::InvalidClientExports,
-                invalid_client_export_key(&item.export, self.root),
-                &item.export.path,
-                |rules| rules.invalid_client_export,
-            );
-        }
+        self.add_items(AuditCollection::InvalidClientExports, items);
     }
 
     fn add_mixed_client_server_barrels(
         &mut self,
         items: &[fallow_types::output_dead_code::MixedClientServerBarrelFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::MixedClientServerBarrels,
-                mixed_client_server_barrel_key(&item.barrel, self.root),
-                &item.barrel.path,
-                |rules| rules.mixed_client_server_barrel,
-            );
-        }
+        self.add_items(AuditCollection::MixedClientServerBarrels, items);
     }
 
     fn add_misplaced_directives(
         &mut self,
         items: &[fallow_types::output_dead_code::MisplacedDirectiveFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::MisplacedDirectives,
-                misplaced_directive_key(&item.directive_site, self.root),
-                &item.directive_site.path,
-                |rules| rules.misplaced_directive,
-            );
-        }
+        self.add_items(AuditCollection::MisplacedDirectives, items);
     }
 
     fn add_unprovided_injects(
         &mut self,
         items: &[fallow_types::output_dead_code::UnprovidedInjectFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnprovidedInjects,
-                unprovided_inject_key(&item.inject, self.root),
-                &item.inject.path,
-                |rules| rules.unprovided_injects,
-            );
-        }
+        self.add_items(AuditCollection::UnprovidedInjects, items);
     }
 
     fn add_unrendered_components(
         &mut self,
         items: &[fallow_types::output_dead_code::UnrenderedComponentFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnrenderedComponents,
-                unrendered_component_key(&item.component, self.root),
-                &item.component.path,
-                |rules| rules.unrendered_components,
-            );
-        }
+        self.add_items(AuditCollection::UnrenderedComponents, items);
     }
 
     fn add_unused_component_props(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedComponentPropFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedComponentProps,
-                unused_component_prop_key(&item.prop, self.root),
-                &item.prop.path,
-                |rules| rules.unused_component_props,
-            );
-        }
+        self.add_items(AuditCollection::UnusedComponentProps, items);
     }
 
     fn add_unused_component_emits(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedComponentEmitFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedComponentEmits,
-                unused_component_emit_key(&item.emit, self.root),
-                &item.emit.path,
-                |rules| rules.unused_component_emits,
-            );
-        }
+        self.add_items(AuditCollection::UnusedComponentEmits, items);
     }
 
     fn add_unused_component_inputs(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedComponentInputFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedComponentInputs,
-                unused_component_input_key(&item.input, self.root),
-                &item.input.path,
-                |rules| rules.unused_component_inputs,
-            );
-        }
+        self.add_items(AuditCollection::UnusedComponentInputs, items);
     }
 
     fn add_unused_component_outputs(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedComponentOutputFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedComponentOutputs,
-                unused_component_output_key(&item.output, self.root),
-                &item.output.path,
-                |rules| rules.unused_component_outputs,
-            );
-        }
+        self.add_items(AuditCollection::UnusedComponentOutputs, items);
     }
 
     fn add_unused_svelte_events(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedSvelteEventFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedSvelteEvents,
-                unused_svelte_event_key(&item.event, self.root),
-                &item.event.path,
-                |rules| rules.unused_svelte_events,
-            );
-        }
+        self.add_items(AuditCollection::UnusedSvelteEvents, items);
+    }
+    fn add_unused_effect_layers(
+        &mut self,
+        items: &[fallow_types::output_dead_code::UnusedEffectLayerFinding],
+    ) {
+        self.add_items(AuditCollection::UnusedEffectLayers, items);
+    }
+    fn add_unused_tagged_errors(
+        &mut self,
+        items: &[fallow_types::output_dead_code::UnusedTaggedErrorFinding],
+    ) {
+        self.add_items(AuditCollection::UnusedTaggedErrors, items);
+    }
+    fn add_unproduced_catch_tags(
+        &mut self,
+        items: &[fallow_types::output_dead_code::UnproducedCatchTagFinding],
+    ) {
+        self.add_items(AuditCollection::UnproducedCatchTags, items);
     }
 
     fn add_unused_server_actions(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedServerActionFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedServerActions,
-                unused_server_action_key(&item.action, self.root),
-                &item.action.path,
-                |rules| rules.unused_server_actions,
-            );
-        }
+        self.add_items(AuditCollection::UnusedServerActions, items);
     }
 
     fn add_unused_load_data_keys(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedLoadDataKeyFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedLoadDataKeys,
-                unused_load_data_key_key(&item.key, self.root),
-                &item.key.path,
-                |rules| rules.unused_load_data_keys,
-            );
-        }
+        self.add_items(AuditCollection::UnusedLoadDataKeys, items);
     }
 
     fn add_route_collisions(
         &mut self,
         items: &[fallow_types::output_dead_code::RouteCollisionFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::RouteCollisions,
-                route_collision_key(&item.collision, self.root),
-                &item.collision.path,
-                |rules| rules.route_collision,
-            );
-        }
+        self.add_items(AuditCollection::RouteCollisions, items);
     }
 
     fn add_dynamic_segment_name_conflicts(
         &mut self,
         items: &[fallow_types::output_dead_code::DynamicSegmentNameConflictFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::DynamicSegmentNameConflicts,
-                dynamic_segment_name_conflict_key(&item.conflict, self.root),
-                &item.conflict.path,
-                |rules| rules.dynamic_segment_name_conflict,
-            );
-        }
+        self.add_items(AuditCollection::DynamicSegmentNameConflicts, items);
     }
 
     fn add_unused_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::UnusedDependencies,
-                unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::UnusedDependencies, items);
     }
 
     fn add_unused_dev_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedDevDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::UnusedDevDependencies,
-                unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_dev_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::UnusedDevDependencies, items);
     }
 
     fn add_unused_optional_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedOptionalDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::UnusedOptionalDependencies,
-                unused_dependency_key(&item.dep, self.root),
-                |rules| rules.unused_optional_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::UnusedOptionalDependencies, items);
     }
 
     fn add_unused_enum_members(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedEnumMemberFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedEnumMembers,
-                unused_member_key("unused-enum-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_enum_members,
-            );
-        }
+        self.add_items(AuditCollection::UnusedEnumMembers, items);
     }
 
     fn add_unused_class_members(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedClassMemberFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedClassMembers,
-                unused_member_key("unused-class-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_class_members,
-            );
-        }
+        self.add_items(AuditCollection::UnusedClassMembers, items);
     }
 
     fn add_unused_store_members(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedStoreMemberFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedStoreMembers,
-                unused_member_key("unused-store-member", &item.member, self.root),
-                &item.member.path,
-                |rules| rules.unused_store_members,
-            );
-        }
+        self.add_items(AuditCollection::UnusedStoreMembers, items);
     }
 
     fn add_unresolved_imports(
         &mut self,
         items: &[fallow_types::output_dead_code::UnresolvedImportFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnresolvedImports,
-                format!(
-                    "unresolved-import:{}:{}",
-                    relative_key_path(&item.import.path, self.root),
-                    item.import.specifier
-                ),
-                &item.import.path,
-                |rules| rules.unresolved_imports,
-            );
-        }
+        self.add_items(AuditCollection::UnresolvedImports, items);
     }
 
     fn add_unlisted_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::UnlistedDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::UnlistedDependencies,
-                unlisted_dependency_key(&item.dep, self.root),
-                |rules| rules.unlisted_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::UnlistedDependencies, items);
     }
 
     fn add_duplicate_exports(
         &mut self,
         items: &[fallow_types::output_dead_code::DuplicateExportFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::DuplicateExports,
-                duplicate_export_key(item, self.root),
-                |rules| rules.duplicate_exports,
-            );
-        }
+        self.add_items(AuditCollection::DuplicateExports, items);
     }
 
     fn add_type_only_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::TypeOnlyDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::TypeOnlyDependencies,
-                format!(
-                    "type-only-dependency:{}:{}",
-                    relative_key_path(&item.dep.path, self.root),
-                    item.dep.package_name
-                ),
-                |rules| rules.type_only_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::TypeOnlyDependencies, items);
     }
 
     fn add_test_only_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::TestOnlyDependencyFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::TestOnlyDependencies,
-                format!(
-                    "test-only-dependency:{}:{}",
-                    relative_key_path(&item.dep.path, self.root),
-                    item.dep.package_name
-                ),
-                |rules| rules.test_only_dependencies,
-            );
-        }
+        self.add_items(AuditCollection::TestOnlyDependencies, items);
     }
 
     fn add_dev_dependencies_in_production(
         &mut self,
         items: &[fallow_types::output_dead_code::DevDependencyInProductionFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::DevDependenciesInProduction,
-                format!(
-                    "dev-dependency-in-production:{}:{}",
-                    relative_key_path(&item.dep.path, self.root),
-                    item.dep.package_name
-                ),
-                |rules| rules.dev_dependencies_in_production,
-            );
-        }
+        self.add_items(AuditCollection::DevDependenciesInProduction, items);
     }
 
     fn add_circular_dependencies(
         &mut self,
         items: &[fallow_types::output_dead_code::CircularDependencyFinding],
     ) {
-        for item in items {
-            let severity = self.config.map_or(Severity::Off, |config| {
-                item.cycle
-                    .files
-                    .iter()
-                    .fold(Severity::Off, |current, path| {
-                        merge_severity(
-                            current,
-                            config.resolve_rules_for_path(path).circular_dependencies,
-                        )
-                    })
-            });
-            self.insert(
-                AuditCollection::CircularDependencies,
-                circular_dependency_key(item, self.root),
-                severity,
-            );
-        }
+        self.add_items(AuditCollection::CircularDependencies, items);
     }
 
     fn add_re_export_cycles(
         &mut self,
         items: &[fallow_types::output_dead_code::ReExportCycleFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::ReExportCycles,
-                re_export_cycle_key(item, self.root),
-                |rules| rules.re_export_cycle,
-            );
-        }
+        self.add_items(AuditCollection::ReExportCycles, items);
+    }
+
+    fn add_package_cycles(
+        &mut self,
+        items: &[fallow_types::output_dead_code::PackageCycleFinding],
+    ) {
+        self.add_items(AuditCollection::PackageCycles, items);
     }
 
     fn add_boundary_violations(
         &mut self,
         items: &[fallow_types::output_dead_code::BoundaryViolationFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::BoundaryViolations,
-                boundary_violation_key(item, self.root),
-                &item.violation.from_path,
-                |rules| rules.boundary_violation,
-            );
-        }
+        self.add_items(AuditCollection::BoundaryViolations, items);
     }
 
     fn add_boundary_coverage_violations(
         &mut self,
         items: &[fallow_types::output_dead_code::BoundaryCoverageViolationFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::BoundaryCoverageViolations,
-                boundary_coverage_key(item, self.root),
-                &item.violation.path,
-                |rules| rules.boundary_violation,
-            );
-        }
+        self.add_items(AuditCollection::BoundaryCoverageViolations, items);
     }
 
     fn add_boundary_call_violations(
         &mut self,
         items: &[fallow_types::output_dead_code::BoundaryCallViolationFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::BoundaryCallViolations,
-                boundary_call_key(item, self.root),
-                &item.violation.path,
-                |rules| rules.boundary_violation,
-            );
-        }
+        self.add_items(AuditCollection::BoundaryCallViolations, items);
     }
 
     fn add_policy_violations(
         &mut self,
         items: &[fallow_types::output_dead_code::PolicyViolationFinding],
     ) {
-        for item in items {
-            let severity = match item.violation.severity {
-                fallow_types::results::PolicyViolationSeverity::Error => Severity::Error,
-                fallow_types::results::PolicyViolationSeverity::Warn => Severity::Warn,
-            };
-            self.insert(
-                AuditCollection::PolicyViolations,
-                policy_violation_key(item, self.root),
-                severity,
-            );
-        }
+        self.add_items(AuditCollection::PolicyViolations, items);
     }
 
     fn add_stale_suppressions(&mut self, items: &[fallow_types::results::StaleSuppression]) {
-        for item in items {
-            let effective = self.config.map_or(Severity::Off, |config| {
-                let rules = config.resolve_rules_for_path(&item.path);
-                if item.missing_reason {
-                    rules.require_suppression_reason
-                } else {
-                    rules.stale_suppressions
-                }
-            });
-            self.insert(
-                AuditCollection::StaleSuppressions,
-                stale_suppression_key(item, self.root),
-                effective,
-            );
-        }
+        self.add_items(AuditCollection::StaleSuppressions, items);
     }
 
     fn add_unresolved_catalog_references(
         &mut self,
         items: &[fallow_types::output_dead_code::UnresolvedCatalogReferenceFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnresolvedCatalogReferences,
-                unresolved_catalog_reference_key(item, self.root),
-                &item.reference.path,
-                |rules| rules.unresolved_catalog_references,
-            );
-        }
+        self.add_items(AuditCollection::UnresolvedCatalogReferences, items);
     }
 
     fn add_unused_catalog_entries(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedCatalogEntryFinding],
     ) {
-        for item in items {
-            self.insert_project(
-                AuditCollection::UnusedCatalogEntries,
-                unused_catalog_entry_key(&item.entry, self.root),
-                |rules| rules.unused_catalog_entries,
-            );
-        }
+        self.add_items(AuditCollection::UnusedCatalogEntries, items);
     }
 
     fn add_empty_catalog_groups(
         &mut self,
         items: &[fallow_types::output_dead_code::EmptyCatalogGroupFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::EmptyCatalogGroups,
-                empty_catalog_group_key(&item.group, self.root),
-                &item.group.path,
-                |rules| rules.empty_catalog_groups,
-            );
-        }
+        self.add_items(AuditCollection::EmptyCatalogGroups, items);
     }
 
     fn add_unused_dependency_overrides(
         &mut self,
         items: &[fallow_types::output_dead_code::UnusedDependencyOverrideFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::UnusedDependencyOverrides,
-                unused_dependency_override_key(item, self.root),
-                &item.entry.path,
-                |rules| rules.unused_dependency_overrides,
-            );
-        }
+        self.add_items(AuditCollection::UnusedDependencyOverrides, items);
     }
 
     fn add_misconfigured_dependency_overrides(
         &mut self,
         items: &[fallow_types::output_dead_code::MisconfiguredDependencyOverrideFinding],
     ) {
-        for item in items {
-            self.insert_file(
-                AuditCollection::MisconfiguredDependencyOverrides,
-                misconfigured_dependency_override_key(item, self.root),
-                &item.entry.path,
-                |rules| rules.misconfigured_dependency_overrides,
-            );
-        }
-    }
-}
-
-const fn merge_severity(left: Severity, right: Severity) -> Severity {
-    match (left, right) {
-        (Severity::Error, _) | (_, Severity::Error) => Severity::Error,
-        (Severity::Warn, _) | (_, Severity::Warn) => Severity::Warn,
-        (Severity::Off, Severity::Off) => Severity::Off,
+        self.add_items(AuditCollection::MisconfiguredDependencyOverrides, items);
     }
 }
 
@@ -2104,8 +1532,10 @@ const fn merge_severity(left: Severity, right: Severity) -> Severity {
 /// `dead_code_keys`, `retain_introduced_dead_code`.
 /// Non-exhaustive siblings the compiler will NOT flag (wire manually when a
 /// finding type is added): `annotate_dead_code_json` (same key formats, this
-/// file) and the per-collection severity branches in
-/// `crates/cli/src/check/rules.rs` (`apply_rules`, `has_error_severity_issues`).
+/// file) and the per-collection `off` filter branches in
+/// `crates/engine/src/dead_code.rs` (`apply_rule_severities`). The severity of
+/// each record comes from the `RuleSeverity` table in
+/// `crates/engine/src/effective_severity.rs`, whose visitors are exhaustive.
 /// TypeScript mirror: `editors/vscode/scripts/codegen-contracts.mjs` derives
 /// backwards-compatible aliases from `fallow schema` `ts_alias` rows.
 #[expect(
@@ -2128,35 +1558,72 @@ pub fn retain_introduced_dead_code(
     // retains keep exactly the items whose key is NOT in `base`, and the
     // `!base.contains(key)` filter below removes the same base-member keys
     // from the full key set, so `introduced` is identical either way.
-    let introduced = introduced_dead_code_keys(results, root, base);
     classify_introduced_dead_code_fields(results);
-
-    // The three "fast path" retains use a direct base-lookup rather than the
-    // introduced set; both predicates are equivalent for these collections
-    // (see the `introduced` comment above), so this preserves the original
-    // behavior.
-    retain_introduced_fast_paths(
-        &mut results.unused_files,
-        &mut results.unused_exports,
-        &mut results.unused_types,
-        root,
-        base,
+    macro_rules! retain {
+        ($($field:ident),* $(,)?) => {
+            $(retain_introduced(&mut results.$field, root, base);)*
+        };
+    }
+    retain!(
+        prop_drilling_chains,
+        unused_files,
+        unused_exports,
+        unused_types,
+        private_type_leaks,
+        deprecated_exports_in_use,
+        unused_enum_members,
+        unused_class_members,
+        unused_store_members,
+        unresolved_imports,
+        unused_dependencies,
+        unused_dev_dependencies,
+        unused_optional_dependencies,
+        unlisted_dependencies,
+        duplicate_exports,
+        type_only_dependencies,
+        test_only_dependencies,
+        circular_dependencies,
+        re_export_cycles,
+        package_cycles,
+        boundary_violations,
+        boundary_coverage_violations,
+        boundary_call_violations,
+        policy_violations,
+        stale_suppressions,
+        unresolved_catalog_references,
+        unused_catalog_entries,
+        empty_catalog_groups,
+        unused_dependency_overrides,
+        misconfigured_dependency_overrides,
+        invalid_client_exports,
+        mixed_client_server_barrels,
+        misplaced_directives,
+        unprovided_injects,
+        unrendered_components,
+        unused_component_props,
+        absent_component_props,
+        unused_component_emits,
+        unused_component_inputs,
+        unused_component_outputs,
+        unused_svelte_events,
+        unused_effect_layers,
+        unused_tagged_errors,
+        unproduced_catch_tags,
+        unused_server_actions,
+        unused_load_data_keys,
+        route_collisions,
+        dynamic_segment_name_conflicts,
     );
-    retain_introduced_core_findings(results, root, &introduced);
-    retain_introduced_dependency_and_graph_findings(results, root, &introduced);
-    retain_introduced_workspace_findings(results, root, &introduced);
-    retain_introduced_framework_findings(results, root, &introduced);
 }
 
-fn introduced_dead_code_keys(
-    results: &fallow_types::results::AnalysisResults,
+/// Keep the findings of one collection whose audit key is absent from `base`.
+fn retain_introduced<T: IdentifiedFinding>(
+    items: &mut Vec<T>,
     root: &Path,
     base: &FxHashSet<String>,
-) -> FxHashSet<String> {
-    dead_code_keys(results, root)
-        .into_iter()
-        .filter(|key| !base.contains(key))
-        .collect()
+) {
+    let mut keys = collection_keys(items, root).into_iter();
+    items.retain(|_| keys.next().is_some_and(|key| !base.contains(&key)));
 }
 
 fn classify_introduced_dead_code_fields(results: &fallow_types::results::AnalysisResults) {
@@ -2165,6 +1632,7 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
         unused_exports: _unused_exports,
         unused_types: _unused_types,
         private_type_leaks: _private_type_leaks,
+        deprecated_exports_in_use: _deprecated_exports_in_use,
         unused_dependencies: _unused_dependencies,
         unused_dev_dependencies: _unused_dev_dependencies,
         unused_optional_dependencies: _unused_optional_dependencies,
@@ -2179,6 +1647,7 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
         dev_dependencies_in_production: _dev_dependencies_in_production,
         circular_dependencies: _circular_dependencies,
         re_export_cycles: _re_export_cycles,
+        package_cycles: _package_cycles,
         boundary_violations: _boundary_violations,
         boundary_coverage_violations: _boundary_coverage_violations,
         boundary_call_violations: _boundary_call_violations,
@@ -2195,10 +1664,14 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
         unprovided_injects: _unprovided_injects,
         unrendered_components: _unrendered_components,
         unused_component_props: _unused_component_props,
+        absent_component_props: _absent_component_props,
         unused_component_emits: _unused_component_emits,
         unused_component_inputs: _unused_component_inputs,
         unused_component_outputs: _unused_component_outputs,
         unused_svelte_events: _unused_svelte_events,
+        unused_effect_layers: _unused_effect_layers,
+        unused_tagged_errors: _unused_tagged_errors,
+        unproduced_catch_tags: _unproduced_catch_tags,
         unused_server_actions: _unused_server_actions,
         unused_load_data_keys: _unused_load_data_keys,
         unused_load_data_keys_global_abstain: _unused_load_data_keys_global_abstain,
@@ -2206,6 +1679,8 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
         dynamic_segment_name_conflicts: _dynamic_segment_name_conflicts,
         // Non-finding fields: counts and metadata, not subject to base-keyed
         // filtering.
+        cascade_hidden: _cascade_hidden,
+        cascade: _cascade,
         suppression_count: _suppression_count,
         unused_component_props_exempted: _unused_component_props_exempted,
         active_suppressions: _active_suppressions,
@@ -2217,8 +1692,7 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
         security_unresolved_edge_files: _security_unresolved_edge_files,
         security_unresolved_callee_sites: _security_unresolved_callee_sites,
         security_unresolved_callee_diagnostics: _security_unresolved_callee_diagnostics,
-        // Prop-drilling is a dormant multi-file health signal (rule defaults to
-        // `off`); it carries no dead-code key and is not base-filtered here.
+        // Prop chains use source identities and occurrence-aware audit filtering.
         prop_drilling_chains: _prop_drilling_chains,
         // Thin wrappers are a dormant health signal (rule defaults to `off`);
         // no dead-code key and not base-filtered here.
@@ -2240,229 +1714,16 @@ fn classify_introduced_dead_code_fields(results: &fallow_types::results::Analysi
     } = results;
 }
 
-fn retain_introduced_fast_paths(
-    unused_files: &mut Vec<fallow_types::output_dead_code::UnusedFileFinding>,
-    unused_exports: &mut Vec<fallow_types::output_dead_code::UnusedExportFinding>,
-    unused_types: &mut Vec<fallow_types::output_dead_code::UnusedTypeFinding>,
+/// The `introduced` flag of each finding in one collection, in order.
+fn introduced_flags<T: IdentifiedFinding>(
+    items: &[T],
     root: &Path,
     base: &FxHashSet<String>,
-) {
-    unused_files.retain(|item| {
-        !base.contains(&format!(
-            "unused-file:{}",
-            relative_key_path(&item.file.path, root)
-        ))
-    });
-    unused_exports.retain(|item| {
-        !base.contains(&format!(
-            "unused-export:{}:{}",
-            relative_key_path(&item.export.path, root),
-            item.export.export_name
-        ))
-    });
-    unused_types.retain(|item| {
-        !base.contains(&format!(
-            "unused-type:{}:{}",
-            relative_key_path(&item.export.path, root),
-            item.export.export_name
-        ))
-    });
-}
-
-fn keep_introduced(introduced: &FxHashSet<String>, key: impl AsRef<str>) -> bool {
-    introduced.contains(key.as_ref())
-}
-
-fn retain_introduced_core_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    root: &Path,
-    introduced: &FxHashSet<String>,
-) {
-    results.private_type_leaks.retain(|item| {
-        keep_introduced(
-            introduced,
-            format!(
-                "private-type-leak:{}:{}:{}",
-                relative_key_path(&item.leak.path, root),
-                item.leak.export_name,
-                item.leak.type_name
-            ),
-        )
-    });
-    results.unused_enum_members.retain(|item| {
-        keep_introduced(
-            introduced,
-            unused_member_key("unused-enum-member", &item.member, root),
-        )
-    });
-    results.unused_class_members.retain(|item| {
-        keep_introduced(
-            introduced,
-            unused_member_key("unused-class-member", &item.member, root),
-        )
-    });
-    results.unused_store_members.retain(|item| {
-        keep_introduced(
-            introduced,
-            unused_member_key("unused-store-member", &item.member, root),
-        )
-    });
-    results.unresolved_imports.retain(|item| {
-        keep_introduced(
-            introduced,
-            format!(
-                "unresolved-import:{}:{}",
-                relative_key_path(&item.import.path, root),
-                item.import.specifier
-            ),
-        )
-    });
-}
-
-fn retain_introduced_dependency_and_graph_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    root: &Path,
-    introduced: &FxHashSet<String>,
-) {
-    results
-        .unused_dependencies
-        .retain(|item| keep_introduced(introduced, unused_dependency_key(&item.dep, root)));
-    results
-        .unused_dev_dependencies
-        .retain(|item| keep_introduced(introduced, unused_dependency_key(&item.dep, root)));
-    results
-        .unused_optional_dependencies
-        .retain(|item| keep_introduced(introduced, unused_dependency_key(&item.dep, root)));
-    results
-        .unlisted_dependencies
-        .retain(|item| keep_introduced(introduced, unlisted_dependency_key(&item.dep, root)));
-    results
-        .duplicate_exports
-        .retain(|item| keep_introduced(introduced, duplicate_export_key(item, root)));
-    results.type_only_dependencies.retain(|item| {
-        keep_introduced(
-            introduced,
-            format!(
-                "type-only-dependency:{}:{}",
-                relative_key_path(&item.dep.path, root),
-                item.dep.package_name
-            ),
-        )
-    });
-    results.test_only_dependencies.retain(|item| {
-        keep_introduced(
-            introduced,
-            format!(
-                "test-only-dependency:{}:{}",
-                relative_key_path(&item.dep.path, root),
-                item.dep.package_name
-            ),
-        )
-    });
-    results
-        .circular_dependencies
-        .retain(|item| keep_introduced(introduced, circular_dependency_key(item, root)));
-    results
-        .re_export_cycles
-        .retain(|item| keep_introduced(introduced, re_export_cycle_key(item, root)));
-    results
-        .boundary_violations
-        .retain(|item| keep_introduced(introduced, boundary_violation_key(item, root)));
-    results
-        .boundary_coverage_violations
-        .retain(|item| keep_introduced(introduced, boundary_coverage_key(item, root)));
-    results
-        .boundary_call_violations
-        .retain(|item| keep_introduced(introduced, boundary_call_key(item, root)));
-    results
-        .policy_violations
-        .retain(|item| keep_introduced(introduced, policy_violation_key(item, root)));
-    results
-        .stale_suppressions
-        .retain(|item| keep_introduced(introduced, stale_suppression_key(item, root)));
-}
-
-fn retain_introduced_workspace_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    root: &Path,
-    introduced: &FxHashSet<String>,
-) {
-    results
-        .unresolved_catalog_references
-        .retain(|item| keep_introduced(introduced, unresolved_catalog_reference_key(item, root)));
-    results
-        .unused_catalog_entries
-        .retain(|item| keep_introduced(introduced, unused_catalog_entry_key(&item.entry, root)));
-    results
-        .empty_catalog_groups
-        .retain(|item| keep_introduced(introduced, empty_catalog_group_key(&item.group, root)));
-    results
-        .unused_dependency_overrides
-        .retain(|item| keep_introduced(introduced, unused_dependency_override_key(item, root)));
-    results.misconfigured_dependency_overrides.retain(|item| {
-        keep_introduced(
-            introduced,
-            misconfigured_dependency_override_key(item, root),
-        )
-    });
-}
-
-fn retain_introduced_framework_findings(
-    results: &mut fallow_types::results::AnalysisResults,
-    root: &Path,
-    introduced: &FxHashSet<String>,
-) {
-    results
-        .invalid_client_exports
-        .retain(|item| keep_introduced(introduced, invalid_client_export_key(&item.export, root)));
-    results.mixed_client_server_barrels.retain(|item| {
-        keep_introduced(
-            introduced,
-            mixed_client_server_barrel_key(&item.barrel, root),
-        )
-    });
-    results.misplaced_directives.retain(|item| {
-        keep_introduced(
-            introduced,
-            misplaced_directive_key(&item.directive_site, root),
-        )
-    });
-    results
-        .unprovided_injects
-        .retain(|item| keep_introduced(introduced, unprovided_inject_key(&item.inject, root)));
-    results.unrendered_components.retain(|item| {
-        keep_introduced(introduced, unrendered_component_key(&item.component, root))
-    });
-    results
-        .unused_component_props
-        .retain(|item| keep_introduced(introduced, unused_component_prop_key(&item.prop, root)));
-    results
-        .unused_component_emits
-        .retain(|item| keep_introduced(introduced, unused_component_emit_key(&item.emit, root)));
-    results
-        .unused_component_inputs
-        .retain(|item| keep_introduced(introduced, unused_component_input_key(&item.input, root)));
-    results.unused_component_outputs.retain(|item| {
-        keep_introduced(introduced, unused_component_output_key(&item.output, root))
-    });
-    results
-        .unused_svelte_events
-        .retain(|item| keep_introduced(introduced, unused_svelte_event_key(&item.event, root)));
-    results
-        .unused_server_actions
-        .retain(|item| keep_introduced(introduced, unused_server_action_key(&item.action, root)));
-    results
-        .unused_load_data_keys
-        .retain(|item| keep_introduced(introduced, unused_load_data_key_key(&item.key, root)));
-    results
-        .route_collisions
-        .retain(|item| keep_introduced(introduced, route_collision_key(&item.collision, root)));
-    results.dynamic_segment_name_conflicts.retain(|item| {
-        keep_introduced(
-            introduced,
-            dynamic_segment_name_conflict_key(&item.conflict, root),
-        )
-    });
+) -> Vec<bool> {
+    collection_keys(items, root)
+        .iter()
+        .map(|key| !base.contains(key))
+        .collect()
 }
 
 fn issue_was_introduced(key: &str, base: &FxHashSet<String>) -> bool {
@@ -2497,18 +1758,64 @@ pub fn annotate_dead_code_json(
     root: &Path,
     base: &FxHashSet<String>,
 ) {
-    let mut annotator = DeadCodeJsonAnnotator {
-        json,
-        results,
-        root,
-        base,
-    };
-    annotator.annotate_file_symbols();
-    annotator.annotate_dependencies();
-    annotator.annotate_members();
-    annotator.annotate_imports_and_exports();
-    annotator.annotate_graph();
-    annotator.annotate_catalog();
+    macro_rules! annotate {
+        ($($field:ident),* $(,)?) => {
+            $(annotate_issue_array(
+                json,
+                stringify!($field),
+                introduced_flags(&results.$field, root, base),
+            );)*
+        };
+    }
+    annotate!(
+        prop_drilling_chains,
+        unused_files,
+        unused_exports,
+        unused_types,
+        private_type_leaks,
+        deprecated_exports_in_use,
+        unused_dependencies,
+        unused_dev_dependencies,
+        unused_optional_dependencies,
+        type_only_dependencies,
+        test_only_dependencies,
+        unlisted_dependencies,
+        unused_enum_members,
+        unused_class_members,
+        unused_store_members,
+        unresolved_imports,
+        duplicate_exports,
+        circular_dependencies,
+        re_export_cycles,
+        package_cycles,
+        boundary_violations,
+        boundary_coverage_violations,
+        boundary_call_violations,
+        policy_violations,
+        stale_suppressions,
+        unresolved_catalog_references,
+        unused_catalog_entries,
+        empty_catalog_groups,
+        unused_dependency_overrides,
+        misconfigured_dependency_overrides,
+        invalid_client_exports,
+        mixed_client_server_barrels,
+        misplaced_directives,
+        unprovided_injects,
+        unrendered_components,
+        unused_component_props,
+        absent_component_props,
+        unused_component_emits,
+        unused_component_inputs,
+        unused_component_outputs,
+        unused_svelte_events,
+        unused_effect_layers,
+        unused_tagged_errors,
+        unproduced_catch_tags,
+        unused_server_actions,
+        route_collisions,
+        dynamic_segment_name_conflicts,
+    );
 }
 
 /// Annotate the sole legacy dead-code collection without a typed
@@ -2527,614 +1834,17 @@ pub fn annotate_stale_suppressions_json(
     annotate_issue_array(
         json,
         "stale_suppressions",
-        results
-            .stale_suppressions
-            .iter()
-            .map(|item| issue_was_introduced(&stale_suppression_key(item, root), base)),
-    );
-}
-
-struct DeadCodeJsonAnnotator<'a> {
-    json: &'a mut serde_json::Value,
-    results: &'a fallow_types::results::AnalysisResults,
-    root: &'a Path,
-    base: &'a FxHashSet<String>,
-}
-
-impl DeadCodeJsonAnnotator<'_> {
-    fn annotate_file_symbols(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "unused_files",
-            self.results.unused_files.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "unused-file:{}",
-                        relative_key_path(&item.file.path, self.root)
-                    ),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_exports",
-            self.results.unused_exports.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "unused-export:{}:{}",
-                        relative_key_path(&item.export.path, self.root),
-                        item.export.export_name
-                    ),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_types",
-            self.results.unused_types.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "unused-type:{}:{}",
-                        relative_key_path(&item.export.path, self.root),
-                        item.export.export_name
-                    ),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "private_type_leaks",
-            self.results.private_type_leaks.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "private-type-leak:{}:{}:{}",
-                        relative_key_path(&item.leak.path, self.root),
-                        item.leak.export_name,
-                        item.leak.type_name
-                    ),
-                    self.base,
-                )
-            }),
-        );
-    }
-
-    fn annotate_dependencies(&mut self) {
-        annotate_dependency_json(self.json, self.results, self.root, self.base);
-        annotate_issue_array(
-            self.json,
-            "type_only_dependencies",
-            self.results.type_only_dependencies.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "type-only-dependency:{}:{}",
-                        relative_key_path(&item.dep.path, self.root),
-                        item.dep.package_name
-                    ),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "test_only_dependencies",
-            self.results.test_only_dependencies.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "test-only-dependency:{}:{}",
-                        relative_key_path(&item.dep.path, self.root),
-                        item.dep.package_name
-                    ),
-                    self.base,
-                )
-            }),
-        );
-    }
-
-    fn annotate_members(&mut self) {
-        annotate_member_json(self.json, self.results, self.root, self.base);
-    }
-
-    fn annotate_imports_and_exports(&mut self) {
-        self.annotate_import_dependency_keys();
-        self.annotate_framework_keys();
-        self.annotate_component_keys();
-        self.annotate_route_keys();
-    }
-
-    fn annotate_import_dependency_keys(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "unresolved_imports",
-            self.results.unresolved_imports.iter().map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "unresolved-import:{}:{}",
-                        relative_key_path(&item.import.path, self.root),
-                        item.import.specifier
-                    ),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unlisted_dependencies",
-            self.results.unlisted_dependencies.iter().map(|item| {
-                issue_was_introduced(&unlisted_dependency_key(&item.dep, self.root), self.base)
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "duplicate_exports",
-            self.results.duplicate_exports.iter().map(|item| {
-                let mut locations: Vec<String> = item
-                    .export
-                    .locations
-                    .iter()
-                    .map(|loc| relative_key_path(&loc.path, self.root))
-                    .collect();
-                locations.sort();
-                locations.dedup();
-                issue_was_introduced(
-                    &format!(
-                        "duplicate-export:{}:{}",
-                        item.export.export_name,
-                        locations.join("|")
-                    ),
-                    self.base,
-                )
-            }),
-        );
-    }
-
-    fn annotate_framework_keys(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "invalid_client_exports",
-            self.results.invalid_client_exports.iter().map(|item| {
-                issue_was_introduced(
-                    &invalid_client_export_key(&item.export, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "mixed_client_server_barrels",
-            self.results.mixed_client_server_barrels.iter().map(|item| {
-                issue_was_introduced(
-                    &mixed_client_server_barrel_key(&item.barrel, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "misplaced_directives",
-            self.results.misplaced_directives.iter().map(|item| {
-                issue_was_introduced(
-                    &misplaced_directive_key(&item.directive_site, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unprovided_injects",
-            self.results.unprovided_injects.iter().map(|item| {
-                issue_was_introduced(&unprovided_inject_key(&item.inject, self.root), self.base)
-            }),
-        );
-    }
-
-    fn annotate_component_keys(&mut self) {
-        self.annotate_component_render_keys();
-        self.annotate_component_io_keys();
-    }
-
-    /// Annotate rendered-component, prop, and emit issue arrays.
-    fn annotate_component_render_keys(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "unrendered_components",
-            self.results.unrendered_components.iter().map(|item| {
-                issue_was_introduced(
-                    &unrendered_component_key(&item.component, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_component_props",
-            self.results.unused_component_props.iter().map(|item| {
-                issue_was_introduced(&unused_component_prop_key(&item.prop, self.root), self.base)
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_component_emits",
-            self.results.unused_component_emits.iter().map(|item| {
-                issue_was_introduced(&unused_component_emit_key(&item.emit, self.root), self.base)
-            }),
-        );
-    }
-
-    /// Annotate component input/output, Svelte event, and server-action issue arrays.
-    fn annotate_component_io_keys(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "unused_component_inputs",
-            self.results.unused_component_inputs.iter().map(|item| {
-                issue_was_introduced(
-                    &unused_component_input_key(&item.input, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_component_outputs",
-            self.results.unused_component_outputs.iter().map(|item| {
-                issue_was_introduced(
-                    &unused_component_output_key(&item.output, self.root),
-                    self.base,
-                )
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_svelte_events",
-            self.results.unused_svelte_events.iter().map(|item| {
-                issue_was_introduced(&unused_svelte_event_key(&item.event, self.root), self.base)
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "unused_server_actions",
-            self.results.unused_server_actions.iter().map(|item| {
-                issue_was_introduced(
-                    &unused_server_action_key(&item.action, self.root),
-                    self.base,
-                )
-            }),
-        );
-    }
-
-    fn annotate_route_keys(&mut self) {
-        annotate_issue_array(
-            self.json,
-            "route_collisions",
-            self.results.route_collisions.iter().map(|item| {
-                issue_was_introduced(&route_collision_key(&item.collision, self.root), self.base)
-            }),
-        );
-        annotate_issue_array(
-            self.json,
-            "dynamic_segment_name_conflicts",
-            self.results
-                .dynamic_segment_name_conflicts
-                .iter()
-                .map(|item| {
-                    issue_was_introduced(
-                        &dynamic_segment_name_conflict_key(&item.conflict, self.root),
-                        self.base,
-                    )
-                }),
-        );
-    }
-
-    fn annotate_graph(&mut self) {
-        annotate_graph_json(self.json, self.results, self.root, self.base);
-    }
-
-    fn annotate_catalog(&mut self) {
-        annotate_catalog_json(self.json, self.results, self.root, self.base);
-    }
-}
-
-fn annotate_dependency_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "unused_dependencies",
-        results
-            .unused_dependencies
-            .iter()
-            .map(|item| issue_was_introduced(&unused_dependency_key(&item.dep, root), base)),
-    );
-    annotate_issue_array(
-        json,
-        "unused_dev_dependencies",
-        results
-            .unused_dev_dependencies
-            .iter()
-            .map(|item| issue_was_introduced(&unused_dependency_key(&item.dep, root), base)),
-    );
-    annotate_issue_array(
-        json,
-        "unused_optional_dependencies",
-        results
-            .unused_optional_dependencies
-            .iter()
-            .map(|item| issue_was_introduced(&unused_dependency_key(&item.dep, root), base)),
-    );
-}
-
-fn annotate_member_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "unused_enum_members",
-        results.unused_enum_members.iter().map(|item| {
-            issue_was_introduced(
-                &unused_member_key("unused-enum-member", &item.member, root),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "unused_class_members",
-        results.unused_class_members.iter().map(|item| {
-            issue_was_introduced(
-                &unused_member_key("unused-class-member", &item.member, root),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "unused_store_members",
-        results.unused_store_members.iter().map(|item| {
-            issue_was_introduced(
-                &unused_member_key("unused-store-member", &item.member, root),
-                base,
-            )
-        }),
-    );
-}
-
-fn annotate_graph_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_cycle_json(json, results, root, base);
-    annotate_boundary_json(json, results, root, base);
-    annotate_policy_json(json, results, root, base);
-}
-
-fn annotate_cycle_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "circular_dependencies",
-        results.circular_dependencies.iter().map(|item| {
-            let mut files: Vec<String> = item
-                .cycle
-                .files
-                .iter()
-                .map(|path| relative_key_path(path, root))
-                .collect();
-            files.sort();
-            issue_was_introduced(&format!("circular-dependency:{}", files.join("|")), base)
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "re_export_cycles",
-        results.re_export_cycles.iter().map(|item| {
-            let kind = match item.cycle.kind {
-                fallow_types::results::ReExportCycleKind::MultiNode => "multi-node",
-                fallow_types::results::ReExportCycleKind::SelfLoop => "self-loop",
-            };
-            let mut files: Vec<String> = item
-                .cycle
-                .files
-                .iter()
-                .map(|path| relative_key_path(path, root))
-                .collect();
-            files.sort();
-            issue_was_introduced(&format!("re-export-cycle:{kind}:{}", files.join("|")), base)
-        }),
-    );
-}
-
-fn annotate_boundary_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "boundary_violations",
-        results.boundary_violations.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "boundary-violation:{}:{}:{}",
-                    relative_key_path(&item.violation.from_path, root),
-                    relative_key_path(&item.violation.to_path, root),
-                    item.violation.import_specifier
-                ),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "boundary_coverage_violations",
-        results.boundary_coverage_violations.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "boundary-coverage:{}",
-                    relative_key_path(&item.violation.path, root)
-                ),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "boundary_call_violations",
-        results.boundary_call_violations.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "boundary-call:{}:{}",
-                    relative_key_path(&item.violation.path, root),
-                    item.violation.callee
-                ),
-                base,
-            )
-        }),
-    );
-}
-
-fn annotate_policy_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "policy_violations",
-        results.policy_violations.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "policy-violation:{}:{}/{}:{}",
-                    relative_key_path(&item.violation.path, root),
-                    item.violation.pack,
-                    item.violation.rule_id,
-                    item.violation.matched
-                ),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "stale_suppressions",
-        results
-            .stale_suppressions
-            .iter()
-            .map(|item| issue_was_introduced(&stale_suppression_key(item, root), base)),
-    );
-}
-
-fn annotate_catalog_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_catalog_entry_json(json, results, root, base);
-    annotate_dependency_override_json(json, results, root, base);
-}
-
-/// Annotate catalog-reference, catalog-entry, and empty-group issue arrays.
-fn annotate_catalog_entry_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "unresolved_catalog_references",
-        results.unresolved_catalog_references.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "unresolved-catalog-reference:{}:{}:{}:{}",
-                    relative_key_path(&item.reference.path, root),
-                    item.reference.line,
-                    item.reference.catalog_name,
-                    item.reference.entry_name
-                ),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "unused_catalog_entries",
-        results
-            .unused_catalog_entries
-            .iter()
-            .map(|item| issue_was_introduced(&unused_catalog_entry_key(&item.entry, root), base)),
-    );
-    annotate_issue_array(
-        json,
-        "empty_catalog_groups",
-        results
-            .empty_catalog_groups
-            .iter()
-            .map(|item| issue_was_introduced(&empty_catalog_group_key(&item.group, root), base)),
-    );
-}
-
-/// Annotate dependency-override issue arrays (unused and misconfigured).
-fn annotate_dependency_override_json(
-    json: &mut serde_json::Value,
-    results: &fallow_types::results::AnalysisResults,
-    root: &Path,
-    base: &FxHashSet<String>,
-) {
-    annotate_issue_array(
-        json,
-        "unused_dependency_overrides",
-        results.unused_dependency_overrides.iter().map(|item| {
-            issue_was_introduced(
-                &format!(
-                    "unused-dependency-override:{}:{}:{}",
-                    relative_key_path(&item.entry.path, root),
-                    item.entry.line,
-                    item.entry.raw_key
-                ),
-                base,
-            )
-        }),
-    );
-    annotate_issue_array(
-        json,
-        "misconfigured_dependency_overrides",
-        results
-            .misconfigured_dependency_overrides
-            .iter()
-            .map(|item| {
-                issue_was_introduced(
-                    &format!(
-                        "misconfigured-dependency-override:{}:{}:{}",
-                        relative_key_path(&item.entry.path, root),
-                        item.entry.line,
-                        item.entry.raw_key
-                    ),
-                    base,
-                )
-            }),
+        introduced_flags(&results.stale_suppressions, root, base),
     );
 }
 
 /// Insert `"introduced": bool` into each `findings` and `styling_findings`
 /// object in serialized health JSON, matching entries to the typed report by
 /// array position.
+///
+/// A complexity finding keeps the typed `introduced` flag that the audit
+/// comparison set, because that flag compares metric values. Only a finding
+/// without the typed flag falls back to identity-key membership in `base`.
 #[expect(
     clippy::implicit_hasher,
     reason = "fallow standardizes on FxHashSet across audit attribution keys"
@@ -3153,10 +1863,9 @@ pub fn annotate_health_json(
             if let serde_json::Value::Object(map) = item {
                 map.insert(
                     "introduced".to_string(),
-                    serde_json::json!(issue_was_introduced(
-                        &health_finding_key(finding, root),
-                        base
-                    )),
+                    serde_json::json!(finding.introduced.unwrap_or_else(|| {
+                        issue_was_introduced(&health_finding_key(finding, root), base)
+                    })),
                 );
             }
         }
@@ -3248,15 +1957,17 @@ pub fn health_keys(report: &fallow_output::HealthReport, root: &Path) -> FxHashS
         .collect()
 }
 
-/// Attribution key for one complexity finding:
-/// `complexity:<path>:<function>:<exceeded metric>`. Line numbers are
-/// deliberately excluded so a finding survives unrelated edits above it.
+/// Identity key for one complexity finding: `complexity:<path>:<function>`.
+///
+/// Line numbers are excluded, so a finding survives unrelated edits above it.
+/// The exceeded category is excluded, so a category change keeps the match.
+/// The new-only gate compares the metric values of matched findings, see
+/// [`classify_complexity_findings`].
 pub fn health_finding_key(finding: &fallow_output::ComplexityViolation, root: &Path) -> String {
     format!(
-        "complexity:{}:{}:{:?}",
+        "complexity:{}:{}",
         relative_key_path(Path::new(&finding.path), root),
         finding.name,
-        finding.exceeded
     )
 }
 
@@ -3377,6 +2088,67 @@ mod tests {
         PathBuf::from("/repo")
     }
 
+    #[test]
+    fn prop_audit_matches_source_occurrences_and_keeps_warnings_out_of_counts() {
+        let root = root();
+        let mut chain = PropDrillingChainFinding::with_actions(PropDrillingChain {
+            prop: "user".to_owned(),
+            depth: 3,
+            hops: vec![PropDrillHop {
+                file: root.join("src/Page.tsx"),
+                line: 4,
+                component: "Page".to_owned(),
+            }],
+        });
+        let original = AnalysisResults {
+            prop_drilling_chains: vec![chain.clone()],
+            ..Default::default()
+        };
+        let base = dead_code_keys(&original, &root);
+        chain.chain.hops[0].line = 12;
+        let mut repeated = AnalysisResults {
+            prop_drilling_chains: vec![chain.clone(), chain],
+            ..Default::default()
+        };
+        let config: FallowConfig =
+            serde_json::from_value(json!({"rules": {"prop-drilling": "error"}}))
+                .expect("prop policy");
+        let config = config.resolve(root.clone(), OutputFormat::Json, 1, false, true, None);
+        let ledger = dead_code_audit_ledger(&repeated, &root, &config, Some(&base));
+        assert_eq!(
+            (ledger.introduced_count(), ledger.inherited_count()),
+            (1, 1)
+        );
+        assert!(ledger.has_introduced_errors());
+        ledger.annotate_results(&mut repeated);
+        assert_eq!(
+            repeated.prop_drilling_chains[0].introduced,
+            Some(AuditIntroduced(false))
+        );
+        assert_eq!(
+            repeated.prop_drilling_chains[1].introduced,
+            Some(AuditIntroduced(true))
+        );
+        retain_introduced_dead_code(&mut repeated, &root, Some(&base));
+        assert_eq!(repeated.prop_drilling_chains.len(), 1);
+        let mut config = config;
+        config.rules.prop_drilling = Severity::Warn;
+        let ledger = dead_code_audit_ledger(&original, &root, &config, Some(&FxHashSet::default()));
+        assert_eq!((ledger.introduced_count(), ledger.visible_count()), (0, 0));
+        assert!(!ledger.has_introduced_errors());
+        assert!(ledger.records()[0].introduced);
+        let mut ledger = ledger;
+        ledger.demote_unattributable_introductions(&FxHashSet::default());
+        assert_eq!(
+            (
+                ledger.introduced_count(),
+                ledger.inherited_count(),
+                ledger.visible_count()
+            ),
+            (0, 0, 0)
+        );
+    }
+
     fn export(path: &Path, name: &str) -> UnusedExportFinding {
         UnusedExportFinding::with_actions(UnusedExport {
             path: path.to_path_buf(),
@@ -3386,6 +2158,8 @@ mod tests {
             col: 0,
             span_start: 0,
             is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
         })
     }
 
@@ -3402,6 +2176,7 @@ mod tests {
             path: path.to_path_buf(),
             line: 4,
             used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
         })
     }
 
@@ -3456,6 +2231,26 @@ mod tests {
         })
     }
 
+    fn deprecated_export(
+        path: &Path,
+        name: &str,
+    ) -> fallow_types::output_dead_code::DeprecatedExportInUseFinding {
+        fallow_types::output_dead_code::DeprecatedExportInUseFinding::with_actions(
+            fallow_types::results::DeprecatedExportInUse {
+                path: path.to_path_buf(),
+                export_name: name.to_string(),
+                is_type_only: false,
+                line: 9,
+                col: 13,
+                span_start: 90,
+                deprecated_reason: None,
+                consumer_count: 1,
+                consumers: Vec::new(),
+                public_api: false,
+            },
+        )
+    }
+
     fn sample_results(root: &Path) -> AnalysisResults {
         let source = root.join("src/page.ts");
         let package_json = root.join("package.json");
@@ -3471,6 +2266,9 @@ mod tests {
             .unresolved_imports
             .push(unresolved(&source, "./missing"));
         results.unlisted_dependencies.push(unlisted(&source, "zod"));
+        results
+            .deprecated_exports_in_use
+            .push(deprecated_export(&source, "legacyLoader"));
         results.duplicate_exports.push(duplicate_export(root));
         results
     }
@@ -3493,13 +2291,11 @@ mod tests {
         assert!(keys.contains("unused-export:src/page.ts:loader"));
         assert!(keys.contains("unused-dependency:package.json:left-pad"));
         assert!(keys.contains("unresolved-import:src/page.ts:./missing"));
-        assert!(keys.contains("unlisted-dependency:zod:src/page.ts:9:2"));
+        assert!(keys.contains("unlisted-dependency:zod"));
         assert!(keys.contains("duplicate-export:Button:src/a.ts|src/b.ts"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_type_member_and_dependency_variants() {
-        let root = root();
+    fn type_member_and_dependency_results(root: &Path) -> AnalysisResults {
         let source = root.join("src/types.ts");
         let package_json = root.join("package.json");
         let mut results = AnalysisResults::default();
@@ -3513,6 +2309,8 @@ mod tests {
                 col: 0,
                 span_start: 12,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .private_type_leaks
@@ -3533,6 +2331,7 @@ mod tests {
                 path: package_json.clone(),
                 line: 10,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .unused_optional_dependencies
@@ -3543,6 +2342,7 @@ mod tests {
                     path: package_json.clone(),
                     line: 11,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         results
@@ -3584,6 +2384,14 @@ mod tests {
                 },
             ));
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_type_member_and_dependency_variants() {
+        let root = root();
+        let results = type_member_and_dependency_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unused-type:src/types.ts:UnusedType"));
@@ -3623,6 +2431,25 @@ mod tests {
                 files: vec![source.clone()],
                 kind: ReExportCycleKind::SelfLoop,
             }));
+        results.package_cycles.push(
+            fallow_types::output_dead_code::PackageCycleFinding::with_actions(
+                fallow_types::results::PackageCycle {
+                    packages: vec!["@x/a".to_string(), "@x/b".to_string()],
+                    package_roots: Vec::new(),
+                    length: 2,
+                    edges: vec![fallow_types::results::PackageCycleEdge {
+                        from_package: "@x/a".to_string(),
+                        to_package: "@x/b".to_string(),
+                        path: source.clone(),
+                        target_path: other.clone(),
+                        line: 4,
+                        col: 0,
+                        type_only: false,
+                    }],
+                    group_truncated: false,
+                },
+            ),
+        );
         results
             .boundary_violations
             .push(BoundaryViolationFinding::with_actions(BoundaryViolation {
@@ -3633,6 +2460,7 @@ mod tests {
                 import_specifier: "../other".to_string(),
                 line: 1,
                 col: 0,
+                via_path: None,
             }));
         results
             .boundary_coverage_violations
@@ -3656,6 +2484,7 @@ mod tests {
                 },
             ));
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: source,
             line: 2,
             col: 0,
@@ -3667,8 +2496,10 @@ mod tests {
             },
             missing_reason: false,
             actions: StaleSuppression::actions_for(false),
+            effective_severity: None,
         });
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/app.ts"),
             line: 2,
             col: 0,
@@ -3680,6 +2511,7 @@ mod tests {
             },
             missing_reason: true,
             actions: StaleSuppression::actions_for(true),
+            effective_severity: None,
         });
         results.unresolved_catalog_references.push(
             UnresolvedCatalogReferenceFinding::with_actions(UnresolvedCatalogReference {
@@ -3746,22 +2578,18 @@ mod tests {
 
         assert!(keys.contains("circular-dependency:src/app.ts|src/other.ts"));
         assert!(keys.contains("re-export-cycle:self-loop:src/app.ts"));
-        assert!(keys.contains("boundary-violation:src/app.ts:src/other.ts:../other"));
+        assert!(keys.contains("boundary-violation:src/app.ts:src/other.ts"));
         assert!(keys.contains("boundary-coverage:src/unmatched.ts"));
-        assert!(keys.contains("boundary-call:src/app.ts:child_process.exec"));
+        assert!(keys.contains("boundary-call-violation:src/app.ts:child_process.exec"));
+        assert!(keys.contains("stale-suppression:src/app.ts:comment:unused-export:line"));
+        assert!(keys.contains("missing-suppression-reason:src/app.ts:comment:unused-export:line"));
         assert!(
-            keys.contains("stale-suppression:src/app.ts:// fallow-ignore-next-line unused-export")
+            keys.contains("unresolved-catalog-reference:packages/app/package.json:default:react")
         );
-        assert!(keys.contains(
-            "missing-suppression-reason:src/app.ts:// fallow-ignore-next-line unused-export"
-        ));
-        assert!(
-            keys.contains("unresolved-catalog-reference:packages/app/package.json:9:default:react")
-        );
-        assert!(keys.contains("unused-catalog-entry:pnpm-workspace.yaml:3:default:lodash"));
-        assert!(keys.contains("empty-catalog-group:pnpm-workspace.yaml:7:react17"));
-        assert!(keys.contains("unused-dependency-override:pnpm-workspace.yaml:11:left-pad"));
-        assert!(keys.contains("misconfigured-dependency-override:pnpm-workspace.yaml:12:>"));
+        assert!(keys.contains("unused-catalog-entry:pnpm-workspace.yaml:default:lodash"));
+        assert!(keys.contains("empty-catalog-group:pnpm-workspace.yaml:react17"));
+        assert!(keys.contains("unused-dependency-override:pnpm-workspace.yaml:left-pad"));
+        assert!(keys.contains("misconfigured-dependency-override:pnpm-workspace.yaml:>"));
     }
 
     #[test]
@@ -3790,7 +2618,7 @@ mod tests {
         let results = sample_results(&root);
         let base = FxHashSet::from_iter([
             "unused-file:src/dead.ts".to_string(),
-            "unlisted-dependency:zod:src/page.ts:9:2".to_string(),
+            "unlisted-dependency:zod".to_string(),
         ]);
         let mut json = json!({
             "unused_files": [{}],
@@ -3813,9 +2641,44 @@ mod tests {
 
     // --- key-building coverage for lines 68-177 (framework-specific key fns) ---
 
-    #[test]
-    fn dead_code_keys_cover_framework_inject_and_render_variants() {
-        let root = root();
+    fn effect_results(root: &Path) -> AnalysisResults {
+        use fallow_types::output_dead_code::{
+            UnproducedCatchTagFinding, UnusedEffectLayerFinding, UnusedTaggedErrorFinding,
+        };
+        use fallow_types::results::{
+            EffectLayerKind, UnproducedCatchTag, UnusedEffectLayer, UnusedTaggedError,
+        };
+        AnalysisResults {
+            unused_effect_layers: vec![UnusedEffectLayerFinding::with_actions(UnusedEffectLayer {
+                path: root.join("src/services.ts"),
+                name: "CacheLive".to_owned(),
+                kind: EffectLayerKind::TopLevel,
+                line: 3,
+                col: 0,
+                dead_consumers: vec!["OrphanLive".to_owned()],
+            })],
+            unused_tagged_errors: vec![UnusedTaggedErrorFinding::with_actions(UnusedTaggedError {
+                path: root.join("src/errors.ts"),
+                name: "Expired".to_owned(),
+                tag: "Expired".to_owned(),
+                line: 4,
+                col: 0,
+                catch_sites: Vec::new(),
+            })],
+            unproduced_catch_tags: vec![UnproducedCatchTagFinding::with_actions(
+                UnproducedCatchTag {
+                    path: root.join("src/main.ts"),
+                    tag: "Expired".to_owned(),
+                    line: 5,
+                    col: 0,
+                    candidate_classes: vec!["Expired".to_owned()],
+                },
+            )],
+            ..Default::default()
+        }
+    }
+
+    fn framework_inject_and_render_results(root: &Path) -> AnalysisResults {
         let src = root.join("src/App.vue");
         let mut results = AnalysisResults::default();
         results
@@ -3871,18 +2734,24 @@ mod tests {
                 col: 0,
             }));
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_framework_inject_and_render_variants() {
+        let root = root();
+        let results = framework_inject_and_render_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unprovided-inject:src/App.vue:userStore"));
         assert!(keys.contains("unrendered-component:src/App.vue:MyModal"));
-        assert!(keys.contains("unused-component-prop:src/App.vue:title"));
-        assert!(keys.contains("unused-component-emit:src/App.vue:close"));
-        assert!(keys.contains("unused-svelte-event:src/Counter.svelte:increment"));
+        assert!(keys.contains("unused-component-prop:src/App.vue:MyModal:title"));
+        assert!(keys.contains("unused-component-emit:src/App.vue:MyModal:close"));
+        assert!(keys.contains("unused-svelte-event:src/Counter.svelte:Counter:increment"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_server_action_load_data_and_route_variants() {
-        let root = root();
+    fn server_action_load_data_and_route_results(root: &Path) -> AnalysisResults {
         let actions_file = root.join("src/actions/submit.ts");
         let page_file = root.join("src/routes/blog/+page.server.ts");
         let route_file = root.join("app/(auth)/login/page.tsx");
@@ -3927,6 +2796,14 @@ mod tests {
             }),
         );
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_server_action_load_data_and_route_variants() {
+        let root = root();
+        let results = server_action_load_data_and_route_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
         assert!(keys.contains("unused-server-action:src/actions/submit.ts:submitForm"));
@@ -3935,9 +2812,7 @@ mod tests {
         assert!(keys.contains("dynamic-segment-name-conflict:app/(auth)/login/page.tsx:/shop"));
     }
 
-    #[test]
-    fn dead_code_keys_cover_angular_input_output_and_policy_variants() {
-        let root = root();
+    fn angular_input_output_and_policy_results(root: &Path) -> AnalysisResults {
         let component = root.join("src/app/card.component.ts");
         let src = root.join("src/utils.ts");
         let mut results = AnalysisResults::default();
@@ -3977,11 +2852,25 @@ mod tests {
                 message: None,
             }));
 
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_angular_input_output_and_policy_variants() {
+        let root = root();
+        let results = angular_input_output_and_policy_results(&root);
+
         let keys = dead_code_keys(&results, &root);
 
-        assert!(keys.contains("unused-component-input:src/app/card.component.ts:label"));
-        assert!(keys.contains("unused-component-output:src/app/card.component.ts:clicked"));
-        assert!(keys.contains("policy-violation:src/utils.ts:security/no-eval:eval"));
+        assert!(
+            keys.contains("unused-component-input:src/app/card.component.ts:CardComponent:label")
+        );
+        assert!(
+            keys.contains(
+                "unused-component-output:src/app/card.component.ts:CardComponent:clicked"
+            )
+        );
+        assert!(keys.contains("policy-violation:src/utils.ts:security:no-eval:eval"));
     }
 
     #[test]
@@ -4004,8 +2893,38 @@ mod tests {
     }
 
     #[test]
-    fn dead_code_keys_cover_unused_store_member() {
+    fn dead_code_keys_cover_package_cycles_by_package_roots() {
         let root = root();
+        let mut results = AnalysisResults::default();
+        results.package_cycles.push(
+            fallow_types::output_dead_code::PackageCycleFinding::with_actions(
+                fallow_types::results::PackageCycle {
+                    packages: vec!["@x/b".to_string(), "@x/a".to_string()],
+                    package_roots: vec![root.join("packages/b"), root.join("packages/a")],
+                    length: 2,
+                    edges: vec![fallow_types::results::PackageCycleEdge {
+                        from_package: "@x/a".to_string(),
+                        to_package: "@x/b".to_string(),
+                        path: root.join("packages/a/src/index.ts"),
+                        target_path: root.join("packages/b/src/index.ts"),
+                        line: 3,
+                        col: 0,
+                        type_only: false,
+                    }],
+                    group_truncated: false,
+                },
+            ),
+        );
+
+        let keys = dead_code_keys(&results, &root);
+
+        assert!(
+            keys.contains("package-cycle:packages/a|packages/b"),
+            "{keys:?}"
+        );
+    }
+
+    fn unused_store_member_results(root: &Path) -> AnalysisResults {
         let src = root.join("src/store.ts");
         let mut results = AnalysisResults::default();
         results
@@ -4018,6 +2937,14 @@ mod tests {
                 line: 42,
                 col: 2,
             }));
+
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_cover_unused_store_member() {
+        let root = root();
+        let results = unused_store_member_results(&root);
 
         let keys = dead_code_keys(&results, &root);
 
@@ -4230,6 +3157,7 @@ mod tests {
                 path: pkg.clone(),
                 line: 8,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         results
             .type_only_dependencies
@@ -4276,16 +3204,16 @@ mod tests {
     }
 
     #[test]
-    fn annotate_dead_code_json_handles_missing_json_key_gracefully() {
-        // annotate_issue_array is a no-op when the key is absent; this covers
-        // the early-return branch inside annotate_issue_array (lines 1477-1479).
+    fn annotate_dead_code_json_is_noop_when_issue_keys_absent() {
         let root = root();
         let results = sample_results(&root);
         let base = FxHashSet::default();
         let mut json_val = json!({"other_key": []});
+        let original = json_val.clone();
 
-        // Must not panic when the expected arrays are absent.
         annotate_dead_code_json(&mut json_val, &results, &root, &base);
+
+        assert_eq!(json_val, original);
     }
 
     // --- annotate_health_json ---
@@ -4305,16 +3233,9 @@ mod tests {
             react_prop_count: 0,
             react_hook_profile: None,
             exceeded: ExceededThreshold::Cyclomatic,
+            effective_severity: None,
             severity: FindingSeverity::High,
-            crap: None,
-            coverage_pct: None,
-            coverage_tier: None,
-            coverage_source: None,
-            inherited_from: None,
-            component_rollup: None,
-            contributions: Vec::new(),
-            effective_thresholds: None,
-            threshold_source: None,
+            ..Default::default()
         }
     }
 
@@ -4335,16 +3256,16 @@ mod tests {
         let path = root.join("src/heavy.ts");
         let report = make_health_report(&[(&path, "processAll")]);
         let keys = health_keys(&report, &root);
-        assert!(keys.contains("complexity:src/heavy.ts:processAll:Cyclomatic"));
+        assert!(keys.contains("complexity:src/heavy.ts:processAll"));
     }
 
     #[test]
-    fn health_finding_key_uses_path_name_and_exceeded() {
+    fn health_finding_key_uses_path_and_name() {
         let root = root();
         let path = root.join("src/heavy.ts");
         let violation = make_violation(&path, "render");
         let key = health_finding_key(&violation, &root);
-        assert_eq!(key, "complexity:src/heavy.ts:render:Cyclomatic");
+        assert_eq!(key, "complexity:src/heavy.ts:render");
     }
 
     #[test]
@@ -4355,7 +3276,7 @@ mod tests {
         let report = make_health_report(&[(&path_a, "doWork"), (&path_b, "render")]);
 
         // Only path_b:render is in the base.
-        let base = FxHashSet::from_iter(["complexity:src/other.ts:render:Cyclomatic".to_string()]);
+        let base = FxHashSet::from_iter(["complexity:src/other.ts:render".to_string()]);
         let mut json_val = json!({
             "findings": [{}, {}],
         });
@@ -4367,13 +3288,31 @@ mod tests {
     }
 
     #[test]
+    fn annotate_health_json_keeps_the_typed_complexity_flag() {
+        let root = root();
+        let path = root.join("src/other.ts");
+        let mut report = make_health_report(&[(&path, "render")]);
+        // The metric comparison found a worse value for an inherited key.
+        report.findings[0].introduced = Some(true);
+        let base = FxHashSet::from_iter(["complexity:src/other.ts:render".to_string()]);
+        let mut json_val = json!({ "findings": [{}] });
+
+        annotate_health_json(&mut json_val, &report, &root, &base);
+
+        assert_eq!(json_val["findings"][0]["introduced"], true);
+    }
+
+    #[test]
     fn annotate_health_json_is_noop_when_findings_key_absent() {
         let root = root();
         let report = make_health_report(&[]);
         let base = FxHashSet::default();
         let mut json_val = json!({"summary": {}});
-        // Must not panic.
+        let original = json_val.clone();
+
         annotate_health_json(&mut json_val, &report, &root, &base);
+
+        assert_eq!(json_val, original);
     }
 
     // --- annotate_dupes_json and dupe_group_key ---
@@ -4383,6 +3322,7 @@ mod tests {
             instances: files
                 .iter()
                 .map(|f| CloneInstance {
+                    is_symlink: false,
                     file: f.clone(),
                     start_line: 1,
                     end_line: 5,
@@ -4542,8 +3482,11 @@ mod tests {
         let report = make_duplication_report(Vec::new());
         let base = FxHashSet::default();
         let mut json_val = json!({"stats": {}});
-        // Must not panic.
+        let original = json_val.clone();
+
         annotate_dupes_json(&mut json_val, &report, &root, &base);
+
+        assert_eq!(json_val, original);
     }
 
     // --- retain_introduced_dead_code with None base (no-op path, line 1127) ---
@@ -4741,7 +3684,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_ledger_counts_colliding_dead_code_keys_once_but_annotates_each_record() {
+    fn audit_ledger_counts_each_occurrence_of_a_repeated_key() {
         let root = root();
         let config: FallowConfig = serde_json::from_value(json!({
             "rules": { "unused-exports": "error" }
@@ -4760,7 +3703,7 @@ mod tests {
 
         assert_eq!(ledger.classification_count(), 2);
         assert_eq!(ledger.records().len(), 2);
-        assert_eq!(ledger.introduced_count(), 1);
+        assert_eq!(ledger.introduced_count(), 2);
         assert_eq!(ledger.inherited_count(), 0);
 
         ledger.annotate_results(&mut results);
@@ -4797,6 +3740,7 @@ mod tests {
         let root = root();
         let mut results = AnalysisResults::default();
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/new.ts"),
             line: 2,
             col: 0,
@@ -4808,6 +3752,7 @@ mod tests {
             },
             missing_reason: false,
             actions: StaleSuppression::actions_for(false),
+            effective_severity: None,
         });
         let mut json = serde_json::to_value(&results).expect("json");
 
@@ -4885,5 +3830,398 @@ mod tests {
             std::iter::once("unused-export:src/utils.ts:helper".to_string()).collect();
 
         assert_eq!(remap_keys_for_renames(&keys, &renames), keys);
+    }
+
+    /// One finding in each collection that no other fixture fills.
+    fn production_and_directive_results(root: &Path) -> AnalysisResults {
+        let page = root.join("src/app.ts");
+        let mut results = AnalysisResults::default();
+        results.dev_dependencies_in_production.push(
+            DevDependencyInProductionFinding::with_actions(DevDependencyInProduction {
+                package_name: "vite".to_string(),
+                path: root.join("package.json"),
+                line: 14,
+            }),
+        );
+        results
+            .invalid_client_exports
+            .push(InvalidClientExportFinding::with_actions(
+                InvalidClientExport {
+                    path: page.clone(),
+                    export_name: "config".to_string(),
+                    directive: "use client".to_string(),
+                    line: 3,
+                    col: 0,
+                },
+            ));
+        results
+            .mixed_client_server_barrels
+            .push(MixedClientServerBarrelFinding::with_actions(
+                MixedClientServerBarrel {
+                    path: page.clone(),
+                    client_origin: "./client".to_string(),
+                    server_origin: "./server".to_string(),
+                    line: 1,
+                    col: 0,
+                },
+            ));
+        results
+            .misplaced_directives
+            .push(MisplacedDirectiveFinding::with_actions(
+                MisplacedDirective {
+                    path: page,
+                    directive: "use server".to_string(),
+                    line: 5,
+                    col: 2,
+                },
+            ));
+        results
+    }
+
+    /// Every finding of the fixtures, each as its own result set, so a
+    /// disagreement names one collection.
+    fn isolated_findings(fixtures: &[AnalysisResults]) -> Vec<(String, AnalysisResults)> {
+        let mut isolated = Vec::new();
+        for fixture in fixtures {
+            let value = serde_json::to_value(fixture).expect("results serialize");
+            let object = value.as_object().expect("results serialize as an object");
+            for (collection, items) in object {
+                let Some(items) = items.as_array() else {
+                    continue;
+                };
+                for item in items {
+                    let mut single = serde_json::to_value(AnalysisResults::default())
+                        .expect("empty results serialize");
+                    single[collection.as_str()] = serde_json::Value::Array(vec![item.clone()]);
+                    let results = serde_json::from_value(single)
+                        .unwrap_or_else(|error| panic!("{collection} round-trips: {error}"));
+                    isolated.push((collection.clone(), results));
+                }
+            }
+        }
+        isolated
+    }
+
+    fn absent_component_prop_results(root: &Path) -> AnalysisResults {
+        let mut results = AnalysisResults::default();
+        results
+            .absent_component_props
+            .push(AbsentComponentPropFinding::with_actions(
+                AbsentComponentProp {
+                    path: root.join("src/App.vue"),
+                    component_name: "MyModal".into(),
+                    framework: "vue".into(),
+                    prop_name: "highlight".into(),
+                    line: 3,
+                    col: 2,
+                    has_default: true,
+                    inspected_call_sites: vec![ComponentPropCallSite {
+                        path: root.join("src/page.ts"),
+                        line: 8,
+                        col: 0,
+                    }],
+                    explanation: "Review known callers and API intent.".into(),
+                },
+            ));
+        results
+    }
+
+    /// A config that sets every rule by `base` and, for the files of the
+    /// fixtures that an `overrides` entry matches, by `scoped`. Each pair
+    /// gives the severity of the rules at an even and at an odd position, so
+    /// a finding that reads the rule of another kind shows as a difference.
+    fn every_rule_config(
+        base: [&str; 2],
+        scoped: Option<[&str; 2]>,
+    ) -> fallow_config::ResolvedConfig {
+        let every_rule = |severities: [&str; 2]| {
+            let rules = serde_json::to_value(fallow_config::RulesConfig::default())
+                .expect("rules serialize");
+            let names = rules
+                .as_object()
+                .expect("rules serialize as an object")
+                .keys();
+            serde_json::Value::Object(
+                names
+                    .enumerate()
+                    .map(|(index, name)| (name.clone(), json!(severities[index % 2])))
+                    .collect(),
+            )
+        };
+        let mut config = json!({ "rules": every_rule(base) });
+        if let Some(scoped) = scoped {
+            config["overrides"] = json!([{
+                "files": [
+                    "package.json",
+                    "pnpm-workspace.yaml",
+                    "src/app.ts",
+                    "src/page.ts",
+                    "src/types.ts",
+                    "src/App.vue",
+                    "src/actions/**",
+                    "app/**",
+                    "src/app/**",
+                    "src/store.ts"
+                ],
+                "rules": every_rule(scoped)
+            }]);
+        }
+        let config: FallowConfig = serde_json::from_value(config).expect("config");
+        config.resolve(root(), OutputFormat::Json, 1, false, true, None)
+    }
+
+    /// The audit ledger and the exit-code rule resolve severity in two
+    /// places. With every finding introduced, the ledger must report an
+    /// error exactly when `has_error_severity_issues` does, for every
+    /// collection, with and without `overrides`.
+    #[test]
+    fn audit_ledger_errors_match_the_exit_code_rule_for_every_collection() {
+        let root = root();
+        // Two arrays keep each stack array under the large-array lint limit.
+        let fixtures: Vec<AnalysisResults> = [
+            sample_results(&root),
+            graph_boundary_catalog_override_results(&root),
+            type_member_and_dependency_results(&root),
+            framework_inject_and_render_results(&root),
+            absent_component_prop_results(&root),
+        ]
+        .into_iter()
+        .chain([
+            server_action_load_data_and_route_results(&root),
+            angular_input_output_and_policy_results(&root),
+            unused_store_member_results(&root),
+            production_and_directive_results(&root),
+            AnalysisResults {
+                prop_drilling_chains: vec![PropDrillingChainFinding::with_actions(
+                    PropDrillingChain {
+                        prop: "user".to_owned(),
+                        depth: 3,
+                        hops: vec![PropDrillHop {
+                            file: root.join("src/page.ts"),
+                            line: 4,
+                            component: "Page".to_owned(),
+                        }],
+                    },
+                )],
+                ..effect_results(&root)
+            },
+        ])
+        .collect();
+        let findings = isolated_findings(&fixtures);
+        let empty_base = FxHashSet::default();
+        let mut covered = std::collections::BTreeSet::new();
+        let mut mismatches = Vec::new();
+        for (base, scoped) in [
+            (["error", "error"], None),
+            (["warn", "warn"], None),
+            (["error", "warn"], None),
+            (["error", "error"], Some(["warn", "warn"])),
+            (["warn", "warn"], Some(["error", "error"])),
+            (["off", "off"], Some(["error", "error"])),
+            (["error", "warn"], Some(["warn", "error"])),
+            (["warn", "error"], Some(["error", "warn"])),
+        ] {
+            let config = every_rule_config(base, scoped);
+            for (collection, results) in &findings {
+                let ledger = dead_code_audit_ledger(results, &root, &config, Some(&empty_base));
+                covered.extend(ledger.records().iter().map(|record| record.collection));
+                let exit_rule = fallow_engine::error_severity::has_error_severity_issues(
+                    results,
+                    &config.rules,
+                    Some(&config),
+                    false,
+                );
+                if ledger.has_introduced_errors() != exit_rule {
+                    mismatches.push(format!(
+                        "{collection} (rules {base:?}, overrides {scoped:?}): ledger {}, exit rule {exit_rule}",
+                        ledger.has_introduced_errors()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        let missing: Vec<&str> = super::AuditCollection::ALL
+            .iter()
+            .map(|collection| collection.json_key())
+            .filter(|key| !covered.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the fixtures hold no finding in {missing:?}"
+        );
+    }
+
+    // Line-free, count-aware audit keys.
+
+    fn audit_suppression(root: &Path, line: u32, reason: Option<&str>) -> StaleSuppression {
+        StaleSuppression {
+            finding_id: None,
+            path: root.join("src/flags.ts"),
+            line,
+            col: 0,
+            origin: SuppressionOrigin::Comment {
+                issue_kind: Some("unused-export".to_string()),
+                reason: reason.map(str::to_owned),
+                is_file_level: false,
+                kind_known: true,
+            },
+            missing_reason: false,
+            actions: StaleSuppression::actions_for(false),
+            effective_severity: None,
+        }
+    }
+
+    /// Add `by` to the line of every finding whose old audit key held a line.
+    fn shift_lines(results: &mut AnalysisResults, by: u32) {
+        for item in &mut results.unlisted_dependencies {
+            for site in &mut item.dep.imported_from {
+                site.line += by;
+            }
+        }
+        for item in &mut results.stale_suppressions {
+            item.line += by;
+        }
+        for item in &mut results.unused_catalog_entries {
+            item.entry.line += by;
+        }
+        for item in &mut results.empty_catalog_groups {
+            item.group.line += by;
+        }
+        for item in &mut results.unresolved_catalog_references {
+            item.reference.line += by;
+        }
+        for item in &mut results.unused_dependency_overrides {
+            item.entry.line += by;
+        }
+        for item in &mut results.misconfigured_dependency_overrides {
+            item.entry.line += by;
+        }
+        for item in &mut results.misplaced_directives {
+            item.directive_site.line += by;
+        }
+        for item in &mut results.unused_exports {
+            item.export.line += by;
+        }
+    }
+
+    fn line_sensitive_results(root: &Path) -> AnalysisResults {
+        let mut results = graph_boundary_catalog_override_results(root);
+        let sample = sample_results(root);
+        results.unlisted_dependencies = sample.unlisted_dependencies;
+        results.unused_exports = sample.unused_exports;
+        results
+            .misplaced_directives
+            .push(MisplacedDirectiveFinding::with_actions(
+                MisplacedDirective {
+                    path: root.join("src/action.ts"),
+                    directive: "use server".to_string(),
+                    line: 4,
+                    col: 0,
+                },
+            ));
+        results
+    }
+
+    #[test]
+    fn dead_code_keys_do_not_change_when_lines_shift() {
+        let root = root();
+        let before = line_sensitive_results(&root);
+        let mut after = before.clone();
+        shift_lines(&mut after, 20);
+
+        let before_keys = dead_code_keys(&before, &root);
+        let after_keys = dead_code_keys(&after, &root);
+
+        let mut changed: Vec<&String> = after_keys.difference(&before_keys).collect();
+        changed.sort();
+        assert!(changed.is_empty(), "keys that hold a line: {changed:?}");
+    }
+
+    #[test]
+    fn stale_suppression_keys_ignore_the_reason_text() {
+        let root = root();
+        let with_reason = |reason: &str| AnalysisResults {
+            stale_suppressions: vec![audit_suppression(&root, 3, Some(reason))],
+            ..AnalysisResults::default()
+        };
+
+        assert_eq!(
+            dead_code_keys(&with_reason("kept for the plugin API"), &root),
+            dead_code_keys(&with_reason("removed in v3"), &root)
+        );
+    }
+
+    #[test]
+    fn unlisted_dependency_keys_ignore_the_import_sites() {
+        let root = root();
+        let base = sample_results(&root);
+        let mut head = base.clone();
+        let item = &mut head.unlisted_dependencies[0].dep;
+        item.imported_from[0].line = 40;
+        item.imported_from.push(ImportSite {
+            path: root.join("src/other.ts"),
+            line: 1,
+            col: 0,
+        });
+
+        assert_eq!(dead_code_keys(&base, &root), dead_code_keys(&head, &root));
+    }
+
+    #[test]
+    fn a_second_occurrence_of_an_inherited_key_is_introduced() {
+        let root = root();
+        let config: FallowConfig = serde_json::from_value(json!({
+            "rules": { "stale-suppressions": "error" }
+        }))
+        .expect("config");
+        let config = config.resolve(root.clone(), OutputFormat::Json, 1, false, true, None);
+        let base_results = AnalysisResults {
+            stale_suppressions: vec![audit_suppression(&root, 3, None)],
+            ..AnalysisResults::default()
+        };
+        let base = dead_code_keys(&base_results, &root);
+        let mut head = AnalysisResults {
+            stale_suppressions: vec![
+                audit_suppression(&root, 13, None),
+                audit_suppression(&root, 17, None),
+            ],
+            ..AnalysisResults::default()
+        };
+
+        let ledger = dead_code_audit_ledger(&head, &root, &config, Some(&base));
+        assert_eq!(ledger.introduced_count(), 1);
+        assert_eq!(ledger.inherited_count(), 1);
+        assert!(!ledger.records()[0].introduced);
+        assert!(ledger.records()[1].introduced);
+
+        retain_introduced_dead_code(&mut head, &root, Some(&base));
+        assert_eq!(head.stale_suppressions.len(), 1);
+        assert_eq!(head.stale_suppressions[0].line, 17);
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_findings_and_occurrences_inherited() {
+        let root = root();
+        let finding = |path: &str, line: u32| {
+            let mut suppression = audit_suppression(&root, line, None);
+            suppression.path = root.join(path);
+            suppression
+        };
+        let base_results = AnalysisResults {
+            stale_suppressions: vec![finding("src/old.ts", 3), finding("src/old.ts", 9)],
+            ..AnalysisResults::default()
+        };
+        let head = AnalysisResults {
+            stale_suppressions: vec![finding("src/new.ts", 4), finding("src/new.ts", 10)],
+            ..AnalysisResults::default()
+        };
+        let renames = rustc_hash::FxHashMap::from_iter([(
+            "src/old.ts".to_string(),
+            "src/new.ts".to_string(),
+        )]);
+
+        let base = remap_keys_for_renames(&dead_code_keys(&base_results, &root), &renames);
+
+        assert_eq!(base, dead_code_keys(&head, &root));
     }
 }

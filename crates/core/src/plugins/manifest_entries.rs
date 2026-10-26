@@ -248,7 +248,7 @@ fn build_rule_report(rule: &ManifestEntryRule, root: &Path) -> RuleReport {
         return report;
     }
 
-    let Ok(glob) = globset::Glob::new(&rule.manifests) else {
+    let Ok(glob) = fallow_config::compile_path_glob(&rule.manifests) else {
         // Glob validity is enforced at config load; a compile failure here is
         // defensive and, like a non-matching glob, seeds nothing.
         report.warnings.push(CheckWarning::glob(
@@ -349,7 +349,27 @@ fn build_rule_report(rule: &ManifestEntryRule, root: &Path) -> RuleReport {
     report
 }
 
-fn parse_manifest(source: &str, format: ManifestFormat) -> Option<Value> {
+/// Seed the entries of one manifest that a built-in plugin already found and
+/// parsed. The rule's `manifests` glob is not used: the caller owns discovery.
+/// The gates, the `${...}` interpolation and the root containment are the same
+/// as for an external plugin rule. A gate or template that exceeds an
+/// evaluator limit seeds nothing, as on the external path.
+#[must_use]
+pub(crate) fn seed_parsed_manifest(
+    rule: &ManifestEntryRule,
+    manifest: &Value,
+    manifest_path: &Path,
+    root: &Path,
+) -> Vec<String> {
+    if !matches!(when_matches(manifest, &rule.when), Ok(true)) {
+        return Vec::new();
+    }
+    seed_rule_entries(rule, manifest, manifest_path, root).0
+}
+
+/// Parse manifest source text in the rule's declared format.
+#[must_use]
+pub(crate) fn parse_manifest(source: &str, format: ManifestFormat) -> Option<Value> {
     match format {
         ManifestFormat::Jsonc => fallow_config::jsonc::parse_to_value(source).ok(),
         ManifestFormat::Json => serde_json::from_str(source).ok(),
@@ -700,11 +720,7 @@ fn push_field_value<'a>(
 fn discover_manifest_paths(root: &Path, matcher: &globset::GlobMatcher) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let canonical_root = root.canonicalize().ok();
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+    let walker = fallow_config::source_walk_builder(root)
         .filter_entry(|entry| entry.file_name() != "node_modules")
         .build();
     for entry in walker.flatten() {
@@ -1015,6 +1031,7 @@ mod tests {
                 ],
             }],
             config_patterns: vec![],
+            config_default_export_opt_out: vec![],
             always_used: vec![],
             tooling_dependencies: vec![],
             used_exports: vec![],
@@ -1076,6 +1093,7 @@ mod tests {
             entry_point_role: EntryPointRole::Runtime,
             manifest_entries: rules,
             config_patterns: vec![],
+            config_default_export_opt_out: vec![],
             always_used: vec![],
             tooling_dependencies: vec![],
             used_exports: vec![],
@@ -1213,6 +1231,29 @@ mod tests {
             !beta.seeded.iter().any(|s| s.contains("server/index")),
             "beta server:false must not seed the server entry, got {:?}",
             beta.seeded
+        );
+    }
+
+    #[test]
+    fn manifests_glob_single_star_stays_within_one_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_manifest(root, "plugins/alpha/kibana.jsonc", r#"{"type":"plugin"}"#);
+        write_manifest(
+            root,
+            "plugins/group/beta/kibana.jsonc",
+            r#"{"type":"plugin"}"#,
+        );
+        let ext = plugin_with(vec![rule(
+            "plugins/*/kibana.jsonc",
+            &[],
+            vec![seed("public/index.ts", &[])],
+        )]);
+
+        let reports = check_manifest_entries(&ext, root);
+        assert_eq!(
+            reports[0].manifests_matched,
+            vec!["plugins/alpha/kibana.jsonc".to_string()]
         );
     }
 

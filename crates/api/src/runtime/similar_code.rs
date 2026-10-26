@@ -8,18 +8,19 @@ use std::time::Instant;
 
 use fallow_engine::session::AnalysisSession;
 use fallow_engine::similar_code::{
-    FunctionVector, SimilarCodeLimits as EngineLimits, SimilarCodeSelectionInput,
-    SimilarCodeSkipReason as EngineSkipReason, evaluate_selected_similar_code,
-    select_similar_code_corpus,
+    FunctionVector, SimilarCodeCorpusSelection, SimilarCodeLimits as EngineLimits,
+    SimilarCodeSelectionInput, SimilarCodeSkipReason as EngineSkipReason,
+    evaluate_selected_similar_code, select_similar_code_corpus,
 };
 use fallow_engine::source::similar_code::{
     ExtractedSimilarCodeFunction, SIMILAR_CODE_EXTRACTION_SEMANTICS_VERSION,
     SimilarCodeExtractionLimits, SimilarCodeExtractionSkipReason,
 };
+use fallow_engine::test_paths::is_test_code_path_str;
 use fallow_engine::{
     codeowners::CodeOwners,
     project_analysis::ProjectAnalysisArtifactOptions,
-    trace::{trace_file, trace_impact_closure},
+    trace::{trace_file, trace_impact_closure_without_search},
 };
 use fallow_output::{
     SimilarCodeAction, SimilarCodeActionType, SimilarCodeCacheStatus, SimilarCodeCacheSummary,
@@ -37,14 +38,14 @@ use fallow_output::{
     SimilarCodeVerdictMatch, SimilarCodeVerificationStatus,
 };
 use fallow_types::envelope::{ElapsedMs, ToolVersion};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::analysis_context::{
-    ProgrammaticAnalysisContext, changed_files_for_run,
-    resolve_programmatic_analysis_context_deferred_workspace, workspace_roots_for_session,
+    ProgrammaticAnalysisContext, changed_files_for_run, resolve_programmatic_analysis_context,
+    workspace_roots_for_session,
 };
 use crate::similar_code::{
     self, EmbeddingInput, EmbeddingResult, ProviderError, ReadyProvider, SimilarCodeProviderStatus,
@@ -64,7 +65,7 @@ const MAX_INSPECT_SOURCE_BYTES: u64 = fallow_config::DEFAULT_MAX_FILE_SIZE_BYTES
 const MAX_INSPECT_GRAPH_REFERENCES: usize = 50;
 const MAX_INSPECT_RELATED_TESTS: usize = 50;
 const MODULE_REFERENCE_NAME: &str = "<module>";
-const INSPECT_CHURN_WINDOW: &str = "6 months ago";
+const INSPECT_CHURN_WINDOW_MONTHS: u64 = 6;
 
 #[derive(Clone, Copy)]
 struct PhaseCompleteness {
@@ -115,7 +116,7 @@ impl PhaseCompleteness {
 /// setup, source discovery failures, or unusable provider output.
 pub fn run_similar_code(options: &SimilarCodeOptions) -> ProgrammaticResult<SimilarCodeOutput> {
     validate_options(options)?;
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     let provider = options
         .adapter_provider_path
         .as_deref()
@@ -207,7 +208,7 @@ pub fn inspect_similar_code(
 ) -> ProgrammaticResult<SimilarCodeInspectOutput> {
     let started = Instant::now();
     let candidate = options.snapshot.candidate.clone();
-    let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+    let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     let root = resolved.root().to_path_buf();
     let mut left = inspect_side(&root, &candidate.left)?;
     let mut right = inspect_side(&root, &candidate.right)?;
@@ -286,17 +287,13 @@ pub fn review_similar_code(
 
     let mut matched = vec![None; raw.candidates.len()];
     let mut match_kind = vec![SimilarCodeVerdictMatch::Unverified; raw.candidates.len()];
-    let mut diagnostics = raw.diagnostics.clone();
+    let mut diagnostics = raw.diagnostics;
     let mut seen_candidate_ids = FxHashSet::default();
     let mut seen_review_keys = FxHashSet::default();
     for verdict in verdicts.verdicts {
         validate_verdict(&verdict)?;
-        if !seen_candidate_ids.insert(verdict.candidate_id.clone())
-            || !seen_review_keys.insert(verdict.review_key.clone())
-        {
-            return Err(review_error(
-                "verdict document contains duplicate candidate or review identities",
-            ));
+        if !seen_candidate_ids.insert(verdict.candidate_id.clone()) {
+            return Err(duplicate_verdict_identity_error());
         }
         if let Some(&index) = by_candidate_id.get(verdict.candidate_id.as_str()) {
             if raw.candidates[index].review_key != verdict.review_key {
@@ -304,9 +301,19 @@ pub fn review_similar_code(
                     "verdict review_key does not match its candidate_id",
                 ));
             }
+            if matched[index].is_some() {
+                return Err(review_error(
+                    "multiple verdicts resolve to the same candidate",
+                ));
+            }
             matched[index] = Some(verdict);
             match_kind[index] = SimilarCodeVerdictMatch::CandidateId;
             continue;
+        }
+        // Two candidates can share a review_key when one function is copied
+        // verbatim, so the key is unique only among verdicts that match by it.
+        if !seen_review_keys.insert(verdict.review_key.clone()) {
+            return Err(duplicate_verdict_identity_error());
         }
         let Some(indices) = by_review_key.get(verdict.review_key.as_str()) else {
             return Err(review_error(
@@ -324,7 +331,9 @@ pub fn review_similar_code(
             match_kind[index] = SimilarCodeVerdictMatch::ReviewKey;
         } else {
             for &index in indices {
-                match_kind[index] = SimilarCodeVerdictMatch::AmbiguousReviewKey;
+                if matched[index].is_none() {
+                    match_kind[index] = SimilarCodeVerdictMatch::AmbiguousReviewKey;
+                }
             }
             diagnostics.push(SimilarCodeDiagnostic {
                 domain: SimilarCodeDiagnosticDomain::Review,
@@ -382,10 +391,19 @@ fn run_similar_code_inner(
     run_similar_code_inner_with_embedder(options, resolved, &provider.status, &mut embedder)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the orchestration keeps one auditable sequence of bounded analysis phases"
-)]
+struct FileAdmission<'a> {
+    files: Vec<(&'a fallow_types::discover::DiscoveredFile, String)>,
+    total_eligible_files: usize,
+    scope: SimilarCodeScopeProvenance,
+}
+
+struct ExtractedCorpus {
+    functions: Vec<ExtractedSimilarCodeFunction>,
+    limits: SimilarCodeExtractionLimits,
+    skips: BTreeMap<SimilarCodeSkipReason, usize>,
+    source_read_failures: usize,
+}
+
 fn run_similar_code_inner_with_embedder(
     options: &SimilarCodeOptions,
     resolved: &ProgrammaticAnalysisContext,
@@ -394,6 +412,81 @@ fn run_similar_code_inner_with_embedder(
 ) -> ProgrammaticResult<SimilarCodeOutput> {
     let started = Instant::now();
     let session = load_session(resolved)?;
+    let (threshold, min_lines) = detection_parameters(options, &session)?;
+    let changed_files = changed_files_for_run(resolved)?;
+    let workspace_roots = workspace_roots_for_session(resolved, session.workspaces())?;
+    let scope_active = similar_code_scope_active(
+        options,
+        resolved,
+        changed_files.as_ref(),
+        workspace_roots.as_deref(),
+    );
+    let in_scope = |path: &str| {
+        !scope_active
+            || similar_code_path_in_scope(
+                path,
+                options,
+                resolved,
+                changed_files.as_ref(),
+                workspace_roots.as_deref(),
+            )
+    };
+    let ignore = build_ignore_set(&session.config().similar_code.ignore)?;
+    let mut diagnostics = Vec::new();
+    let admission = admit_source_files(&session, &ignore, scope_active, in_scope);
+    let extraction = extract_corpus(&admission, min_lines, &mut diagnostics);
+    let engine_limits = EngineLimits::for_dimensions(provider.dimensions);
+    let selection = select_corpus(
+        &extraction.functions,
+        engine_limits,
+        scope_active,
+        in_scope,
+        &mut diagnostics,
+    )?;
+    let selected = selection
+        .selected_indices
+        .iter()
+        .map(|index| &extraction.functions[*index])
+        .collect::<Vec<_>>();
+    let mut embedding = embed_corpus(session.root(), resolved.no_cache(), &selected, embedder)?;
+    let (vectors, effective_selection) = comparison_inputs(&selected, &selection, &mut embedding)?;
+    let evaluation = evaluate_selected_similar_code(
+        &vectors,
+        &effective_selection,
+        threshold,
+        engine_limits,
+        SIMILAR_CODE_EXTRACTION_SEMANTICS_VERSION,
+    )
+    .map_err(engine_error)?;
+    let candidates = output_candidates(
+        evaluation.candidates,
+        &extraction.functions,
+        in_scope,
+        options.top,
+    );
+    let completion = build_completion(
+        &admission,
+        &extraction,
+        &selection,
+        &mut embedding,
+        &evaluation.completion,
+        &mut diagnostics,
+    );
+    Ok(SimilarCodeOutput {
+        schema_version: SimilarCodeSchemaVersion::V1,
+        version: ToolVersion(env!("CARGO_PKG_VERSION").to_owned()),
+        elapsed_ms: ElapsedMs(duration_ms(started)),
+        generation: generation(provider, threshold, min_lines, admission.scope),
+        candidates,
+        completion,
+        diagnostics,
+    })
+}
+
+fn detection_parameters(
+    options: &SimilarCodeOptions,
+    session: &AnalysisSession,
+) -> ProgrammaticResult<(f64, usize)> {
     let threshold = options
         .threshold
         .unwrap_or_else(|| session.config().similar_code.threshold);
@@ -408,58 +501,30 @@ fn run_similar_code_inner_with_embedder(
                 .with_context("similarCode.minLines"),
         );
     }
-    let changed_files = changed_files_for_run(resolved)?;
-    let workspace_roots = workspace_roots_for_session(resolved, session.workspaces())?;
-    let scope_active = similar_code_scope_active(
-        options,
-        resolved,
-        changed_files.as_ref(),
-        workspace_roots.as_deref(),
-    );
+    Ok((threshold, min_lines))
+}
 
-    let ignore = build_ignore_set(&session.config().similar_code.ignore)?;
-    let extraction_limits = SimilarCodeExtractionLimits::default();
-    let mut functions = Vec::new();
-    let mut extracted_source_bytes = 0usize;
-    let mut extraction_skips = BTreeMap::new();
-    let mut source_read_failures = 0usize;
-    let mut diagnostics = Vec::new();
-    let files = session.files();
-    let mut eligible_files = files
+fn admit_source_files<'a>(
+    session: &'a AnalysisSession,
+    ignore: &GlobSet,
+    scope_active: bool,
+    in_scope: impl Fn(&str) -> bool,
+) -> FileAdmission<'a> {
+    let mut eligible_files = session
+        .files()
         .iter()
         .filter_map(|file| {
             let relative = root_relative(session.root(), &file.path);
             (!ignore.is_match(&relative)).then_some((file, relative))
         })
         .collect::<Vec<_>>();
-    eligible_files.sort_by_key(|(_, relative)| {
-        usize::from(
-            scope_active
-                && !similar_code_path_in_scope(
-                    relative,
-                    options,
-                    resolved,
-                    changed_files.as_ref(),
-                    workspace_roots.as_deref(),
-                ),
-        )
-    });
+    eligible_files.sort_by_key(|(_, relative)| usize::from(!in_scope(relative)));
     let total_eligible_files = eligible_files.len();
-    let admitted_files = total_eligible_files.min(MAX_FILES);
-    let omitted_files = total_eligible_files.saturating_sub(admitted_files);
-    eligible_files.truncate(admitted_files);
+    eligible_files.truncate(total_eligible_files.min(MAX_FILES));
     let mut effective_scope_paths = if scope_active {
         eligible_files
             .iter()
-            .filter(|(_, relative)| {
-                similar_code_path_in_scope(
-                    relative,
-                    options,
-                    resolved,
-                    changed_files.as_ref(),
-                    workspace_roots.as_deref(),
-                )
-            })
+            .filter(|(_, relative)| in_scope(relative))
             .map(|(_, relative)| relative.clone())
             .collect::<Vec<_>>()
     } else {
@@ -467,7 +532,27 @@ fn run_similar_code_inner_with_embedder(
     };
     effective_scope_paths.sort();
     effective_scope_paths.dedup();
-    for (file_index, (file, relative)) in eligible_files.iter().enumerate() {
+    FileAdmission {
+        files: eligible_files,
+        total_eligible_files,
+        scope: SimilarCodeScopeProvenance {
+            active: scope_active,
+            paths: effective_scope_paths,
+        },
+    }
+}
+
+fn extract_corpus(
+    admission: &FileAdmission<'_>,
+    min_lines: usize,
+    diagnostics: &mut Vec<SimilarCodeDiagnostic>,
+) -> ExtractedCorpus {
+    let extraction_limits = SimilarCodeExtractionLimits::default();
+    let mut functions = Vec::new();
+    let mut extracted_source_bytes = 0usize;
+    let mut extraction_skips = BTreeMap::new();
+    let mut source_read_failures = 0usize;
+    for (file_index, (file, relative)) in admission.files.iter().enumerate() {
         let remaining_functions = extraction_limits
             .max_functions
             .saturating_sub(functions.len());
@@ -478,7 +563,7 @@ fn run_similar_code_inner_with_embedder(
             add_skip(
                 &mut extraction_skips,
                 reason,
-                remaining_extraction_inputs(eligible_files.len(), file_index),
+                remaining_extraction_inputs(admission.files.len(), file_index),
             );
             break;
         }
@@ -530,21 +615,27 @@ fn run_similar_code_inner_with_embedder(
             }
         }
     }
+    ExtractedCorpus {
+        functions,
+        limits: extraction_limits,
+        skips: extraction_skips,
+        source_read_failures,
+    }
+}
 
-    let engine_limits = EngineLimits::for_dimensions(provider.dimensions);
+fn select_corpus(
+    functions: &[ExtractedSimilarCodeFunction],
+    engine_limits: EngineLimits,
+    scope_active: bool,
+    in_scope: impl Fn(&str) -> bool,
+    diagnostics: &mut Vec<SimilarCodeDiagnostic>,
+) -> ProgrammaticResult<SimilarCodeCorpusSelection> {
     let selection_inputs = functions
         .iter()
         .map(|function| SimilarCodeSelectionInput {
             location: &function.location,
             source_sha256: function.source_sha256,
-            in_scope: !scope_active
-                || similar_code_path_in_scope(
-                    &function.location.file,
-                    options,
-                    resolved,
-                    changed_files.as_ref(),
-                    workspace_roots.as_deref(),
-                ),
+            in_scope: in_scope(&function.location.file),
         })
         .collect::<Vec<_>>();
     let selection =
@@ -568,11 +659,15 @@ fn run_similar_code_inner_with_embedder(
             path: None,
         });
     }
-    let selected = selection
-        .selected_indices
-        .iter()
-        .map(|index| &functions[*index])
-        .collect::<Vec<_>>();
+    Ok(selection)
+}
+
+fn embed_corpus(
+    root: &Path,
+    no_cache: bool,
+    selected: &[&ExtractedSimilarCodeFunction],
+    embedder: &mut dyn RuntimeEmbedder,
+) -> ProgrammaticResult<EmbeddingResult> {
     let embedding_inputs = selected
         .iter()
         .map(|function| EmbeddingInput {
@@ -580,13 +675,22 @@ fn run_similar_code_inner_with_embedder(
             source: &function.source,
         })
         .collect::<Vec<_>>();
-    let embedding = embedder
-        .embed(session.root(), resolved.no_cache(), &embedding_inputs)
-        .map_err(provider_error)?;
+    embedder
+        .embed(root, no_cache, &embedding_inputs)
+        .map_err(provider_error)
+}
 
+fn comparison_inputs(
+    selected: &[&ExtractedSimilarCodeFunction],
+    selection: &SimilarCodeCorpusSelection,
+    embedding: &mut EmbeddingResult,
+) -> ProgrammaticResult<(Vec<FunctionVector>, SimilarCodeCorpusSelection)> {
     let mut vectors = Vec::new();
     let mut effective_scope = Vec::new();
-    for (selected_index, values) in embedding.vectors.into_iter().enumerate() {
+    for (selected_index, values) in std::mem::take(&mut embedding.vectors)
+        .into_iter()
+        .enumerate()
+    {
         if let Some(values) = values {
             let function = selected[selected_index];
             vectors.push(FunctionVector {
@@ -600,7 +704,7 @@ fn run_similar_code_inner_with_embedder(
     }
     if vectors.len() < 2 && selected.len() >= 2 {
         return Err(ProgrammaticError::new(
-            embedding.provider_problem.unwrap_or_else(|| {
+            embedding.provider_problem.take().unwrap_or_else(|| {
                 "the local similar-code provider returned fewer than two usable vectors".to_owned()
             }),
             2,
@@ -609,56 +713,48 @@ fn run_similar_code_inner_with_embedder(
         .with_context("similarCode.provider"));
     }
 
-    let effective_selection = fallow_engine::similar_code::SimilarCodeCorpusSelection {
+    let effective_selection = SimilarCodeCorpusSelection {
         selected_indices: (0..vectors.len()).collect(),
         selected_in_scope: effective_scope,
         skipped: selection.skipped.clone(),
     };
-    let evaluation = evaluate_selected_similar_code(
-        &vectors,
-        &effective_selection,
-        threshold,
-        engine_limits,
-        SIMILAR_CODE_EXTRACTION_SEMANTICS_VERSION,
-    )
-    .map_err(engine_error)?;
+    Ok((vectors, effective_selection))
+}
+
+fn output_candidates(
+    candidates: Vec<fallow_engine::similar_code::SimilarCodeCandidate>,
+    functions: &[ExtractedSimilarCodeFunction],
+    in_scope: impl Fn(&str) -> bool,
+    top: Option<usize>,
+) -> Vec<SimilarCodeCandidate> {
     let metadata = functions
         .iter()
         .map(|function| (location_key(&function.location), function))
         .collect::<FxHashMap<_, _>>();
-    let mut candidates = evaluation
-        .candidates
+    let mut candidates = candidates
         .into_iter()
-        .filter(|candidate| {
-            !scope_active
-                || similar_code_path_in_scope(
-                    &candidate.left.file,
-                    options,
-                    resolved,
-                    changed_files.as_ref(),
-                    workspace_roots.as_deref(),
-                )
-                || similar_code_path_in_scope(
-                    &candidate.right.file,
-                    options,
-                    resolved,
-                    changed_files.as_ref(),
-                    workspace_roots.as_deref(),
-                )
-        })
+        .filter(|candidate| in_scope(&candidate.left.file) || in_scope(&candidate.right.file))
         .filter_map(|candidate| map_candidate(candidate, &metadata))
         .collect::<Vec<_>>();
-    if let Some(top) = options.top {
+    if let Some(top) = top {
         candidates.truncate(top);
     }
+    candidates
+}
 
-    let extraction_complete = extraction_is_complete(&extraction_skips, source_read_failures);
+fn completion_skips(
+    extraction_skips: &BTreeMap<SimilarCodeSkipReason, usize>,
+    omitted_files: usize,
+    comparison: &fallow_engine::similar_code::SimilarCodeCompletion,
+    embedding: &EmbeddingResult,
+    missing_vectors: usize,
+) -> Vec<SimilarCodeSkip> {
     let mut skips = extraction_skips
-        .into_iter()
+        .iter()
         .map(|(reason, count)| SimilarCodeSkip {
             phase: SimilarCodePhase::Extraction,
-            reason,
-            count: usize_to_u64(count),
+            reason: *reason,
+            count: usize_to_u64(*count),
         })
         .collect::<Vec<_>>();
     if omitted_files > 0 {
@@ -668,18 +764,11 @@ fn run_similar_code_inner_with_embedder(
             count: usize_to_u64(omitted_files),
         });
     }
-    skips.extend(
-        evaluation
-            .completion
-            .skipped
-            .iter()
-            .map(|skip| SimilarCodeSkip {
-                phase: SimilarCodePhase::Comparison,
-                reason: map_engine_skip(skip.reason),
-                count: usize_to_u64(skip.count),
-            }),
-    );
-    let missing_vectors = selected.len().saturating_sub(vectors.len());
+    skips.extend(comparison.skipped.iter().map(|skip| SimilarCodeSkip {
+        phase: SimilarCodePhase::Comparison,
+        reason: map_engine_skip(skip.reason),
+        count: usize_to_u64(skip.count),
+    }));
     if missing_vectors > 0 {
         skips.push(SimilarCodeSkip {
             phase: SimilarCodePhase::Embedding,
@@ -703,7 +792,33 @@ fn run_similar_code_inner_with_embedder(
         });
     }
     skips.sort_by_key(|skip| (skip.phase as u8, skip.reason as u8));
-    if let Some(problem) = embedding.provider_problem {
+    skips
+}
+
+fn build_completion(
+    admission: &FileAdmission<'_>,
+    extraction: &ExtractedCorpus,
+    selection: &SimilarCodeCorpusSelection,
+    embedding: &mut EmbeddingResult,
+    comparison: &fallow_engine::similar_code::SimilarCodeCompletion,
+    diagnostics: &mut Vec<SimilarCodeDiagnostic>,
+) -> SimilarCodeCompletion {
+    let omitted_files = admission
+        .total_eligible_files
+        .saturating_sub(admission.files.len());
+    let embedded_functions = comparison.functions_considered;
+    let missing_vectors = selection
+        .selected_indices
+        .len()
+        .saturating_sub(embedded_functions);
+    let skips = completion_skips(
+        &extraction.skips,
+        omitted_files,
+        comparison,
+        embedding,
+        missing_vectors,
+    );
+    if let Some(problem) = embedding.provider_problem.take() {
         diagnostics.push(SimilarCodeDiagnostic {
             domain: SimilarCodeDiagnosticDomain::Provider,
             code: "FALLOW_SIMILAR_CODE_PROVIDER_PARTIAL".to_owned(),
@@ -711,7 +826,7 @@ fn run_similar_code_inner_with_embedder(
             path: None,
         });
     }
-    if let Some(problem) = embedding.cache_problem {
+    if let Some(problem) = embedding.cache_problem.take() {
         diagnostics.push(SimilarCodeDiagnostic {
             domain: SimilarCodeDiagnosticDomain::Cache,
             code: "FALLOW_SIMILAR_CODE_CACHE_ADVISORY".to_owned(),
@@ -721,9 +836,9 @@ fn run_similar_code_inner_with_embedder(
     }
     let phase_completeness = PhaseCompleteness {
         discovery: omitted_files == 0,
-        extraction: extraction_complete,
+        extraction: extraction_is_complete(&extraction.skips, extraction.source_read_failures),
         embedding: missing_vectors == 0 && embedding.truncated_functions == 0,
-        comparison: evaluation.completion.status
+        comparison: comparison.status
             == fallow_engine::similar_code::SimilarCodeCompletionStatus::Complete,
     };
     let complete = phase_completeness.all_complete()
@@ -735,25 +850,25 @@ fn run_similar_code_inner_with_embedder(
         embedding.cache_hits,
         embedding.cache_misses,
     );
-    let completion = SimilarCodeCompletion {
+    SimilarCodeCompletion {
         status: if complete {
             SimilarCodeCompletionStatus::Complete
         } else {
             SimilarCodeCompletionStatus::Partial
         },
         phases: phases(
-            admitted_files,
-            total_eligible_files,
-            functions.len(),
-            selected.len(),
-            vectors.len(),
-            evaluation.completion.comparisons_performed,
+            admission.files.len(),
+            admission.total_eligible_files,
+            extraction.functions.len(),
+            selection.selected_indices.len(),
+            embedded_functions,
+            comparison.comparisons_performed,
             phase_completeness,
             missing_vectors,
             embedding.truncated_functions,
-            source_read_failures,
+            extraction.source_read_failures,
         ),
-        limits: output_limits(engine_limits, extraction_limits),
+        limits: output_limits(comparison.limits, extraction.limits),
         skips,
         cache: SimilarCodeCacheSummary {
             status: cache_status,
@@ -763,25 +878,7 @@ fn run_similar_code_inner_with_embedder(
             invalid_entries: usize_to_u64(embedding.cache_invalid_entries),
         },
         provider_inference_ms: finite_f64_to_u64(embedding.inference_ms),
-    };
-
-    Ok(SimilarCodeOutput {
-        schema_version: SimilarCodeSchemaVersion::V1,
-        version: ToolVersion(env!("CARGO_PKG_VERSION").to_owned()),
-        elapsed_ms: ElapsedMs(duration_ms(started)),
-        generation: generation(
-            provider,
-            threshold,
-            min_lines,
-            SimilarCodeScopeProvenance {
-                active: scope_active,
-                paths: effective_scope_paths,
-            },
-        ),
-        candidates,
-        completion,
-        diagnostics,
-    })
+    }
 }
 
 fn inspect_side(
@@ -1049,9 +1146,12 @@ fn enrich_graph_and_clones(
         return;
     };
 
-    let left_impact = trace_impact_closure(graph, session.root(), &left_location.path);
-    let right_impact = trace_impact_closure(graph, session.root(), &right_location.path);
+    let left_impact =
+        trace_impact_closure_without_search(graph, session.root(), &left_location.path);
+    let right_impact =
+        trace_impact_closure_without_search(graph, session.root(), &right_location.path);
     apply_graph_evidence(
+        session.root(),
         &left_trace,
         &right_trace,
         left_location,
@@ -1073,6 +1173,7 @@ fn enrich_graph_and_clones(
     reason = "the helper applies symmetric evidence for both immutable candidate sides"
 )]
 fn apply_graph_evidence(
+    root: &Path,
     left_trace: &fallow_engine::trace::FileTrace,
     right_trace: &fallow_engine::trace::FileTrace,
     left_location: &SimilarCodeLocation,
@@ -1100,9 +1201,9 @@ fn apply_graph_evidence(
     right.callees = right_callees;
 
     let (left_tests, left_tests_truncated) =
-        bounded_related_tests(left_impact_paths, MAX_INSPECT_RELATED_TESTS);
+        bounded_related_tests(root, left_impact_paths, MAX_INSPECT_RELATED_TESTS);
     let (right_tests, right_tests_truncated) =
-        bounded_related_tests(right_impact_paths, MAX_INSPECT_RELATED_TESTS);
+        bounded_related_tests(root, right_impact_paths, MAX_INSPECT_RELATED_TESTS);
     left.tests = left_tests;
     right.tests = right_tests;
 
@@ -1162,27 +1263,17 @@ fn bounded_module_references(
     )
 }
 
-fn bounded_related_tests(paths: &[String], limit: usize) -> (Vec<String>, bool) {
+fn bounded_related_tests(root: &Path, paths: &[String], limit: usize) -> (Vec<String>, bool) {
     let mut tests = paths
         .iter()
         .map(|path| path.replace('\\', "/"))
-        .filter(|path| is_test_path(path))
+        .filter(|path| is_test_code_path_str(root, path))
         .collect::<Vec<_>>();
     tests.sort();
     tests.dedup();
     let truncated = tests.len() > limit;
     tests.truncate(limit);
     (tests, truncated)
-}
-
-fn is_test_path(path: &str) -> bool {
-    let surrounded = format!("/{}/", path.trim_matches('/'));
-    surrounded.contains("/__tests__/")
-        || surrounded.contains("/__mocks__/")
-        || surrounded.contains("/test/")
-        || surrounded.contains("/tests/")
-        || path.contains(".test.")
-        || path.contains(".spec.")
 }
 
 fn module_relationship(
@@ -1275,10 +1366,11 @@ fn enrich_churn(
         ));
         return;
     }
-    let since = fallow_engine::churn::SinceDuration {
-        git_after: INSPECT_CHURN_WINDOW.to_owned(),
-        display: "6 months".to_owned(),
-    };
+    let since = fallow_engine::churn::SinceDuration::relative(
+        INSPECT_CHURN_WINDOW_MONTHS,
+        fallow_engine::churn::ChurnWindowUnit::Months,
+        "6 months",
+    );
     let Some((churn, _cache_hit)) = fallow_engine::churn::analyze_churn_cached(
         session.root(),
         &since,
@@ -1419,6 +1511,10 @@ fn validate_verdict(verdict: &fallow_output::SimilarCodeVerdict) -> Programmatic
     Ok(())
 }
 
+fn duplicate_verdict_identity_error() -> ProgrammaticError {
+    review_error("verdict document contains duplicate candidate or review identities")
+}
+
 fn review_error(message: impl Into<String>) -> ProgrammaticError {
     ProgrammaticError::new(message, 2)
         .with_code("FALLOW_SIMILAR_CODE_REVIEW_INVALID")
@@ -1448,6 +1544,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the guards above leave only finite positive values"
+)]
 fn finite_f64_to_u64(value: f64) -> u64 {
     if !value.is_finite() || value <= 0.0 {
         0
@@ -1479,7 +1579,7 @@ fn load_session(resolved: &ProgrammaticAnalysisContext) -> ProgrammaticResult<An
 fn build_ignore_set(patterns: &[String]) -> ProgrammaticResult<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(|error| {
+        builder.add(fallow_config::compile_path_glob(pattern).map_err(|error| {
             ProgrammaticError::new(
                 format!("invalid `similarCode.ignore` pattern `{pattern}`: {error}"),
                 2,
@@ -1953,9 +2053,8 @@ fn usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 #[expect(
-    clippy::float_cmp,
     clippy::unwrap_used,
-    reason = "deterministic fixtures fail immediately and ratios have exact binary representations"
+    reason = "deterministic fixtures fail immediately"
 )]
 mod tests {
     use super::*;
@@ -1965,6 +2064,13 @@ mod tests {
     use crate::similar_code::{
         EmbeddingBatch, EmbeddingBatchVector, EmbeddingSession, EmbeddingSessionFactory,
     };
+
+    #[test]
+    fn ignore_glob_single_star_stays_within_one_segment() {
+        let set = build_ignore_set(&["src/*.ts".to_string()]).unwrap();
+        assert!(set.is_match("src/a.ts"));
+        assert!(!set.is_match("src/nested/a.ts"));
+    }
 
     #[derive(Default)]
     struct FakeProviderState {
@@ -1979,6 +2085,10 @@ mod tests {
     }
 
     impl EmbeddingSession for FakeEmbeddingSession {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "test helper: a panic fails the test"
+        )]
         fn embed(&mut self, functions: &[(u32, &str)]) -> Result<EmbeddingBatch, String> {
             let should_return_partial = {
                 let mut state = self.state.lock().unwrap();
@@ -2020,6 +2130,10 @@ mod tests {
     }
 
     impl EmbeddingSessionFactory for FakeEmbeddingFactory {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "test helper: a panic fails the test"
+        )]
         fn spawn(&mut self) -> Result<Box<dyn EmbeddingSession>, String> {
             self.state.lock().unwrap().spawns += 1;
             Ok(Box::new(FakeEmbeddingSession {
@@ -2112,7 +2226,7 @@ mod tests {
         status: &SimilarCodeProviderStatus,
         embedder: &mut FixtureEmbedder,
     ) -> ProgrammaticResult<SimilarCodeOutput> {
-        let resolved = resolve_programmatic_analysis_context_deferred_workspace(&options.analysis)?;
+        let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
         resolved
             .install(|| run_similar_code_inner_with_embedder(options, &resolved, status, embedder))
     }
@@ -2211,11 +2325,7 @@ mod tests {
         let discovery =
             run_with_fixture(&fixture_options(&project), &status, &mut embedder).unwrap();
         let candidate_id = discovery.candidates.last().unwrap().candidate_id.clone();
-        let tagged = fallow_output::serialize_similar_code_json_output(
-            discovery,
-            fallow_output::RootEnvelopeMode::Tagged,
-        )
-        .unwrap();
+        let tagged = fallow_output::serialize_similar_code_json_output(discovery).unwrap();
         let snapshot = select_similar_code_candidate_snapshot(
             &serde_json::to_vec(&tagged).unwrap(),
             &candidate_id,
@@ -2402,6 +2512,7 @@ mod tests {
             imports_from: imports_from.iter().map(PathBuf::from).collect(),
             imported_by: imported_by.iter().map(PathBuf::from).collect(),
             re_exports: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
@@ -2480,12 +2591,11 @@ mod tests {
     #[test]
     fn similar_code_scope_requires_one_endpoint_to_match_every_active_filter() {
         let root = tempfile::tempdir().unwrap();
-        let resolved =
-            resolve_programmatic_analysis_context_deferred_workspace(&crate::AnalysisOptions {
-                root: Some(root.path().to_path_buf()),
-                ..crate::AnalysisOptions::default()
-            })
-            .unwrap();
+        let resolved = resolve_programmatic_analysis_context(&crate::AnalysisOptions {
+            root: Some(root.path().to_path_buf()),
+            ..crate::AnalysisOptions::default()
+        })
+        .unwrap();
         let options = SimilarCodeOptions {
             files: vec![PathBuf::from("src/file-scoped.ts")],
             ..SimilarCodeOptions::default()
@@ -2549,10 +2659,26 @@ mod tests {
             "src/a.test.ts".to_owned(),
         ];
 
-        let (tests, truncated) = bounded_related_tests(&paths, 1);
+        let (tests, truncated) = bounded_related_tests(Path::new("/project"), &paths, 1);
 
         assert!(truncated);
         assert_eq!(tests, vec!["src/a.test.ts"]);
+    }
+
+    #[test]
+    fn similar_code_related_tests_leave_out_test_support_files() {
+        let paths = vec![
+            "src/__mocks__/api.ts".to_owned(),
+            "src/__fixtures__/user.ts".to_owned(),
+            "src/__snapshots__/api.ts.snap".to_owned(),
+            "src/user.fixture.ts".to_owned(),
+            "src/api.test.ts".to_owned(),
+        ];
+
+        let (tests, truncated) = bounded_related_tests(Path::new("/project"), &paths, 10);
+
+        assert!(!truncated);
+        assert_eq!(tests, vec!["src/api.test.ts"]);
     }
 
     #[test]
@@ -2605,6 +2731,9 @@ mod tests {
             files,
             shallow_clone: false,
             author_pool: Vec::new(),
+            clock: fallow_engine::clock::AnalysisClock::pinned(1_788_782_400),
+            git_log_bytes: 0,
+            commits: Vec::new(),
         };
 
         assert_eq!(churn_commits_for(&churn, Path::new(r"C:\repo\src\a.ts")), 7);
@@ -2721,12 +2850,199 @@ mod tests {
         end_line: usize,
     ) -> fallow_engine::duplicates::CloneInstance {
         fallow_engine::duplicates::CloneInstance {
+            is_symlink: false,
             file: PathBuf::from(file),
             start_line,
             end_line,
             start_col: 0,
             end_col: 0,
             fragment: String::new(),
+        }
+    }
+
+    fn shared_review_key_candidates() -> (Vec<u8>, Vec<SimilarCodeCandidate>) {
+        let (_temp, project, status) = similar_code_fixture();
+        std::fs::copy(project.join("src/a.ts"), project.join("src/d.ts")).unwrap();
+        let mut embedder = FixtureEmbedder {
+            provider_cache_dir: PathBuf::from(&status.cache_dir),
+            run_timeout: Duration::from_secs(5),
+            factory: FakeEmbeddingFactory {
+                state: Arc::new(Mutex::new(FakeProviderState::default())),
+                dimensions: status.dimensions,
+            },
+        };
+        let output = run_with_fixture(&fixture_options(&project), &status, &mut embedder).unwrap();
+        let mut document = serde_json::to_value(&output).unwrap();
+        document["kind"] = Value::from("similar-code");
+        (serde_json::to_vec(&document).unwrap(), output.candidates)
+    }
+
+    fn abstaining_verdict(candidate_id: &str, review_key: &str) -> Value {
+        serde_json::json!({
+            "candidate_id": candidate_id,
+            "review_key": review_key,
+            "candidate_worthy": null,
+            "behaviorally_equivalent": null,
+            "refactor_safe": null,
+            "outcome": "needs-human-review",
+            "rationale": "Evidence is incomplete."
+        })
+    }
+
+    fn verdict_document(verdicts: &[Value]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": "1",
+            "verdicts": verdicts,
+        }))
+        .unwrap()
+    }
+
+    /// Returns the shared review key and the candidates that carry it.
+    fn shared_key_group(
+        candidates: &[SimilarCodeCandidate],
+    ) -> (String, Vec<&SimilarCodeCandidate>) {
+        let mut groups: BTreeMap<&str, Vec<&SimilarCodeCandidate>> = BTreeMap::new();
+        for candidate in candidates {
+            groups
+                .entry(candidate.review_key.as_str())
+                .or_default()
+                .push(candidate);
+        }
+        let (key, group) = groups
+            .into_iter()
+            .find(|(_, group)| group.len() > 1)
+            .expect("a copied function gives two candidates with one review_key");
+        (key.to_owned(), group)
+    }
+
+    #[test]
+    fn review_accepts_candidate_id_verdicts_that_share_a_review_key() {
+        let (candidate_json, candidates) = shared_review_key_candidates();
+        shared_key_group(&candidates);
+        let verdicts = verdict_document(
+            &candidates
+                .iter()
+                .map(|candidate| abstaining_verdict(&candidate.candidate_id, &candidate.review_key))
+                .collect::<Vec<_>>(),
+        );
+
+        let reviewed = review_similar_code(&candidate_json, &verdicts, true).unwrap();
+
+        assert_eq!(reviewed.candidates.len(), candidates.len());
+        assert!(reviewed.candidates.iter().all(|reviewed| {
+            reviewed.verdict.is_some()
+                && reviewed.verdict_match == SimilarCodeVerdictMatch::CandidateId
+        }));
+    }
+
+    #[test]
+    fn review_does_not_apply_a_review_key_verdict_that_matches_several_candidates() {
+        let (candidate_json, candidates) = shared_review_key_candidates();
+        let (key, group) = shared_key_group(&candidates);
+        let verdicts = verdict_document(&[abstaining_verdict("sc_stale", &key)]);
+
+        let reviewed = review_similar_code(&candidate_json, &verdicts, false).unwrap();
+        assert!(
+            reviewed.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "FALLOW_SIMILAR_CODE_REVIEW_KEY_AMBIGUOUS"
+            })
+        );
+        for candidate in &group {
+            let joined = reviewed
+                .candidates
+                .iter()
+                .find(|reviewed| reviewed.candidate.candidate_id == candidate.candidate_id)
+                .unwrap();
+            assert!(joined.verdict.is_none());
+            assert_eq!(
+                joined.verdict_match,
+                SimilarCodeVerdictMatch::AmbiguousReviewKey
+            );
+        }
+
+        let error = review_similar_code(&candidate_json, &verdicts, true).unwrap_err();
+        assert_eq!(error.message, "a verdict is required for every candidate");
+    }
+
+    #[test]
+    fn review_keeps_candidate_id_matches_next_to_an_ambiguous_review_key_verdict() {
+        let (candidate_json, candidates) = shared_review_key_candidates();
+        let (key, group) = shared_key_group(&candidates);
+        let first = group[0];
+        for verdicts in [
+            vec![
+                abstaining_verdict(&first.candidate_id, &key),
+                abstaining_verdict("sc_stale", &key),
+            ],
+            vec![
+                abstaining_verdict("sc_stale", &key),
+                abstaining_verdict(&first.candidate_id, &key),
+            ],
+        ] {
+            let reviewed =
+                review_similar_code(&candidate_json, &verdict_document(&verdicts), false).unwrap();
+            let joined = reviewed
+                .candidates
+                .iter()
+                .find(|reviewed| reviewed.candidate.candidate_id == first.candidate_id)
+                .unwrap();
+            assert!(joined.verdict.is_some());
+            assert_eq!(joined.verdict_match, SimilarCodeVerdictMatch::CandidateId);
+        }
+    }
+
+    #[test]
+    fn review_rejects_repeated_identities_that_do_not_identify_one_candidate() {
+        let (candidate_json, candidates) = shared_review_key_candidates();
+        let (key, _) = shared_key_group(&candidates);
+        let unique = candidates
+            .iter()
+            .find(|candidate| {
+                candidates
+                    .iter()
+                    .filter(|other| other.review_key == candidate.review_key)
+                    .count()
+                    == 1
+            })
+            .expect("the fixture has a candidate with a unique review_key");
+        let cases = [
+            (
+                vec![
+                    abstaining_verdict(&unique.candidate_id, &unique.review_key),
+                    abstaining_verdict(&unique.candidate_id, &unique.review_key),
+                ],
+                "verdict document contains duplicate candidate or review identities",
+            ),
+            (
+                vec![
+                    abstaining_verdict("sc_stale_one", &key),
+                    abstaining_verdict("sc_stale_two", &key),
+                ],
+                "verdict document contains duplicate candidate or review identities",
+            ),
+            (
+                vec![
+                    abstaining_verdict(&unique.candidate_id, &unique.review_key),
+                    abstaining_verdict("sc_stale", &unique.review_key),
+                ],
+                "multiple verdicts resolve to the same candidate",
+            ),
+            (
+                vec![
+                    abstaining_verdict("sc_stale", &unique.review_key),
+                    abstaining_verdict(&unique.candidate_id, &unique.review_key),
+                ],
+                "multiple verdicts resolve to the same candidate",
+            ),
+            (
+                vec![abstaining_verdict(&unique.candidate_id, &key)],
+                "verdict review_key does not match its candidate_id",
+            ),
+        ];
+        for (verdicts, message) in cases {
+            let error = review_similar_code(&candidate_json, &verdict_document(&verdicts), false)
+                .unwrap_err();
+            assert_eq!(error.message, message);
         }
     }
 }

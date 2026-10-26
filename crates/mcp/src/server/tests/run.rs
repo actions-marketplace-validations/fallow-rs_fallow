@@ -16,13 +16,13 @@ const WINDOWS_FIXTURE_COMPLETION_TIMEOUT: Duration = Duration::from_mins(2);
 #[cfg(windows)]
 const WINDOWS_FIXTURE_FIRED_TIMEOUT: Duration = Duration::from_mins(1);
 
-use crate::tools::run_fallow;
+use crate::tools::run_tool;
 #[cfg(any(unix, windows))]
-use crate::tools::run_fallow_with_timeout;
+use crate::tools::run_tool_with_timeout;
 #[cfg(unix)]
-use crate::tools::{run_fallow_with_output_limit, run_fallow_with_top_level_warnings, run_tool};
+use crate::tools::{run_tool_with_limit, run_tool_with_top_level_warnings};
 
-use super::super::resolve_binary;
+use super::super::resolve_binary_from;
 
 /// Extract the text content from a `CallToolResult`.
 #[cfg(unix)]
@@ -123,7 +123,9 @@ fn process_exists(pid: u32) -> bool {
 
 #[cfg(any(unix, windows))]
 async fn read_pid(path: &std::path::Path) -> u32 {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Only a guard against a hang: a fixture on a loaded machine can take many
+    // seconds to start and write its PID.
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
     loop {
         if let Ok(pid) = std::fs::read_to_string(path)
             && let Ok(pid) = pid.trim().parse()
@@ -187,7 +189,12 @@ fn process_cleanup_disarm_does_not_signal_reused_pid() {
 
 #[tokio::test]
 async fn run_fallow_missing_binary() {
-    let result = run_fallow("nonexistent-binary-12345", &["dead-code".to_string()]).await;
+    let result = run_tool(
+        "nonexistent-binary-12345",
+        "analyze",
+        &["dead-code".to_string()],
+    )
+    .await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.message.contains("nonexistent-binary-12345"));
@@ -197,8 +204,9 @@ async fn run_fallow_missing_binary() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_0_with_stdout() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &["-c".to_string(), "echo '{\"ok\":true}'".to_string()],
     )
     .await
@@ -211,23 +219,29 @@ async fn run_fallow_exit_code_0_with_stdout() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_0_empty_stdout_returns_empty_json() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "true".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "true".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(false));
     assert_eq!(extract_text(&result), "{}");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn run_fallow_with_top_level_warnings_inserts_empty_array() {
-    let result = run_fallow_with_top_level_warnings(
+async fn run_tool_with_top_level_warnings_inserts_empty_array() {
+    let result = run_tool_with_top_level_warnings(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo '{\"schema_version\":4,\"runtime_coverage\":{\"schema_version\":\"1\"}}'"
                 .to_string(),
         ],
+        None,
     )
     .await
     .unwrap();
@@ -245,8 +259,9 @@ async fn run_fallow_with_top_level_warnings_inserts_empty_array() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_1_treated_as_success_with_issues() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo '{\"issues\":[]}'; exit 1".to_string(),
@@ -352,9 +367,13 @@ async fn complete_requirement_rejects_mixed_semantic_sections_and_query_statuses
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_1_empty_stdout_returns_empty_json() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "exit 1".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 1".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(false));
     assert_eq!(extract_text(&result), "{}");
 }
@@ -362,8 +381,9 @@ async fn run_fallow_exit_code_1_empty_stdout_returns_empty_json() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_2_with_stderr_returns_structured_json_error() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo 'invalid config' >&2; exit 2".to_string(),
@@ -388,9 +408,13 @@ async fn run_fallow_exit_code_2_with_stderr_returns_structured_json_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_2_empty_stderr_returns_structured_json_error() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "exit 2".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 2".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     let parsed: serde_json::Value = serde_json::from_str(text).expect("error should be valid JSON");
@@ -407,9 +431,13 @@ async fn run_fallow_exit_code_2_empty_stderr_returns_structured_json_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_high_exit_code_returns_error() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "exit 127".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 127".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     let parsed: serde_json::Value = serde_json::from_str(text).expect("error should be valid JSON");
@@ -419,8 +447,9 @@ async fn run_fallow_high_exit_code_returns_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_stderr_is_trimmed_in_error_message() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo '  whitespace around  ' >&2; exit 3".to_string(),
@@ -435,30 +464,24 @@ async fn run_fallow_stderr_is_trimmed_in_error_message() {
 }
 
 #[test]
-#[expect(unsafe_code, reason = "env var mutation requires unsafe")]
 fn resolve_binary_behavior() {
-    // SAFETY: These tests intentionally mutate the process environment to
-    // prove the binary resolver respects the override and reset paths.
-    unsafe { std::env::remove_var("FALLOW_BIN") };
-    let bin = resolve_binary();
+    let bin = resolve_binary_from(None);
     assert!(bin.contains("fallow"));
 
-    // SAFETY: Restore the override to validate that resolve_binary reads the
-    // custom path and does not cache the prior unset state.
-    unsafe { std::env::set_var("FALLOW_BIN", "/custom/path/fallow") };
-    let bin = resolve_binary();
+    let bin = resolve_binary_from(Some("/custom/path/fallow".to_string()));
     assert_eq!(bin, "/custom/path/fallow");
-
-    // SAFETY: Leave the environment clean for the rest of the test suite.
-    unsafe { std::env::remove_var("FALLOW_BIN") };
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_killed_by_signal_returns_error_with_negative_code() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "kill -9 $$".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "kill -9 $$".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     let parsed: serde_json::Value = serde_json::from_str(text).expect("error should be valid JSON");
@@ -468,8 +491,9 @@ async fn run_fallow_killed_by_signal_returns_error_with_negative_code() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_1_with_stderr_returns_stdout_not_stderr() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo '{\"issues\":1}'; echo 'debug warning' >&2; exit 1".to_string(),
@@ -486,8 +510,9 @@ async fn run_fallow_exit_code_1_with_stderr_returns_stdout_not_stderr() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_multiline_stdout() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo 'line1'; echo 'line2'; echo 'line3'".to_string(),
@@ -505,9 +530,13 @@ async fn run_fallow_multiline_stdout() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_empty_args() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "echo ok".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "echo ok".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(false));
     let text = extract_text(&result);
     assert!(text.contains("ok"));
@@ -516,8 +545,9 @@ async fn run_fallow_empty_args() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_multiline_stderr_in_error() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo 'error line 1' >&2; echo 'error line 2' >&2; exit 2".to_string(),
@@ -536,25 +566,37 @@ async fn run_fallow_multiline_stderr_in_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_result_has_single_content_item() {
-    let success = run_fallow("/bin/sh", &["-c".to_string(), "echo test".to_string()])
-        .await
-        .unwrap();
+    let success = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "echo test".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(success.content.len(), 1);
 
-    let error = run_fallow("/bin/sh", &["-c".to_string(), "exit 2".to_string()])
-        .await
-        .unwrap();
+    let error = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 2".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(error.content.len(), 1);
 
-    let issues = run_fallow("/bin/sh", &["-c".to_string(), "exit 1".to_string()])
-        .await
-        .unwrap();
+    let issues = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 1".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(issues.content.len(), 1);
 }
 
 #[tokio::test]
 async fn run_fallow_missing_binary_error_includes_install_hint() {
-    let result = run_fallow("nonexistent-binary-xyz", &[]).await;
+    let result = run_tool("nonexistent-binary-xyz", "analyze", &[]).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -566,8 +608,9 @@ async fn run_fallow_missing_binary_error_includes_install_hint() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_unicode_in_stdout() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo '{\"file\":\"ソース/コード.ts\"}'".to_string(),
@@ -583,8 +626,9 @@ async fn run_fallow_unicode_in_stdout() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_unicode_in_stderr_error() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo 'Fehler: ungültige Konfiguration' >&2; exit 2".to_string(),
@@ -605,9 +649,13 @@ async fn run_fallow_unicode_in_stderr_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_255() {
-    let result = run_fallow("/bin/sh", &["-c".to_string(), "exit 255".to_string()])
-        .await
-        .unwrap();
+    let result = run_tool(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), "exit 255".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
     let parsed: serde_json::Value = serde_json::from_str(text).expect("error should be valid JSON");
@@ -617,8 +665,9 @@ async fn run_fallow_exit_code_255() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_large_stderr_in_error() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "for i in $(seq 1 100); do echo \"error line $i\" >&2; done; exit 2".to_string(),
@@ -637,8 +686,9 @@ async fn run_fallow_large_stderr_in_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_stdout_preserves_content() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             r#"printf '{"key": "value"}\n'"#.to_string(),
@@ -659,8 +709,9 @@ async fn run_fallow_stdout_preserves_content() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_1_only_stderr_returns_empty_json() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             "echo 'some warning' >&2; exit 1".to_string(),
@@ -675,8 +726,9 @@ async fn run_fallow_exit_code_1_only_stderr_returns_empty_json() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_stdin_is_not_inherited() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &["-c".to_string(), "cat < /dev/null".to_string()],
     )
     .await
@@ -692,8 +744,9 @@ async fn run_fallow_completed_child_cleans_descendant_process_tree() {
     let descendant_pid_path = temp.path().join("descendant.pid");
     let script = r#"sleep 30 >/dev/null 2>&1 & echo $! > "$1"; printf '{}'"#;
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             script.to_string(),
@@ -701,6 +754,7 @@ async fn run_fallow_completed_child_cleans_descendant_process_tree() {
             descendant_pid_path.to_string_lossy().into_owned(),
         ],
         Duration::from_secs(5),
+        None,
     )
     .await
     .expect("completed subprocess should stay a tool result");
@@ -726,18 +780,27 @@ async fn run_fallow_completed_child_cleanup_closes_inherited_pipes_without_timeo
     let script = r#"sleep 30 & echo $! > "$1"; printf '{}'"#;
     let started = std::time::Instant::now();
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             script.to_string(),
             "fallow-mcp-completed-pipe-test".to_string(),
             descendant_pid_path.to_string_lossy().into_owned(),
         ],
-        Duration::from_secs(2),
+        // A regression holds the call open until this timeout, so the bound
+        // below stays far from both the timeout and a slow start under load.
+        Duration::from_secs(20),
+        None,
     )
     .await
     .expect("completed subprocess should stay a tool result");
+    // Measure the tool call only. The killed descendant is an orphan, so its
+    // parent is the init process of the host or container. Some container
+    // init processes reap zombies slowly, and `kill -0` reports a zombie as
+    // live, so `wait_for_process_exit` can take longer than the timeout.
+    let tool_elapsed = started.elapsed();
 
     let descendant_pid = read_pid(&descendant_pid_path).await;
     let mut cleanup = ProcessCleanup(vec![descendant_pid]);
@@ -747,7 +810,7 @@ async fn run_fallow_completed_child_cleanup_closes_inherited_pipes_without_timeo
     }
     assert_eq!(result.is_error, Some(false));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        tool_elapsed < Duration::from_secs(10),
         "completed child waited for the timeout before cleaning inherited pipes"
     );
     assert!(descendant_exited);
@@ -769,8 +832,9 @@ Write-Output '{}'
 ";
     std::fs::write(&script_path, script).expect("PowerShell fixture script");
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "powershell.exe",
+        "analyze",
         &[
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
@@ -782,6 +846,7 @@ Write-Output '{}'
             descendant_pid_path.to_string_lossy().into_owned(),
         ],
         WINDOWS_FIXTURE_COMPLETION_TIMEOUT,
+        None,
     )
     .await
     .expect("completed subprocess should stay a tool result");
@@ -802,10 +867,12 @@ Write-Output '{}'
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_timeout_returns_mcp_error() {
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "/bin/sh",
+        "analyze",
         &["-c".to_string(), "sleep 10".to_string()],
         Duration::from_millis(20),
+        None,
     )
     .await
     .expect("timeout should stay a tool result");
@@ -831,8 +898,9 @@ async fn run_fallow_timeout_terminates_and_reaps_process_tree() {
     let descendant_pid_path = temp.path().join("descendant.pid");
     let script = r#"echo $$ > "$1"; sleep 30 & echo $! > "$2"; exec sleep 30"#;
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             script.to_string(),
@@ -841,6 +909,7 @@ async fn run_fallow_timeout_terminates_and_reaps_process_tree() {
             descendant_pid_path.to_string_lossy().into_owned(),
         ],
         Duration::from_millis(500),
+        None,
     )
     .await
     .expect("timeout should stay a tool result");
@@ -866,23 +935,98 @@ async fn run_fallow_timeout_terminates_and_reaps_process_tree() {
     );
 }
 
+/// A client cancel (`notifications/cancelled`) reaches the subprocess route:
+/// the call returns at once and the whole process tree is gone, long before
+/// the response deadline.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_fallow_request_cancel_terminates_and_reaps_process_tree() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let direct_pid_path = temp.path().join("direct.pid");
+    let descendant_pid_path = temp.path().join("descendant.pid");
+    let script = r#"echo $$ > "$1"; sleep 30 & echo $! > "$2"; exec sleep 30"#;
+    let request = tokio_util::sync::CancellationToken::new();
+    let canceller = {
+        let request = request.clone();
+        let descendant_pid_path = descendant_pid_path.clone();
+        tokio::spawn(async move {
+            read_pid(&descendant_pid_path).await;
+            request.cancel();
+        })
+    };
+
+    let started = std::time::Instant::now();
+    let result = crate::tools::with_request_cancellation(
+        request,
+        run_tool_with_timeout(
+            "/bin/sh",
+            "analyze",
+            &[
+                "-c".to_string(),
+                script.to_string(),
+                "fallow-mcp-cancel-test".to_string(),
+                direct_pid_path.to_string_lossy().into_owned(),
+                descendant_pid_path.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(60),
+            None,
+        ),
+    )
+    .await
+    .expect("cancellation should stay a tool result");
+    canceller.await.expect("the canceller ends");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the cancelled call must not wait for its deadline"
+    );
+    assert_eq!(result.is_error, Some(true));
+    let body: serde_json::Value =
+        serde_json::from_str(extract_text(&result)).expect("cancel body is JSON");
+    assert_eq!(body["code"], "FALLOW_MCP_CANCELLED");
+    assert_eq!(body["exit_code"], 2);
+    let direct_pid = read_pid(&direct_pid_path).await;
+    let descendant_pid = read_pid(&descendant_pid_path).await;
+    let mut cleanup = ProcessCleanup(vec![direct_pid, descendant_pid]);
+    let direct_exited = wait_for_process_exit(direct_pid).await;
+    let descendant_exited = wait_for_process_exit(descendant_pid).await;
+    if direct_exited {
+        cleanup.disarm(direct_pid);
+    }
+    if descendant_exited {
+        cleanup.disarm(descendant_pid);
+    }
+
+    assert!(
+        direct_exited && descendant_exited,
+        "cancelled process tree survived: direct={direct_pid} alive={}, descendant={descendant_pid} alive={}",
+        process_exists(direct_pid),
+        process_exists(descendant_pid),
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_timeout_is_not_held_open_by_escaped_pipe_writer() {
     let temp = tempfile::tempdir().expect("temp directory");
     let escaped_pid_path = temp.path().join("escaped.pid");
-    let script = r#"python3 -c 'import os,sys,time; os.setsid(); p=open(sys.argv[1], "w"); p.write(str(os.getpid())); p.close(); time.sleep(30)' "$1" & exec sleep 30"#;
+    // The shell waits for the PID file, so the writer has left the process
+    // group before the timeout kills that group. The writer holds the pipes
+    // for 120 seconds, so a regression lasts far longer than the bound below.
+    let script = r#"python3 -c 'import os,sys,time; os.setsid(); p=open(sys.argv[1] + ".tmp", "w"); p.write(str(os.getpid())); p.close(); os.rename(sys.argv[1] + ".tmp", sys.argv[1]); time.sleep(120)' "$1" & while [ ! -s "$1" ]; do sleep 0.05; done; exec sleep 120"#;
     let started = std::time::Instant::now();
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             script.to_string(),
             "fallow-mcp-escaped-writer-test".to_string(),
             escaped_pid_path.to_string_lossy().into_owned(),
         ],
-        Duration::from_secs(1),
+        Duration::from_secs(10),
+        None,
     )
     .await
     .expect("timeout should stay a tool result");
@@ -891,7 +1035,7 @@ async fn run_fallow_timeout_is_not_held_open_by_escaped_pipe_writer() {
     let _cleanup = ProcessCleanup(vec![escaped_pid]);
     assert_eq!(result.is_error, Some(true));
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_mins(1),
         "escaped inherited pipe writer suppressed the timeout result"
     );
     assert!(
@@ -921,8 +1065,9 @@ Start-Sleep -Seconds 600
 ";
     std::fs::write(&script_path, script).expect("PowerShell fixture script");
 
-    let result = run_fallow_with_timeout(
+    let result = run_tool_with_timeout(
         "powershell.exe",
+        "analyze",
         &[
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
@@ -936,6 +1081,7 @@ Start-Sleep -Seconds 600
             descendant_pid_path.to_string_lossy().into_owned(),
         ],
         WINDOWS_FIXTURE_FIRED_TIMEOUT,
+        None,
     )
     .await
     .expect("timeout should stay a tool result");
@@ -961,29 +1107,78 @@ Start-Sleep -Seconds 600
     );
 }
 
+/// An over-limit response is a REFUSAL that carries its measurement. The
+/// caller got no analysis, so the three signals an agent already gates on
+/// (protocol `isError`, `error: true`, `exit_code`) must all say so; the
+/// measurement fields ride along so the caller still knows how much came back
+/// and what it looked like, instead of guessing whether to retry or narrow.
 #[cfg(unix)]
 #[tokio::test]
-async fn run_fallow_output_limit_returns_structured_error() {
+async fn run_fallow_output_limit_refuses_and_reports_truncation_with_a_preview() {
     let script = r#"i=0; while [ "$i" -lt 2048 ]; do printf x; i=$((i + 1)); done"#;
-    let result =
-        run_fallow_with_output_limit("/bin/sh", &["-c".to_string(), script.to_string()], 1024)
-            .await
-            .expect("output limit should stay a tool result");
+    let result = run_tool_with_limit(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), script.to_string()],
+        Some(1024),
+    )
+    .await
+    .expect("output limit should stay a tool result");
 
-    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an agent gating on isError must not read a 256-byte preview as a completed analysis"
+    );
     let body: serde_json::Value =
         serde_json::from_str(extract_text(&result)).expect("output-limit body is JSON");
     assert_eq!(body["error"], true);
     assert_eq!(body["exit_code"], 2);
-    assert_eq!(body["code"], "FALLOW_MCP_SUBPROCESS_OUTPUT_LIMIT");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(body["result_bytes"], 2048);
     assert_eq!(body["limit_bytes"], 1024);
+    assert_eq!(body["stream"], "stdout");
+    assert_eq!(body["code"], "FALLOW_MCP_SUBPROCESS_OUTPUT_LIMIT");
+    assert_eq!(body["context"], "subprocess");
+    assert_eq!(body["result_preview"], "x".repeat(256));
+}
+
+/// The over-limit help must not advise an action that cannot work:
+/// `max_output_bytes` only ever LOWERS the 16 MiB default, so a caller who
+/// never set it has nothing to raise.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_fallow_output_limit_help_never_advises_raising_the_cap() {
+    let script = r#"i=0; while [ "$i" -lt 2048 ]; do printf x; i=$((i + 1)); done"#;
+    let result = run_tool_with_limit(
+        "/bin/sh",
+        "analyze",
+        &["-c".to_string(), script.to_string()],
+        Some(1024),
+    )
+    .await
+    .expect("output limit should stay a tool result");
+
+    let body: serde_json::Value =
+        serde_json::from_str(extract_text(&result)).expect("output-limit body is JSON");
+    let help = body["help"].as_str().expect("help string");
+    assert!(
+        !help.contains("raise max_output_bytes for this call"),
+        "help advises an impossible action: {help}"
+    );
+    assert!(
+        help.contains("only LOWERS"),
+        "help must state the cap is a bound, not a suggestion: {help}"
+    );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_2_with_json_stdout_passes_through() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             r#"echo '{"error":true,"message":"config not found","exit_code":2}'; exit 2"#
@@ -1003,8 +1198,9 @@ async fn run_fallow_exit_code_2_with_json_stdout_passes_through() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_fallow_exit_code_2_prefers_json_stdout_over_stderr() {
-    let result = run_fallow(
+    let result = run_tool(
         "/bin/sh",
+        "analyze",
         &[
             "-c".to_string(),
             r#"echo '{"error":true,"message":"structured error","exit_code":2}'; echo 'raw stderr msg' >&2; exit 2"#.to_string(),

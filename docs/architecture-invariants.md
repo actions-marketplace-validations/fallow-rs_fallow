@@ -1,8 +1,6 @@
 # Architecture Invariants
 
-This guide states the crate and protocol boundaries contributors should check
-before adding a feature. It is intentionally shorter than the repo map and
-more concrete than the migration notes.
+Check these crate and protocol boundaries before adding a feature.
 
 ## System Overview
 
@@ -20,6 +18,7 @@ The core crates are:
 | `fallow-types` | Shared typed contracts, issue metadata, suppressions, and envelope data. |
 | `fallow-config` | Config loading and typed configuration. |
 | `fallow-process` | Shared child-process lifecycle and process-tree termination. |
+| `fallow-mutation` | Pure mutant site discovery, mutant ids, and mutation-switching instrumentation. It depends only on Oxc crates. |
 | `fallow-extract` | Parser-facing facts from source files. |
 | `fallow-graph` | Module graph, dependency traversal, cycles, and impact facts. |
 | `fallow-security` | Security matcher catalogue and candidate helpers. |
@@ -56,6 +55,12 @@ The protocol adapters are `fallow-cli`, `fallow-lsp`, `fallow-mcp`, and
 - Shared child-process lifecycle behavior belongs in `fallow-process`; adapters
   must not fork their own timeout, process-tree setup, termination, or cleanup
   implementation.
+- `fallow-engine` owns git ref and root detection. `repo_refs` is the only owner
+  of base-ref detection, the short HEAD SHA and the base analysis root, and a
+  protocol adapter must call it instead of spawning git for those facts. A git
+  spawn in an adapter is for a fact the engine does not model, such as worktree
+  lifecycle or a coverage upload envelope, and the CLI boundary test names each
+  one.
 - Public contract crates should avoid CLI-only assumptions. A contract should
   still make sense for API, MCP, LSP, and NAPI consumers.
 

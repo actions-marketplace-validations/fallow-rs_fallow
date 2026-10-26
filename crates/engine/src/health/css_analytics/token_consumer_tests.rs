@@ -335,6 +335,152 @@ fn cached_class_inventory_preserves_vue_style_typo_targets() {
     assert_eq!(unresolved[0].suggestion, "panel-title");
 }
 
+/// The `(class, suggestion)` pairs of the unresolved class references.
+fn unresolved_pairs(computation: &CssAnalyticsComputation) -> Vec<(String, String)> {
+    computation
+        .report
+        .unresolved_class_references
+        .iter()
+        .map(|r| (r.class.clone(), r.suggestion.clone()))
+        .collect()
+}
+
+#[test]
+fn tailwind_utility_is_not_a_typo_of_an_authored_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"tw-classes"}"#).unwrap();
+    let entry = write_file(
+        root,
+        0,
+        "src/styles/global.css",
+        "@import \"tailwindcss\";\n",
+    );
+    let header = write_file(
+        root,
+        1,
+        "src/components/Header.astro",
+        "<div class=\"w-full\"></div>\n<img class=\"wl-full card-titl\" />\n\
+         <style>\n.wl-full { width: 90%; }\n.card-title { color: red; }\n</style>\n",
+    );
+
+    let computation = assert_cached_css_report_parity(root, &[entry, header], &[]);
+    assert_eq!(
+        unresolved_pairs(&computation),
+        vec![("card-titl".to_owned(), "card-title".to_owned())],
+        "a Tailwind utility is skipped, an authored-class typo is still reported"
+    );
+}
+
+#[test]
+fn tailwind_shaped_token_is_checked_without_tailwind() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"plain-classes"}"#).unwrap();
+    let header = write_file(
+        root,
+        0,
+        "src/Header.astro",
+        "<div class=\"w-full\"></div>\n<style>\n.wl-full { width: 90%; }\n</style>\n",
+    );
+
+    let computation = assert_cached_css_report_parity(root, &[header], &[]);
+    assert_eq!(
+        unresolved_pairs(&computation),
+        vec![("w-full".to_owned(), "wl-full".to_owned())],
+        "without Tailwind, a utility-shaped token is an ordinary class token"
+    );
+}
+
+#[test]
+fn global_scoped_style_block_class_counts_as_defined() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"astro-global"}"#).unwrap();
+    let drawer = write_file(
+        root,
+        0,
+        "src/components/Drawer.astro",
+        "<Chevron class=\"nav-chev\" />\n<span class=\"nap-chev\"></span>\n\
+         <style>\nnav :global(.nav-chev) { rotate: 90deg; }\n.nap-chev { color: red; }\n</style>\n",
+    );
+    let module = write_file(
+        root,
+        1,
+        "src/Panel.module.css",
+        ".panel :global(.ant-header) { color: red; }\n.ant-headed { color: blue; }\n",
+    );
+    let markup = write_file(
+        root,
+        2,
+        "src/Panel.tsx",
+        "export const Panel = () => <div className=\"ant-header\" />;\n",
+    );
+
+    let computation = assert_cached_css_report_parity(root, &[drawer, module, markup], &[]);
+    assert!(
+        computation.report.unresolved_class_references.is_empty(),
+        "a class defined through :global(...) is defined: {:?}",
+        unresolved_pairs(&computation)
+    );
+}
+
+#[test]
+fn svelte_global_block_and_selector_classes_count_as_defined() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"svelte-global"}"#).unwrap();
+    let drawer = write_file(
+        root,
+        0,
+        "src/Drawer.svelte",
+        "<Chevron class=\"sb-chev\" />\n<span class=\"sc-chev\"></span>\n\
+         <style>\n:global {\n  .sb-chev { rotate: 90deg; }\n}\n.sc-chev { color: red; }\n</style>\n",
+    );
+    let menu = write_file(
+        root,
+        1,
+        "src/Menu.svelte",
+        "<Chevron class=\"xa-chev\" />\n<span class=\"xb-chev\"></span>\n\
+         <style>\ndiv :global .xa-chev { rotate: 90deg; }\n.xb-chev { color: red; }\n</style>\n",
+    );
+
+    let computation = assert_cached_css_report_parity(root, &[drawer, menu], &[]);
+    assert!(
+        computation.report.unresolved_class_references.is_empty(),
+        "a class defined through an unparenthesized :global is defined: {:?}",
+        unresolved_pairs(&computation)
+    );
+}
+
+#[test]
+fn html_style_block_classes_count_as_defined() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), r#"{"name":"html-style"}"#).unwrap();
+    let page = write_file(
+        root,
+        0,
+        "src/pages/index.astro",
+        "<label class=\"consent consent-bx\"></label>\n\
+         <style>\n.consent { color: blue; }\n.consent-box { margin: 0; }\n</style>\n",
+    );
+    let error_page = write_file(
+        root,
+        1,
+        "public/error.html",
+        "<!doctype html>\n<html><head><style>.content { margin: 0; }</style></head>\n\
+         <body><div class=\"content\"></div></body></html>\n",
+    );
+
+    let computation = assert_cached_css_report_parity(root, &[page, error_page], &[]);
+    assert_eq!(
+        unresolved_pairs(&computation),
+        vec![("consent-bx".to_owned(), "consent-box".to_owned())],
+        "a class from an .html <style> block is defined, a real typo is still reported"
+    );
+}
+
 #[test]
 fn cached_class_inventory_preserves_health_ignore_for_typo_targets() {
     let dir = tempfile::tempdir().unwrap();
@@ -427,6 +573,56 @@ fn cva_duplicate_variant_blocks_surface_as_css_copy_paste() {
     assert_eq!(blocks[0].value, "px-3 py-2 text-sm font-medium");
     assert_eq!(blocks[0].occurrence_count, 2);
     assert_eq!(blocks[0].occurrences[0].path, "src/button.ts");
+}
+
+/// A button module with two identical CVA variant blocks.
+const DUPLICATE_CVA_BUTTON: &str = "import { cva } from 'class-variance-authority';\n\
+     export const button = cva('inline-flex', {\n\
+       variants: {\n\
+         tone: {\n\
+           primary: 'px-3 py-2 text-sm font-medium',\n\
+           secondary: 'px-3 py-2 text-sm font-medium',\n\
+         },\n\
+       },\n\
+     });\n";
+
+/// Write a CVA project below `root` and return its duplicate variant blocks.
+fn cva_blocks_for(root: &Path, relative: &str) -> Vec<fallow_output::CvaDuplicateVariantBlock> {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"dependencies":{"class-variance-authority":"0.7.0","tailwindcss":"4.0.0"}}"#,
+    )
+    .unwrap();
+    let button = write_file(root, 0, relative, DUPLICATE_CVA_BUTTON);
+    css_computation(root, &[button])
+        .map(|computation| computation.report.cva_duplicate_variant_blocks)
+        .unwrap_or_default()
+}
+
+#[test]
+fn cva_scan_ignores_test_directories_above_the_project_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tests").join("project");
+    let blocks = cva_blocks_for(&root, "src/button.ts");
+    assert_eq!(
+        blocks.len(),
+        1,
+        "a project below `tests/` keeps its CVA files"
+    );
+}
+
+#[test]
+fn cva_scan_skips_test_files_inside_the_project() {
+    for relative in [
+        "src/__tests__/button.ts",
+        "tests/button.ts",
+        "src/button.test.ts",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = cva_blocks_for(dir.path(), relative);
+        assert!(blocks.is_empty(), "{relative} is test code");
+    }
 }
 
 #[test]

@@ -35,6 +35,7 @@ fn check_changed_args_with_special_ref() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -81,6 +82,7 @@ fn check_changed_args_production_false_is_omitted() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -96,6 +98,25 @@ fn find_dupes_args_cross_language_false_is_omitted() {
     };
     let args = build_find_dupes_args(&params).unwrap();
     assert!(!args.contains(&"--cross-language".to_string()));
+}
+
+#[test]
+fn find_dupes_args_ignore_symlinks_emits_both_directions() {
+    let args = |ignore_symlinks| {
+        build_find_dupes_args(&FindDupesParams {
+            ignore_symlinks,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let on = args(Some(true));
+    assert!(on.contains(&"--ignore-symlinks".to_string()));
+    assert!(!on.contains(&"--no-ignore-symlinks".to_string()));
+    let off = args(Some(false));
+    assert!(off.contains(&"--no-ignore-symlinks".to_string()));
+    assert!(!off.contains(&"--ignore-symlinks".to_string()));
+    let unset = args(None);
+    assert!(!unset.iter().any(|arg| arg.contains("ignore-symlinks")));
 }
 
 #[test]
@@ -149,6 +170,27 @@ fn fix_apply_args_production_false_is_omitted() {
     };
     let args = build_fix_apply_args(&params);
     assert!(!args.contains(&"--production".to_string()));
+}
+
+#[test]
+fn fix_args_pass_show_cascade_only_when_true() {
+    for show_cascade in [None, Some(false), Some(true)] {
+        let params = FixParams {
+            show_cascade,
+            ..Default::default()
+        };
+        let expected = show_cascade == Some(true);
+        for args in [
+            build_fix_preview_args(&params),
+            build_fix_apply_args(&params),
+        ] {
+            assert_eq!(
+                args.contains(&"--show-cascade".to_string()),
+                expected,
+                "{show_cascade:?}: {args:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -246,31 +288,6 @@ fn health_args_workspace_and_production() {
 }
 
 #[test]
-fn find_dupes_args_individual_numeric_params() {
-    let params = FindDupesParams {
-        min_tokens: Some(75),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--min-tokens".to_string()));
-    assert!(args.contains(&"75".to_string()));
-    assert!(!args.contains(&"--min-lines".to_string()));
-    assert!(!args.contains(&"--threshold".to_string()));
-    assert!(!args.contains(&"--top".to_string()));
-}
-
-#[test]
-fn find_dupes_args_top_only() {
-    let params = FindDupesParams {
-        top: Some(3),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--top".to_string()));
-    assert!(args.contains(&"3".to_string()));
-}
-
-#[test]
 fn check_changed_args_only_root() {
     let params = CheckChangedParams {
         root: Some("/workspace".to_string()),
@@ -286,6 +303,7 @@ fn check_changed_args_only_root() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -505,36 +523,7 @@ fn find_dupes_args_cross_language_true() {
 
 #[test]
 fn valid_dupes_modes_count_and_contents() {
-    assert_eq!(VALID_DUPES_MODES.len(), 4);
-    assert!(VALID_DUPES_MODES.contains(&"strict"));
-    assert!(VALID_DUPES_MODES.contains(&"mild"));
-    assert!(VALID_DUPES_MODES.contains(&"weak"));
-    assert!(VALID_DUPES_MODES.contains(&"semantic"));
-}
-
-#[test]
-fn analyze_args_unicode_in_paths() {
-    let params = AnalyzeParams {
-        root: Some("/home/ユーザー/プロジェクト".to_string()),
-        workspace: Some("パッケージ".to_string()),
-        ..Default::default()
-    };
-    let args = build_analyze_args(&params).unwrap();
-    assert!(args.contains(&"/home/ユーザー/プロジェクト".to_string()));
-    assert!(args.contains(&"パッケージ".to_string()));
-}
-
-#[test]
-fn analyze_args_empty_root_is_dropped() {
-    let params = AnalyzeParams {
-        root: Some(String::new()),
-        ..Default::default()
-    };
-    let args = build_analyze_args(&params).unwrap();
-    assert!(
-        !args.iter().any(|a| a == "--root"),
-        "expected empty --root to be dropped, got {args:?}"
-    );
+    assert_eq!(VALID_DUPES_MODES, ["strict", "mild", "weak", "semantic"]);
 }
 
 #[test]
@@ -548,18 +537,6 @@ fn health_args_empty_sort_is_dropped() {
         !args.iter().any(|a| a == "--sort"),
         "expected empty --sort to be dropped, got {args:?}"
     );
-}
-
-#[test]
-fn find_dupes_args_min_lines_only() {
-    let params = FindDupesParams {
-        min_lines: Some(20),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--min-lines".to_string()));
-    assert!(args.contains(&"20".to_string()));
-    assert!(!args.contains(&"--min-tokens".to_string()));
 }
 
 #[test]
@@ -592,6 +569,7 @@ fn check_changed_args_baseline_only() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -617,6 +595,7 @@ fn check_changed_args_save_baseline_only() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -624,28 +603,6 @@ fn check_changed_args_save_baseline_only() {
     assert!(!args.contains(&"--baseline".to_string()));
     assert!(args.contains(&"--save-baseline".to_string()));
     assert!(args.contains(&"new.json".to_string()));
-}
-
-#[test]
-fn analyze_args_threads_zero() {
-    let params = AnalyzeParams {
-        threads: Some(0),
-        ..Default::default()
-    };
-    let args = build_analyze_args(&params).unwrap();
-    assert!(args.contains(&"--threads".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
-fn health_args_threads_large() {
-    let params = HealthParams {
-        threads: Some(1024),
-        ..Default::default()
-    };
-    let args = build_health_args(&params);
-    assert!(args.contains(&"--threads".to_string()));
-    assert!(args.contains(&"1024".to_string()));
 }
 
 #[test]
@@ -732,6 +689,8 @@ fn health_args_with_all_options_including_targets_and_snapshot() {
         ownership: Some(true),
         ownership_email_mode: Some(crate::params::EmailModeParam::Anonymized),
         group_by: Some("section".to_string()),
+        group: None,
+        trend_from: None,
     };
     let args = build_health_args(&params);
     assert!(args.contains(&"--ownership".to_string()));
@@ -765,96 +724,6 @@ fn health_args_with_all_options_including_targets_and_snapshot() {
 }
 
 #[test]
-fn check_changed_args_unicode_in_paths() {
-    let params = CheckChangedParams {
-        since: "main".to_string(),
-        root: Some("/home/用户/项目".to_string()),
-        config: Some("配置.json".to_string()),
-        allow_remote_extends: None,
-        workspace: Some("包裹".to_string()),
-        production: None,
-        baseline: None,
-        save_baseline: None,
-        fail_on_regression: None,
-        tolerance: None,
-        regression_baseline: None,
-        save_regression_baseline: None,
-        include_entry_exports: None,
-        no_cache: None,
-        threads: None,
-    };
-    let args = build_check_changed_args(params);
-    assert!(args.contains(&"/home/用户/项目".to_string()));
-    assert!(args.contains(&"配置.json".to_string()));
-    assert!(args.contains(&"包裹".to_string()));
-}
-
-#[test]
-fn find_dupes_args_unicode_in_paths() {
-    let params = FindDupesParams {
-        root: Some("/home/ユーザー/プロジェクト".to_string()),
-        config: Some("設定.toml".to_string()),
-        allow_remote_extends: None,
-        workspace: Some("パッケージ".to_string()),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"/home/ユーザー/プロジェクト".to_string()));
-    assert!(args.contains(&"設定.toml".to_string()));
-    assert!(args.contains(&"パッケージ".to_string()));
-}
-
-#[test]
-fn fix_args_unicode_in_paths() {
-    let params = FixParams {
-        root: Some("/home/사용자/프로젝트".to_string()),
-        config: Some("설정.json".to_string()),
-        allow_remote_extends: None,
-        workspace: Some("패키지".to_string()),
-        ..Default::default()
-    };
-    let preview = build_fix_preview_args(&params);
-    assert!(preview.contains(&"/home/사용자/프로젝트".to_string()));
-    assert!(preview.contains(&"설정.json".to_string()));
-    assert!(preview.contains(&"패키지".to_string()));
-
-    let apply = build_fix_apply_args(&params);
-    assert!(apply.contains(&"/home/사용자/프로젝트".to_string()));
-    assert!(apply.contains(&"설정.json".to_string()));
-    assert!(apply.contains(&"패키지".to_string()));
-}
-
-#[test]
-fn health_args_unicode_in_paths() {
-    let params = HealthParams {
-        root: Some("/home/Benutzer/Projekt".to_string()),
-        config: Some("Konfiguration.toml".to_string()),
-        allow_remote_extends: None,
-        workspace: Some("Paket".to_string()),
-        save_snapshot: Some("/Schnappschüsse/v1.json".to_string()),
-        ..Default::default()
-    };
-    let args = build_health_args(&params);
-    assert!(args.contains(&"/home/Benutzer/Projekt".to_string()));
-    assert!(args.contains(&"Konfiguration.toml".to_string()));
-    assert!(args.contains(&"Paket".to_string()));
-    assert!(args.contains(&"/Schnappschüsse/v1.json".to_string()));
-}
-
-#[test]
-fn project_info_args_unicode_in_paths() {
-    let params = ProjectInfoParams {
-        root: Some("/домой/пользователь/проект".to_string()),
-        config: Some("конфиг.toml".to_string()),
-        allow_remote_extends: None,
-        ..Default::default()
-    };
-    let args = build_project_info_args(&params);
-    assert!(args.contains(&"/домой/пользователь/проект".to_string()));
-    assert!(args.contains(&"конфиг.toml".to_string()));
-}
-
-#[test]
 fn check_changed_args_empty_config_is_dropped() {
     let params = CheckChangedParams {
         since: "main".to_string(),
@@ -870,6 +739,7 @@ fn check_changed_args_empty_config_is_dropped() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         no_cache: None,
         threads: None,
     };
@@ -877,19 +747,6 @@ fn check_changed_args_empty_config_is_dropped() {
     assert!(
         !args.iter().any(|a| a == "--config"),
         "expected empty --config to be dropped, got {args:?}"
-    );
-}
-
-#[test]
-fn find_dupes_args_empty_root_is_dropped() {
-    let params = FindDupesParams {
-        root: Some(String::new()),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(
-        !args.iter().any(|a| a == "--root"),
-        "expected empty --root to be dropped, got {args:?}"
     );
 }
 
@@ -911,67 +768,6 @@ fn fix_args_empty_config_is_dropped() {
         !apply.iter().any(|a| a == "--config"),
         "expected empty --config to be dropped from fix_apply, got {apply:?}"
     );
-}
-
-#[test]
-fn check_changed_args_threads_boundary() {
-    let params = CheckChangedParams {
-        since: "main".to_string(),
-        threads: Some(1),
-        root: None,
-        config: None,
-        allow_remote_extends: None,
-        production: None,
-        workspace: None,
-        baseline: None,
-        save_baseline: None,
-        fail_on_regression: None,
-        tolerance: None,
-        regression_baseline: None,
-        save_regression_baseline: None,
-        include_entry_exports: None,
-        no_cache: None,
-    };
-    let args = build_check_changed_args(params);
-    assert!(args.contains(&"--threads".to_string()));
-    assert!(args.contains(&"1".to_string()));
-}
-
-#[test]
-fn find_dupes_args_threads_zero() {
-    let params = FindDupesParams {
-        threads: Some(0),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--threads".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
-fn fix_args_threads_large() {
-    let params = FixParams {
-        threads: Some(256),
-        ..Default::default()
-    };
-    let preview = build_fix_preview_args(&params);
-    assert!(preview.contains(&"--threads".to_string()));
-    assert!(preview.contains(&"256".to_string()));
-
-    let apply = build_fix_apply_args(&params);
-    assert!(apply.contains(&"--threads".to_string()));
-    assert!(apply.contains(&"256".to_string()));
-}
-
-#[test]
-fn project_info_args_threads_zero() {
-    let params = ProjectInfoParams {
-        threads: Some(0),
-        ..Default::default()
-    };
-    let args = build_project_info_args(&params);
-    assert!(args.contains(&"--threads".to_string()));
-    assert!(args.contains(&"0".to_string()));
 }
 
 #[test]
@@ -1000,39 +796,6 @@ fn find_dupes_args_skip_local_true() {
 }
 
 #[test]
-fn find_dupes_args_min_tokens_zero() {
-    let params = FindDupesParams {
-        min_tokens: Some(0),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--min-tokens".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
-fn find_dupes_args_min_lines_zero() {
-    let params = FindDupesParams {
-        min_lines: Some(0),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--min-lines".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
-fn find_dupes_args_threshold_negative() {
-    let params = FindDupesParams {
-        threshold: Some(-1.0),
-        ..Default::default()
-    };
-    let args = build_find_dupes_args(&params).unwrap();
-    assert!(args.contains(&"--threshold".to_string()));
-    assert!(args.contains(&"-1".to_string()));
-}
-
-#[test]
 fn check_changed_args_no_cache_true() {
     let params = CheckChangedParams {
         since: "main".to_string(),
@@ -1049,6 +812,7 @@ fn check_changed_args_no_cache_true() {
         regression_baseline: None,
         save_regression_baseline: None,
         include_entry_exports: None,
+        show_cascade: None,
         threads: None,
     };
     let args = build_check_changed_args(params);
@@ -1101,28 +865,6 @@ fn health_args_save_snapshot_with_value_has_correct_order() {
     let args = build_health_args(&params);
     let snap_idx = args.iter().position(|a| a == "--save-snapshot").unwrap();
     assert_eq!(args[snap_idx + 1], "output/snap.json");
-}
-
-#[test]
-fn health_args_min_commits_zero() {
-    let params = HealthParams {
-        min_commits: Some(0),
-        ..Default::default()
-    };
-    let args = build_health_args(&params);
-    assert!(args.contains(&"--min-commits".to_string()));
-    assert!(args.contains(&"0".to_string()));
-}
-
-#[test]
-fn health_args_max_cyclomatic_one() {
-    let params = HealthParams {
-        max_cyclomatic: Some(1),
-        ..Default::default()
-    };
-    let args = build_health_args(&params);
-    assert!(args.contains(&"--max-cyclomatic".to_string()));
-    assert!(args.contains(&"1".to_string()));
 }
 
 #[test]

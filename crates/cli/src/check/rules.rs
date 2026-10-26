@@ -1,852 +1,31 @@
-use fallow_config::{ResolvedConfig, RulesConfig, Severity};
-use std::path::Path;
+use fallow_config::ResolvedConfig;
 
 /// Remove issues whose effective severity is `Off` from the results.
 ///
-/// When overrides are configured, per-file rule resolution is used for
-/// file-scoped issue types. Circular dependencies resolve against every file in
-/// the cycle. Non-file-scoped issues (unused deps, unlisted deps, duplicate
-/// exports) use the base rules only.
+/// The policy itself lives in `fallow_engine::dead_code` so every surface that
+/// reports findings resolves rule severity through the same code.
 pub fn apply_rules(results: &mut fallow_types::results::AnalysisResults, config: &ResolvedConfig) {
-    let rules = &config.rules;
-    let has_overrides = !config.overrides.is_empty();
-
-    if has_overrides {
-        apply_file_override_rules(results, config);
-        apply_boundary_override_rules(results, config);
-    } else {
-        apply_base_file_rules(results, rules);
-    }
-
-    apply_base_collection_rules(results, rules);
+    fallow_engine::dead_code::apply_rule_severities(results, config);
 }
 
-fn apply_base_collection_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) {
-    if rules.unused_dependencies == Severity::Off {
-        results.unused_dependencies.clear();
-    }
-    if rules.unused_dev_dependencies == Severity::Off {
-        results.unused_dev_dependencies.clear();
-    }
-    if rules.unused_optional_dependencies == Severity::Off {
-        results.unused_optional_dependencies.clear();
-    }
-    if rules.unlisted_dependencies == Severity::Off {
-        results.unlisted_dependencies.clear();
-    }
-    if rules.duplicate_exports == Severity::Off {
-        results.duplicate_exports.clear();
-    }
-    if rules.type_only_dependencies == Severity::Off {
-        results.type_only_dependencies.clear();
-    }
-    if rules.test_only_dependencies == Severity::Off {
-        results.test_only_dependencies.clear();
-    }
-    if rules.dev_dependencies_in_production == Severity::Off {
-        results.dev_dependencies_in_production.clear();
-    }
-    if rules.circular_dependencies == Severity::Off {
-        results.circular_dependencies.clear();
-    }
-    if rules.re_export_cycle == Severity::Off {
-        results.re_export_cycles.clear();
-    }
-    if rules.boundary_violation == Severity::Off {
-        results.boundary_violations.clear();
-        results.boundary_coverage_violations.clear();
-        results.boundary_call_violations.clear();
-    }
-    if rules.policy_violation == Severity::Off {
-        results.policy_violations.clear();
-    }
-    if rules.unused_catalog_entries == Severity::Off {
-        results.unused_catalog_entries.clear();
-    }
-    if rules.empty_catalog_groups == Severity::Off {
-        results.empty_catalog_groups.clear();
-    }
-    if rules.unresolved_catalog_references == Severity::Off {
-        results.unresolved_catalog_references.clear();
-    }
-    if rules.unused_dependency_overrides == Severity::Off {
-        results.unused_dependency_overrides.clear();
-    }
-    if rules.misconfigured_dependency_overrides == Severity::Off {
-        results.misconfigured_dependency_overrides.clear();
-    }
-}
+pub use fallow_engine::error_severity::{
+    count_error_severity_issues, promote_policy_finding_warns, promote_warns_to_errors,
+};
 
-fn apply_file_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    apply_dead_code_override_rules(results, config);
-    apply_catalog_override_rules(results, config);
-    apply_framework_override_rules(results, config);
-    apply_circular_override_rules(results, config);
-}
-
-fn apply_dead_code_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    apply_core_dead_code_override_rules(results, config);
-    apply_component_dead_code_override_rules(results, config);
-}
-
-/// Retain core (non-component) dead-code findings whose per-file rule is not Off.
-fn apply_core_dead_code_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results
-        .unused_files
-        .retain(|f| config.resolve_rules_for_path(&f.file.path).unused_files != Severity::Off);
-    results
-        .unused_exports
-        .retain(|e| config.resolve_rules_for_path(&e.export.path).unused_exports != Severity::Off);
-    results
-        .unused_types
-        .retain(|e| config.resolve_rules_for_path(&e.export.path).unused_types != Severity::Off);
-    results.private_type_leaks.retain(|e| {
-        config
-            .resolve_rules_for_path(&e.leak.path)
-            .private_type_leaks
-            != Severity::Off
-    });
-    results.unused_enum_members.retain(|m| {
-        config
-            .resolve_rules_for_path(&m.member.path)
-            .unused_enum_members
-            != Severity::Off
-    });
-    results.unused_class_members.retain(|m| {
-        config
-            .resolve_rules_for_path(&m.member.path)
-            .unused_class_members
-            != Severity::Off
-    });
-    results.unused_store_members.retain(|m| {
-        config
-            .resolve_rules_for_path(&m.member.path)
-            .unused_store_members
-            != Severity::Off
-    });
-    results.unprovided_injects.retain(|f| {
-        config
-            .resolve_rules_for_path(&f.inject.path)
-            .unprovided_injects
-            != Severity::Off
-    });
-    results.unresolved_imports.retain(|i| {
-        config
-            .resolve_rules_for_path(&i.import.path)
-            .unresolved_imports
-            != Severity::Off
-    });
-}
-
-/// Retain component-shaped dead-code findings whose per-file rule is not Off.
-fn apply_component_dead_code_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results.unrendered_components.retain(|c| {
-        config
-            .resolve_rules_for_path(&c.component.path)
-            .unrendered_components
-            != Severity::Off
-    });
-    results.unused_component_props.retain(|p| {
-        config
-            .resolve_rules_for_path(&p.prop.path)
-            .unused_component_props
-            != Severity::Off
-    });
-    results.unused_component_emits.retain(|e| {
-        config
-            .resolve_rules_for_path(&e.emit.path)
-            .unused_component_emits
-            != Severity::Off
-    });
-    results.unused_component_inputs.retain(|i| {
-        config
-            .resolve_rules_for_path(&i.input.path)
-            .unused_component_inputs
-            != Severity::Off
-    });
-    results.unused_component_outputs.retain(|o| {
-        config
-            .resolve_rules_for_path(&o.output.path)
-            .unused_component_outputs
-            != Severity::Off
-    });
-    results.unused_svelte_events.retain(|e| {
-        config
-            .resolve_rules_for_path(&e.event.path)
-            .unused_svelte_events
-            != Severity::Off
-    });
-    results.unused_server_actions.retain(|a| {
-        config
-            .resolve_rules_for_path(&a.action.path)
-            .unused_server_actions
-            != Severity::Off
-    });
-    results.unused_load_data_keys.retain(|k| {
-        config
-            .resolve_rules_for_path(&k.key.path)
-            .unused_load_data_keys
-            != Severity::Off
-    });
-}
-
-fn apply_catalog_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results.stale_suppressions.retain(|s| {
-        let rules = config.resolve_rules_for_path(&s.path);
-        if s.missing_reason {
-            rules.require_suppression_reason != Severity::Off
-        } else {
-            rules.stale_suppressions != Severity::Off
-        }
-    });
-    results.unresolved_catalog_references.retain(|r| {
-        config
-            .resolve_rules_for_path(&r.reference.path)
-            .unresolved_catalog_references
-            != Severity::Off
-    });
-    results.empty_catalog_groups.retain(|g| {
-        config
-            .resolve_rules_for_path(&g.group.path)
-            .empty_catalog_groups
-            != Severity::Off
-    });
-    results.unused_dependency_overrides.retain(|o| {
-        config
-            .resolve_rules_for_path(&o.entry.path)
-            .unused_dependency_overrides
-            != Severity::Off
-    });
-    results.misconfigured_dependency_overrides.retain(|o| {
-        config
-            .resolve_rules_for_path(&o.entry.path)
-            .misconfigured_dependency_overrides
-            != Severity::Off
-    });
-}
-
-fn apply_framework_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results.invalid_client_exports.retain(|e| {
-        config
-            .resolve_rules_for_path(&e.export.path)
-            .invalid_client_export
-            != Severity::Off
-    });
-    results.mixed_client_server_barrels.retain(|b| {
-        config
-            .resolve_rules_for_path(&b.barrel.path)
-            .mixed_client_server_barrel
-            != Severity::Off
-    });
-    results.misplaced_directives.retain(|d| {
-        config
-            .resolve_rules_for_path(&d.directive_site.path)
-            .misplaced_directive
-            != Severity::Off
-    });
-    results.route_collisions.retain(|c| {
-        config
-            .resolve_rules_for_path(&c.collision.path)
-            .route_collision
-            != Severity::Off
-    });
-    results.dynamic_segment_name_conflicts.retain(|c| {
-        config
-            .resolve_rules_for_path(&c.conflict.path)
-            .dynamic_segment_name_conflict
-            != Severity::Off
-    });
-}
-
-fn apply_circular_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results.circular_dependencies.retain(|c| {
-        c.cycle
-            .files
-            .iter()
-            .any(|path| config.resolve_rules_for_path(path).circular_dependencies != Severity::Off)
-    });
-}
-
-fn apply_base_file_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) {
-    clear_base_core_dead_code(results, rules);
-    clear_base_component_dead_code(results, rules);
-    clear_base_suppression_and_framework(results, rules);
-}
-
-/// Clear core (non-component) dead-code findings whose base rule is Off.
-fn clear_base_core_dead_code(
-    results: &mut fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) {
-    if rules.unused_files == Severity::Off {
-        results.unused_files.clear();
-    }
-    if rules.unused_exports == Severity::Off {
-        results.unused_exports.clear();
-    }
-    if rules.unused_types == Severity::Off {
-        results.unused_types.clear();
-    }
-    if rules.private_type_leaks == Severity::Off {
-        results.private_type_leaks.clear();
-    }
-    if rules.unused_enum_members == Severity::Off {
-        results.unused_enum_members.clear();
-    }
-    if rules.unused_class_members == Severity::Off {
-        results.unused_class_members.clear();
-    }
-    if rules.unused_store_members == Severity::Off {
-        results.unused_store_members.clear();
-    }
-    if rules.unprovided_injects == Severity::Off {
-        results.unprovided_injects.clear();
-    }
-    if rules.unresolved_imports == Severity::Off {
-        results.unresolved_imports.clear();
-    }
-}
-
-/// Clear component-shaped dead-code findings whose base rule is Off.
-fn clear_base_component_dead_code(
-    results: &mut fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) {
-    if rules.unrendered_components == Severity::Off {
-        results.unrendered_components.clear();
-    }
-    if rules.unused_component_props == Severity::Off {
-        results.unused_component_props.clear();
-    }
-    if rules.unused_component_emits == Severity::Off {
-        results.unused_component_emits.clear();
-    }
-    if rules.unused_component_inputs == Severity::Off {
-        results.unused_component_inputs.clear();
-    }
-    if rules.unused_component_outputs == Severity::Off {
-        results.unused_component_outputs.clear();
-    }
-    if rules.unused_svelte_events == Severity::Off {
-        results.unused_svelte_events.clear();
-    }
-    if rules.unused_server_actions == Severity::Off {
-        results.unused_server_actions.clear();
-    }
-    if rules.unused_load_data_keys == Severity::Off {
-        results.unused_load_data_keys.clear();
-    }
-}
-
-/// Apply base stale-suppression retention and clear framework findings whose
-/// base rule is Off.
-fn clear_base_suppression_and_framework(
-    results: &mut fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) {
-    results.stale_suppressions.retain(|s| {
-        if s.missing_reason {
-            rules.require_suppression_reason != Severity::Off
-        } else {
-            rules.stale_suppressions != Severity::Off
-        }
-    });
-    if rules.invalid_client_export == Severity::Off {
-        results.invalid_client_exports.clear();
-    }
-    if rules.mixed_client_server_barrel == Severity::Off {
-        results.mixed_client_server_barrels.clear();
-    }
-    if rules.misplaced_directive == Severity::Off {
-        results.misplaced_directives.clear();
-    }
-    if rules.route_collision == Severity::Off {
-        results.route_collisions.clear();
-    }
-    if rules.dynamic_segment_name_conflict == Severity::Off {
-        results.dynamic_segment_name_conflicts.clear();
-    }
-}
-
-fn apply_boundary_override_rules(
-    results: &mut fallow_types::results::AnalysisResults,
-    config: &ResolvedConfig,
-) {
-    results.boundary_violations.retain(|v| {
-        config
-            .resolve_rules_for_path(&v.violation.from_path)
-            .boundary_violation
-            != Severity::Off
-    });
-    results.boundary_coverage_violations.retain(|v| {
-        config
-            .resolve_rules_for_path(&v.violation.path)
-            .boundary_violation
-            != Severity::Off
-    });
-    results.boundary_call_violations.retain(|v| {
-        config
-            .resolve_rules_for_path(&v.violation.path)
-            .boundary_violation
-            != Severity::Off
-    });
-    results.policy_violations.retain(|v| {
-        config
-            .resolve_rules_for_path(&v.violation.path)
-            .policy_violation
-            != Severity::Off
-    });
-}
-
-/// Check whether any issue type with `Severity::Error` has remaining issues.
-///
-/// When overrides are configured, per-file rule resolution is used for
-/// file-scoped issue types to determine if any individual issue has Error
-/// severity. Circular dependencies resolve against every file in the cycle.
-///
-/// `promote_warns` mirrors `--fail-on-issues`: `rules` is expected to arrive
-/// already promoted, and the per-file override path promotes each resolved
-/// severity after override resolution so an explicit per-path `warn` fails
-/// the run just like the base rules would.
-pub fn has_error_severity_issues(
-    results: &fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-    config: Option<&ResolvedConfig>,
-    promote_warns: bool,
-) -> bool {
-    let has_overrides = config.is_some_and(|c| !c.overrides.is_empty());
-
-    let file_scoped_errors = if let Some(config) = config.filter(|c| !c.overrides.is_empty()) {
-        let resolver = OverrideSeverities {
-            config,
-            promote_warns,
-        };
-        has_override_file_scoped_error(results, &resolver)
-    } else {
-        has_default_file_scoped_error(results, rules)
-    };
-
-    file_scoped_errors || has_project_level_error(results, rules, has_overrides)
-}
-
-/// Per-file severity source for the override path of the exit-code check.
-///
-/// Warn-to-error promotion happens after override resolution so it reaches
-/// severities set by a per-path override, not only the base rules.
-struct OverrideSeverities<'a> {
-    config: &'a ResolvedConfig,
-    promote_warns: bool,
-}
-
-impl OverrideSeverities<'_> {
-    fn effective_rules_for(&self, path: &Path) -> RulesConfig {
-        let mut rules = self.config.resolve_rules_for_path(path);
-        if self.promote_warns {
-            promote_warns_to_errors(&mut rules);
-        }
-        rules
-    }
-}
-
-fn has_override_file_scoped_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    has_override_dead_code_error(results, resolver)
-        || has_override_catalog_boundary_error(results, resolver)
-        || has_override_framework_error(results, resolver)
-}
-
-fn has_override_dead_code_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    has_override_core_dead_code_error(results, resolver)
-        || has_override_component_dead_code_error(results, resolver)
-}
-
-/// Per-file Error check for the core (non-component) dead-code issue types.
-fn has_override_core_dead_code_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    results
-        .unused_files
-        .iter()
-        .any(|f| resolver.effective_rules_for(&f.file.path).unused_files == Severity::Error)
-        || results
-            .unused_exports
-            .iter()
-            .any(|e| resolver.effective_rules_for(&e.export.path).unused_exports == Severity::Error)
-        || results
-            .unused_types
-            .iter()
-            .any(|e| resolver.effective_rules_for(&e.export.path).unused_types == Severity::Error)
-        || results.private_type_leaks.iter().any(|e| {
-            resolver
-                .effective_rules_for(&e.leak.path)
-                .private_type_leaks
-                == Severity::Error
-        })
-        || results.unused_enum_members.iter().any(|m| {
-            resolver
-                .effective_rules_for(&m.member.path)
-                .unused_enum_members
-                == Severity::Error
-        })
-        || results.unused_class_members.iter().any(|m| {
-            resolver
-                .effective_rules_for(&m.member.path)
-                .unused_class_members
-                == Severity::Error
-        })
-        || results.unused_store_members.iter().any(|m| {
-            resolver
-                .effective_rules_for(&m.member.path)
-                .unused_store_members
-                == Severity::Error
-        })
-        || results.unprovided_injects.iter().any(|f| {
-            resolver
-                .effective_rules_for(&f.inject.path)
-                .unprovided_injects
-                == Severity::Error
-        })
-        || results.unresolved_imports.iter().any(|i| {
-            resolver
-                .effective_rules_for(&i.import.path)
-                .unresolved_imports
-                == Severity::Error
-        })
-}
-
-/// Per-file Error check for the component-shaped dead-code issue types.
-fn has_override_component_dead_code_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    results.unrendered_components.iter().any(|c| {
-        resolver
-            .effective_rules_for(&c.component.path)
-            .unrendered_components
-            == Severity::Error
-    }) || results.unused_component_props.iter().any(|p| {
-        resolver
-            .effective_rules_for(&p.prop.path)
-            .unused_component_props
-            == Severity::Error
-    }) || results.unused_component_emits.iter().any(|e| {
-        resolver
-            .effective_rules_for(&e.emit.path)
-            .unused_component_emits
-            == Severity::Error
-    }) || results.unused_component_inputs.iter().any(|i| {
-        resolver
-            .effective_rules_for(&i.input.path)
-            .unused_component_inputs
-            == Severity::Error
-    }) || results.unused_component_outputs.iter().any(|o| {
-        resolver
-            .effective_rules_for(&o.output.path)
-            .unused_component_outputs
-            == Severity::Error
-    }) || results.unused_svelte_events.iter().any(|e| {
-        resolver
-            .effective_rules_for(&e.event.path)
-            .unused_svelte_events
-            == Severity::Error
-    }) || results.unused_server_actions.iter().any(|a| {
-        resolver
-            .effective_rules_for(&a.action.path)
-            .unused_server_actions
-            == Severity::Error
-    }) || results.unused_load_data_keys.iter().any(|k| {
-        resolver
-            .effective_rules_for(&k.key.path)
-            .unused_load_data_keys
-            == Severity::Error
-    })
-}
-
-fn has_override_catalog_boundary_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    results.stale_suppressions.iter().any(|s| {
-        let rules = resolver.effective_rules_for(&s.path);
-        if s.missing_reason {
-            rules.require_suppression_reason == Severity::Error
-        } else {
-            rules.stale_suppressions == Severity::Error
-        }
-    }) || results.unresolved_catalog_references.iter().any(|r| {
-        resolver
-            .effective_rules_for(&r.reference.path)
-            .unresolved_catalog_references
-            == Severity::Error
-    }) || results.empty_catalog_groups.iter().any(|g| {
-        resolver
-            .effective_rules_for(&g.group.path)
-            .empty_catalog_groups
-            == Severity::Error
-    }) || results.boundary_violations.iter().any(|v| {
-        resolver
-            .effective_rules_for(&v.violation.from_path)
-            .boundary_violation
-            == Severity::Error
-    }) || results.boundary_coverage_violations.iter().any(|v| {
-        resolver
-            .effective_rules_for(&v.violation.path)
-            .boundary_violation
-            == Severity::Error
-    }) || results.boundary_call_violations.iter().any(|v| {
-        resolver
-            .effective_rules_for(&v.violation.path)
-            .boundary_violation
-            == Severity::Error
-    }) || results.circular_dependencies.iter().any(|c| {
-        c.cycle
-            .files
-            .iter()
-            .any(|path| resolver.effective_rules_for(path).circular_dependencies == Severity::Error)
-    })
-}
-
-fn has_override_framework_error(
-    results: &fallow_types::results::AnalysisResults,
-    resolver: &OverrideSeverities<'_>,
-) -> bool {
-    results.invalid_client_exports.iter().any(|e| {
-        resolver
-            .effective_rules_for(&e.export.path)
-            .invalid_client_export
-            == Severity::Error
-    }) || results.mixed_client_server_barrels.iter().any(|b| {
-        resolver
-            .effective_rules_for(&b.barrel.path)
-            .mixed_client_server_barrel
-            == Severity::Error
-    }) || results.misplaced_directives.iter().any(|d| {
-        resolver
-            .effective_rules_for(&d.directive_site.path)
-            .misplaced_directive
-            == Severity::Error
-    }) || results.route_collisions.iter().any(|c| {
-        resolver
-            .effective_rules_for(&c.collision.path)
-            .route_collision
-            == Severity::Error
-    }) || results.dynamic_segment_name_conflicts.iter().any(|c| {
-        resolver
-            .effective_rules_for(&c.conflict.path)
-            .dynamic_segment_name_conflict
-            == Severity::Error
-    })
-}
-
-fn has_default_file_scoped_error(
-    results: &fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-) -> bool {
-    (rules.unused_files == Severity::Error && !results.unused_files.is_empty())
-        || (rules.unused_exports == Severity::Error && !results.unused_exports.is_empty())
-        || (rules.unused_types == Severity::Error && !results.unused_types.is_empty())
-        || (rules.private_type_leaks == Severity::Error && !results.private_type_leaks.is_empty())
-        || (rules.unused_enum_members == Severity::Error && !results.unused_enum_members.is_empty())
-        || (rules.unused_class_members == Severity::Error
-            && !results.unused_class_members.is_empty())
-        || (rules.unused_store_members == Severity::Error
-            && !results.unused_store_members.is_empty())
-        || (rules.unprovided_injects == Severity::Error && !results.unprovided_injects.is_empty())
-        || (rules.unrendered_components == Severity::Error
-            && !results.unrendered_components.is_empty())
-        || (rules.unused_component_props == Severity::Error
-            && !results.unused_component_props.is_empty())
-        || (rules.unused_component_emits == Severity::Error
-            && !results.unused_component_emits.is_empty())
-        || (rules.unused_component_inputs == Severity::Error
-            && !results.unused_component_inputs.is_empty())
-        || (rules.unused_component_outputs == Severity::Error
-            && !results.unused_component_outputs.is_empty())
-        || (rules.unused_svelte_events == Severity::Error
-            && !results.unused_svelte_events.is_empty())
-        || (rules.unused_server_actions == Severity::Error
-            && !results.unused_server_actions.is_empty())
-        || (rules.unused_load_data_keys == Severity::Error
-            && !results.unused_load_data_keys.is_empty())
-        || (rules.unresolved_imports == Severity::Error && !results.unresolved_imports.is_empty())
-        || results.stale_suppressions.iter().any(|s| {
-            if s.missing_reason {
-                rules.require_suppression_reason == Severity::Error
-            } else {
-                rules.stale_suppressions == Severity::Error
-            }
-        })
-        || (rules.unresolved_catalog_references == Severity::Error
-            && !results.unresolved_catalog_references.is_empty())
-        || (rules.empty_catalog_groups == Severity::Error
-            && !results.empty_catalog_groups.is_empty())
-        || (rules.invalid_client_export == Severity::Error
-            && !results.invalid_client_exports.is_empty())
-        || (rules.mixed_client_server_barrel == Severity::Error
-            && !results.mixed_client_server_barrels.is_empty())
-        || (rules.misplaced_directive == Severity::Error
-            && !results.misplaced_directives.is_empty())
-        || (rules.route_collision == Severity::Error && !results.route_collisions.is_empty())
-        || (rules.dynamic_segment_name_conflict == Severity::Error
-            && !results.dynamic_segment_name_conflicts.is_empty())
-}
-
-fn has_project_level_error(
-    results: &fallow_types::results::AnalysisResults,
-    rules: &RulesConfig,
-    has_overrides: bool,
-) -> bool {
-    (rules.unused_dependencies == Severity::Error && !results.unused_dependencies.is_empty())
-        || (rules.unused_dev_dependencies == Severity::Error
-            && !results.unused_dev_dependencies.is_empty())
-        || (rules.unused_optional_dependencies == Severity::Error
-            && !results.unused_optional_dependencies.is_empty())
-        || (rules.unlisted_dependencies == Severity::Error
-            && !results.unlisted_dependencies.is_empty())
-        || (rules.duplicate_exports == Severity::Error && !results.duplicate_exports.is_empty())
-        || (rules.type_only_dependencies == Severity::Error
-            && !results.type_only_dependencies.is_empty())
-        || (rules.test_only_dependencies == Severity::Error
-            && !results.test_only_dependencies.is_empty())
-        || (rules.dev_dependencies_in_production == Severity::Error
-            && !results.dev_dependencies_in_production.is_empty())
-        || (!has_overrides
-            && rules.circular_dependencies == Severity::Error
-            && !results.circular_dependencies.is_empty())
-        || (rules.re_export_cycle == Severity::Error && !results.re_export_cycles.is_empty())
-        || (!has_overrides
-            && rules.boundary_violation == Severity::Error
-            && !results.boundary_violations.is_empty())
-        || (!has_overrides
-            && rules.boundary_violation == Severity::Error
-            && !results.boundary_coverage_violations.is_empty())
-        || (!has_overrides
-            && rules.boundary_violation == Severity::Error
-            && !results.boundary_call_violations.is_empty())
-        || (rules.unused_catalog_entries == Severity::Error
-            && !results.unused_catalog_entries.is_empty())
-        || (rules.empty_catalog_groups == Severity::Error
-            && !results.empty_catalog_groups.is_empty())
-        || (rules.unused_dependency_overrides == Severity::Error
-            && !results.unused_dependency_overrides.is_empty())
-        || (rules.misconfigured_dependency_overrides == Severity::Error
-            && !results.misconfigured_dependency_overrides.is_empty())
-        // Policy violations gate on the EFFECTIVE per-finding severity baked
-        // by the evaluator (per-file override master + per-rule override),
-        // not on `rules.policy_violation`: a master of `warn` with one
-        // `severity: "error"` rule must still fail the run.
-        || results
-            .policy_violations
-            .iter()
-            .any(|v| v.violation.severity == fallow_types::results::PolicyViolationSeverity::Error)
-}
-
-/// Promote all `Warn` severities to `Error` for a single run.
-pub fn promote_warns_to_errors(rules: &mut RulesConfig) {
-    for rule in [
-        &mut rules.unused_files,
-        &mut rules.unused_exports,
-        &mut rules.unused_types,
-        &mut rules.private_type_leaks,
-        &mut rules.unused_dependencies,
-        &mut rules.unused_dev_dependencies,
-        &mut rules.unused_optional_dependencies,
-        &mut rules.unused_enum_members,
-        &mut rules.unused_class_members,
-        &mut rules.unused_store_members,
-        &mut rules.unprovided_injects,
-        &mut rules.unrendered_components,
-        &mut rules.unused_component_props,
-        &mut rules.unused_component_emits,
-        &mut rules.unused_component_inputs,
-        &mut rules.unused_component_outputs,
-        &mut rules.unused_svelte_events,
-        &mut rules.unused_server_actions,
-        &mut rules.unused_load_data_keys,
-        &mut rules.unresolved_imports,
-        &mut rules.unlisted_dependencies,
-        &mut rules.duplicate_exports,
-        &mut rules.type_only_dependencies,
-        &mut rules.test_only_dependencies,
-        &mut rules.dev_dependencies_in_production,
-        &mut rules.circular_dependencies,
-        &mut rules.re_export_cycle,
-        &mut rules.boundary_violation,
-        &mut rules.coverage_gaps,
-        &mut rules.stale_suppressions,
-        &mut rules.require_suppression_reason,
-        &mut rules.unused_catalog_entries,
-        &mut rules.empty_catalog_groups,
-        &mut rules.unresolved_catalog_references,
-        &mut rules.unused_dependency_overrides,
-        &mut rules.misconfigured_dependency_overrides,
-        &mut rules.policy_violation,
-        &mut rules.invalid_client_export,
-        &mut rules.mixed_client_server_barrel,
-        &mut rules.misplaced_directive,
-        &mut rules.route_collision,
-        &mut rules.dynamic_segment_name_conflict,
-    ] {
-        promote_warn_to_error(rule);
-    }
-}
-
-fn promote_warn_to_error(rule: &mut Severity) {
-    if *rule == Severity::Warn {
-        *rule = Severity::Error;
-    }
-}
-
-/// Promote per-finding `warn` policy-violation severities to `error` for a
-/// strict (fail-on-issues) run. Policy findings carry their effective
-/// severity baked by the evaluator, so the rule-level promotion in
-/// [`promote_warns_to_errors`] alone would not flip findings whose rule
-/// explicitly opted down to `warn`; under strict mode every warning fails.
-pub fn promote_policy_finding_warns(results: &mut fallow_types::results::AnalysisResults) {
-    use fallow_types::results::PolicyViolationSeverity;
-    for finding in &mut results.policy_violations {
-        if finding.violation.severity == PolicyViolationSeverity::Warn {
-            finding.violation.severity = PolicyViolationSeverity::Error;
-        }
-    }
+/// Promote every per-finding `warn` severity to `error` for a strict
+/// (fail-on-issues) run: the policy severities and the gate severity that the
+/// CI formats read. Run it again after each rule pass, because a rule pass
+/// writes the gate severities from the config again.
+pub fn promote_finding_warns(results: &mut fallow_types::results::AnalysisResults) {
+    promote_policy_finding_warns(results);
+    fallow_engine::dead_code::promote_effective_warns(results);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fallow_config::{RulesConfig, Severity};
+    use fallow_engine::error_severity::has_error_severity_issues;
 
     type RuleFieldSetter = fn(&mut RulesConfig);
     type ResultFieldCheck = fn(&AnalysisResults) -> bool;
@@ -874,6 +53,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         r.unused_types
             .push(UnusedTypeFinding::with_actions(UnusedExport {
@@ -884,6 +65,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         r.unused_dependencies
             .push(UnusedDependencyFinding::with_actions(UnusedDependency {
@@ -892,6 +75,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.unused_dev_dependencies
             .push(UnusedDevDependencyFinding::with_actions(UnusedDependency {
@@ -900,6 +84,7 @@ mod tests {
                 path: PathBuf::from("/project/package.json"),
                 line: 5,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         r.unused_enum_members
             .push(UnusedEnumMemberFinding::with_actions(UnusedMember {
@@ -978,6 +163,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -986,8 +172,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules,
@@ -1007,7 +195,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
         }
         .resolve(
@@ -1063,6 +253,7 @@ mod tests {
             unused_types: Severity::Off,
             private_type_leaks: Severity::Off,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Off,
             unused_dependencies: Severity::Off,
             unused_dev_dependencies: Severity::Off,
             unused_optional_dependencies: Severity::Off,
@@ -1072,10 +263,14 @@ mod tests {
             unprovided_injects: Severity::Off,
             unrendered_components: Severity::Off,
             unused_component_props: Severity::Off,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Off,
             unused_component_inputs: Severity::Off,
             unused_component_outputs: Severity::Off,
             unused_svelte_events: Severity::Off,
+            unused_effect_layers: Severity::Off,
+            unused_tagged_errors: Severity::Off,
+            unproduced_catch_tags: Severity::Off,
             unused_server_actions: Severity::Off,
             unused_load_data_keys: Severity::Off,
             prop_drilling: Severity::Off,
@@ -1086,6 +281,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Off,
             unlisted_dependencies: Severity::Off,
             duplicate_exports: Severity::Off,
@@ -1095,6 +293,7 @@ mod tests {
             boundary_violation: Severity::Error,
             circular_dependencies: Severity::Off,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Off,
             feature_flags: Severity::Off,
             stale_suppressions: Severity::Off,
@@ -1112,6 +311,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         let config = config_with_rules(rules);
         apply_rules(&mut results, &config);
@@ -1136,6 +340,10 @@ mod tests {
             (
                 |r| r.private_type_leaks = Severity::Off,
                 |res| res.private_type_leaks.is_empty(),
+            ),
+            (
+                |r| r.deprecated_exports_in_use = Severity::Off,
+                |res| res.deprecated_exports_in_use.is_empty(),
             ),
             (
                 |r| r.unused_dependencies = Severity::Off,
@@ -1207,6 +415,7 @@ mod tests {
             unused_types: Severity::Warn,
             private_type_leaks: Severity::Warn,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Warn,
             unused_dependencies: Severity::Warn,
             unused_dev_dependencies: Severity::Warn,
             unused_optional_dependencies: Severity::Warn,
@@ -1216,10 +425,14 @@ mod tests {
             unprovided_injects: Severity::Warn,
             unrendered_components: Severity::Warn,
             unused_component_props: Severity::Warn,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Warn,
             unused_component_inputs: Severity::Warn,
             unused_component_outputs: Severity::Warn,
             unused_svelte_events: Severity::Warn,
+            unused_effect_layers: Severity::Warn,
+            unused_tagged_errors: Severity::Warn,
+            unproduced_catch_tags: Severity::Warn,
             unused_server_actions: Severity::Warn,
             unused_load_data_keys: Severity::Warn,
             prop_drilling: Severity::Off,
@@ -1230,6 +443,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Warn,
             unlisted_dependencies: Severity::Warn,
             duplicate_exports: Severity::Warn,
@@ -1239,6 +455,7 @@ mod tests {
             boundary_violation: Severity::Error,
             circular_dependencies: Severity::Warn,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
             stale_suppressions: Severity::Warn,
@@ -1256,6 +473,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         assert!(!has_error_severity_issues(&results, &rules, None, false));
     }
@@ -1274,6 +496,7 @@ mod tests {
             unused_types: Severity::Warn,
             private_type_leaks: Severity::Warn,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Warn,
             unused_dependencies: Severity::Warn,
             unused_dev_dependencies: Severity::Warn,
             unused_optional_dependencies: Severity::Warn,
@@ -1283,10 +506,14 @@ mod tests {
             unprovided_injects: Severity::Warn,
             unrendered_components: Severity::Warn,
             unused_component_props: Severity::Warn,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Warn,
             unused_component_inputs: Severity::Warn,
             unused_component_outputs: Severity::Warn,
             unused_svelte_events: Severity::Warn,
+            unused_effect_layers: Severity::Warn,
+            unused_tagged_errors: Severity::Warn,
+            unproduced_catch_tags: Severity::Warn,
             unused_server_actions: Severity::Warn,
             unused_load_data_keys: Severity::Warn,
             prop_drilling: Severity::Off,
@@ -1297,6 +524,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Warn,
             unlisted_dependencies: Severity::Warn,
             duplicate_exports: Severity::Warn,
@@ -1306,6 +536,7 @@ mod tests {
             boundary_violation: Severity::Error,
             circular_dependencies: Severity::Warn,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
             stale_suppressions: Severity::Warn,
@@ -1323,6 +554,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         assert!(!has_error_severity_issues(&results, &rules, None, false));
 
@@ -1361,6 +597,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -1369,8 +606,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules: RulesConfig::default(), // all Error
@@ -1389,7 +628,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
             overrides: vec![fallow_config::ConfigOverride {
                 files: vec!["**/*.test.ts".to_string()],
@@ -1420,6 +661,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -1428,8 +670,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules: RulesConfig::default(),
@@ -1448,7 +692,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
             overrides: vec![fallow_config::ConfigOverride {
                 files: vec![pattern.to_string()],
@@ -1479,6 +725,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -1487,8 +734,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules: RulesConfig::default(),
@@ -1507,7 +756,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
             overrides: vec![fallow_config::ConfigOverride {
                 files: vec![pattern.to_string()],
@@ -1547,6 +798,7 @@ mod tests {
             import_specifier: "../db/query".to_string(),
             line: 1,
             col: 0,
+            via_path: None,
         })
     }
 
@@ -1571,6 +823,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_exports
@@ -1582,6 +836,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let config = config_with_test_override();
@@ -1681,6 +937,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let config = config_with_test_override();
@@ -1705,6 +963,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let config = config_with_test_override();
@@ -1846,6 +1106,7 @@ mod tests {
             unused_types: Severity::Warn,
             private_type_leaks: Severity::Warn,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Warn,
             unused_dependencies: Severity::Warn,
             unused_dev_dependencies: Severity::Warn,
             unused_optional_dependencies: Severity::Warn,
@@ -1855,10 +1116,14 @@ mod tests {
             unprovided_injects: Severity::Warn,
             unrendered_components: Severity::Warn,
             unused_component_props: Severity::Warn,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Warn,
             unused_component_inputs: Severity::Warn,
             unused_component_outputs: Severity::Warn,
             unused_svelte_events: Severity::Warn,
+            unused_effect_layers: Severity::Warn,
+            unused_tagged_errors: Severity::Warn,
+            unproduced_catch_tags: Severity::Warn,
             unused_server_actions: Severity::Warn,
             unused_load_data_keys: Severity::Warn,
             prop_drilling: Severity::Off,
@@ -1869,6 +1134,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Warn,
             unlisted_dependencies: Severity::Warn,
             duplicate_exports: Severity::Warn,
@@ -1878,6 +1146,7 @@ mod tests {
             boundary_violation: Severity::Error,
             circular_dependencies: Severity::Warn,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
             stale_suppressions: Severity::Warn,
@@ -1895,6 +1164,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         promote_warns_to_errors(&mut rules);
 
@@ -1902,6 +1176,7 @@ mod tests {
         assert_eq!(rules.unused_exports, Severity::Error);
         assert_eq!(rules.unused_types, Severity::Error);
         assert_eq!(rules.private_type_leaks, Severity::Error);
+        assert_eq!(rules.deprecated_exports_in_use, Severity::Error);
         assert_eq!(rules.unused_dependencies, Severity::Error);
         assert_eq!(rules.unused_dev_dependencies, Severity::Error);
         assert_eq!(rules.unused_optional_dependencies, Severity::Error);
@@ -1926,6 +1201,7 @@ mod tests {
             unused_types: Severity::Off,
             private_type_leaks: Severity::Off,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Off,
             unused_dependencies: Severity::Off,
             unused_dev_dependencies: Severity::Off,
             unused_optional_dependencies: Severity::Off,
@@ -1935,10 +1211,14 @@ mod tests {
             unprovided_injects: Severity::Off,
             unrendered_components: Severity::Off,
             unused_component_props: Severity::Off,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Off,
             unused_component_inputs: Severity::Off,
             unused_component_outputs: Severity::Off,
             unused_svelte_events: Severity::Off,
+            unused_effect_layers: Severity::Off,
+            unused_tagged_errors: Severity::Off,
+            unproduced_catch_tags: Severity::Off,
             unused_server_actions: Severity::Off,
             unused_load_data_keys: Severity::Off,
             prop_drilling: Severity::Off,
@@ -1949,6 +1229,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Off,
             unlisted_dependencies: Severity::Off,
             duplicate_exports: Severity::Off,
@@ -1958,6 +1241,7 @@ mod tests {
             boundary_violation: Severity::Error,
             circular_dependencies: Severity::Off,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Off,
             feature_flags: Severity::Off,
             stale_suppressions: Severity::Off,
@@ -1975,6 +1259,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         promote_warns_to_errors(&mut rules);
 
@@ -2053,6 +1342,7 @@ mod tests {
         let rules = RulesConfig {
             circular_dependencies: Severity::Warn,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             ..RulesConfig::default()
         };
         assert!(!has_error_severity_issues(&results, &rules, None, false));
@@ -2070,6 +1360,7 @@ mod tests {
                     path: PathBuf::from("/project/package.json"),
                     line: 5,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         let rules = RulesConfig::default();
@@ -2088,6 +1379,7 @@ mod tests {
                     path: PathBuf::from("/project/package.json"),
                     line: 5,
                     used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
                 },
             ));
         let rules = RulesConfig {
@@ -2152,6 +1444,7 @@ mod tests {
             framework: vec![],
             workspaces: None,
             ignore_dependencies: vec![],
+            ignore_command_entries: vec![],
             ignore_unresolved_imports: vec![],
             ignore_exports: vec![],
             ignore_catalog_references: vec![],
@@ -2160,8 +1453,10 @@ mod tests {
             used_class_members: vec![],
             ignore_decorators: vec![],
             unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+            circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
             duplicates: fallow_config::DuplicatesConfig::default(),
             similar_code: fallow_config::SimilarCodeConfig::default(),
+            mutation: fallow_config::MutationConfig::default(),
             health: fallow_config::HealthConfig::default(),
             type_aware: fallow_config::TypeAwareConfig::default(),
             rules: RulesConfig::default(),
@@ -2180,7 +1475,9 @@ mod tests {
             resolve: fallow_config::ResolveConfig::default(),
             sealed: false,
             include_entry_exports: false,
+            show_cascade: false,
             auto_imports: false,
+            fail_on_parse_error: false,
             cache: fallow_config::CacheConfig::default(),
             overrides: vec![fallow_config::ConfigOverride {
                 files: vec![pattern.to_string()],
@@ -2199,6 +1496,7 @@ mod tests {
 
     fn stale_suppression(path: &str, missing_reason: bool) -> StaleSuppression {
         StaleSuppression {
+            finding_id: None,
             path: PathBuf::from(path),
             line: 1,
             col: 0,
@@ -2214,6 +1512,7 @@ mod tests {
             },
             missing_reason,
             actions: StaleSuppression::actions_for(missing_reason),
+            effective_severity: None,
         }
     }
 
@@ -2430,6 +1729,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let config = config_with_override_for_rule("src/generated/**", |p| {
             p.unused_types = Some(Severity::Off);
@@ -2451,6 +1752,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let config = config_with_override_for_rule("src/generated/**", |p| {
             p.unused_types = Some(Severity::Off);
@@ -3254,6 +2557,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let config = config_with_override_for_rule("src/generated/**", |p| {
             p.unused_types = Some(Severity::Off);
@@ -3280,6 +2585,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let config = config_with_override_for_rule("src/generated/**", |p| {
             p.unused_types = Some(Severity::Off);
@@ -3924,6 +3231,7 @@ mod tests {
             unused_types: Severity::Warn,
             private_type_leaks: Severity::Warn,
             private_type_leaks_configured: false,
+            deprecated_exports_in_use: Severity::Warn,
             unused_dependencies: Severity::Warn,
             unused_dev_dependencies: Severity::Warn,
             unused_optional_dependencies: Severity::Warn,
@@ -3933,10 +3241,14 @@ mod tests {
             unprovided_injects: Severity::Warn,
             unrendered_components: Severity::Warn,
             unused_component_props: Severity::Warn,
+            absent_component_props: Severity::Off,
             unused_component_emits: Severity::Warn,
             unused_component_inputs: Severity::Warn,
             unused_component_outputs: Severity::Warn,
             unused_svelte_events: Severity::Warn,
+            unused_effect_layers: Severity::Warn,
+            unused_tagged_errors: Severity::Warn,
+            unproduced_catch_tags: Severity::Warn,
             unused_server_actions: Severity::Warn,
             unused_load_data_keys: Severity::Warn,
             prop_drilling: Severity::Off,
@@ -3947,6 +3259,9 @@ mod tests {
             css_selector_complexity: Severity::Off,
             css_dead_surface: Severity::Off,
             css_broken_reference: Severity::Off,
+            complexity_cyclomatic: Severity::Off,
+            complexity_cognitive: Severity::Off,
+            complexity_crap: Severity::Off,
             unresolved_imports: Severity::Warn,
             unlisted_dependencies: Severity::Warn,
             duplicate_exports: Severity::Warn,
@@ -3956,6 +3271,7 @@ mod tests {
             boundary_violation: Severity::Warn,
             circular_dependencies: Severity::Warn,
             re_export_cycle: Severity::Warn,
+            package_cycle: Severity::Warn,
             coverage_gaps: Severity::Warn,
             feature_flags: Severity::Warn,
             stale_suppressions: Severity::Warn,
@@ -3973,6 +3289,11 @@ mod tests {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Warn,
             dynamic_segment_name_conflict: Severity::Warn,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Warn,
         };
         assert!(!has_error_severity_issues(&results, &all_warn, None, false));
     }
@@ -4187,6 +3508,7 @@ mod tests {
             ));
         let rules = RulesConfig {
             unused_component_props: Severity::Off,
+            absent_component_props: Severity::Off,
             ..RulesConfig::default()
         };
         let config = config_with_rules(rules);
@@ -4277,6 +3599,9 @@ mod tests {
             }));
         let rules = RulesConfig {
             unused_svelte_events: Severity::Off,
+            unused_effect_layers: Severity::Off,
+            unused_tagged_errors: Severity::Off,
+            unproduced_catch_tags: Severity::Off,
             ..RulesConfig::default()
         };
         let config = config_with_rules(rules);
@@ -4346,5 +3671,69 @@ mod tests {
         let config = config_with_rules(rules);
         apply_rules(&mut results, &config);
         assert!(results.unprovided_injects.is_empty());
+    }
+
+    /// Base rules with `private-type-leaks` reportable, plus one override that
+    /// turns the rule off for `src/ui/**`.
+    fn config_with_private_type_leak_override() -> ResolvedConfig {
+        let base = config_with_rules(RulesConfig {
+            private_type_leaks: Severity::Warn,
+            ..RulesConfig::default()
+        });
+        ResolvedConfig {
+            overrides: vec![fallow_config::ResolvedOverride {
+                matchers: vec![
+                    globset::Glob::new("src/ui/**")
+                        .expect("override glob compiles")
+                        .compile_matcher(),
+                ],
+                rules: fallow_config::PartialRulesConfig {
+                    private_type_leaks: Some(Severity::Off),
+                    ..fallow_config::PartialRulesConfig::default()
+                },
+            }],
+            ..base
+        }
+    }
+
+    fn private_type_leak_at(path: &str) -> PrivateTypeLeakFinding {
+        PrivateTypeLeakFinding::with_actions(PrivateTypeLeak {
+            path: PathBuf::from(path),
+            export_name: "build".to_string(),
+            type_name: "Internal".to_string(),
+            line: 1,
+            col: 0,
+            span_start: 0,
+            semantic: None,
+        })
+    }
+
+    /// Type-aware reconciliation appends findings the syntactic pass never saw,
+    /// so both the CLI and the editor resolve severities again over the refined
+    /// set. Pins that the second pass reaches such a finding.
+    #[test]
+    fn override_off_removes_a_finding_appended_after_the_first_pass() {
+        let config = config_with_private_type_leak_override();
+        let mut results = AnalysisResults::default();
+        results
+            .private_type_leaks
+            .push(private_type_leak_at("/project/src/lib/util.ts"));
+
+        apply_rules(&mut results, &config);
+        assert_eq!(results.private_type_leaks.len(), 1);
+
+        // Stand in for the reconciliation stage, which pushes a semantic-only
+        // leak straight onto the already-filtered result set.
+        results
+            .private_type_leaks
+            .push(private_type_leak_at("/project/src/ui/kit.ts"));
+        apply_rules(&mut results, &config);
+
+        let paths: Vec<PathBuf> = results
+            .private_type_leaks
+            .iter()
+            .map(|finding| finding.leak.path.clone())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("/project/src/lib/util.ts")]);
     }
 }

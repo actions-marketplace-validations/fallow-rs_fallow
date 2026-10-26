@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   checkAuditSchemaDoc,
+  companionDocsDir,
   expectedAuditSchemaVersions,
   parseRustSchemaVersion,
   runAuditSchemaDocCheck,
@@ -111,6 +114,84 @@ test("audit documentation fails closed on missing or extra schema contexts", () 
   );
 });
 
+test("the companion checkout resolves as a sibling of the main checkout", () => {
+  assert.equal(
+    companionDocsDir({ gitCommonDir: ".git", repoRoot: "/checkouts/fallow" }),
+    "/checkouts/fallow-docs",
+  );
+  // A linked worktree lives under the main checkout, so only the common git
+  // directory names the checkout whose sibling the companion is.
+  assert.equal(
+    companionDocsDir({
+      gitCommonDir: "/checkouts/fallow/.git",
+      repoRoot: "/checkouts/fallow/.worktrees/topic",
+    }),
+    "/checkouts/fallow-docs",
+  );
+  assert.equal(
+    companionDocsDir({ gitCommonDir: null, repoRoot: "/checkouts/fallow" }),
+    "/checkouts/fallow-docs",
+  );
+  for (const gitCommonDir of [".git", "/checkouts/fallow/.git", null]) {
+    assert.equal(
+      companionDocsDir({
+        env: { FALLOW_DOCS_DIR: "/elsewhere/docs" },
+        gitCommonDir,
+        repoRoot: "/checkouts/fallow/.worktrees/topic",
+      }),
+      "/elsewhere/docs",
+    );
+  }
+});
+
+test("a guessed companion checkout that is absent skips instead of reporting drift", () => {
+  const root = mkdtempSync(join(tmpdir(), "fallow-audit-schema-skip-"));
+  const checkout = join(root, "checkout");
+  mkdirSync(join(checkout, "crates", "output", "src"), { recursive: true });
+  writeFileSync(
+    join(checkout, "crates", "output", "src", "root_envelopes.rs"),
+    "pub const AUDIT_SCHEMA_VERSION: u32 = 11;\n",
+  );
+  writeFileSync(
+    join(checkout, "crates", "output", "src", "check.rs"),
+    "pub const CHECK_SCHEMA_VERSION: u32 = 9;\n",
+  );
+
+  const skipped = runAuditSchemaDocCheck({ env: {}, gitCommonDir: ".git", repoRoot: checkout });
+  assert.equal(skipped.status, 0);
+  assert.match(skipped.message, /^skipped: no companion documentation checkout at /u);
+  assert.match(skipped.message, /FALLOW_DOCS_DIR/u);
+
+  // A named companion keeps failing closed, so continuous integration is unchanged.
+  const named = join(root, "fallow-docs");
+  assert.equal(runAuditSchemaDocCheck({ docsDir: named, env: {}, repoRoot: checkout }).status, 1);
+  assert.equal(
+    runAuditSchemaDocCheck({
+      env: { FALLOW_DOCS_DIR: named },
+      gitCommonDir: ".git",
+      repoRoot: checkout,
+    }).status,
+    1,
+  );
+
+  // A variable that is set but empty names no path, so the sibling guess still
+  // decides where to look, but it does ask for the check and cannot skip.
+  const empty = runAuditSchemaDocCheck({
+    env: { FALLOW_DOCS_DIR: "" },
+    gitCommonDir: ".git",
+    repoRoot: checkout,
+  });
+  assert.equal(empty.status, 1);
+  assert.match(empty.message, /expected companion doc not found/u);
+
+  // A companion checkout that exists but has lost the document is drift, even
+  // when the path was guessed.
+  mkdirSync(named, { recursive: true });
+  const present = runAuditSchemaDocCheck({ env: {}, gitCommonDir: ".git", repoRoot: checkout });
+  assert.equal(present.status, 1);
+  assert.match(present.message, /expected companion doc not found/u);
+});
+
 test("audit documentation parity fails closed when the companion is absent", () => {
   const root = mkdtempSync(join(tmpdir(), "fallow-audit-schema-parity-"));
   const result = runAuditSchemaDocCheck({ docsDir: join(root, "missing-docs") });
@@ -125,4 +206,33 @@ test("audit documentation parity fails closed when canonical sources are absent"
 
   assert.equal(result.status, 2);
   assert.match(result.message, /could not read canonical schema versions/u);
+});
+
+test("a CI run of check-audit-schema-doc-sync.mjs reports parity with a named companion", () => {
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const expected = expectedAuditSchemaVersions({
+    auditSource: readFileSync(join(repoRoot, "crates/output/src/root_envelopes.rs"), "utf8"),
+    checkSource: readFileSync(join(repoRoot, "crates/output/src/check.rs"), "utf8"),
+  });
+  const docsDir = mkdtempSync(join(tmpdir(), "fallow-audit-schema-start-"));
+  try {
+    mkdirSync(join(docsDir, "cli"));
+    writeFileSync(
+      join(docsDir, "cli", "audit.mdx"),
+      auditDocument({ audit: expected.audit, deadCode: expected.deadCode }),
+    );
+    const result = spawnSync(process.execPath, ["scripts/check-audit-schema-doc-sync.mjs"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { PATH: process.env.PATH, FALLOW_DOCS_DIR: docsDir },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      result.stdout,
+      `audit schema docs match source contracts: audit=${expected.audit}, dead_code=${expected.deadCode}\n`,
+    );
+  } finally {
+    rmSync(docsDir, { recursive: true, force: true });
+  }
 });

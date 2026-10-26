@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { clampMinLines, clampMinOccurrences } from "./duplication-utils.js";
 import type {
   AuditGate,
+  AuditWorsened,
   DiagnosticSeveritySetting,
   DuplicationMode,
   IssueTypeConfig,
@@ -55,6 +56,18 @@ export const getTypeAwareSettings = (): TypeAwareSettings => ({
     .filter((project) => project.length > 0),
   require: getConfig().get<TypeAwareRequireSetting>("typeAware.require", "best-effort"),
 });
+
+/**
+ * Wall clock in seconds allowed for one semantic sidecar request, forwarded as
+ * `FALLOW_TYPE_AWARE_TIMEOUT_SECS`. `0` keeps the CLI default. A semantic query
+ * scans the whole TypeScript program, so a very large program can need more
+ * than the default, and the editor is the surface where that is least
+ * discoverable.
+ */
+export const getTypeAwareTimeoutSeconds = (): number => {
+  const configured = getConfig().get<number>("typeAware.timeoutSeconds", 0);
+  return Number.isInteger(configured) && configured > 0 ? configured : 0;
+};
 
 const getConfigPath = (resource?: vscode.Uri): string =>
   getConfig(resource).get<string>("configPath", "").trim();
@@ -132,6 +145,9 @@ export const getDuplicationCrossLanguageOverride = (): boolean | undefined =>
 export const getDuplicationIgnoreImportsOverride = (): boolean | undefined =>
   getConfiguredValue<boolean>("duplication.ignoreImports");
 
+export const getDuplicationIgnoreSymlinksOverride = (): boolean | undefined =>
+  getConfiguredValue<boolean>("duplication.ignoreSymlinks");
+
 /**
  * Resolve `fallow.production` to a production-mode override forwarded to BOTH
  * the CLI-driven sidebar AND the LSP so the two editor surfaces agree. `true`
@@ -180,6 +196,17 @@ export const getCoverageTop = (): number => getConfig().get<number>("coverage.to
 export const getAuditGate = (): AuditGate => getConfig().get<AuditGate>("audit.gate", "new-only");
 
 /**
+ * How a worsened complexity finding affects the audit verdict. Mirrors
+ * `fallow audit --worsened`. `undefined` (`"auto"`, the default, or unset)
+ * defers to `audit.worsened` in the project config. Uses the inspect-based
+ * override pattern so an unset editor value never overrides project config.
+ */
+export const getAuditWorsened = (): AuditWorsened | undefined => {
+  const value = getConfiguredValue<string>("audit.worsened");
+  return value === "warn" || value === "error" || value === "off" ? value : undefined;
+};
+
+/**
  * Whether the audit verdict status-bar item is created. Default on; creating an
  * idle item runs no analysis, so this only controls the surface, not cost.
  */
@@ -223,6 +250,10 @@ export const getMutedDiagnosticCategories = (): ReadonlySet<string> => {
 export const getAuditRunOnSave = (): boolean => getConfig().get<boolean>("audit.runOnSave", false);
 
 export const getChangedSince = (): string => getConfig().get<string>("changedSince", "").trim();
+
+/** `false` turns `workspaces.changedSince` off, as `--no-package-baselines` does. */
+export const getPackageBaselines = (): boolean =>
+  getConfig().get<boolean>("packageBaselines", true);
 
 export const getHealthEnabled = (): boolean => getConfig().get<boolean>("health.enabled", true);
 

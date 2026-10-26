@@ -27,9 +27,13 @@ for contributors and maintainers of the open-source codebase.
   steps and the invariants the policy tests assert
 - [Release security](development/release-security.md): credential boundaries
   and publication workflow ownership.
+- [Dependency updates](development/dependency-updates.md): Dependabot
+  auto-merge, the repair workflow, and its setup.
 
 ## Architecture and extension points
 
+- [Architecture overview](architecture.md): pipeline, external interfaces, and
+  trust boundaries.
 - [Architecture invariants](architecture-invariants.md): crate boundaries,
   dependency direction, and ownership rules.
 - [Analyzer authoring](analyzer-authoring.md): adding and registering analyzers.
@@ -43,6 +47,8 @@ for contributors and maintainers of the open-source codebase.
   boundaries, evidence policy, packaging, and corpus validation.
 - [Similar-code analysis](similar-code-analysis.md): local semantic discovery,
   inspect and verdict flow, privacy boundary, packaging, and version 1 scope.
+- [Mutation testing](mutation-testing.md): the opt-in `fallow mutation`
+  command, its safety boundary, exit codes, verdicts, inspect, and config.
 
 ## Internal implementation references
 
@@ -65,6 +71,8 @@ for contributors and maintainers of the open-source codebase.
 
 ## Verification and operations
 
+- [Drift contract](development/drift-contract.md): rules that keep commands
+  and surfaces in agreement, and the harness that checks them.
 - [Benchmarking](benchmarking.md): performance measurement and benchmark
   maintenance.
 - [Public config corpus](public-config-corpus.md): safe public configuration

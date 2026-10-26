@@ -6,19 +6,19 @@ use serde_json::{Value, json};
 use crate::{ACTIONS_AUTO_FIXABLE_FIELD_DEFINITION, ACTIONS_FIELD_DEFINITION};
 
 /// Docs URL for the duplication command.
-pub const DUPES_DOCS: &str = "https://docs.fallow.tools/cli/dupes";
+pub const DUPES_DOCS: &str = "https://fallow.tools/docs/cli/dupes/";
 
 /// Docs URL for the runtime coverage setup command's agent-readable JSON.
-pub const COVERAGE_SETUP_DOCS: &str = "https://docs.fallow.tools/cli/coverage#agent-readable-json";
+pub const COVERAGE_SETUP_DOCS: &str = "https://fallow.tools/docs/cli/coverage/#agent-readable-json";
 
 /// Docs URL for `fallow coverage analyze --format json --explain`.
-pub const COVERAGE_ANALYZE_DOCS: &str = "https://docs.fallow.tools/cli/coverage#analyze";
+pub const COVERAGE_ANALYZE_DOCS: &str = "https://fallow.tools/docs/cli/coverage/#analyze";
 
 /// Docs URL for the health command.
-pub const HEALTH_DOCS: &str = "https://docs.fallow.tools/cli/health";
+pub const HEALTH_DOCS: &str = "https://fallow.tools/docs/cli/health/";
 
 /// Docs URL for the security command.
-pub const SECURITY_DOCS: &str = "https://docs.fallow.tools/cli/security";
+pub const SECURITY_DOCS: &str = "https://fallow.tools/docs/cli/security/";
 
 /// Output-facing metadata for one security rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub fn security_meta<'a>(rules: impl IntoIterator<Item = SecurityRuleMeta<'a>>) 
                     MetaRule {
                         name: Some(rule.name.to_string()),
                         description: Some(rule.description.to_string()),
-                        docs: Some(report_rule_docs_url(rule.docs_path)),
+                        docs: Some(crate::issue_contract::rule_docs_url(rule.docs_path)),
                     },
                 )
             })
@@ -255,20 +255,24 @@ pub fn coverage_analyze_meta() -> Value {
             "runtime_coverage._matching": "Function-identity fallback order when joining runtime evidence to local static analysis: (1) exact stable_id match (fallow:fn:<hash>) when both sides carry one; (2) exact (path, name, start_line); (3) fuzzy nearest candidate within a line tolerance. Baseline suppression accepts BOTH the stable_id and the legacy fallow:prod: id during the grace window, so baselines written before this version keep suppressing.",
             "runtime_coverage.findings[].evidence.static_status": "used = the function is reachable in the AST module graph; unused = it is dead by static analysis.",
             "runtime_coverage.findings[].evidence.test_coverage": "covered = the local test suite hits the function; not_covered otherwise.",
+            "runtime_coverage.findings[].evidence.test_only_reference": "true = the function is unreachable in the production module graph but still referenced from a file production mode excludes (test, spec, story, fixture, benchmark), so it is not dead code and never earns safe_to_delete; false = both graphs were compared and no such reference exists. Omitted from the JSON entirely when the run applied no production filter or the producing surface carries no second reachability answer.",
             "runtime_coverage.findings[].evidence.v8_tracking": "tracked = V8 observed the function during the capture window; untracked otherwise.",
             "runtime_coverage.findings[].actions[].type": "Suggested follow-up identifier. delete-cold-code is emitted on safe_to_delete; review-runtime on review_required.",
             "runtime_coverage.blast_radius[]": "First-class blast-radius entries with stable fallow:blast IDs, static caller count, traffic-weighted caller reach, optional cloud deploy touch count, and low/medium/high risk band.",
-            "runtime_coverage.importance[]": "First-class production-importance entries with stable fallow:importance IDs, invocations, cyclomatic complexity, owner count, 0-100 importance score, and templated reason.",
-            "runtime_coverage.warnings[].code": "Stable warning identifier. cloud_functions_unmatched flags entries dropped because no AST/static counterpart was found locally."
+            "runtime_coverage.importance[]": "First-class production-importance entries with stable fallow:importance IDs, invocations, cyclomatic complexity, owner count, 0-100 importance score, and templated reason. importance ranks the risk of a change; use hot_paths[].optimization_target to rank speed work.",
+            "runtime_coverage.hot_paths[].optimization_target": "Speed-work inputs for a hot function: cost_score (invocations multiplied by the per-call cost, uncapped), cost_basis (inner_iterations when V8 block counts exist, else cognitive), cognitive, cyclomatic, line_count, and inner_iterations_per_call (peak block executions per call, block-coverage dumps only). Omitted when the hot path has no stable_id or no static counterpart. cognitive is a static proxy for the work per call, not a measurement.",
+            "runtime_coverage.warnings[].code": "Stable warning identifier. cloud_functions_unmatched flags entries dropped because no AST/static counterpart was found locally. optimization_target_unmatched counts hot paths without an optimization_target: the hot path has no stable_id, or no static function matches its stable_id."
         },
         "enums": {
             "data_source": ["local", "cloud"],
             "report_verdict": ["clean", "hot-path-touched", "cold-code-detected", "license-expired-grace", "unknown"],
             "finding_verdict": ["safe_to_delete", "review_required", "coverage_unavailable", "low_traffic", "active", "unknown"],
             "static_status": ["used", "unused"],
+            "test_only_reference": [true, false],
             "test_coverage": ["covered", "not_covered"],
             "v8_tracking": ["tracked", "untracked"],
-            "action_type": ["delete-cold-code", "review-runtime"]
+            "action_type": ["delete-cold-code", "review-runtime"],
+            "cost_basis": ["inner_iterations", "cognitive"]
         },
         "warnings": {
             "no_runtime_data": "Cloud returned an empty runtime window. Either the period is too narrow or no traces have been ingested yet.",
@@ -365,11 +369,60 @@ fn security_field_definitions() -> BTreeMap<String, String> {
 fn health_metrics() -> BTreeMap<String, MetaMetric> {
     let mut metrics = BTreeMap::new();
     metrics.extend(health_complexity_metrics());
+    metrics.extend(health_population_metrics());
     metrics.extend(health_churn_and_target_metrics());
+    metrics.extend(health_change_history_metrics());
     metrics.extend(health_ownership_metrics());
     metrics.extend(health_runtime_metrics());
     metrics.extend(health_styling_metrics());
     metrics
+}
+
+fn health_population_metrics() -> [(String, MetaMetric); 6] {
+    [
+        health_metric(
+            "avg_cyclomatic",
+            "Average Cyclomatic Complexity",
+            "Mean over authored function, module-scope, and template units before finding filters. Divide the sum of cyclomatic_population group sums by the sum of their counts, rounded to one decimal.",
+            Some("[0, infinity)"),
+            "zero for an empty population; lower is better",
+        ),
+        health_metric(
+            "p90_cyclomatic",
+            "P90 Cyclomatic Complexity",
+            "Nearest-rank 90th percentile over the same units as avg_cyclomatic, including module scopes and templates.",
+            Some("[0, infinity)"),
+            "zero for an empty population; lower is better",
+        ),
+        health_metric(
+            "critical_complexity_pct",
+            "Critical Cyclomatic Share",
+            "Percentage of the cyclomatic unit population at or above the critical threshold, including module scopes and templates.",
+            Some("[0, 100]"),
+            "absent for an empty population; lower is better",
+        ),
+        health_metric(
+            "cyclomatic_population.count",
+            "Cyclomatic Population Count",
+            "Unit count in each disjoint functions, modules, or templates group. Modules contribute to aggregate metrics without producing function findings.",
+            Some("[0, infinity)"),
+            "sum the three counts to obtain the distribution denominator",
+        ),
+        health_metric(
+            "cyclomatic_population.sum",
+            "Cyclomatic Population Sum",
+            "Sum of cyclomatic values in each functions, modules, or templates group before rounding and threshold filtering.",
+            Some("[0, infinity)"),
+            "sum the three groups to obtain the mean numerator",
+        ),
+        health_metric(
+            "cyclomatic_population.max",
+            "Cyclomatic Population Maximum",
+            "Highest cyclomatic value within each functions, modules, or templates group; null when that group has no units.",
+            Some("[1, infinity) or null"),
+            "identifies which kind of unit drives the tail; module units remain aggregate-only",
+        ),
+    ]
 }
 
 fn health_complexity_metrics() -> [(String, MetaMetric); 11] {
@@ -454,7 +507,7 @@ fn health_complexity_metrics() -> [(String, MetaMetric); 11] {
     ]
 }
 
-fn health_churn_and_target_metrics() -> [(String, MetaMetric); 8] {
+fn health_churn_and_target_metrics() -> [(String, MetaMetric); 10] {
     [
         health_metric(
             "score",
@@ -512,6 +565,46 @@ fn health_churn_and_target_metrics() -> [(String, MetaMetric); 8] {
             Some("[0, 100]"),
             "higher is better; missing metrics are not penalized",
         ),
+        health_metric(
+            "health_score.formula_version",
+            "Health Score Formula Version",
+            "Version of the health-scoring rubric used to produce the current score.",
+            Some("[1, infinity)"),
+            "compare score values only when both formula versions are known and equal",
+        ),
+        health_metric(
+            "health_trend.compared_to.score_formula_version",
+            "Baseline Health Score Formula Version",
+            "Formula version saved with the historical score; absent on legacy or unscored snapshots.",
+            Some("[1, infinity)"),
+            "the score delta is omitted when formula versions are unknown or different; available raw metric trends remain comparable",
+        ),
+    ]
+}
+
+fn health_change_history_metrics() -> [(String, MetaMetric); 3] {
+    [
+        health_metric(
+            "median_files_per_commit",
+            "Change Dispersion (Files)",
+            "Median number of analyzed files in the commits that changed this file. Bulk commits above the change coupling file cap are not counted.",
+            Some("[1, infinity)"),
+            "higher means a change to this file usually spreads over more files",
+        ),
+        health_metric(
+            "median_lines_per_commit",
+            "Change Dispersion (Lines)",
+            "Median number of added plus deleted lines, analyzed files only, in the commits that changed this file.",
+            Some("[0, infinity)"),
+            "higher means a change to this file is usually large",
+        ),
+        health_metric(
+            "degree",
+            "Change Coupling Degree",
+            "Shared commits of two files divided by the mean commit count of the two files.",
+            Some("[0, 1]"),
+            "higher means the two files change together more often; a hidden pair has no import between the files",
+        ),
     ]
 }
 
@@ -562,7 +655,7 @@ fn health_ownership_metrics() -> [(String, MetaMetric); 6] {
     ]
 }
 
-fn health_runtime_metrics() -> [(String, MetaMetric); 5] {
+fn health_runtime_metrics() -> [(String, MetaMetric); 7] {
     [
         health_metric(
             "runtime_coverage_verdict",
@@ -598,6 +691,20 @@ fn health_runtime_metrics() -> [(String, MetaMetric); 5] {
             "Fraction of tracked functions with zero observed invocations, multiplied by 100.",
             Some("[0, 100]"),
             "lower is better",
+        ),
+        health_metric(
+            "optimization_cost_score",
+            "Optimization Cost Score",
+            "Invocations multiplied by the per-call cost, on runtime_coverage.hot_paths[].optimization_target. The per-call cost is the peak block executions per call from V8 block coverage (cost_basis inner_iterations), or static cognitive complexity with a minimum of 1 when the function has no usable block counts (cost_basis cognitive).",
+            Some("[0, infinity)"),
+            "higher means a larger speed gain; compare it only between hot paths with the same cost_basis. importance ranks the risk of a change, not the speed gain",
+        ),
+        health_metric(
+            "inner_iterations_per_call",
+            "Inner Iterations per Call",
+            "Peak executions of one block inside a hot function per call, from V8 block coverage.",
+            Some("[1, infinity)"),
+            "1.0 means no block ran more than once per call; 3.0 means a loop body ran 3 times per call. Calls to other functions do not change the value",
         ),
     ]
 }
@@ -708,10 +815,6 @@ fn metric(
     }
 }
 
-fn report_rule_docs_url(docs_path: &str) -> String {
-    format!("https://docs.fallow.tools/{docs_path}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +852,11 @@ mod tests {
         assert!(meta.field_definitions.contains_key("actions[]"));
         assert!(meta.metrics.contains_key("cyclomatic"));
         assert!(meta.metrics.contains_key("health_score"));
+        assert!(meta.metrics.contains_key("health_score.formula_version"));
+        assert!(
+            meta.metrics
+                .contains_key("health_trend.compared_to.score_formula_version")
+        );
         assert!(meta.metrics.contains_key("max_render_fan_in"));
         assert!(meta.metrics.contains_key("percent_dead_in_production"));
         assert!(meta.metrics.contains_key("styling_health.score"));
@@ -775,7 +883,7 @@ mod tests {
         assert!(meta.metrics.is_empty());
         assert_eq!(
             meta.rules["security/example"].docs.as_deref(),
-            Some("https://docs.fallow.tools/cli/security")
+            Some("https://fallow.tools/docs/cli/security/")
         );
     }
 

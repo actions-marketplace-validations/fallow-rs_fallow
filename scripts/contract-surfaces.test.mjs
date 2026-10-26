@@ -1,30 +1,15 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { contractSurfacePaths, contractSurfaces } from "./contract-surfaces.mjs";
+import {
+  MUTATION_COMPANION_FILES,
+  MUTATION_COMPANION_SOURCE_ROOT,
+  contractSurfaces,
+} from "./contract-surfaces.mjs";
 import { checkGithubActionsPathFilter } from "./check-contract-surfaces.mjs";
 
-const EXPECTED_GENERATED_PATHS = [
-  "crates/napi/index.d.ts",
-  "docs/output-schema.json",
-  "editors/vscode/package.json",
-  "editors/vscode/src/generated/issue-types.ts",
-  "editors/vscode/src/generated/lsp-initialization-options.d.ts",
-  "editors/vscode/src/generated/output-contract.d.ts",
-  "npm/fallow/capabilities.json",
-  "npm/fallow/issue-registry.json",
-  "npm/fallow/skills/fallow/SKILL.md",
-  "npm/fallow/skills/fallow/references/cli-reference.md",
-  "npm/fallow/skills/fallow/references/mcp.md",
-  "npm/fallow/types/output-contract.d.ts",
-  "plugin-schema.json",
-  "rule-pack-schema.json",
-  "schema.json",
-  "tools/type-aware-sidecar/src/generated-protocol.mjs",
-].toSorted();
-
-test("contract surface ids and generated paths are stable and unique", () => {
+test("contract surface ids and generated paths are unique relative literals", () => {
   const ids = contractSurfaces.map((surface) => surface.id);
   assert.deepEqual(ids, [...new Set(ids)]);
 
@@ -41,7 +26,8 @@ test("contract surface ids and generated paths are stable and unique", () => {
     }
   }
 
-  assert.deepEqual(contractSurfacePaths(), EXPECTED_GENERATED_PATHS);
+  const paths = contractSurfaces.flatMap((surface) => surface.generatedPaths);
+  assert.deepEqual(paths, [...new Set(paths)]);
 });
 
 test("current CI rust path filter covers generated contract surfaces", () => {
@@ -87,4 +73,25 @@ jobs:
       surfaceId: "fixture",
     },
   ]);
+});
+
+test("every mutation companion runtime source has an embedded copy", () => {
+  const sources = readdirSync(MUTATION_COMPANION_SOURCE_ROOT, {
+    recursive: true,
+    withFileTypes: true,
+  })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".mjs"))
+    .map((entry) =>
+      `${entry.parentPath}/${entry.name}`
+        .replaceAll("\\", "/")
+        .slice(MUTATION_COMPANION_SOURCE_ROOT.length + 1),
+    )
+    .toSorted();
+
+  assert.deepEqual([...MUTATION_COMPANION_FILES].toSorted(), sources);
+  const companion = contractSurfaces.find((surface) => surface.id === "mutation-runner-companion");
+  assert.deepEqual(
+    companion.generatedPaths,
+    MUTATION_COMPANION_FILES.map((file) => `crates/api/src/mutation/companion/${file}`),
+  );
 });

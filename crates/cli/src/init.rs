@@ -2,7 +2,6 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use fallow_config::{ExternalPluginDef, FallowConfig, PackageJson};
-use fallow_engine::changed_files::clear_ambient_git_env;
 
 use crate::validate;
 
@@ -44,14 +43,18 @@ This file gives coding agents project-specific context. Keep it short and update
 |---|---|
 | delete an "unused" export or file | `fallow dead-code --trace <file>:<export>` |
 | prove a TypeScript symbol's exact consumers before refactoring | `fallow dead-code --type-aware --symbol-impact <file>:<export-or-class.method>` |
+| find how one module reaches another | `fallow trace --path <from> <to>` (Reports `reachable: false` instead of failing when no import path exists; type-only hops are reported, not skipped.) |
 | delete an "unused" dependency | `fallow dead-code --trace-dependency <name>` |
+| migrate a dependency | `fallow trace --dependency <name> --sites` (Counts each imported name, follows one hop through project wrappers, and counts each use that it cannot resolve.) |
 | commit or open a PR | `fallow audit --base <ref>` |
+| read a diff before approving it | `fallow review --base <ref> --brief` (orientation, never gates: deterministic and always exit 0, unlike the audit row) |
 | prioritize refactoring | `fallow health --hotspots --targets` |
 | ask who owns code | `fallow health --ownership` |
 | check untested-but-reachable code | `fallow health --coverage-gaps` |
 | consolidate duplication | `fallow dupes --trace dup:<fingerprint>` |
 | find feature flags | `fallow flags` |
 | check which architecture rules apply to a file before changing it | `fallow guard <files>` |
+| check import cycles, boundaries and policy rules after changing code | `fallow architecture` |
 | surface security candidates | `fallow security` |
 | understand a finding | `fallow explain <issue-type>` |
 | scope a monorepo | `--workspace <glob> / --changed-workspaces <ref>` (global flags, prefix any command) |
@@ -90,6 +93,13 @@ pub struct ProjectInfo {
     pub has_local_schema: bool,
 }
 
+/// One project-inspection snapshot shared by consumers that need both the
+/// detected shape and the dependency names that produced its framework facts.
+pub struct ProjectDetection {
+    pub(crate) info: ProjectInfo,
+    pub(crate) dependency_names: Vec<String>,
+}
+
 /// Detected workspace shape: monorepo flag, package patterns, and tool name.
 struct WorkspaceShape {
     is_monorepo: bool,
@@ -99,6 +109,12 @@ struct WorkspaceShape {
 
 /// Inspect the project root and detect frameworks, workspace setup, etc.
 pub fn detect_project(root: &Path) -> ProjectInfo {
+    detect_project_with_dependencies(root).info
+}
+
+/// Inspect the project once and retain the dependency union for consumers
+/// whose output also depends on workspace-wide framework presence.
+pub fn detect_project_with_dependencies(root: &Path) -> ProjectDetection {
     let has_typescript = root.join("tsconfig.json").exists();
     let has_storybook = root.join(".storybook").is_dir();
     let has_local_schema = has_local_schema_file(root);
@@ -107,10 +123,10 @@ pub fn detect_project(root: &Path) -> ProjectInfo {
 
     let workspace = detect_workspace_shape(root, pkg.as_ref());
 
-    let all_deps = collect_dependency_names(root, pkg.as_ref(), workspace.is_monorepo);
+    let dependency_names = collect_dependency_names(root, pkg.as_ref(), workspace.is_monorepo);
 
-    let (test_framework, test_framework_ambiguous) = detect_test_framework(&all_deps);
-    let ui_framework = detect_ui_framework(&all_deps);
+    let (test_framework, test_framework_ambiguous) = detect_test_framework(&dependency_names);
+    let ui_framework = detect_ui_framework(&dependency_names);
 
     // Extract just the manager name from `packageManager` (e.g. "pnpm@9.1.0" -> "pnpm").
     let package_manager = pkg
@@ -120,17 +136,20 @@ pub fn detect_project(root: &Path) -> ProjectInfo {
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    ProjectInfo {
-        is_monorepo: workspace.is_monorepo,
-        workspace_patterns: workspace.patterns,
-        workspace_tool: workspace.tool,
-        has_typescript,
-        test_framework,
-        ui_framework,
-        has_storybook,
-        package_manager,
-        test_framework_ambiguous,
-        has_local_schema,
+    ProjectDetection {
+        info: ProjectInfo {
+            is_monorepo: workspace.is_monorepo,
+            workspace_patterns: workspace.patterns,
+            workspace_tool: workspace.tool,
+            has_typescript,
+            test_framework,
+            ui_framework,
+            has_storybook,
+            package_manager,
+            test_framework_ambiguous,
+            has_local_schema,
+        },
+        dependency_names,
     }
 }
 
@@ -531,7 +550,7 @@ fn build_toml_config(info: &ProjectInfo) -> String {
 
     let mut lines = vec![
         "# fallow.toml - Codebase analysis configuration".to_string(),
-        "# See https://docs.fallow.tools for documentation".to_string(),
+        "# See https://fallow.tools/docs/ for documentation".to_string(),
         String::new(),
     ];
 
@@ -654,6 +673,8 @@ pub struct GitHooksInstallOptions<'a> {
     pub branch: Option<&'a str>,
     pub dry_run: bool,
     pub force: bool,
+    /// Run `fallow baselines prune` before the audit and stage the pruned files.
+    pub prune_baselines: bool,
 }
 
 /// Options for uninstalling a managed Git pre-commit hook.
@@ -676,9 +697,10 @@ pub fn run_init(opts: &InitOptions<'_>) -> ExitCode {
             branch: opts.branch,
             dry_run: false,
             force: false,
+            prune_baselines: false,
         });
     }
-    run_init_config(opts.root, opts.use_toml)
+    run_init_config(opts.root, opts.use_toml, opts.quiet)
 }
 
 /// `init --decline`: persist a deliberate "stay unconfigured" decision so the
@@ -687,7 +709,13 @@ pub fn run_init(opts: &InitOptions<'_>) -> ExitCode {
 /// (no new state file); this neither enables Impact tracking nor writes a
 /// config file.
 fn run_init_decline(root: &Path, quiet: bool) -> ExitCode {
-    let newly = crate::impact::decline_onboarding(root);
+    let newly = match crate::impact::decline_onboarding(root) {
+        Ok(newly) => newly,
+        Err(newer) => {
+            eprintln!("{}", newer.message());
+            return ExitCode::from(2);
+        }
+    };
     if !quiet {
         println!(
             "{}",
@@ -701,7 +729,7 @@ fn run_init_decline(root: &Path, quiet: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_init_config(root: &Path, use_toml: bool) -> ExitCode {
+fn run_init_config(root: &Path, use_toml: bool, quiet: bool) -> ExitCode {
     let existing_names = [
         ".fallowrc.json",
         ".fallowrc.jsonc",
@@ -738,8 +766,38 @@ fn run_init_config(root: &Path, use_toml: bool) -> ExitCode {
 
     print_detection_summary(&info);
     ensure_gitignore(root);
+    if !quiet {
+        let cwd = std::env::current_dir().ok();
+        eprintln!("{}", init_next_step(root, cwd.as_deref()));
+    }
 
     ExitCode::SUCCESS
+}
+
+/// The line `fallow init` prints after it writes the config. Without it, the
+/// first run ends with no pointer to the first report.
+///
+/// When the config root is not the current directory, both commands carry
+/// `--root`, because a bare `fallow` analyzes the current directory.
+fn init_next_step(root: &Path, cwd: Option<&Path>) -> String {
+    let same_dir =
+        cwd.is_some_and(
+            |cwd| match (dunce::canonicalize(root), dunce::canonicalize(cwd)) {
+                (Ok(root), Ok(cwd)) => root == cwd,
+                _ => false,
+            },
+        );
+    let root_flag = if same_dir {
+        String::new()
+    } else {
+        format!(
+            " --root {}",
+            fallow_engine::shell_quote::shell_quote(&root.to_string_lossy())
+        )
+    };
+    format!(
+        "Next: run `fallow{root_flag}` for a first report. Run `fallow agent install --dry-run{root_flag}` to see the setup for coding agents."
+    )
 }
 
 fn run_init_agents(root: &Path) -> ExitCode {
@@ -800,22 +858,10 @@ fn ensure_gitignore(root: &Path) {
     }
 }
 
-/// Detect the default branch name by querying git.
+/// The remote default branch name, such as `main`, for the hook fallback.
 fn detect_default_branch(root: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .current_dir(root);
-    clear_ambient_git_env(&mut command);
-    let output = command.output().ok()?;
-    if output.status.success() {
-        let full_ref = String::from_utf8(output.stdout).ok()?;
-        return full_ref
-            .trim()
-            .strip_prefix("refs/remotes/origin/")
-            .map(String::from);
-    }
-    None
+    fallow_engine::repo_refs::detect_remote_default_ref(root)
+        .and_then(|remote_ref| remote_ref.strip_prefix("origin/").map(str::to_owned))
 }
 
 pub const GIT_HOOK_MARKER: &str = "# Generated by fallow hooks install --target git.";
@@ -823,12 +869,17 @@ pub const GIT_HOOK_MARKER: &str = "# Generated by fallow hooks install --target 
 /// Hint printed when an existing pre-commit hook prevents installation.
 /// Mirrors the resolution block emitted by [`run_git_hooks_install`] so the
 /// caller can paste it into their existing hook by hand.
-fn existing_hook_hint(hook_path: &str, fallback_base_ref: &str) -> String {
+fn existing_hook_hint(hook_path: &str, fallback_base_ref: &str, prune_baselines: bool) -> String {
+    let prune = if prune_baselines {
+        indent_block(&prune_baselines_block("fallow"), "  ")
+    } else {
+        String::new()
+    };
     format!(
         r#"Error: {hook_path} already exists. Add the following block to your existing hook:
 
   command -v fallow >/dev/null 2>&1 || exit 0
-  UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+{prune}  UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
   if [ -n "$UPSTREAM" ]; then
     BASE="$(git merge-base "$UPSTREAM" HEAD 2>/dev/null || echo "$UPSTREAM")"
   else
@@ -840,7 +891,12 @@ fn existing_hook_hint(hook_path: &str, fallback_base_ref: &str) -> String {
 
 /// Hint printed when Lefthook is the active hook manager. Resolves package-local
 /// launchers under a `run: |` scalar without changing standalone hook behavior.
-fn lefthook_hint(fallback_base_ref: &str) -> String {
+fn lefthook_hint(fallback_base_ref: &str, prune_baselines: bool) -> String {
+    let prune = if prune_baselines {
+        indent_block(&prune_baselines_block("run_fallow"), "          ")
+    } else {
+        String::new()
+    };
     format!(
         r#"Lefthook detected. Add the following to your lefthook.yml:
 
@@ -859,7 +915,7 @@ fn lefthook_hint(fallback_base_ref: &str) -> String {
           else
             exit 0
           fi
-          UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+{prune}          UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
           if [ -n "$UPSTREAM" ]; then
             BASE="$(git merge-base "$UPSTREAM" HEAD 2>/dev/null || echo "$UPSTREAM")"
           else
@@ -867,6 +923,46 @@ fn lefthook_hint(fallback_base_ref: &str) -> String {
           fi
           run_fallow audit --base "$BASE" --quiet --gate-marker pre-commit"#
     )
+}
+
+/// The hook lines that prune the configured baselines before the audit.
+///
+/// The prune reads the working tree, while the commit carries the index. So the
+/// step runs only when the working tree matches the index: no unstaged change
+/// and no untracked file. Then the files that `git add -u` stages are exactly
+/// the files that the prune wrote. A commit with paths (`git commit <path>`,
+/// `--only`) builds a temporary `next-index-*` index, and a file staged there
+/// does not reach the real index, so the step skips it. A failed prune, or an
+/// older fallow without the command, never blocks the commit: the audit stays
+/// the gate.
+fn prune_baselines_block(run: &str) -> String {
+    format!(
+        r#"case "${{GIT_INDEX_FILE:-}}" in
+  *next-index-*)
+    echo "fallow: skipped baselines prune: a commit with paths uses a temporary index" >&2
+    ;;
+  *)
+    if ! git diff --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+      echo "fallow: skipped baselines prune: the working tree has unstaged or untracked changes" >&2
+    elif {run} baselines prune --quiet; then
+      git add -u
+    else
+      echo "fallow: baselines prune did not finish; the commit continues" >&2
+    fi
+    ;;
+esac
+"#
+    )
+}
+
+fn indent_block(block: &str, indent: &str) -> String {
+    let mut indented = String::with_capacity(block.len());
+    for line in block.lines() {
+        indented.push_str(indent);
+        indented.push_str(line);
+        indented.push('\n');
+    }
+    indented
 }
 
 enum HookTarget {
@@ -910,7 +1006,7 @@ pub fn run_git_hooks_install(opts: &GitHooksInstallOptions<'_>) -> ExitCode {
         .or_else(|| detect_default_branch(root))
         .unwrap_or_else(|| "main".to_string());
 
-    let hook_content = build_pre_commit_hook_content(&fallback_base_ref);
+    let hook_content = build_pre_commit_hook_content(&fallback_base_ref, opts.prune_baselines);
 
     let target = match detect_hook_target(root) {
         Ok(target) => target,
@@ -930,7 +1026,10 @@ pub fn run_git_hooks_install(opts: &GitHooksInstallOptions<'_>) -> ExitCode {
             }
         }
         HookTarget::Lefthook => {
-            eprintln!("{}", lefthook_hint(&fallback_base_ref));
+            eprintln!(
+                "{}",
+                lefthook_hint(&fallback_base_ref, opts.prune_baselines)
+            );
             return ExitCode::SUCCESS;
         }
         HookTarget::GitHooks(hook_path) => {
@@ -950,12 +1049,27 @@ pub fn run_git_hooks_install(opts: &GitHooksInstallOptions<'_>) -> ExitCode {
         "\nThe hook runs `fallow audit` against the merge-base with the current branch upstream, \
          falling back to `{fallback_base_ref}` when no upstream is set (gate=new-only by default)."
     );
+    if opts.prune_baselines {
+        eprintln!(
+            "Before the audit, the hook runs `fallow baselines prune` and stages the pruned \
+             baseline files. It skips the prune when the working tree has unstaged or \
+             untracked changes, and for a commit with paths."
+        );
+    }
     eprintln!("To skip the hook on a single commit: git commit --no-verify");
     ExitCode::SUCCESS
 }
 
 /// Render the managed pre-commit hook script body for the given fallback base ref.
-fn build_pre_commit_hook_content(fallback_base_ref: &str) -> String {
+fn build_pre_commit_hook_content(fallback_base_ref: &str, prune_baselines: bool) -> String {
+    let prune = if prune_baselines {
+        format!(
+            "# Remove the baseline entries of findings that this commit fixes.\n{}",
+            prune_baselines_block("fallow")
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"#!/bin/sh
 {GIT_HOOK_MARKER}
@@ -967,7 +1081,7 @@ fn build_pre_commit_hook_content(fallback_base_ref: &str) -> String {
 # Bypass on a single commit with: git commit --no-verify
 
 command -v fallow >/dev/null 2>&1 || exit 0
-UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
+{prune}UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{{upstream}}' 2>/dev/null || true)"
 if [ -n "$UPSTREAM" ]; then
   # Diff against the merge-base with the upstream so feature branches forked off
   # a non-default integration branch (next-release / hotfix / LTS) compare
@@ -993,7 +1107,10 @@ fn install_hook_file(
 ) -> Result<(), ExitCode> {
     let existed = hook_path.exists();
     if existed && !opts.force {
-        eprintln!("{}", existing_hook_hint(label, fallback_base_ref));
+        eprintln!(
+            "{}",
+            existing_hook_hint(label, fallback_base_ref, opts.prune_baselines)
+        );
         return Err(ExitCode::from(2));
     }
     if opts.dry_run {
@@ -1134,6 +1251,27 @@ pub fn run_rule_pack_schema(json_style: crate::json_style::JsonStyle) -> ExitCod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The next step names a bare `fallow` only when the config root is the
+    /// current directory.
+    #[test]
+    fn init_next_step_adds_root_only_for_another_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = init_next_step(dir.path(), Some(dir.path()));
+        assert!(
+            here.starts_with("Next: run `fallow` for a first report."),
+            "{here}"
+        );
+        assert!(!here.contains("--root"), "{here}");
+
+        let other = tempfile::tempdir().unwrap();
+        let there = init_next_step(dir.path(), Some(other.path()));
+        assert!(there.contains("`fallow --root "), "{there}");
+        assert!(
+            there.contains("`fallow agent install --dry-run --root "),
+            "{there}"
+        );
+    }
 
     fn config_opts(root: &Path, use_toml: bool) -> InitOptions<'_> {
         InitOptions {
@@ -1643,7 +1781,7 @@ mod tests {
 
     #[test]
     fn existing_hook_hint_includes_resolution_block() {
-        let hint = existing_hook_hint(".git/hooks/pre-commit", "main");
+        let hint = existing_hook_hint(".git/hooks/pre-commit", "main", false);
         assert!(hint.contains(".git/hooks/pre-commit already exists"));
         assert!(hint.contains("command -v fallow"));
         assert!(hint.contains("@{upstream}"));
@@ -1654,7 +1792,7 @@ mod tests {
 
     #[test]
     fn lefthook_hint_includes_resolution_block() {
-        let hint = lefthook_hint("develop");
+        let hint = lefthook_hint("develop", false);
         assert!(hint.contains("Lefthook detected"));
         assert!(hint.contains("pre-commit:"));
         assert!(hint.contains("run: |"));
@@ -1664,6 +1802,37 @@ mod tests {
         assert!(hint.contains("./node_modules/.bin/fallow"));
         assert!(hint.contains("yarn exec fallow -- \"$@\""));
         assert!(hint.contains("run_fallow audit --base \"$BASE\" --quiet"));
+    }
+
+    #[test]
+    fn prune_baselines_hook_prunes_before_the_audit() {
+        let content = build_pre_commit_hook_content("main", true);
+        let prune = content
+            .find("fallow baselines prune --quiet")
+            .expect("the hook runs the prune");
+        let audit = content
+            .find("fallow audit --base")
+            .expect("the hook runs the audit");
+        assert!(prune < audit, "{content}");
+        assert!(content.contains("*next-index-*)"));
+        assert!(content.contains("git ls-files --others --exclude-standard"));
+        assert!(content.contains("elif fallow baselines prune --quiet; then\n      git add -u"));
+        assert!(!build_pre_commit_hook_content("main", false).contains("baselines prune"));
+    }
+
+    #[test]
+    fn prune_baselines_hints_carry_the_prune_block() {
+        let hint = existing_hook_hint(".git/hooks/pre-commit", "main", true);
+        assert!(
+            hint.contains("\n      elif fallow baselines prune --quiet; then"),
+            "{hint}"
+        );
+        let lefthook = lefthook_hint("main", true);
+        assert!(
+            lefthook.contains("\n              elif run_fallow baselines prune --quiet; then"),
+            "{lefthook}"
+        );
+        assert!(!lefthook_hint("main", false).contains("baselines prune"));
     }
 
     #[test]
@@ -1677,6 +1846,7 @@ mod tests {
                 branch: None,
                 dry_run: false,
                 force: false,
+                prune_baselines: false,
             }),
             ExitCode::SUCCESS
         );
@@ -2398,6 +2568,29 @@ mod config_schema_drift {
             !COMMITTED.contains("fallow.dev"),
             "schema.json must not reference the dead fallow.dev domain; \
              use ./node_modules/fallow/schema.json or the raw.githubusercontent.com fallback"
+        );
+    }
+
+    /// Issue #2623: editors fetch these committed bytes, not the derived
+    /// value, so the JSONC dialect keywords are pinned on the published file
+    /// as well as on the generator.
+    #[test]
+    fn schema_json_advertises_the_jsonc_dialect() {
+        let committed: serde_json::Value =
+            serde_json::from_str(COMMITTED).expect("committed schema.json must parse as JSON");
+        let root = committed
+            .as_object()
+            .expect("committed schema.json must be an object");
+
+        assert_eq!(
+            root.get("allowTrailingCommas"),
+            Some(&serde_json::Value::Bool(true)),
+            "schema.json must tell JSON language service clients that trailing commas are accepted"
+        );
+        assert_eq!(
+            root.get("allowComments"),
+            Some(&serde_json::Value::Bool(true)),
+            "schema.json must tell JSON language service clients that comments are accepted"
         );
     }
 }

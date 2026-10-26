@@ -8,6 +8,7 @@ use crate::baseline::{HealthBaselineData, filter_new_health_targets};
 use crate::duplicates::{DuplicationReport, DuplicationStats};
 
 use super::HealthExecutionOptions;
+use super::change_coupling_section::{ChangeCouplingOutcome, compute_change_coupling};
 use super::filters::{
     collect_candidate_paths, filter_files_to_paths, filter_hotspots_by_diff,
     filter_refactoring_targets_by_diff,
@@ -46,6 +47,20 @@ pub struct HealthDerivedSections {
     pub(crate) targets: Vec<RefactoringTarget>,
     pub(crate) target_thresholds: Option<fallow_output::TargetThresholds>,
     pub(crate) targets_ms: f64,
+    /// The `change_coupling` section after `--top`. `None` when the
+    /// hotspots section did not run or the run read no git history.
+    pub(crate) change_coupling: Option<fallow_output::ChangeCouplingReport>,
+    /// Hotspots before `--top` for scoring, plus complete grouped targets.
+    /// Each group applies `--top` to its own displayed lists.
+    pub(crate) group_lists: GroupUntruncatedLists,
+}
+
+/// Lists before `--top`: hotspots serve project scoring and groups, while
+/// targets serve groups. `None` means the project list is complete.
+#[derive(Default)]
+pub struct GroupUntruncatedLists {
+    pub(crate) hotspots: Option<Vec<HotspotEntry>>,
+    pub(crate) targets: Option<Vec<RefactoringTarget>>,
 }
 
 pub fn prepare_health_derived_sections(
@@ -55,7 +70,8 @@ pub fn prepare_health_derived_sections(
     let pre_computed_duplication = input.pre_computed_duplication.take();
     let (candidate_paths, dupes_report, duplication_ms) =
         prepare_health_section_dupes(opts, &input, pre_computed_duplication);
-    let (hotspots, hotspot_summary, hotspots_ms) = prepare_health_section_hotspots(
+    let coupling = prepare_change_coupling(opts, &input);
+    let (hotspots, group_hotspots, hotspot_summary, hotspots_ms) = prepare_health_section_hotspots(
         opts,
         HealthHotspotSectionInput {
             config: input.config,
@@ -64,21 +80,24 @@ pub fn prepare_health_derived_sections(
             ws_roots: input.ws_roots,
             churn_fetch: input.churn_fetch,
             diff_index: input.diff_index,
+            dispersion: coupling
+                .as_ref()
+                .map(|outcome| &outcome.analysis.dispersion),
         },
     );
-    let (targets, target_thresholds, targets_ms) = prepare_health_section_targets(
-        opts,
-        &HealthTargetSectionInput {
-            score_output: input.score_output,
-            file_scores: input.file_scores,
-            hotspots: &hotspots,
-            loaded_baseline: input.loaded_baseline,
-            config: input.config,
-            diff_index: input.diff_index,
-            dupes_report: dupes_report.as_ref(),
-            max_crap: input.max_crap,
-        },
-    );
+    let target_input = HealthTargetSectionInput {
+        score_output: input.score_output,
+        file_scores: input.file_scores,
+        hotspots: &hotspots,
+        loaded_baseline: input.loaded_baseline,
+        config: input.config,
+        diff_index: input.diff_index,
+        dupes_report: dupes_report.as_ref(),
+        max_crap: input.max_crap,
+        co_change: coupling.as_ref().map(|outcome| &outcome.analysis),
+    };
+    let (targets, group_targets, target_thresholds, targets_ms) =
+        prepare_health_section_targets(opts, &target_input, group_hotspots.as_deref());
 
     HealthDerivedSections {
         candidate_paths,
@@ -90,6 +109,11 @@ pub fn prepare_health_derived_sections(
         targets,
         target_thresholds,
         targets_ms,
+        change_coupling: coupling.and_then(|outcome| report_change_coupling(opts, outcome)),
+        group_lists: GroupUntruncatedLists {
+            hotspots: group_hotspots,
+            targets: group_targets,
+        },
     }
 }
 
@@ -115,6 +139,44 @@ fn prepare_health_section_dupes(
     })
 }
 
+/// Run change coupling over the churn commits when the run read git history
+/// and built the static edge index.
+fn prepare_change_coupling(
+    opts: &HealthExecutionOptions<'_>,
+    input: &HealthDerivedSectionInput<'_>,
+) -> Option<ChangeCouplingOutcome> {
+    let churn_fetch = input.churn_fetch.as_ref()?;
+    let links = input.score_output?.static_links.as_ref()?;
+    Some(compute_change_coupling(
+        opts,
+        input.config,
+        churn_fetch,
+        links,
+        &crate::change_coupling::PairScope {
+            root: &input.config.root,
+            ignore_set: input.ignore_set,
+            ws_roots: input.ws_roots,
+            diff_index: input.diff_index,
+        },
+    ))
+}
+
+/// The section as the report carries it: only with the hotspots section,
+/// never in score-only output, and cut to `--top`.
+fn report_change_coupling(
+    opts: &HealthExecutionOptions<'_>,
+    outcome: ChangeCouplingOutcome,
+) -> Option<fallow_output::ChangeCouplingReport> {
+    if !opts.hotspots || opts.score_only_output {
+        return None;
+    }
+    let mut report = outcome.report;
+    if let Some(top) = opts.top {
+        report.pairs.truncate(top);
+    }
+    Some(report)
+}
+
 struct HealthHotspotSectionInput<'a> {
     config: &'a ResolvedConfig,
     file_scores: &'a [FileHealthScore],
@@ -122,12 +184,20 @@ struct HealthHotspotSectionInput<'a> {
     ws_roots: Option<&'a [std::path::PathBuf]>,
     churn_fetch: Option<hotspots::ChurnFetchResult>,
     diff_index: Option<&'a fallow_output::DiffIndex>,
+    dispersion: Option<
+        &'a rustc_hash::FxHashMap<std::path::PathBuf, crate::change_coupling::FileDispersion>,
+    >,
 }
 
 fn prepare_health_section_hotspots(
     opts: &HealthExecutionOptions<'_>,
     input: HealthHotspotSectionInput<'_>,
-) -> (Vec<HotspotEntry>, Option<HotspotSummary>, f64) {
+) -> (
+    Vec<HotspotEntry>,
+    Option<Vec<HotspotEntry>>,
+    Option<HotspotSummary>,
+    f64,
+) {
     compute_filtered_hotspots(FilteredHotspotInput {
         opts,
         config: input.config,
@@ -136,6 +206,7 @@ fn prepare_health_section_hotspots(
         ws_roots: input.ws_roots,
         churn_fetch: input.churn_fetch,
         diff_index: input.diff_index,
+        dispersion: input.dispersion,
     })
 }
 
@@ -148,27 +219,46 @@ struct HealthTargetSectionInput<'a> {
     diff_index: Option<&'a fallow_output::DiffIndex>,
     dupes_report: Option<&'a crate::duplicates::DuplicationReport>,
     max_crap: f64,
+    co_change: Option<&'a crate::change_coupling::ChangeHistoryAnalysis>,
 }
 
+/// Compute the project targets, plus the complete group list of a grouped run
+/// whose `--top` removes targets or hotspots.
+///
+/// The project targets use the truncated hotspot list, as an ungrouped run
+/// does. The group list uses the complete hotspot list, so a group target
+/// does not depend on a global `--top` cut.
 fn prepare_health_section_targets(
     opts: &HealthExecutionOptions<'_>,
     input: &HealthTargetSectionInput<'_>,
+    group_hotspots: Option<&[HotspotEntry]>,
 ) -> (
     Vec<RefactoringTarget>,
+    Option<Vec<RefactoringTarget>>,
     Option<fallow_output::TargetThresholds>,
     f64,
 ) {
-    compute_filtered_targets(FilteredTargetInput {
-        opts,
-        score_output: input.score_output,
-        file_scores_slice: input.file_scores,
-        hotspots: input.hotspots,
-        loaded_baseline: input.loaded_baseline,
-        config: input.config,
-        diff_index: input.diff_index,
-        dupes_report: input.dupes_report,
-        max_crap: input.max_crap,
-    })
+    let filtered = |hotspots: &[HotspotEntry], top: Option<usize>| {
+        compute_filtered_targets(
+            FilteredTargetInput {
+                opts,
+                score_output: input.score_output,
+                file_scores_slice: input.file_scores,
+                hotspots,
+                loaded_baseline: input.loaded_baseline,
+                config: input.config,
+                diff_index: input.diff_index,
+                dupes_report: input.dupes_report,
+                max_crap: input.max_crap,
+                co_change: input.co_change,
+            },
+            top,
+        )
+    };
+    let (targets, target_thresholds, targets_ms) = filtered(input.hotspots, opts.top);
+    let group_targets = (opts.group_by.is_some() && opts.top.is_some() && opts.targets)
+        .then(|| filtered(group_hotspots.unwrap_or(input.hotspots), None).0);
+    (targets, group_targets, target_thresholds, targets_ms)
 }
 
 struct FilteredHotspotInput<'a> {
@@ -179,11 +269,19 @@ struct FilteredHotspotInput<'a> {
     ws_roots: Option<&'a [std::path::PathBuf]>,
     churn_fetch: Option<hotspots::ChurnFetchResult>,
     diff_index: Option<&'a fallow_output::DiffIndex>,
+    dispersion: Option<
+        &'a rustc_hash::FxHashMap<std::path::PathBuf, crate::change_coupling::FileDispersion>,
+    >,
 }
 
 fn compute_filtered_hotspots(
     input: FilteredHotspotInput<'_>,
-) -> (Vec<HotspotEntry>, Option<HotspotSummary>, f64) {
+) -> (
+    Vec<HotspotEntry>,
+    Option<Vec<HotspotEntry>>,
+    Option<HotspotSummary>,
+    f64,
+) {
     let t = Instant::now();
     let (mut hotspots, hotspot_summary) = if let Some(churn_data) = input.churn_fetch {
         compute_hotspots(HotspotComputationInput {
@@ -193,15 +291,28 @@ fn compute_filtered_hotspots(
             ignore_set: input.ignore_set,
             ws_roots: input.ws_roots,
             churn_fetch: churn_data,
+            dispersion: input.dispersion,
         })
     } else {
         (Vec::new(), None)
     };
+    let mut group_hotspots = input
+        .opts
+        .top
+        .filter(|&top| top < hotspots.len())
+        .map(|top| {
+            let displayed = hotspots[..top].to_vec();
+            std::mem::replace(&mut hotspots, displayed)
+        });
     if let Some(diff_index) = input.diff_index {
         filter_hotspots_by_diff(&mut hotspots, diff_index, &input.config.root);
+        if let Some(group_hotspots) = group_hotspots.as_mut() {
+            filter_hotspots_by_diff(group_hotspots, diff_index, &input.config.root);
+        }
     }
     (
         hotspots,
+        group_hotspots,
         hotspot_summary,
         t.elapsed().as_secs_f64() * 1000.0,
     )
@@ -218,10 +329,12 @@ struct FilteredTargetInput<'a> {
     diff_index: Option<&'a fallow_output::DiffIndex>,
     dupes_report: Option<&'a crate::duplicates::DuplicationReport>,
     max_crap: f64,
+    co_change: Option<&'a crate::change_coupling::ChangeHistoryAnalysis>,
 }
 
 fn compute_filtered_targets(
     input: FilteredTargetInput<'_>,
+    top: Option<usize>,
 ) -> (
     Vec<RefactoringTarget>,
     Option<fallow_output::TargetThresholds>,
@@ -229,6 +342,9 @@ fn compute_filtered_targets(
 ) {
     let t = Instant::now();
     let (mut targets, target_thresholds) = compute_targets(&input);
+    if let Some(top) = top {
+        targets.truncate(top);
+    }
     if let Some(diff_index) = input.diff_index {
         filter_refactoring_targets_by_diff(&mut targets, diff_index, &input.config.root);
     }
@@ -294,31 +410,34 @@ fn compute_health_duplication_report(
     let t = Instant::now();
     let dupes_report = if input.opts.score || input.opts.targets {
         if let Some(report) = input.pre_computed_duplication {
-            return (
-                Some(subset_precomputed_duplication_report(
+            // When every file is a candidate, the report covers the same files
+            // with the same config as the detection below, so it is already
+            // the exact result. The subset recomputes the stats from the
+            // parsed modules, which also count the lines of files that
+            // `duplicates.ignore` excludes.
+            let report = if input.candidate_paths.len() == input.files.len() {
+                report
+            } else {
+                subset_precomputed_duplication_report(
                     report,
                     input.modules,
                     input.file_paths,
                     input.candidate_paths,
-                )),
-                t.elapsed().as_secs_f64() * 1000.0,
-            );
+                )
+            };
+            return (Some(report), t.elapsed().as_secs_f64() * 1000.0);
         }
         let scoped_files = filter_files_to_paths(input.files, input.candidate_paths);
-        Some(if input.opts.no_cache {
-            crate::duplicates::find_duplicates(
+        let cache_dir = (!input.opts.no_cache).then_some(input.config.cache_dir.as_path());
+        Some(
+            crate::duplicates::find_duplicates_with_defaults(
                 &input.config.root,
                 &scoped_files,
                 &input.config.duplicates,
+                cache_dir,
             )
-        } else {
-            crate::duplicates::find_duplicates_cached(
-                &input.config.root,
-                &scoped_files,
-                &input.config.duplicates,
-                &input.config.cache_dir,
-            )
-        })
+            .report,
+        )
     } else {
         None
     };
@@ -403,6 +522,9 @@ fn subset_precomputed_duplication_stats(
         total_tokens: original.total_tokens,
         duplicated_tokens: duplicated_tokens.min(original.total_tokens),
         clone_groups: clone_groups.len(),
+        // The scoped report carries no families, so nothing is withheld from an
+        // empty array.
+        clone_families: 0,
         clone_instances,
         duplication_percentage: if total_lines > 0 {
             (duplicated_lines as f64 / total_lines as f64) * 100.0
@@ -431,7 +553,8 @@ fn total_lines_for_candidate_paths(
         .sum()
 }
 
-/// Compute refactoring targets when requested, applying baseline and top filters.
+/// Compute refactoring targets when requested, applying the baseline and effort
+/// filters. The caller applies `--top`.
 fn compute_targets(
     input: &FilteredTargetInput<'_>,
 ) -> (
@@ -449,7 +572,7 @@ fn compute_targets(
         .map_or_else(rustc_hash::FxHashMap::default, |report| {
             targets::build_clone_sibling_evidence(report)
         });
-    let target_aux = TargetAuxData::from_output(output, &clone_siblings);
+    let target_aux = TargetAuxData::from_output(output, &clone_siblings, input.co_change);
     let (mut tgts, thresholds) = compute_refactoring_targets(
         input.file_scores_slice,
         &target_aux,
@@ -461,9 +584,6 @@ fn compute_targets(
     }
     if let Some(ref effort) = input.opts.effort {
         tgts.retain(|t| t.effort == *effort);
-    }
-    if let Some(top) = input.opts.top {
-        tgts.truncate(top);
     }
     (tgts, Some(thresholds))
 }
@@ -507,6 +627,7 @@ mod tests {
 
     fn clone_instance(file: &std::path::Path) -> CloneInstance {
         CloneInstance {
+            is_symlink: false,
             file: file.to_path_buf(),
             start_line: 1,
             end_line: 3,

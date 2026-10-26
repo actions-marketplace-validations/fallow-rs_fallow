@@ -22,6 +22,7 @@ pub(super) struct HealthReportAssembly {
     pub(super) score_output: Option<scoring::FileScoreOutput>,
     pub(super) hotspots: Vec<HotspotEntry>,
     pub(super) hotspot_summary: Option<HotspotSummary>,
+    pub(super) change_coupling: Option<fallow_output::ChangeCouplingReport>,
     pub(super) targets: Vec<RefactoringTarget>,
     pub(super) target_thresholds: Option<TargetThresholds>,
     pub(super) health_trend: Option<fallow_output::HealthTrend>,
@@ -32,7 +33,7 @@ pub(super) struct HealthReportAssembly {
     pub(super) sev_critical: usize,
     pub(super) sev_high: usize,
     pub(super) sev_moderate: usize,
-    pub(super) baseline_staleness: Option<fallow_output::HealthBaselineStaleness>,
+    pub(super) baseline_staleness: Option<fallow_output::BaselineStaleness>,
 }
 
 struct HealthSummaryAssembly<'a> {
@@ -52,10 +53,11 @@ struct HealthSummaryAssembly<'a> {
     istanbul_total: usize,
     istanbul_files_matched: usize,
     istanbul_files_total: usize,
+    coverage_input_format: Option<fallow_output::CoverageInputFormat>,
     sev_critical: usize,
     sev_high: usize,
     sev_moderate: usize,
-    baseline_staleness: Option<fallow_output::HealthBaselineStaleness>,
+    baseline_staleness: Option<fallow_output::BaselineStaleness>,
 }
 
 /// Assemble the final `HealthReport` from all computed data.
@@ -98,10 +100,14 @@ fn build_summary_from_assembly(
             istanbul_total: ist_total,
             istanbul_files_matched: ist_files_matched,
             istanbul_files_total: ist_files_total,
+            coverage_input_format: assembly
+                .score_output
+                .as_ref()
+                .and_then(|output| output.coverage_input_format),
             sev_critical: assembly.sev_critical,
             sev_high: assembly.sev_high,
             sev_moderate: assembly.sev_moderate,
-            baseline_staleness: assembly.baseline_staleness.clone(),
+            baseline_staleness: assembly.baseline_staleness,
         },
     )
 }
@@ -122,6 +128,7 @@ fn build_health_report(
         score_output,
         hotspots,
         hotspot_summary,
+        change_coupling,
         targets,
         target_thresholds,
         health_trend,
@@ -151,6 +158,7 @@ fn build_health_report(
             prop_drilling_chains: prelude.prop_drilling_chains,
             report_hotspots: prelude.report_hotspots,
             report_hotspot_summary: prelude.report_hotspot_summary,
+            change_coupling,
             runtime_coverage,
             large_functions,
             targets,
@@ -181,11 +189,8 @@ fn compute_report_prelude(
     hotspot_summary: Option<fallow_output::HotspotSummary>,
     report_coverage_gaps: bool,
 ) -> ReportPrelude {
-    let coverage_gaps = build_report_coverage_gaps(report_coverage_gaps, score_output.as_ref());
-    let prop_drilling_chains = build_prop_drilling_chains(opts, score_output.as_ref());
     // Render fan-in is a descriptive blast-radius signal. Build the per-file
-    // top-component lookup BEFORE moving `score_output` into the file-scores
-    // builder, so the human hotspot/complexity drill-down can show `rendered in N
+    // top-component lookup before moving the owned report sections out, so the human hotspot/complexity drill-down can show `rendered in N
     // places` for the top component of a file. Empty on non-React runs. The
     // public surface stays the VitalSigns aggregate; this map is `#[serde(skip)]`.
     let render_fan_in_top = if opts.score_only_output {
@@ -193,7 +198,20 @@ fn compute_report_prelude(
     } else {
         build_render_fan_in_top(score_output.as_ref())
     };
-    let file_scores = build_report_file_scores(opts, score_output);
+    let (coverage_gaps, prop_drilling_chains, scores) = score_output.map_or_else(
+        || (None, Vec::new(), Vec::new()),
+        |output| {
+            let coverage_gaps =
+                (report_coverage_gaps && !opts.score_only_output).then_some(output.coverage.report);
+            let prop_drilling_chains = if opts.score_only_output {
+                Vec::new()
+            } else {
+                output.prop_drilling_chains
+            };
+            (coverage_gaps, prop_drilling_chains, output.scores)
+        },
+    );
+    let file_scores = build_report_file_scores(opts, scores);
     let (report_hotspots, report_hotspot_summary) =
         report_hotspot_data(opts, hotspots, hotspot_summary);
     ReportPrelude {
@@ -203,22 +221,6 @@ fn compute_report_prelude(
         file_scores,
         report_hotspots,
         report_hotspot_summary,
-    }
-}
-
-/// Prop-drilling chains ride on the whole-project score output. Surfaced in
-/// the report (unless score-only output) so `health --hotspots` and the JSON
-/// envelope carry the located records. Empty unless the opt-in rule is on.
-fn build_prop_drilling_chains(
-    opts: &HealthOptions<'_>,
-    score_output: Option<&super::scoring::FileScoreOutput>,
-) -> Vec<fallow_types::output_dead_code::PropDrillingChainFinding> {
-    if opts.score_only_output {
-        Vec::new()
-    } else {
-        score_output
-            .map(|o| o.prop_drilling_chains.clone())
-            .unwrap_or_default()
     }
 }
 
@@ -234,6 +236,7 @@ struct HealthReportStructParts {
     prop_drilling_chains: Vec<fallow_types::output_dead_code::PropDrillingChainFinding>,
     report_hotspots: Vec<fallow_output::HotspotEntry>,
     report_hotspot_summary: Option<fallow_output::HotspotSummary>,
+    change_coupling: Option<fallow_output::ChangeCouplingReport>,
     runtime_coverage: Option<fallow_output::RuntimeCoverageReport>,
     large_functions: Vec<fallow_output::LargeFunctionEntry>,
     targets: Vec<fallow_output::RefactoringTarget>,
@@ -250,8 +253,10 @@ fn build_health_report_struct(
     action_ctx: &fallow_output::HealthActionContext,
     parts: HealthReportStructParts,
 ) -> HealthReport {
+    let sections = Some(produced_sections(opts, &parts));
     let mut report = HealthReport {
         summary: parts.summary,
+        sections,
         threshold_overrides: build_report_threshold_overrides(opts, parts.threshold_overrides),
         vital_signs: if opts.score_only_output {
             None
@@ -273,7 +278,9 @@ fn build_health_report_struct(
         } else {
             parts.report_hotspot_summary
         },
+        change_coupling: parts.change_coupling,
         runtime_coverage: parts.runtime_coverage,
+        mutation: None,
         coverage_intelligence: None,
         large_functions: if opts.score_only_output {
             Vec::new()
@@ -300,6 +307,43 @@ fn build_health_report_struct(
     report
 }
 
+/// The sections that the report carries, with the same gates as
+/// [`build_health_report_struct`]. Renderers read this list to tell an empty
+/// section from a section that the run did not produce.
+fn produced_sections(
+    opts: &HealthOptions<'_>,
+    parts: &HealthReportStructParts,
+) -> Vec<fallow_output::HealthSection> {
+    use fallow_output::HealthSection;
+
+    let full = !opts.score_only_output;
+    [
+        (HealthSection::Complexity, opts.complexity),
+        (HealthSection::VitalSigns, full),
+        (HealthSection::Score, parts.health_score.is_some()),
+        (HealthSection::FileScores, full && opts.file_scores),
+        (
+            HealthSection::CoverageGaps,
+            full && parts.coverage_gaps.is_some(),
+        ),
+        (HealthSection::Hotspots, opts.hotspots),
+        (
+            HealthSection::ChangeCoupling,
+            parts.change_coupling.is_some(),
+        ),
+        (HealthSection::Targets, full && opts.targets),
+        (HealthSection::Trend, parts.health_trend.is_some()),
+        (
+            HealthSection::RuntimeCoverage,
+            parts.runtime_coverage.is_some(),
+        ),
+        (HealthSection::Css, opts.css),
+    ]
+    .into_iter()
+    .filter_map(|(section, produced)| produced.then_some(section))
+    .collect()
+}
+
 /// Populate `coverage_intelligence` from the built report unless score-only.
 fn fill_coverage_intelligence(report: &mut HealthReport, opts: &HealthOptions<'_>) {
     if opts.score_only_output {
@@ -314,13 +358,6 @@ fn fill_coverage_intelligence(report: &mut HealthReport, opts: &HealthOptions<'_
                 || opts.use_shared_diff_index,
         },
     );
-}
-
-fn build_report_coverage_gaps(
-    report_coverage_gaps: bool,
-    score_output: Option<&super::scoring::FileScoreOutput>,
-) -> Option<fallow_output::CoverageGaps> {
-    report_coverage_gaps.then(|| score_output.map(|o| o.coverage.report.clone()))?
 }
 
 fn istanbul_counts_from_score_output(
@@ -397,6 +434,7 @@ fn build_health_summary(
         functions_analyzed: input.total_functions,
         functions_above_threshold: input.total_above_threshold,
         max_cyclomatic_threshold: input.max_cyclomatic,
+        cyclomatic_policy: None,
         max_cognitive_threshold: input.max_cognitive,
         max_crap_threshold: input.max_crap,
         max_unit_size_threshold: input.max_unit_size,
@@ -410,6 +448,11 @@ fn build_health_summary(
             input.report_coverage_gaps,
             input.has_istanbul_coverage,
         ),
+        coverage_input_format: summary_coverage_input_format(
+            opts,
+            input.report_coverage_gaps,
+            input.coverage_input_format,
+        ),
         coverage_source_consistency: summary_coverage_source_consistency(opts, input.findings),
         istanbul_matched,
         istanbul_total,
@@ -418,7 +461,7 @@ fn build_health_summary(
         severity_critical_count: input.sev_critical,
         severity_high_count: input.sev_high,
         severity_moderate_count: input.sev_moderate,
-        baseline_staleness: input.baseline_staleness.clone(),
+        baseline_staleness: input.baseline_staleness,
     }
 }
 
@@ -477,6 +520,16 @@ fn summary_coverage_model(
     })
 }
 
+/// The input format sits next to `coverage_model` and follows its gate.
+fn summary_coverage_input_format(
+    opts: &HealthOptions<'_>,
+    report_coverage_gaps: bool,
+    format: Option<fallow_output::CoverageInputFormat>,
+) -> Option<fallow_output::CoverageInputFormat> {
+    summary_coverage_model(opts, report_coverage_gaps, format.is_some())?;
+    format
+}
+
 fn summary_istanbul_counts(
     opts: &HealthOptions<'_>,
     has_istanbul_coverage: bool,
@@ -503,13 +556,12 @@ fn build_report_threshold_overrides(
 
 fn build_report_file_scores(
     opts: &HealthOptions<'_>,
-    score_output: Option<super::scoring::FileScoreOutput>,
+    mut scores: Vec<fallow_output::FileHealthScore>,
 ) -> Vec<fallow_output::FileHealthScore> {
     if opts.score_only_output || !opts.file_scores {
         return Vec::new();
     }
 
-    let mut scores = score_output.map(|o| o.scores).unwrap_or_default();
     if let Some(top) = opts.top {
         scores.truncate(top);
     }

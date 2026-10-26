@@ -19,7 +19,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use fallow_config::{OutputFormat, ProductionAnalysis, Severity};
-use fallow_engine::dead_code::{derive_security_severity, security_catalogue_title};
+use fallow_engine::dead_code::{
+    derive_security_severity, enable_security_rules, resolve_security_finding_severity,
+    security_catalogue_title, security_rule_id as canonical_security_rule_id,
+};
 pub use fallow_output::{
     SecurityBlindSpotFile, SecurityBlindSpotGroup, SecurityBlindSpotsOutput,
     SecurityBlindSpotsSchemaVersion, SecurityBlindSpotsSummary, SecurityGateVerdict,
@@ -41,7 +44,6 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::base_worktree::{BaseWorktree, git_rev_parse};
 use crate::error::emit_error;
-use crate::exit_codes::SECURITY_GATE_EXIT_CODE;
 use crate::health::HealthOptions;
 use crate::load_config_for_analysis;
 use fallow_output::{
@@ -117,6 +119,12 @@ pub struct SecurityOptions<'a> {
     pub changed_workspaces: Option<&'a str>,
     /// `--file <PATH>`: scope findings to selected files or trace hops.
     pub file: &'a [PathBuf],
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Appended to the workspace-roots channel, so it composes with
+    /// `--workspace` the way multiple workspace roots compose (union), and
+    /// intersects with `--changed-since` / `--diff-file` like every other
+    /// scope flag. `None` means whole-project scope.
+    pub scope: Option<PathBuf>,
     /// `--surface`: include the top-level attack-surface inventory in JSON.
     pub surface: bool,
     /// `--gate <mode>`: opt-in regression gate. `new` requires a diff source and
@@ -175,11 +183,13 @@ pub fn run_survivors(opts: &SecuritySurvivorsOptions<'_>) -> ExitCode {
             opts.output,
         );
     }
-    outln!(
-        "{}",
-        render_survivors_output(opts.output, opts.json_style, &output)
-    );
-    ExitCode::SUCCESS
+    match render_survivors_output(opts.output, opts.json_style, &output) {
+        Ok(rendered) => {
+            outln!("{rendered}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => emit_json_error(&message, opts.json_style),
+    }
 }
 
 /// Run `fallow security blind-spots`.
@@ -198,20 +208,23 @@ pub fn run_blind_spots(opts: &SecurityOptions<'_>) -> ExitCode {
     // findings-present accumulator stays unset (-> null). Its findings are the
     // unresolved callee sites it surfaces; zero blind spots is a clean run.
     crate::telemetry::note_result_count(output.summary.unresolved_callee_sites);
-    outln!(
-        "{}",
-        render_blind_spots_output(opts.output, opts.json_style, &output)
-    );
-    ExitCode::SUCCESS
+    match render_blind_spots_output(opts.output, opts.json_style, &output) {
+        Ok(rendered) => {
+            outln!("{rendered}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => emit_json_error(&message, opts.json_style),
+    }
 }
 
-/// Run `fallow security`. Always exits 0 unless the user explicitly raised the
-/// `security-client-server-leak` rule to `error` AND findings exist (the rule
-/// defaults to `off` and the command forces it to `warn`, so the common case is
-/// advisory). Unsupported output formats exit 2.
+/// Run `fallow security`. Exits 0 unless `--fail-on-issues` is set and
+/// findings exist, or a finding's security rule resolves to `error` for its
+/// path (top-level `rules` or a matching `overrides` entry). The rules default
+/// to `off` and the command raises them to `warn`, so the common case is
+/// advisory. Unsupported output formats exit 2.
 pub fn run(opts: &SecurityOptions<'_>) -> ExitCode {
     let started = Instant::now();
-    let (output, effective_severities) = match build_security_command_output(opts, started) {
+    let (mut output, advisory) = match build_security_command_output(opts, started) {
         Ok(output) => output,
         Err(code) => return code,
     };
@@ -220,14 +233,22 @@ pub fn run(opts: &SecurityOptions<'_>) -> ExitCode {
     if let Err(code) = maybe_write_security_sarif(opts, &output) {
         return code;
     }
+    // The envelope was assembled before the SARIF write, so its
+    // `request_outcomes` predates the entry that write records. Re-read it here,
+    // which is the one point where the artefact's fate is known and the report
+    // has not yet been rendered (issue #2734).
+    output.request_outcomes = crate::requests::request_outcomes();
 
-    let rendered = render_security_output(opts, &output);
+    let rendered = match render_security_output(opts, &output) {
+        Ok(rendered) => rendered,
+        Err(code) => return code,
+    };
     // The annotation stream is legitimately empty on a clean run; other
     // formats always render at least a headline.
     if !rendered.is_empty() || !matches!(opts.output, OutputFormat::GithubAnnotations) {
         outln!("{rendered}");
     }
-    security_exit_code(opts, &output, effective_severities)
+    security_exit_code(opts, &output, advisory)
 }
 
 /// Benchmark hook for the production security analysis and JSON rendering
@@ -254,6 +275,7 @@ pub fn benchmark_security_json(root: &Path, threads: usize) -> Result<(usize, us
         changed_workspaces: None,
         file: files,
         surface: false,
+        scope: None,
         gate: None,
         runtime_coverage: None,
         min_invocations_hot: crate::DEFAULT_MIN_INVOCATIONS_HOT,
@@ -261,7 +283,7 @@ pub fn benchmark_security_json(root: &Path, threads: usize) -> Result<(usize, us
     };
     let (output, _) = build_security_command_output(&opts, Instant::now())?;
     let finding_count = output.security_findings.len();
-    let rendered = render_security_output(&opts, &output);
+    let rendered = render_security_output(&opts, &output)?;
     Ok((finding_count, rendered.len()))
 }
 
@@ -301,6 +323,7 @@ pub fn create_security_survivors_benchmark_corpus(
         changed_workspaces: None,
         file: files,
         surface: false,
+        scope: None,
         gate: None,
         runtime_coverage: None,
         min_invocations_hot: crate::DEFAULT_MIN_INVOCATIONS_HOT,
@@ -318,7 +341,7 @@ fn write_security_survivors_benchmark_corpus(
         .map_err(|err| format!("Failed to create survivors benchmark corpus: {err}"))?;
     let candidates = temp_dir.path().join("candidates.json");
     let verdicts = temp_dir.path().join("verdicts.json");
-    let candidate_json = render_json_with_style(output, crate::json_style::JsonStyle::Compact);
+    let candidate_json = render_json_with_style(output, crate::json_style::JsonStyle::Compact)?;
     std::fs::write(&candidates, candidate_json)
         .map_err(|err| format!("Failed to write survivors benchmark candidates: {err}"))?;
 
@@ -370,7 +393,7 @@ pub fn benchmark_security_survivors_json(
         require_verdict_for_each_candidate: true,
     };
     let output = build_survivors_output(&opts, Instant::now())?;
-    let rendered = render_survivors_output(opts.output, opts.json_style, &output);
+    let rendered = render_survivors_output(opts.output, opts.json_style, &output)?;
     Ok((
         output.summary.survivors,
         output.summary.dismissed,
@@ -394,12 +417,18 @@ pub struct SecurityBlindSpotsBenchmarkResult {
 /// JSON serialization without reading the project root. This is not a
 /// supported API.
 #[doc(hidden)]
+#[expect(
+    clippy::expect_used,
+    reason = "benchmark hook; a serialization failure must stop the benchmark"
+)]
 pub fn benchmark_security_blind_spots_json(
     root: &Path,
     diagnostics: &[SecurityUnresolvedCalleeDiagnostic],
 ) -> SecurityBlindSpotsBenchmarkResult {
     let normalized = unresolved_callee_diagnostics(diagnostics, root);
     let output = SecurityOutput {
+        gate_outcomes: None,
+        request_outcomes: None,
         schema_version: SecuritySchemaVersion::V8,
         version: ToolVersion(env!("CARGO_PKG_VERSION").to_owned()),
         elapsed_ms: ElapsedMs(0),
@@ -431,7 +460,8 @@ pub fn benchmark_security_blind_spots_json(
         OutputFormat::Json,
         crate::json_style::JsonStyle::Compact,
         &output,
-    );
+    )
+    .expect("blind-spots benchmark output serializes");
     SecurityBlindSpotsBenchmarkResult {
         output,
         rendered_bytes: rendered.len(),
@@ -441,7 +471,7 @@ pub fn benchmark_security_blind_spots_json(
 fn build_security_command_output(
     opts: &SecurityOptions<'_>,
     started: Instant,
-) -> Result<(SecurityOutput, SecurityRuleSeverities), ExitCode> {
+) -> Result<(SecurityOutput, SecurityAdvisoryRules), ExitCode> {
     validate_security_output(opts.output)?;
 
     let mut config = load_config_for_analysis(
@@ -459,12 +489,12 @@ fn build_security_command_output(
     )?;
 
     let configured_severities = security_rule_severities(&config);
-    force_security_rules(&mut config);
+    enable_security_rules(&mut config);
     let effective_severities = security_rule_severities(&config);
 
     let mut analysis = analyze_security_candidates(opts, &config)?;
 
-    apply_security_scopes(opts, &mut analysis)?;
+    apply_security_scopes(opts, &config.workspace_patterns, &mut analysis)?;
 
     let gate_mode = apply_security_gate(opts, &config, &mut analysis.results)?;
 
@@ -504,7 +534,33 @@ fn build_security_command_output(
         unresolved_callee_diagnostics,
         workspace_diagnostics,
     });
-    Ok((output, effective_severities))
+    let mut output = output;
+    let advisory = security_advisory_rules(&config, &output);
+    output.gate_outcomes = security_gate_outcomes(opts, &output, advisory);
+    Ok((output, advisory))
+}
+
+/// The rule severities that decide the security advisory gate.
+#[derive(Clone, Copy)]
+struct SecurityAdvisoryRules {
+    /// A security rule is `error` at the top level or in an override.
+    can_error: bool,
+    /// A reported finding resolves to `error` for its own path.
+    has_error_finding: bool,
+}
+
+fn security_advisory_rules(
+    config: &fallow_config::ResolvedConfig,
+    output: &SecurityOutput,
+) -> SecurityAdvisoryRules {
+    let can_error = fallow_engine::dead_code::security_rules_can_error(config);
+    SecurityAdvisoryRules {
+        can_error,
+        has_error_finding: can_error
+            && output.security_findings.iter().any(|finding| {
+                resolve_security_finding_severity(config, finding) == Severity::Error
+            }),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -633,10 +689,10 @@ struct CandidateInput {
 }
 
 fn load_candidate_map(path: &Path) -> Result<CandidateInput, String> {
-    let value = load_json_file(path, "candidate")?;
+    let mut value = load_json_file(path, "candidate")?;
     let workspace_diagnostics = value
-        .get("workspace_diagnostics")
-        .cloned()
+        .get_mut("workspace_diagnostics")
+        .map(serde_json::Value::take)
         .map(serde_json::from_value)
         .transpose()
         .map_err(|err| {
@@ -646,9 +702,9 @@ fn load_candidate_map(path: &Path) -> Result<CandidateInput, String> {
             )
         })?
         .unwrap_or_default();
-    let Some(findings) = value
-        .get("security_findings")
-        .and_then(serde_json::Value::as_array)
+    let Some(serde_json::Value::Array(findings)) = value
+        .get_mut("security_findings")
+        .map(serde_json::Value::take)
     else {
         return Err(format!(
             "Candidate file {} must be raw `fallow security --format json` output with a security_findings array.",
@@ -657,7 +713,7 @@ fn load_candidate_map(path: &Path) -> Result<CandidateInput, String> {
     };
     let mut candidates = BTreeMap::new();
     for finding in findings {
-        let finding: SecurityFinding = serde_json::from_value(finding.clone()).map_err(|err| {
+        let finding: SecurityFinding = serde_json::from_value(finding).map_err(|err| {
             format!(
                 "Candidate file {} contains a malformed security finding: {err}",
                 path.display()
@@ -669,15 +725,17 @@ fn load_candidate_map(path: &Path) -> Result<CandidateInput, String> {
                 path.display()
             ));
         }
-        if candidates
-            .insert(finding.finding_id.clone(), finding.clone())
-            .is_some()
-        {
-            return Err(format!(
-                "Candidate file {} contains duplicate finding_id `{}`.",
-                path.display(),
-                finding.finding_id
-            ));
+        match candidates.entry(finding.finding_id.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(finding);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "Candidate file {} contains duplicate finding_id `{}`.",
+                    path.display(),
+                    entry.key()
+                ));
+            }
         }
     }
     Ok(CandidateInput {
@@ -762,6 +820,8 @@ fn security_rule_severities(config: &fallow_config::ResolvedConfig) -> SecurityR
 
 fn build_security_output(input: SecurityOutputInput<'_, '_>) -> SecurityOutput {
     SecurityOutput {
+        gate_outcomes: None,
+        request_outcomes: crate::requests::request_outcomes(),
         schema_version: SecuritySchemaVersion::V8,
         version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
         elapsed_ms: ElapsedMs(input.started.elapsed().as_millis() as u64),
@@ -800,31 +860,57 @@ fn security_gate_output(mode: SecurityGateMode, finding_count: usize) -> Securit
     }
 }
 
+/// Write the SARIF document `--sarif-file` asked for, and record what became of
+/// that request either way.
+///
+/// This command's writer exits 2 on failure, unlike the dead-code family's,
+/// which warns and continues. The failure is still recorded before the exit: one
+/// writer per reason token means the error document and the entry can never
+/// state different causes, and a reader of the record does not have to know
+/// which command produced it.
 fn maybe_write_security_sarif(
     opts: &SecurityOptions<'_>,
     output: &SecurityOutput,
 ) -> Result<(), ExitCode> {
-    if let Some(path) = opts.sarif_file
-        && let Err(message) = write_sarif_file(output, path)
-    {
-        return Err(emit_error(&message, 2, opts.output));
+    let Some(path) = opts.sarif_file else {
+        return Ok(());
+    };
+    match write_sarif_file(output, path) {
+        Ok(()) => {
+            crate::requests::record_sarif_file_applied(path);
+            Ok(())
+        }
+        Err(failure) => {
+            let message = failure.message(path);
+            crate::requests::record_sarif_file_failure(path, failure.reason(), message.clone());
+            Err(emit_error(&message, 2, opts.output))
+        }
     }
-    Ok(())
 }
 
-fn render_security_output(opts: &SecurityOptions<'_>, output: &SecurityOutput) -> String {
-    match opts.output {
+/// Render the report for the selected format. A JSON serialization failure
+/// returns the error envelope and exit code 2, as other commands do.
+fn render_security_output(
+    opts: &SecurityOptions<'_>,
+    output: &SecurityOutput,
+) -> Result<String, ExitCode> {
+    let rendered = match opts.output {
         OutputFormat::Json if opts.summary => {
             render_json_summary_with_style(output, opts.json_style)
         }
         OutputFormat::Json => render_json_with_style(output, opts.json_style),
-        OutputFormat::Sarif => render_sarif(output),
+        OutputFormat::Sarif => Ok(render_sarif(output)),
         OutputFormat::GithubAnnotations | OutputFormat::GithubSummary => {
-            render_security_github(opts, output)
+            Ok(render_security_github(opts, output))
         }
-        _ if opts.summary => render_human_summary(output),
-        _ => render_human(output),
-    }
+        _ if opts.summary => Ok(render_human_summary(output)),
+        _ => Ok(render_human(output)),
+    };
+    rendered.map_err(|message| emit_json_error(&message, opts.json_style))
+}
+
+fn emit_json_error(message: &str, json_style: crate::json_style::JsonStyle) -> ExitCode {
+    crate::error::emit_error_with_style(message, 2, OutputFormat::Json, json_style)
 }
 
 /// Render security candidates in a GitHub-native format from the same JSON
@@ -834,7 +920,6 @@ fn render_security_output(opts: &SecurityOptions<'_>, output: &SecurityOutput) -
 fn render_security_github(opts: &SecurityOptions<'_>, output: &SecurityOutput) -> String {
     let Ok(envelope) = fallow_output::serialize_security_json_output(
         output.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     ) else {
         return String::new();
@@ -856,33 +941,58 @@ fn render_security_github(opts: &SecurityOptions<'_>, output: &SecurityOutput) -
     }
 }
 
+/// The gates a security run evaluated, for the envelope's `gate_outcomes`.
+///
+/// Projects [`security_exit_code`]'s two branches through the same predicates.
+fn security_gate_outcomes(
+    opts: &SecurityOptions<'_>,
+    output: &SecurityOutput,
+    advisory: SecurityAdvisoryRules,
+) -> Option<fallow_output::GateOutcomes> {
+    crate::gates::security_gate_outcomes(
+        output
+            .gate
+            .as_ref()
+            .map(|gate| gate.verdict == SecurityGateVerdict::Fail),
+        security_advisory_failed(opts, output, advisory),
+        security_advisory_enforced(opts, advisory),
+    )
+}
+
 fn security_exit_code(
     opts: &SecurityOptions<'_>,
     output: &SecurityOutput,
-    effective_severities: SecurityRuleSeverities,
+    advisory: SecurityAdvisoryRules,
 ) -> ExitCode {
-    if let Some(gate) = &output.gate {
-        if gate.verdict == SecurityGateVerdict::Fail {
-            ExitCode::from(SECURITY_GATE_EXIT_CODE)
-        } else {
-            ExitCode::SUCCESS
-        }
-    } else if security_advisory_failed(opts, output, effective_severities) {
-        ExitCode::from(1)
+    // A configured gate decides the exit code before the advisory.
+    let code = if let Some(gate) = &output.gate {
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::Security,
+            gate.verdict == SecurityGateVerdict::Fail,
+        )
     } else {
-        ExitCode::SUCCESS
-    }
+        crate::exit_codes::gate_failed_exit_code(
+            fallow_output::GateName::SecurityAdvisory,
+            security_advisory_failed(opts, output, advisory),
+        )
+    };
+    crate::exit_codes::run_exit_code([code])
 }
 
+/// Whether the advisory fails the run: `--fail-on-issues` with at least one
+/// finding, or a finding whose rule resolves to `error` for its own path.
 fn security_advisory_failed(
     opts: &SecurityOptions<'_>,
     output: &SecurityOutput,
-    effective_severities: SecurityRuleSeverities,
+    advisory: SecurityAdvisoryRules,
 ) -> bool {
-    (opts.fail_on_issues
-        || effective_severities.leak == Severity::Error
-        || effective_severities.sink == Severity::Error)
-        && !output.security_findings.is_empty()
+    (opts.fail_on_issues && !output.security_findings.is_empty()) || advisory.has_error_finding
+}
+
+/// Whether the advisory can fail the run: `--fail-on-issues`, or an `error`
+/// severity on a security rule at the top level or in an override.
+fn security_advisory_enforced(opts: &SecurityOptions<'_>, advisory: SecurityAdvisoryRules) -> bool {
+    opts.fail_on_issues || advisory.can_error
 }
 
 struct PreparedSecurityFindings {
@@ -910,24 +1020,18 @@ fn prepare_security_findings(
     }
     apply_security_severity(&mut findings);
     sort_by_security_severity(&mut findings);
-    for finding in &mut findings {
-        finding.finding_id = security_finding_id(finding);
-    }
+    // The shared analysis pipeline already set each `finding_id`. JSON and
+    // SARIF both read that field, so an empty id is a pipeline bug.
     let (findings, attack_surface) = prepare_findings(findings, root, include_surface);
+    debug_assert!(
+        findings
+            .iter()
+            .all(|finding| !finding.finding_id.is_empty()),
+        "every security finding must carry the finding_id that the pipeline set"
+    );
     PreparedSecurityFindings {
         findings,
         attack_surface,
-    }
-}
-
-fn force_security_rules(config: &mut fallow_config::ResolvedConfig) {
-    // Respect explicit user severities; force the rules on when they are the
-    // default off so this dedicated command actually surfaces candidates.
-    if config.rules.security_client_server_leak == Severity::Off {
-        config.rules.security_client_server_leak = Severity::Warn;
-    }
-    if config.rules.security_sink == Severity::Off {
-        config.rules.security_sink = Severity::Warn;
     }
 }
 
@@ -957,7 +1061,7 @@ fn security_output_config(
 
 fn apply_changed_scope(opts: &SecurityOptions<'_>, results: &mut AnalysisResults) {
     if let Some(git_ref) = opts.changed_since
-        && let Some(changed) = fallow_engine::changed_files::get_changed_files(opts.root, git_ref)
+        && let Some(changed) = crate::requests::resolve_changed_since(opts.root, git_ref)
     {
         fallow_engine::changed_files::filter_results_by_changed_files(results, &changed);
     }
@@ -970,20 +1074,26 @@ fn apply_changed_scope(opts: &SecurityOptions<'_>, results: &mut AnalysisResults
 
 fn apply_security_scopes(
     opts: &SecurityOptions<'_>,
+    workspace_patterns: &[String],
     analysis: &mut SecurityAnalysisState,
 ) -> Result<(), ExitCode> {
-    let ws_roots = crate::check::filtering::resolve_workspace_scope(
+    let mut ws_roots = crate::check::filtering::resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
+        workspace_patterns,
         opts.output,
     )?;
+    if let Some(scope) = opts.scope.as_ref() {
+        ws_roots.get_or_insert_with(Vec::new).push(scope.clone());
+    }
     if let Some(ref roots) = ws_roots {
         crate::check::filtering::filter_to_workspaces(&mut analysis.results, roots);
     }
 
     if !matches!(opts.gate, Some(SecurityGateMode::NewlyReachable)) {
         apply_changed_scope(opts, &mut analysis.results);
+        crate::requests::measure_changed_since_scope(&analysis.changed_since_files);
     }
     filter_to_files(&mut analysis.results, opts.root, opts.file, opts.quiet);
 
@@ -1104,14 +1214,19 @@ fn compute_base_security_snapshot(
     base_ref: &str,
     base_sha: &str,
 ) -> Result<SecurityKeySnapshot, ExitCode> {
-    let Some(worktree) = BaseWorktree::create(opts.root, base_ref, Some(base_sha)) else {
+    let Some(worktree) = BaseWorktree::create(
+        opts.root,
+        base_ref,
+        Some(base_sha),
+        &config.workspace_patterns,
+    ) else {
         return Err(emit_error(
             &format!("could not create a temporary worktree for base ref '{base_ref}'"),
             2,
             opts.output,
         ));
     };
-    let base_root = base_analysis_root(opts.root, worktree.path());
+    let base_root = fallow_engine::repo_refs::base_analysis_root(opts.root, worktree.path());
     let current_config_path = opts
         .config_path
         .clone()
@@ -1129,14 +1244,22 @@ fn compute_base_security_snapshot(
         },
         ProductionAnalysis::DeadCode,
     )?;
-    base_config.cache_dir =
-        remap_cache_dir_for_base_worktree(opts.root, &base_root, &config.cache_dir);
-    force_security_rules(&mut base_config);
+    base_config.cache_dir = fallow_engine::repo_refs::remap_cache_dir_for_base_worktree(
+        opts.root,
+        &base_root,
+        &config.cache_dir,
+    );
+    enable_security_rules(&mut base_config);
     let mut base_analysis = analyze_security_candidates(
         &base_snapshot_security_options(opts, &base_root, &current_config_path),
         &base_config,
     )?;
-    scope_base_snapshot_to_workspaces(opts, &base_root, &mut base_analysis.results)?;
+    scope_base_snapshot_to_workspaces(
+        opts,
+        &base_root,
+        &base_config.workspace_patterns,
+        &mut base_analysis.results,
+    )?;
     Ok(SecurityKeySnapshot {
         reachable: security_reachable_keys(&base_analysis.results.security_findings, &base_root),
     })
@@ -1171,6 +1294,11 @@ fn base_snapshot_security_options<'a>(
         changed_workspaces: None,
         file: &[],
         surface: false,
+        // Deliberately unscoped: the base pass runs in another worktree whose
+        // path spelling differs, so a head-root scope would empty the base
+        // snapshot. The head pass is already scope-narrowed; a full base
+        // snapshot joins correctly against it.
+        scope: None,
         gate: None,
         runtime_coverage: None,
         min_invocations_hot: opts.min_invocations_hot,
@@ -1183,12 +1311,14 @@ fn base_snapshot_security_options<'a>(
 fn scope_base_snapshot_to_workspaces(
     opts: &SecurityOptions<'_>,
     base_root: &Path,
+    workspace_patterns: &[String],
     results: &mut AnalysisResults,
 ) -> Result<(), ExitCode> {
     if let Some(ref roots) = crate::check::filtering::resolve_workspace_scope(
         base_root,
         opts.workspace,
         None,
+        workspace_patterns,
         opts.output,
     )? {
         crate::check::filtering::filter_to_workspaces(results, roots);
@@ -1332,35 +1462,15 @@ fn save_cached_security_base_snapshot(
     let _ = tmp.persist(security_base_snapshot_cache_file(config, key));
 }
 
-fn base_analysis_root(current_root: &Path, base_worktree_root: &Path) -> PathBuf {
-    if current_root.is_absolute()
-        && let Some(git_root) = crate::base_worktree::git_toplevel(current_root)
-        && let Ok(relative) = current_root.strip_prefix(git_root)
-    {
-        return base_worktree_root.join(relative);
-    }
-    base_worktree_root.to_path_buf()
-}
-
-fn remap_cache_dir_for_base_worktree(
-    current_root: &Path,
-    base_worktree_root: &Path,
-    cache_dir: &Path,
-) -> PathBuf {
-    if cache_dir.is_absolute()
-        && let Ok(relative) = cache_dir.strip_prefix(current_root)
-    {
-        return base_worktree_root.join(relative);
-    }
-    cache_dir.to_path_buf()
-}
-
 struct SecurityAnalysisState {
     results: AnalysisResults,
     workspace_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
     modules: Option<Vec<ModuleInfo>>,
     files: Option<Vec<DiscoveredFile>>,
     analysis_output: Option<fallow_engine::dead_code::DeadCodeAnalysisArtifacts>,
+    /// The analyzed set, kept only for a `--changed-since` run: the ref
+    /// resolves after the analysis, and this set sizes the scope it leaves.
+    changed_since_files: Vec<DiscoveredFile>,
 }
 
 fn analyze_security_candidates(
@@ -1369,6 +1479,11 @@ fn analyze_security_candidates(
 ) -> Result<SecurityAnalysisState, ExitCode> {
     let session = fallow_engine::session::AnalysisSession::from_resolved_config(config.clone())
         .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output))?;
+    let changed_since_files = if opts.changed_since.is_some() {
+        session.files().to_vec()
+    } else {
+        Vec::new()
+    };
 
     if opts.runtime_coverage.is_none() {
         return session
@@ -1379,6 +1494,7 @@ fn analyze_security_candidates(
                 modules: None,
                 files: None,
                 analysis_output: None,
+                changed_since_files,
             })
             .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output));
     }
@@ -1395,6 +1511,7 @@ fn analyze_security_candidates(
                 modules,
                 files,
                 analysis_output: Some(output),
+                changed_since_files,
             }
         })
         .map_err(|err| emit_error(&format!("Analysis error: {err}"), 2, opts.output))
@@ -1440,6 +1557,7 @@ fn analyze_security_runtime(
             workspaces: Vec::new(),
             analysis_output: Some(analysis_output),
         },
+        None,
     )?;
     Ok(result.report.runtime_coverage)
 }
@@ -1501,6 +1619,9 @@ fn security_runtime_health_options<'a>(
         analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
         complexity_breakdown: false,
         group_by: None,
+        group_filter: None,
+        trend_from: None,
+        scope: opts.scope.clone(),
     }
 }
 
@@ -1557,10 +1678,16 @@ fn function_spans(
         };
         let path = relative_key(path, root);
         for function in &module.complexity {
+            // A module-scope security finding would otherwise be attributed to
+            // the synthetic `<module>` unit and reported under that name, and
+            // no runtime sample can ever carry it.
+            if fallow_types::extract::is_synthetic_module_unit(&function.name) {
+                continue;
+            }
             spans.push(FunctionSpan {
                 key: RuntimeFunctionKey {
                     path: path.clone(),
-                    function: function.name.clone(),
+                    function: function.identity_name().to_owned(),
                     line: function.line,
                 },
                 end_line: function.line.saturating_add(function.line_count),
@@ -1882,11 +2009,7 @@ fn prepare_findings(
 ) {
     let mut findings: Vec<SecurityFinding> = findings
         .into_iter()
-        .map(|f| {
-            let mut f = relativize_finding(f, root);
-            f.finding_id = security_finding_id(&f);
-            f
-        })
+        .map(|f| relativize_finding(f, root))
         .collect();
     let attack_surface = include_surface.then(|| {
         findings
@@ -1940,22 +2063,19 @@ fn relativize(path: &Path, root: &Path) -> PathBuf {
 #[cfg(test)]
 pub fn render_json(output: &SecurityOutput) -> String {
     render_json_with_style(output, crate::json_style::JsonStyle::Compact)
+        .expect("security output serializes")
 }
 
 fn render_json_with_style(
     output: &SecurityOutput,
     json_style: crate::json_style::JsonStyle,
-) -> String {
-    let Ok(value) = fallow_output::serialize_security_json_output(
+) -> Result<String, String> {
+    fallow_output::serialize_security_json_output(
         output.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
-    ) else {
-        return "{\"error\":\"failed to serialize security output\"}".to_owned();
-    };
-    json_style
-        .serialize(&value)
-        .unwrap_or_else(|_| "{\"error\":\"failed to serialize security output\"}".to_owned())
+    )
+    .and_then(|value| json_style.serialize(&value))
+    .map_err(|err| format!("failed to serialize security output: {err}"))
 }
 
 /// JSON summary: compact aggregate payload without per-finding arrays.
@@ -1963,32 +2083,26 @@ fn render_json_with_style(
 #[cfg(test)]
 pub fn render_json_summary(output: &SecurityOutput) -> String {
     render_json_summary_with_style(output, crate::json_style::JsonStyle::Compact)
+        .expect("security output serializes")
 }
 
 fn render_json_summary_with_style(
     output: &SecurityOutput,
     json_style: crate::json_style::JsonStyle,
-) -> String {
-    let Ok(value) = fallow_output::serialize_security_summary_json_output(
-        output,
-        crate::output_runtime::current_root_envelope_mode(),
-        None,
-    ) else {
-        return "{\"error\":\"failed to serialize security summary output\"}".to_owned();
-    };
-    json_style.serialize(&value).unwrap_or_else(|_| {
-        "{\"error\":\"failed to serialize security summary output\"}".to_owned()
-    })
+) -> Result<String, String> {
+    fallow_output::serialize_security_summary_json_output(output, None)
+        .and_then(|value| json_style.serialize(&value))
+        .map_err(|err| format!("failed to serialize security summary output: {err}"))
 }
 
 fn render_survivors_output(
     output_format: OutputFormat,
     json_style: crate::json_style::JsonStyle,
     output: &SecuritySurvivorsOutput,
-) -> String {
+) -> Result<String, String> {
     match output_format {
         OutputFormat::Json => render_survivors_json_with_style(output, json_style),
-        _ => render_survivors_human(output),
+        _ => Ok(render_survivors_human(output)),
     }
 }
 
@@ -1996,21 +2110,16 @@ fn render_survivors_output(
 #[cfg(test)]
 pub fn render_survivors_json(output: &SecuritySurvivorsOutput) -> String {
     render_survivors_json_with_style(output, crate::json_style::JsonStyle::Compact)
+        .expect("security output serializes")
 }
 
 fn render_survivors_json_with_style(
     output: &SecuritySurvivorsOutput,
     json_style: crate::json_style::JsonStyle,
-) -> String {
-    let Ok(value) = fallow_output::serialize_security_survivors_json_output(
-        output.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
-    ) else {
-        return "{\"error\":\"failed to serialize security survivors output\"}".to_owned();
-    };
-    json_style.serialize(&value).unwrap_or_else(|_| {
-        "{\"error\":\"failed to serialize security survivors output\"}".to_owned()
-    })
+) -> Result<String, String> {
+    fallow_output::serialize_security_survivors_json_output(output.clone())
+        .and_then(|value| json_style.serialize(&value))
+        .map_err(|err| format!("failed to serialize security survivors output: {err}"))
 }
 
 #[must_use]
@@ -2196,10 +2305,10 @@ fn render_blind_spots_output(
     output_format: OutputFormat,
     json_style: crate::json_style::JsonStyle,
     output: &SecurityBlindSpotsOutput,
-) -> String {
+) -> Result<String, String> {
     match output_format {
         OutputFormat::Json => render_blind_spots_json_with_style(output, json_style),
-        _ => render_blind_spots_human(output),
+        _ => Ok(render_blind_spots_human(output)),
     }
 }
 
@@ -2207,21 +2316,16 @@ fn render_blind_spots_output(
 #[cfg(test)]
 pub fn render_blind_spots_json(output: &SecurityBlindSpotsOutput) -> String {
     render_blind_spots_json_with_style(output, crate::json_style::JsonStyle::Compact)
+        .expect("security output serializes")
 }
 
 fn render_blind_spots_json_with_style(
     output: &SecurityBlindSpotsOutput,
     json_style: crate::json_style::JsonStyle,
-) -> String {
-    let Ok(value) = fallow_output::serialize_security_blind_spots_json_output(
-        output.clone(),
-        crate::output_runtime::current_root_envelope_mode(),
-    ) else {
-        return "{\"error\":\"failed to serialize security blind-spots output\"}".to_owned();
-    };
-    json_style.serialize(&value).unwrap_or_else(|_| {
-        "{\"error\":\"failed to serialize security blind-spots output\"}".to_owned()
-    })
+) -> Result<String, String> {
+    fallow_output::serialize_security_blind_spots_json_output(output.clone())
+        .and_then(|value| json_style.serialize(&value))
+        .map_err(|err| format!("failed to serialize security blind-spots output: {err}"))
 }
 
 #[must_use]
@@ -2295,19 +2399,56 @@ fn blind_spot_suggestion(
     }
 }
 
-fn write_sarif_file(output: &SecurityOutput, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "Failed to create directory for SARIF file {}: {err}",
-                path.display()
-            )
-        })?;
+/// Why a `--sarif-file` write did not happen on this command.
+///
+/// The reason tokens match the ones `check::output` records for the same two
+/// failures, so a consumer reading `request_outcomes["sarif-file"].reason` gets
+/// one vocabulary whichever command wrote the file. The prose is unchanged from
+/// what this command has always printed.
+#[derive(Debug)]
+enum SecuritySarifWriteFailure {
+    /// The target's directory could not be created, so nothing was written.
+    DirectoryCreate { error: String },
+    /// The directory exists and the document still could not be written there.
+    Write { error: String },
+}
+
+impl SecuritySarifWriteFailure {
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::DirectoryCreate { .. } => "directory-create-failed",
+            Self::Write { .. } => "write-failed",
+        }
     }
-    std::fs::write(path, render_sarif(output))
-        .map_err(|err| format!("Failed to write SARIF file {}: {err}", path.display()))
+
+    fn message(&self, path: &Path) -> String {
+        let path = path.display();
+        match self {
+            Self::DirectoryCreate { error } => {
+                format!("Failed to create directory for SARIF file {path}: {error}")
+            }
+            Self::Write { error } => format!("Failed to write SARIF file {path}: {error}"),
+        }
+    }
+}
+
+fn write_sarif_file(output: &SecurityOutput, path: &Path) -> Result<(), SecuritySarifWriteFailure> {
+    fallow_engine::write_guard::write_file(
+        path,
+        render_sarif(output).as_bytes(),
+        fallow_engine::write_guard::WriteTarget::Path,
+    )
+    .map_err(|err| {
+        if err.is_directory() {
+            SecuritySarifWriteFailure::DirectoryCreate {
+                error: err.to_string(),
+            }
+        } else {
+            SecuritySarifWriteFailure::Write {
+                error: err.to_string(),
+            }
+        }
+    })
 }
 
 /// One-line gate verdict header. Leads with the ACTION ("REVIEW REQUIRED") and
@@ -2566,11 +2707,11 @@ fn push_human_next_step(out: &mut String, finding: &SecurityFinding) {
         out.push_str(
             "    Next: check whether this server-only code is meant to run on the client. \
              If it is pulled in only through next/dynamic(..., { ssr: false }), type-only, \
-             or removed at build time, mark it as a false positive. If the sink is a \
-             \"use server\" Server Action module, decide by export shape: only a \
-             non-action export (a top-level const, a re-export, or a default value) \
-             carries the server-only import into the client bundle; if every export is \
-             an async action, mark it as a false positive.\n",
+             or removed at build time, mark it as a false positive. fallow already \
+             excludes a \"use server\" module whose value exports are all async \
+             functions. If the sink is a \"use server\" module, move its non-action \
+             export (a top-level const, a re-export, or a default value) to a \
+             server-only file.\n",
         );
     } else if matches!(finding.kind, SecurityFindingKind::ClientServerLeak) {
         out.push_str(
@@ -2749,18 +2890,7 @@ fn is_server_only_leak(finding: &SecurityFinding) -> bool {
 /// secret"; each `TaintedSink` category gets `security/<category>` so candidates
 /// group and label per CWE class.
 fn sarif_rule_id(finding: &SecurityFinding) -> String {
-    match finding.kind {
-        SecurityFindingKind::ClientServerLeak if is_server_only_leak(finding) => {
-            "security/server-only-import".to_owned()
-        }
-        SecurityFindingKind::ClientServerLeak => "security/client-server-leak".to_owned(),
-        SecurityFindingKind::TaintedSink => {
-            format!(
-                "security/{}",
-                finding.category.as_deref().unwrap_or("tainted-sink")
-            )
-        }
-    }
+    canonical_security_rule_id(finding)
 }
 
 fn security_help_text(title: &str) -> String {
@@ -2866,11 +2996,11 @@ fn sarif_rule_def_server_only_leak(rule_id: &str) -> serde_json::Value {
              code such as server-only, next/headers, \
              next/server, or node:fs / node:child_process). fallow does not prove this \
              code runs on the client; a module pulled in only through \
-             next/dynamic(..., { ssr: false }) is a false positive. For a \"use server\" \
-             Server Action module the deciding question is export shape: only a \
-             non-action export (a top-level const, a re-export, or a default value) \
-             carries the server-only import into the client bundle; a module whose \
-             exports are all async actions is a false positive." },
+             next/dynamic(..., { ssr: false }) is a false positive. fallow excludes a \
+             \"use server\" module whose value exports are all async functions, because \
+             the bundler replaces its import with action references. A \"use server\" \
+             sink has a non-action export (a top-level const, a re-export, or a default \
+             value) that carries the server-only import into the client bundle." },
         "help": {
             "text": security_help_text(title),
             "markdown": security_help_markdown(title)
@@ -3032,17 +3162,17 @@ fn sarif_result_for_finding(finding: &SecurityFinding) -> serde_json::Value {
         message.push('.');
     }
     let related = sarif_related_locations(finding);
-    // Stable dedup key for GHAS: rule + anchor path + line. Without
+    // Stable dedup key for GHAS: rule + anchor path + line + column. Without
     // partialFingerprints, every run re-opens previously triaged alerts.
-    // Same helper as the JSON `finding_id` field so the two never drift
-    // (issue #900).
+    // It is the `finding_id` that the shared pipeline set, the same value as
+    // the JSON field, so the two never drift (issue #900).
     let mut result = serde_json::json!({
         "ruleId": rule_id,
         "level": sarif_level(finding.severity),
         "message": { "text": message },
         "locations": [sarif_location(&finding.path, finding.line, finding.col)],
         "relatedLocations": related,
-        "partialFingerprints": { "fallowSecurity/v1": security_finding_id(finding) },
+        "partialFingerprints": { "fallowSecurity/v2": finding.finding_id },
     });
     if let Some(code_flows) = sarif_code_flows(finding) {
         result["codeFlows"] = code_flows;
@@ -3130,31 +3260,6 @@ pub fn build_security_sarif(
     })
 }
 
-/// Small FNV-1a hex digest for SARIF `partialFingerprints` dedup stability.
-fn fnv_hex(input: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-/// Stable per-finding correlation id: FNV-1a hex of `rule:path:line`. The single
-/// source of truth for BOTH the JSON `finding_id` field and the SARIF
-/// `partialFingerprints` value, so an agent can join the two and they never
-/// drift. Computed on the project-relative path, so it must run after the
-/// finding is relativized (issue #900).
-fn security_finding_id(finding: &SecurityFinding) -> String {
-    let fp = format!(
-        "{}:{}:{}",
-        sarif_rule_id(finding),
-        finding.path.to_string_lossy().replace('\\', "/"),
-        finding.line,
-    );
-    fnv_hex(&fp)
-}
-
 fn sarif_location(path: &Path, line: u32, col: u32) -> serde_json::Value {
     serde_json::json!({
         "physicalLocation": {
@@ -3239,6 +3344,8 @@ mod tests {
 
     fn output_with(findings: Vec<SecurityFinding>, unresolved_edge_files: usize) -> SecurityOutput {
         SecurityOutput {
+            gate_outcomes: None,
+            request_outcomes: None,
             schema_version: SecuritySchemaVersion::V8,
             version: ToolVersion("test".to_string()),
             elapsed_ms: ElapsedMs(0),
@@ -3256,6 +3363,8 @@ mod tests {
 
     fn output_with_gate(verdict: SecurityGateVerdict, new_count: usize) -> SecurityOutput {
         SecurityOutput {
+            gate_outcomes: None,
+            request_outcomes: None,
             schema_version: SecuritySchemaVersion::V8,
             version: ToolVersion("test".to_string()),
             elapsed_ms: ElapsedMs(0),
@@ -3273,6 +3382,27 @@ mod tests {
             unresolved_callee_sites: 0,
             unresolved_callee_diagnostics: None,
         }
+    }
+
+    #[test]
+    fn sarif_fingerprint_equals_json_finding_id() {
+        let root = Path::new("/proj/root");
+        let mut finding = relativize_finding(sample_finding(root), root);
+        finding.finding_id = "stamped-by-pipeline".to_owned();
+        let output = output_with(vec![finding], 0);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&output)).expect("valid JSON");
+        let json_id = json["security_findings"][0]["finding_id"]
+            .as_str()
+            .expect("JSON finding_id");
+        let sarif = build_security_sarif(&output.security_findings, None);
+        let sarif_id = sarif["runs"][0]["results"][0]["partialFingerprints"]["fallowSecurity/v2"]
+            .as_str()
+            .expect("SARIF fingerprint");
+
+        assert_eq!(json_id, "stamped-by-pipeline");
+        assert_eq!(sarif_id, json_id);
     }
 
     fn survivor_candidate_json(
@@ -3364,6 +3494,186 @@ mod tests {
         assert_eq!(result.2, 1);
         assert_eq!(result.3, 0);
         assert!(result.4 > 0);
+    }
+
+    #[test]
+    fn survivors_candidate_loader_preserves_validation_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidates = dir.path().join("candidates.json");
+
+        for contents in ["{}", r#"{"security_findings":{}}"#] {
+            std::fs::write(&candidates, contents).expect("write candidates");
+            let error = load_candidate_map(&candidates)
+                .map(|_| ())
+                .expect_err("invalid shape should fail");
+            assert!(error.contains("security_findings array"));
+        }
+
+        std::fs::write(
+            &candidates,
+            r#"{"security_findings":[{"finding_id":"sec-a"}]}"#,
+        )
+        .expect("write malformed candidate");
+        let malformed = load_candidate_map(&candidates)
+            .map(|_| ())
+            .expect_err("malformed finding should fail");
+        assert!(malformed.contains("malformed security finding"));
+
+        let finding = survivor_candidate_json(
+            "sec-a",
+            "src/a.ts",
+            1,
+            SecurityFindingKind::TaintedSink,
+            Some("ssrf"),
+        );
+        std::fs::write(
+            &candidates,
+            serde_json::json!({
+                "security_findings": [finding.clone(), finding]
+            })
+            .to_string(),
+        )
+        .expect("write duplicate candidates");
+        let duplicate = load_candidate_map(&candidates)
+            .map(|_| ())
+            .expect_err("duplicate finding should fail");
+        assert!(duplicate.contains("duplicate finding_id `sec-a`"));
+    }
+
+    #[test]
+    fn survivors_candidate_loader_keeps_findings_and_workspace_diagnostics() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let candidates = dir.path().join("candidates.json");
+        let root = Path::new("/proj/root");
+        let diagnostic = fallow_config::WorkspaceDiagnostic::new(
+            root,
+            root.join("packages/orphan"),
+            fallow_types::workspace::WorkspaceDiagnosticKind::UndeclaredWorkspace,
+        );
+        let first = survivor_candidate_json(
+            "sec-a",
+            "src/a.ts",
+            1,
+            SecurityFindingKind::TaintedSink,
+            Some("ssrf"),
+        );
+        let second = survivor_candidate_json(
+            "sec-b",
+            "src/b.ts",
+            2,
+            SecurityFindingKind::TaintedSink,
+            Some("xss"),
+        );
+        std::fs::write(
+            &candidates,
+            serde_json::json!({
+                "security_findings": [second, first],
+                "workspace_diagnostics": [diagnostic],
+            })
+            .to_string(),
+        )
+        .expect("write candidates");
+
+        let input = load_candidate_map(&candidates).expect("valid candidates load");
+
+        let loaded: Vec<_> = input
+            .candidates
+            .iter()
+            .map(|(id, finding)| {
+                (
+                    id.as_str(),
+                    serde_json::to_value(finding).expect("finding serializes"),
+                )
+            })
+            .collect();
+        assert_eq!(loaded, vec![("sec-a", first), ("sec-b", second)]);
+        assert_eq!(
+            serde_json::to_value(&input.workspace_diagnostics).expect("diagnostics serialize"),
+            serde_json::json!([diagnostic]),
+        );
+
+        std::fs::write(&candidates, r#"{"security_findings":null}"#).expect("write null");
+        let null_findings = load_candidate_map(&candidates)
+            .map(|_| ())
+            .expect_err("null findings should fail");
+        assert!(null_findings.contains("security_findings array"));
+
+        let mut empty_id = survivor_candidate_json(
+            "",
+            "src/a.ts",
+            1,
+            SecurityFindingKind::TaintedSink,
+            Some("ssrf"),
+        );
+        empty_id["finding_id"] = serde_json::json!("");
+        std::fs::write(
+            &candidates,
+            serde_json::json!({ "security_findings": [empty_id] }).to_string(),
+        )
+        .expect("write empty id");
+        let empty = load_candidate_map(&candidates)
+            .map(|_| ())
+            .expect_err("empty finding_id should fail");
+        assert!(empty.contains("empty finding_id"));
+    }
+
+    #[test]
+    fn unresolved_callee_sample_matches_full_stable_sort() {
+        let root = Path::new("/project");
+        let diagnostics: Vec<_> = (0..80u32)
+            .map(|index| SecurityUnresolvedCalleeDiagnostic {
+                path: if index < 40 {
+                    if index % 2 == 0 {
+                        root.join("src/./same.ts")
+                    } else {
+                        root.join("src/same.ts")
+                    }
+                } else if index % 2 == 0 {
+                    root.join(format!("src/z{index}.ts"))
+                } else {
+                    PathBuf::from(format!("outside/z{index}.ts"))
+                },
+                line: 1,
+                col: 0,
+                reason: fallow_types::extract::SkippedSecurityCalleeReason::ComputedMember,
+                expression_kind:
+                    fallow_types::extract::SkippedSecurityCalleeExpressionKind::ComputedMemberExpression,
+            })
+            .collect();
+
+        for len in [1, UNRESOLVED_CALLEE_SAMPLE_LIMIT, diagnostics.len()] {
+            let input = &diagnostics[..len];
+            let mut reference = input.to_vec();
+            reference.sort_by(|a, b| {
+                (&a.path, a.line, a.col, a.reason, a.expression_kind).cmp(&(
+                    &b.path,
+                    b.line,
+                    b.col,
+                    b.reason,
+                    b.expression_kind,
+                ))
+            });
+            let expected: Vec<_> = reference
+                .iter()
+                .take(UNRESOLVED_CALLEE_SAMPLE_LIMIT)
+                .map(|diagnostic| SecurityUnresolvedCalleeSample {
+                    path: relative_key(&diagnostic.path, root),
+                    line: diagnostic.line,
+                    col: diagnostic.col,
+                    reason: diagnostic.reason,
+                    expression_kind: diagnostic.expression_kind,
+                })
+                .collect();
+            let actual = unresolved_callee_diagnostics(input, root)
+                .expect("non-empty diagnostics")
+                .sampled;
+
+            assert_eq!(actual.len(), len.min(UNRESOLVED_CALLEE_SAMPLE_LIMIT));
+            assert_eq!(
+                serde_json::to_value(actual).expect("actual sample serializes"),
+                serde_json::to_value(expected).expect("reference sample serializes")
+            );
+        }
     }
 
     #[test]
@@ -3927,17 +4237,6 @@ mod tests {
     }
 
     #[test]
-    fn fnv_hex_is_deterministic_and_16_hex_digits() {
-        let a = fnv_hex("security/client-server-leak:src/app.tsx:12");
-        let b = fnv_hex("security/client-server-leak:src/app.tsx:12");
-        assert_eq!(a, b, "same input must hash identically");
-        assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        // Distinct input yields a distinct digest (anchor line differs).
-        assert_ne!(a, fnv_hex("security/client-server-leak:src/app.tsx:13"));
-    }
-
-    #[test]
     fn hop_role_labels_cover_every_role() {
         assert_eq!(
             hop_role_label(TraceHopRole::ClientBoundary),
@@ -4296,29 +4595,6 @@ mod tests {
     }
 
     #[test]
-    fn finding_id_is_stable_and_matches_sarif_fingerprint() {
-        // Issue #900: one helper computes both the JSON finding_id and the SARIF
-        // partialFingerprint, so an agent can join the two and they never drift.
-        let root = Path::new("/proj/root");
-        let finding = relativize_finding(sample_finding(root), root);
-        let id = security_finding_id(&finding);
-        assert!(!id.is_empty());
-        assert_eq!(
-            id,
-            security_finding_id(&finding),
-            "deterministic across calls"
-        );
-
-        let sarif: serde_json::Value =
-            serde_json::from_str(&render_sarif(&output_with(vec![finding], 0)))
-                .expect("valid SARIF");
-        assert_eq!(
-            sarif["runs"][0]["results"][0]["partialFingerprints"]["fallowSecurity/v1"],
-            serde_json::Value::String(id)
-        );
-    }
-
-    #[test]
     fn json_render_carries_dead_code_context() {
         let root = Path::new("/proj/root");
         let mut finding = relativize_finding(sample_finding(root), root);
@@ -4370,7 +4646,7 @@ mod tests {
             serde_json::json!("secret-source")
         );
         // Stable dedup fingerprint present for GHAS.
-        assert!(result["partialFingerprints"]["fallowSecurity/v1"].is_string());
+        assert!(result["partialFingerprints"]["fallowSecurity/v2"].is_string());
 
         let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
         assert_eq!(rules[0]["name"], "Client-server secret leak");
@@ -4518,13 +4794,17 @@ mod tests {
     const NO_CONFIG: Option<PathBuf> = None;
 
     fn leak_fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/security-client-server-leak")
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../tests/fixtures/security-client-server-leak")
     }
 
     fn source_reachability_fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/security-source-reachability-885")
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../tests/fixtures/security-source-reachability-885")
     }
 
     fn run_opts(root: &Path, output: OutputFormat, fail_on_issues: bool) -> SecurityOptions<'_> {
@@ -4546,6 +4826,7 @@ mod tests {
             changed_workspaces: None,
             file: &[],
             surface: false,
+            scope: None,
             gate: None,
             runtime_coverage: None,
             min_invocations_hot: 100,

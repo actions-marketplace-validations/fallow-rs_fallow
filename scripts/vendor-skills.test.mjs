@@ -8,15 +8,20 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import {
+  GIT_LOCATION_VARIABLES,
+  companionSkillsRoot,
   decide,
   diffTrees,
   listFiles,
   main,
+  releasedSkillPairs,
   runCheck,
   runVendor,
   stripUnsupportedMetadata,
@@ -140,5 +145,210 @@ test("main throws when the explicit public consumer is missing", () => {
     } else {
       process.env.FALLOW_SKILLS_DIR = previous;
     }
+  }
+});
+
+// An inherited GIT_DIR or GIT_WORK_TREE, for example from a hook, would point
+// these commands at the real repository instead of the temporary one.
+const gitEnv = () =>
+  Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !GIT_LOCATION_VARIABLES.includes(name)),
+  );
+
+const git = (cwd, ...args) => execFileSync("git", args, { cwd, env: gitEnv(), stdio: "pipe" });
+
+test("a linked worktree resolves the companion next to the main working tree", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-worktree-")));
+  const mainTree = join(base, "fallow");
+  const linked = join(base, "fallow", ".worktrees", "linked");
+  try {
+    mkdirSync(mainTree);
+    git(mainTree, "init", "-q");
+    git(
+      mainTree,
+      "-c",
+      "commit.gpgsign=false",
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@example.com",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "init",
+    );
+    git(mainTree, "worktree", "add", "-q", linked);
+
+    assert.equal(companionSkillsRoot({ env: {}, repoRoot: linked }), join(base, "fallow-skills"));
+    assert.equal(companionSkillsRoot({ env: {}, repoRoot: mainTree }), join(base, "fallow-skills"));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the git helper of this file ignores an inherited GIT_DIR", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-gitdir-")));
+  const inherited = join(base, "inherited.git");
+  const previous = process.env.GIT_DIR;
+  process.env.GIT_DIR = inherited;
+  try {
+    const checkout = join(base, "fallow");
+    mkdirSync(checkout);
+    git(checkout, "init", "-q");
+    assert.equal(existsSync(inherited), false, "git init must not write to the inherited GIT_DIR");
+    assert.equal(existsSync(join(checkout, ".git")), true);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.GIT_DIR;
+    } else {
+      process.env.GIT_DIR = previous;
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("FALLOW_SKILLS_DIR overrides the companion location", () => {
+  assert.equal(
+    companionSkillsRoot({ env: { FALLOW_SKILLS_DIR: "/elsewhere/skills" }, repoRoot: "/unused" }),
+    "/elsewhere/skills",
+  );
+});
+
+test("a checkout outside git falls back to the sibling directory", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "vendor-skills-nogit-")));
+  const checkout = join(base, "fallow");
+  try {
+    mkdirSync(checkout);
+    assert.equal(
+      companionSkillsRoot({ env: { GIT_CEILING_DIRECTORIES: base }, repoRoot: checkout }),
+      join(base, "fallow-skills"),
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("main refuses an unknown argument before it touches the companion repo", () => {
+  const previous = process.env.FALLOW_SKILLS_DIR;
+  process.env.FALLOW_SKILLS_DIR = join(tmpdir(), "vendor-skills-missing-consumer");
+  try {
+    assert.throws(() => main(["--frobnicate"]), /unknown argument: --frobnicate/u);
+    assert.throws(() => main(["--check", "--force"]), /unknown argument: --force/u);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.FALLOW_SKILLS_DIR;
+    } else {
+      process.env.FALLOW_SKILLS_DIR = previous;
+    }
+  }
+});
+
+test("main prints the usage for --help and writes nothing", () => {
+  const previous = process.env.FALLOW_SKILLS_DIR;
+  process.env.FALLOW_SKILLS_DIR = join(tmpdir(), "vendor-skills-missing-consumer");
+  const lines = [];
+  const original = console.log;
+  console.log = (line) => lines.push(line);
+  try {
+    assert.equal(main(["--help"]), 0);
+    assert.equal(main(["-h"]), 0);
+  } finally {
+    console.log = original;
+    if (previous === undefined) {
+      delete process.env.FALLOW_SKILLS_DIR;
+    } else {
+      process.env.FALLOW_SKILLS_DIR = previous;
+    }
+  }
+  assert.match(lines.join("\n"), /Usage:/u);
+});
+
+test("every released skill maps to its own published tree", () => {
+  const repoRoot = makeTree({
+    "npm/fallow/skills/fallow/SKILL.md": "---\nname: fallow\n---\n",
+    "npm/fallow/skills/fallow-setup/SKILL.md": "---\nname: fallow-setup\n---\n",
+    "npm/fallow/skills/_artifacts/notes.txt": "build output\n",
+  });
+  assert.deepEqual(releasedSkillPairs(repoRoot, "/companion"), [
+    {
+      name: "fallow",
+      canonical: join(repoRoot, "npm/fallow/skills/fallow"),
+      published: join("/companion", "fallow/skills/fallow"),
+    },
+    {
+      name: "fallow-setup",
+      canonical: join(repoRoot, "npm/fallow/skills/fallow-setup"),
+      published: join("/companion", "fallow/skills/fallow-setup"),
+    },
+  ]);
+});
+
+test("a released skill without a published tree is drift", () => {
+  const canonical = makeTree({ "SKILL.md": "---\nname: fallow-setup\n---\n" });
+  const missing = join(tmpdir(), "vendor-skills-absent-published-tree");
+  assert.deepEqual(diffTrees(canonical, missing).missing, ["SKILL.md"]);
+  assert.equal(runCheck(canonical, missing, { renderDiffs: false }), 1);
+});
+
+test("base parity permits candidate changes but rejects published drift and strict current drift", () => {
+  const sourceSkill = "---\nname: fallow\nmetadata:\n  version: 1.0.0\n---\n# Fallow\n";
+  const publishedSkill = stripUnsupportedMetadata(sourceSkill);
+  const baseReference = "The released command contract.\n";
+  const candidateReference = "The candidate command contract adds a documented fix.\n";
+  const scriptFiles = Object.fromEntries(
+    ["vendor-skills.mjs", "released-skills.mjs"].map((name) => [
+      `scripts/${name}`,
+      readFileSync(new URL(name, import.meta.url), "utf8"),
+    ]),
+  );
+  const sourceFiles = {
+    ...scriptFiles,
+    "npm/fallow/skills/fallow/SKILL.md": sourceSkill,
+  };
+  const fixture = makeTree({
+    ...Object.fromEntries(
+      Object.entries(sourceFiles).map(([path, text]) => [`base/${path}`, text]),
+    ),
+    ...Object.fromEntries(
+      Object.entries(sourceFiles).map(([path, text]) => [`candidate/${path}`, text]),
+    ),
+    "base/npm/fallow/skills/fallow/references/cli.md": baseReference,
+    "candidate/npm/fallow/skills/fallow/references/cli.md": candidateReference,
+    "companion/fallow/skills/fallow/SKILL.md": publishedSkill,
+    "companion/fallow/skills/fallow/references/cli.md": baseReference,
+  });
+  const check = (source, args = ["--check"]) =>
+    spawnSync(process.execPath, ["scripts/vendor-skills.mjs", ...args], {
+      cwd: join(fixture, source),
+      env: { ...gitEnv(), FALLOW_SKILLS_DIR: join(fixture, "companion") },
+      encoding: "utf8",
+    });
+  try {
+    const base = check("base");
+    assert.equal(base.status, 0, base.stderr);
+    const current = check("candidate");
+    assert.equal(current.status, 1, current.stderr);
+    assert.match(current.stderr, /differs: references\/cli\.md/u);
+    assert.equal(
+      readFileSync(join(fixture, "companion/fallow/skills/fallow/references/cli.md"), "utf8"),
+      baseReference,
+      "checks must not publish candidate content",
+    );
+
+    writeFileSync(
+      join(fixture, "companion/fallow/skills/fallow/references/cli.md"),
+      "stale content\n",
+    );
+    const publishedDrift = check("base");
+    assert.equal(publishedDrift.status, 1, publishedDrift.stderr);
+    assert.match(publishedDrift.stderr, /differs: references\/cli\.md/u);
+
+    const synchronized = check("candidate", []);
+    assert.equal(synchronized.status, 0, synchronized.stderr);
+    const currentAfterSync = check("candidate");
+    assert.equal(currentAfterSync.status, 0, currentAfterSync.stderr);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });

@@ -11,6 +11,12 @@ use crate::git_env::clear_ambient_git_env;
 /// Number of seconds in one day.
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Fraction of the file population used for hotspot concentration.
+const HOTSPOT_TOP_FILE_FRACTION: f64 = 0.01;
+
+/// Maximum project health penalty for thresholded hotspots.
+const HOTSPOT_MAX_PENALTY: f64 = 10.0;
+
 use fallow_output::{
     DEFAULT_CYCLOMATIC_CRITICAL, FileHealthScore, HEALTH_SCORE_FORMULA_VERSION,
     HOTSPOT_SCORE_THRESHOLD, HealthScore, HealthScorePenalties, HealthTrend, HotspotEntry,
@@ -64,6 +70,10 @@ pub struct AnalysisCounts {
     pub(crate) total_deps: usize,
 }
 
+/// Every unit's cyclomatic score, sorted, feeding the average, the critical
+/// share, and p90. The synthetic module-scope unit is included: its decision
+/// points are real branching, and leaving them out is what let a file's average
+/// read low while its top level was a guard ladder.
 fn collect_sorted_cyclomatic(input: &VitalSignsInput<'_>) -> Vec<u16> {
     let mut values: Vec<u16> = input
         .selected_modules()
@@ -94,6 +104,10 @@ fn critical_complexity_pct(all_cyclomatic: &[u16]) -> Option<f64> {
     Some((critical_count as f64 / all_cyclomatic.len() as f64 * 1000.0).round() / 10.0)
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "percentile indexes of non-negative counts; float-to-int casts saturate at zero"
+)]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "percentile index is bounded by the cyclomatic collection length"
@@ -143,23 +157,46 @@ struct SelectedModuleMetrics {
     total_loc: u64,
     line_counts: Vec<u32>,
     param_counts: Vec<u8>,
+    cyclomatic_population: fallow_output::CyclomaticPopulation,
 }
 
 fn selected_module_metrics(input: &VitalSignsInput<'_>) -> SelectedModuleMetrics {
     let mut total_loc = 0;
     let mut line_counts = Vec::new();
     let mut param_counts = Vec::new();
+    let mut cyclomatic_population = fallow_output::CyclomaticPopulation::default();
 
     for module in input.selected_modules() {
         total_loc += module.line_offsets.len() as u64;
-        line_counts.extend(module.complexity.iter().map(|c| c.line_count));
-        param_counts.extend(module.complexity.iter().map(|c| c.param_count));
+        // The synthetic module-scope unit is excluded from both distributions.
+        // It has no parameter list, and its size is the distance between its
+        // first and last decision point rather than a body anyone can shorten,
+        // so it is not a refactoring signal in the unit-size profile.
+        for unit in &module.complexity {
+            let is_module = fallow_types::extract::is_synthetic_module_unit(&unit.name);
+            let population = if is_module {
+                &mut cyclomatic_population.modules
+            } else if fallow_types::extract::is_synthetic_template_unit(&unit.name) {
+                &mut cyclomatic_population.templates
+            } else {
+                &mut cyclomatic_population.functions
+            };
+            population.count += 1;
+            population.sum += u64::from(unit.cyclomatic);
+            population.max = Some(population.max.unwrap_or_default().max(unit.cyclomatic));
+            if is_module {
+                continue;
+            }
+            line_counts.push(unit.line_count);
+            param_counts.push(unit.param_count);
+        }
     }
 
     SelectedModuleMetrics {
         total_loc,
         line_counts,
         param_counts,
+        cyclomatic_population,
     }
 }
 
@@ -214,6 +251,7 @@ pub(crate) fn compute_vital_signs(input: &VitalSignsInput<'_>) -> VitalSigns {
         avg_cyclomatic,
         critical_complexity_pct,
         p90_cyclomatic,
+        cyclomatic_population: Some(module_metrics.cyclomatic_population),
         duplication_pct: None, // Lazy: only set if duplication pipeline was run
         hotspot_count,
         hotspot_top_pct_count,
@@ -267,6 +305,10 @@ fn maintainability_vitals(scores: Option<&[FileHealthScore]>) -> (Option<f64>, O
     )
 }
 
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "percentile indexes of non-negative counts; float-to-int casts saturate at zero"
+)]
 fn hotspot_vitals(
     hotspots: Option<&[HotspotEntry]>,
     total_files: usize,
@@ -281,7 +323,7 @@ fn hotspot_vitals(
         if total_files == 0 || entries.is_empty() {
             return 0;
         }
-        let top_count = (total_files as f64 * 0.01).ceil() as usize;
+        let top_count = (total_files as f64 * HOTSPOT_TOP_FILE_FRACTION).ceil() as usize;
         entries
             .iter()
             .take(top_count.max(1))
@@ -382,11 +424,15 @@ fn compute_interfacing_risk_profile(param_counts: &[u8]) -> RiskProfile {
 ///
 /// The component-graph analogue (render fan-in concentration:
 /// `p95_render_fan_in` / `render_fan_in_high_pct` / `max_render_fan_in`) is
-/// computed in core (`crate::render_fan_in`), which has the
-/// resolved-module graph the CLI lacks. It mirrors this helper verbatim (p95 +
-/// `high_pct` over the per-component distinct-parents distribution, reusing the
-/// same `max(p95, 10)` floor) and is assigned onto `VitalSigns` in
-/// `health/mod.rs::prepare_health_vital_data`.
+/// computed in the `analyze::render_fan_in` module of `fallow_core`, which has
+/// the resolved-module graph. It uses the same p95 and floor math over the
+/// per-component distinct-parents distribution; change both together. The
+/// result is assigned onto `VitalSigns` in
+/// `health/vital_data.rs::prepare_health_vital_data`.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "percentile indexes of non-negative counts; float-to-int casts saturate at zero"
+)]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "fan-in values are bounded by project size"
@@ -520,21 +566,14 @@ fn maintainability_penalty(vs: &VitalSigns) -> Option<f64> {
 }
 
 fn hotspot_penalty(vs: &VitalSigns, total_files: usize) -> Option<f64> {
-    if let Some(top_pct_count) = vs.hotspot_top_pct_count {
-        return Some(if total_files > 0 {
-            let top_pct_bucket = (total_files as f64 * 0.01).ceil().max(1.0);
-            round1((f64::from(top_pct_count) / top_pct_bucket * 10.0).min(10.0))
-        } else {
-            0.0
-        });
-    }
-
-    vs.hotspot_count.map(|hc| {
-        if total_files > 0 {
-            round1((f64::from(hc) / total_files as f64 * 200.0).min(10.0))
-        } else {
-            0.0
+    vs.hotspot_count.map(|count| {
+        if total_files == 0 {
+            return 0.0;
         }
+        let top_pct_bucket = (total_files as f64 * HOTSPOT_TOP_FILE_FRACTION)
+            .ceil()
+            .max(1.0);
+        round1((f64::from(count) / top_pct_bucket * HOTSPOT_MAX_PENALTY).min(HOTSPOT_MAX_PENALTY))
     })
 }
 
@@ -598,24 +637,6 @@ pub(crate) fn build_counts(input: &VitalSignsInput<'_>) -> VitalSignsCounts {
     }
 }
 
-/// Get the current git SHA (short form).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "trusted git spawn with ambient repo-state env stripped, matching the core git spawn policy"
-)]
-fn git_sha(root: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(root);
-    clear_ambient_git_env(&mut command);
-    command
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
 /// Get the current git branch name.
 #[expect(
     clippy::disallowed_methods,
@@ -657,15 +678,17 @@ pub(crate) fn build_snapshot(
         snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: now,
-        git_sha: git_sha(root),
+        git_sha: crate::repo_refs::short_head_sha(root),
         git_branch: git_branch(root),
         shallow_clone,
         vital_signs,
         counts,
         score: health_score.map(|s| s.score),
         grade: health_score.map(|s| s.grade.to_string()),
+        score_formula_version: health_score.map(|s| s.formula_version),
         coverage_model,
         analysis_identity,
+        groups: None,
     }
 }
 
@@ -721,14 +744,20 @@ pub(crate) fn save_snapshot(
         Path::to_path_buf,
     );
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create snapshot directory: {e}"))?;
-    }
-
     let json =
         serde_json::to_string_pretty(snapshot).map_err(|e| format!("failed to serialize: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("failed to write snapshot: {e}"))?;
+    crate::write_guard::write_file(
+        &path,
+        json.as_bytes(),
+        crate::write_guard::WriteTarget::Path,
+    )
+    .map_err(|e| {
+        if e.is_directory() {
+            format!("failed to create snapshot directory: {e}")
+        } else {
+            format!("failed to write snapshot: {e}")
+        }
+    })?;
 
     Ok(path)
 }
@@ -737,11 +766,22 @@ pub(crate) fn save_snapshot(
 ///
 /// Corrupt or unreadable files are skipped with a warning to stderr.
 /// Returns an empty vec if the directory does not exist.
+#[cfg(test)]
+pub(crate) fn load_snapshots(root: &Path) -> Vec<VitalSignsSnapshot> {
+    load_snapshots_with_paths(root)
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .collect()
+}
+
+/// Load all snapshots from the default snapshot directory with their file
+/// paths, sorted by timestamp ascending. Corrupt or unreadable files are
+/// skipped with a warning to stderr.
 #[expect(
     clippy::print_stderr,
     reason = "corrupt-snapshot warnings to stderr, preserved verbatim from the CLI health path"
 )]
-pub(crate) fn load_snapshots(root: &Path) -> Vec<VitalSignsSnapshot> {
+fn load_snapshots_with_paths(root: &Path) -> Vec<(PathBuf, VitalSignsSnapshot)> {
     let dir = root.join(".fallow").join("snapshots");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -754,20 +794,103 @@ pub(crate) fn load_snapshots(root: &Path) -> Vec<VitalSignsSnapshot> {
         if path.extension().is_some_and(|ext| ext == "json") {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<VitalSignsSnapshot>(&content) {
-                    Ok(snap) => snapshots.push(snap),
+                    Ok(snap) => snapshots.push((path, snap)),
                     Err(e) => {
                         eprintln!("warning: skipping corrupt snapshot {}: {e}", path.display());
+                        record_unreadable_snapshot(root, &path, &e.to_string());
                     }
                 },
                 Err(e) => {
                     eprintln!("warning: could not read snapshot {}: {e}", path.display());
+                    record_unreadable_snapshot(root, &path, &e.to_string());
                 }
             }
         }
     }
 
-    snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    snapshots.sort_by(|a, b| a.1.timestamp.cmp(&b.1.timestamp));
     snapshots
+}
+
+/// The snapshot a trend compares against, with where it came from.
+#[derive(Debug, Clone)]
+pub(crate) struct TrendBaseline {
+    /// The baseline snapshot.
+    pub(crate) snapshot: VitalSignsSnapshot,
+    /// The file the snapshot was read from.
+    pub(crate) path: PathBuf,
+    /// Number of snapshots the trend source held: the snapshot directory
+    /// count, or `1` for an explicit `--trend-from` file.
+    pub(crate) snapshots_loaded: usize,
+}
+
+impl TrendBaseline {
+    /// The baseline snapshot without its group data.
+    ///
+    /// Each group trend copies this snapshot, so the group data is removed
+    /// once here and not copied again for every group.
+    pub(crate) fn without_groups(&self) -> VitalSignsSnapshot {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.groups = None;
+        snapshot
+    }
+}
+
+/// Load the trend baseline for the project trend and the group trend.
+///
+/// With `explicit`, read exactly that file. It must exist and parse, because
+/// the user named it. Without it, use the newest snapshot of
+/// `.fallow/snapshots/`, and return `Ok(None)` when there is none.
+///
+/// # Errors
+///
+/// Returns a message when the explicit file cannot be read or parsed.
+pub(crate) fn load_trend_baseline(
+    root: &Path,
+    explicit: Option<&Path>,
+) -> Result<Option<TrendBaseline>, String> {
+    if let Some(path) = explicit {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "failed to read --trend-from snapshot {}: {e}",
+                path.display()
+            )
+        })?;
+        // Report only the position. The serde message can quote values from
+        // the file, and MCP `trend_from` returns this text to the caller.
+        let snapshot = serde_json::from_str::<VitalSignsSnapshot>(&content).map_err(|e| {
+            format!(
+                "--trend-from file {} is not a fallow health snapshot (parse error at line {}, column {})",
+                path.display(),
+                e.line(),
+                e.column()
+            )
+        })?;
+        return Ok(Some(TrendBaseline {
+            snapshot,
+            path: path.to_path_buf(),
+            snapshots_loaded: 1,
+        }));
+    }
+    let mut snapshots = load_snapshots_with_paths(root);
+    let snapshots_loaded = snapshots.len();
+    Ok(snapshots.pop().map(|(path, snapshot)| TrendBaseline {
+        snapshot,
+        path,
+        snapshots_loaded,
+    }))
+}
+
+/// Record a snapshot this run could not use, so the thinner trend is visible to
+/// a consumer that never sees the warning above (issue #2689).
+fn record_unreadable_snapshot(root: &Path, path: &Path, error: &str) {
+    crate::health::diagnostics::record_health_diagnostic(
+        root,
+        Some(path),
+        fallow_types::workspace::WorkspaceDiagnosticKind::TrendSnapshotUnreadable {
+            error: error.to_owned(),
+        },
+    );
 }
 
 /// Tolerance for treating a metric delta as "stable" rather than improving/declining.
@@ -779,6 +902,7 @@ fn trend_point_from_snapshot(prev: &VitalSignsSnapshot) -> TrendPoint {
         git_sha: prev.git_sha.clone(),
         score: prev.score,
         grade: prev.grade.clone(),
+        score_formula_version: prev.score_formula_version,
         coverage_model: prev.coverage_model.clone(),
         snapshot_schema_version: Some(prev.snapshot_schema_version),
     }
@@ -804,6 +928,7 @@ fn overall_trend_direction(metrics: &[TrendMetric]) -> TrendDirection {
 ///
 /// Uses the stored `score` field from the snapshot (never re-derives it).
 /// Returns `None` if no snapshots are available.
+#[cfg(test)]
 pub(crate) fn compute_trend(
     current_vs: &VitalSigns,
     current_counts: &VitalSignsCounts,
@@ -811,26 +936,79 @@ pub(crate) fn compute_trend(
     snapshots: &[VitalSignsSnapshot],
 ) -> Option<HealthTrend> {
     let prev = snapshots.last()?;
+    let current_score = current_score.map(|score| HealthScore {
+        score,
+        ..compute_health_score(current_vs, current_counts.total_files)
+    });
+    Some(compute_trend_against(
+        prev,
+        snapshots.len(),
+        current_vs,
+        current_counts,
+        current_score.as_ref(),
+    ))
+}
 
+/// Compare the current metrics against one baseline snapshot.
+///
+/// Uses the stored `score` of the snapshot (never re-derives it).
+pub(crate) fn compute_trend_against(
+    prev: &VitalSignsSnapshot,
+    snapshots_loaded: usize,
+    current_vs: &VitalSigns,
+    current_counts: &VitalSignsCounts,
+    current_score: Option<&HealthScore>,
+) -> HealthTrend {
     let compared_to = trend_point_from_snapshot(prev);
 
     let metrics = TrendBuilder::new(prev, current_vs, current_counts, current_score).build();
 
     let overall_direction = overall_trend_direction(&metrics);
 
-    Some(HealthTrend {
+    HealthTrend {
         compared_to,
         metrics,
-        snapshots_loaded: snapshots.len(),
+        snapshots_loaded,
         overall_direction,
-    })
+    }
+}
+
+/// Compare the current metrics of one group against the same group in the
+/// baseline snapshot.
+///
+/// `compared_to` names the baseline snapshot (timestamp, commit), with the
+/// stored score and grade of the group. `base` is the baseline snapshot
+/// without its `groups`, built once for all groups by
+/// [`TrendBaseline::without_groups`].
+pub(crate) fn compute_group_trend(
+    base: &VitalSignsSnapshot,
+    snapshots_loaded: usize,
+    previous: &fallow_output::GroupSnapshot,
+    current_vs: &VitalSigns,
+    current_counts: &VitalSignsCounts,
+    current_score: Option<&HealthScore>,
+) -> HealthTrend {
+    let prev = VitalSignsSnapshot {
+        vital_signs: previous.vital_signs.clone(),
+        counts: previous.counts.clone(),
+        score: previous.score,
+        grade: previous.grade.clone(),
+        ..base.clone()
+    };
+    compute_trend_against(
+        &prev,
+        snapshots_loaded,
+        current_vs,
+        current_counts,
+        current_score,
+    )
 }
 
 struct TrendBuilder<'a> {
     prev: &'a VitalSignsSnapshot,
     current_vs: &'a VitalSigns,
     current_counts: &'a VitalSignsCounts,
-    current_score: Option<f64>,
+    current_score: Option<&'a HealthScore>,
     metrics: Vec<TrendMetric>,
 }
 
@@ -839,7 +1017,7 @@ impl TrendBuilder<'_> {
         prev: &'a VitalSignsSnapshot,
         current_vs: &'a VitalSigns,
         current_counts: &'a VitalSignsCounts,
-        current_score: Option<f64>,
+        current_score: Option<&'a HealthScore>,
     ) -> TrendBuilder<'a> {
         TrendBuilder {
             prev,
@@ -864,12 +1042,18 @@ impl TrendBuilder<'_> {
     }
 
     fn add_score_metric(&mut self) {
-        if let (Some(prev_score), Some(cur_score)) = (self.prev.score, self.current_score) {
+        let Some(current) = self.current_score else {
+            return;
+        };
+        if self.prev.score_formula_version != Some(current.formula_version) {
+            return;
+        }
+        if let Some(prev_score) = self.prev.score {
             self.push(TrendMetricInput {
                 name: "score",
                 label: "Health Score",
                 previous: prev_score,
-                current: cur_score,
+                current: current.score,
                 unit: "",
                 higher_is_better: true,
                 previous_count: None,
@@ -1118,7 +1302,7 @@ trait RoundTo {
 
 impl RoundTo for f64 {
     fn round_to(self, decimals: u32) -> Self {
-        let factor = 10_f64.powi(decimals as i32);
+        let factor = 10_f64.powi(i32::try_from(decimals).unwrap_or(i32::MAX));
         (self * factor).round() / factor
     }
 }
@@ -1132,6 +1316,7 @@ mod tests {
             complexity: vec![fallow_types::extract::FunctionComplexity {
                 name: format!("fn_{id}"),
                 is_private_member: false,
+                context_named: None,
                 line: id + 1,
                 col: 0,
                 cyclomatic,
@@ -1186,6 +1371,38 @@ mod tests {
     }
 
     #[test]
+    fn cyclomatic_population_partitions_units_and_respects_module_filter() {
+        let mut mixed = make_module(0, 1);
+        let mut module_unit = mixed.complexity[0].clone();
+        module_unit.name = "<module>".into();
+        module_unit.cyclomatic = 31;
+        let mut template_unit = module_unit.clone();
+        template_unit.name = "<template>".into();
+        template_unit.cyclomatic = 4;
+        mixed.complexity.extend([module_unit, template_unit]);
+        let modules = [mixed, make_module(1, 100)];
+        let filter = rustc_hash::FxHashSet::from_iter([crate::discover::FileId(0)]);
+        let input = VitalSignsInput {
+            modules: &modules,
+            module_filter: Some(&filter),
+            file_scores: None,
+            hotspots: None,
+            total_files: 1,
+            analysis_counts: None,
+        };
+        let vs = compute_vital_signs(&input);
+        let population = vs.cyclomatic_population.unwrap();
+        assert_eq!(population.functions.count, 1);
+        assert_eq!(population.modules.count, 1);
+        assert_eq!(population.templates.count, 1);
+        assert_eq!(population.functions.sum, 1);
+        assert_eq!(population.modules.sum, 31);
+        assert_eq!(population.templates.sum, 4);
+        assert_close(vs.avg_cyclomatic, 12.0);
+        assert_eq!(vs.p90_cyclomatic, 31);
+    }
+
+    #[test]
     fn compute_with_analysis_counts() {
         let modules = make_modules();
         let input = VitalSignsInput {
@@ -1223,6 +1440,8 @@ mod tests {
                 complexity_density: 0.5,
                 fan_in: 5,
                 trend: crate::churn::ChurnTrend::Stable,
+                median_files_per_commit: None,
+                median_lines_per_commit: None,
                 ownership: None,
                 is_test_path: false,
             },
@@ -1236,6 +1455,8 @@ mod tests {
                 complexity_density: 0.2,
                 fan_in: 2,
                 trend: crate::churn::ChurnTrend::Cooling,
+                median_files_per_commit: None,
+                median_lines_per_commit: None,
                 ownership: None,
                 is_test_path: false,
             },
@@ -1249,6 +1470,8 @@ mod tests {
                 complexity_density: 0.4,
                 fan_in: 3,
                 trend: crate::churn::ChurnTrend::Accelerating,
+                median_files_per_commit: None,
+                median_lines_per_commit: None,
                 ownership: None,
                 is_test_path: false,
             },
@@ -1265,6 +1488,69 @@ mod tests {
         let vs = compute_vital_signs(&input);
         assert_eq!(vs.hotspot_count, Some(2)); // 80.0 and 50.0 meet threshold
         assert_eq!(vs.hotspot_top_pct_count, Some(1)); // top 1% bucket rounds up to one file
+    }
+
+    #[test]
+    fn hotspot_penalty_ignores_subthreshold_ranked_entries() {
+        let hotspots: Vec<HotspotEntry> = [49.9, 0.1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, score)| HotspotEntry {
+                path: PathBuf::from(format!("src/active-{index}.ts")),
+                score,
+                commits: 3,
+                weighted_commits: 3.0,
+                lines_added: 10,
+                lines_deleted: 5,
+                complexity_density: 0.1,
+                fan_in: 0,
+                trend: crate::churn::ChurnTrend::Stable,
+                median_files_per_commit: None,
+                median_lines_per_commit: None,
+                ownership: None,
+                is_test_path: false,
+            })
+            .collect();
+        let input = VitalSignsInput {
+            modules: &[],
+            module_filter: None,
+            file_scores: None,
+            hotspots: Some(&hotspots),
+            total_files: 200,
+            analysis_counts: None,
+        };
+
+        let vitals = compute_vital_signs(&input);
+        let health = compute_health_score(&vitals, input.total_files);
+
+        assert_eq!(vitals.hotspot_count, Some(0));
+        assert_eq!(vitals.hotspot_top_pct_count, Some(2));
+        assert_some_close(health.penalties.hotspots, 0.0);
+    }
+
+    #[test]
+    fn empty_cyclomatic_population_is_measured_not_unknown() {
+        let vs = compute_vital_signs(&VitalSignsInput {
+            modules: &[],
+            module_filter: None,
+            file_scores: None,
+            hotspots: None,
+            total_files: 0,
+            analysis_counts: None,
+        });
+        let population = vs.cyclomatic_population.unwrap();
+        for group in [
+            population.functions,
+            population.modules,
+            population.templates,
+        ] {
+            assert_eq!(group.count, 0);
+            assert_eq!(group.sum, 0);
+            assert_eq!(group.max, None);
+        }
+        assert_close(vs.avg_cyclomatic, 0.0);
+        assert_eq!(vs.p90_cyclomatic, 0);
+        assert_eq!(vs.critical_complexity_pct, None);
     }
 
     #[test]
@@ -1514,11 +1800,11 @@ mod tests {
     }
 
     #[test]
-    fn health_score_hotspot_top_pct_can_use_full_budget() {
+    fn health_score_thresholded_hotspots_can_use_full_budget() {
         let vs = VitalSigns {
             avg_cyclomatic: 1.0,
             p90_cyclomatic: 2,
-            hotspot_count: Some(0),
+            hotspot_count: Some(250),
             hotspot_top_pct_count: Some(250),
             ..Default::default()
         };
@@ -1532,6 +1818,7 @@ mod tests {
     #[test]
     fn health_score_duplication_penalty() {
         let vs = VitalSigns {
+            cyclomatic_population: None,
             dead_file_pct: None,
             dead_export_pct: None,
             avg_cyclomatic: 1.0,
@@ -1587,7 +1874,7 @@ mod tests {
             critical_complexity_pct: Some(2.3),
             p90_cyclomatic: 4,
             duplication_pct: Some(6.0),
-            hotspot_count: Some(0),
+            hotspot_count: Some(250),
             hotspot_top_pct_count: Some(250),
             maintainability_avg: Some(91.0),
             maintainability_low_pct: Some(8.0),
@@ -1692,6 +1979,241 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_penalty_respects_score_threshold_and_scoped_population() {
+        for (scores, total_files, expected) in [
+            (vec![49.9, 0.1], 563, 0.0),
+            (vec![50.0, 49.9, 0.1], 563, 1.7),
+            (vec![50.0; 6], 563, 10.0),
+            (vec![50.0; 7], 563, 10.0),
+            (vec![50.0], 1, 10.0),
+            (vec![50.0], 101, 5.0),
+            (vec![50.0], 0, 0.0),
+            (vec![], 563, 0.0),
+        ] {
+            let hotspots: Vec<HotspotEntry> = scores
+                .into_iter()
+                .enumerate()
+                .map(|(index, score)| HotspotEntry {
+                    path: PathBuf::from(format!("src/scoped-{index}.ts")),
+                    score,
+                    commits: 3,
+                    weighted_commits: 3.0,
+                    lines_added: 10,
+                    lines_deleted: 5,
+                    complexity_density: 0.1,
+                    fan_in: 0,
+                    trend: crate::churn::ChurnTrend::Stable,
+                    median_files_per_commit: None,
+                    median_lines_per_commit: None,
+                    ownership: None,
+                    is_test_path: false,
+                })
+                .collect();
+            let input = VitalSignsInput {
+                modules: &[],
+                module_filter: None,
+                file_scores: None,
+                hotspots: Some(&hotspots),
+                total_files,
+                analysis_counts: None,
+            };
+            let vitals = compute_vital_signs(&input);
+            let score = compute_health_score(&vitals, total_files);
+            assert_some_close(score.penalties.hotspots, expected);
+            assert_eq!(score.formula_version, HEALTH_SCORE_FORMULA_VERSION);
+        }
+    }
+
+    #[test]
+    fn hotspot_penalty_requires_thresholded_measurement_and_ignores_rank_diagnostic() {
+        let mut vitals = VitalSigns {
+            hotspot_top_pct_count: Some(6),
+            ..Default::default()
+        };
+        assert!(
+            compute_health_score(&vitals, 563)
+                .penalties
+                .hotspots
+                .is_none()
+        );
+
+        vitals.hotspot_count = Some(1);
+        for diagnostic in [None, Some(0), Some(6)] {
+            vitals.hotspot_top_pct_count = diagnostic;
+            assert_some_close(compute_health_score(&vitals, 563).penalties.hotspots, 1.7);
+        }
+    }
+
+    #[test]
+    fn snapshot_persists_the_computed_score_formula() {
+        let dir = tempfile::tempdir().unwrap();
+        let vitals = make_test_vital_signs();
+        let counts = make_test_counts();
+        let mut health = compute_health_score(&vitals, counts.total_files);
+        health.formula_version = HEALTH_SCORE_FORMULA_VERSION + 1;
+        let snapshot = build_snapshot(
+            vitals,
+            counts,
+            dir.path(),
+            false,
+            Some(&health),
+            None,
+            fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        assert_eq!(snapshot.score_formula_version, Some(health.formula_version));
+        assert_eq!(snapshot.score, Some(health.score));
+        assert_eq!(snapshot.grade.as_deref(), Some(health.grade));
+
+        let unscored = build_snapshot(
+            snapshot.vital_signs,
+            snapshot.counts,
+            dir.path(),
+            false,
+            None,
+            None,
+            fallow_types::semantic::SemanticAnalysisIdentity::default(),
+        );
+        assert!(unscored.score_formula_version.is_none());
+    }
+
+    #[test]
+    fn trend_requires_both_scores_even_with_matching_formula_identity() {
+        let current_vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        let health = compute_health_score(&current_vs, counts.total_files);
+        for (previous_score, current_score) in [(None, Some(&health)), (Some(72.0), None)] {
+            let mut previous = make_test_snapshot("2026-01-01T00:00:00Z", previous_score);
+            previous.score_formula_version = Some(health.formula_version);
+            let trend = compute_trend_against(&previous, 1, &current_vs, &counts, current_score);
+            assert!(!trend.metrics.iter().any(|metric| metric.name == "score"));
+            assert!(
+                trend
+                    .metrics
+                    .iter()
+                    .any(|metric| metric.name == "avg_cyclomatic")
+            );
+            assert!(
+                fallow_output::health_score_comparison_note(
+                    previous.score_formula_version,
+                    Some(health.formula_version),
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn trend_compares_only_known_matching_score_formulas() {
+        let current_vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        let current_score = compute_health_score(&current_vs, counts.total_files);
+        for previous_formula in [
+            None,
+            Some(HEALTH_SCORE_FORMULA_VERSION - 1),
+            Some(HEALTH_SCORE_FORMULA_VERSION),
+            Some(HEALTH_SCORE_FORMULA_VERSION + 1),
+        ] {
+            let mut previous = make_test_snapshot("2026-01-01T00:00:00Z", Some(72.0));
+            previous.score_formula_version = previous_formula;
+            let trend =
+                compute_trend_against(&previous, 1, &current_vs, &counts, Some(&current_score));
+            assert_eq!(
+                trend.metrics.iter().any(|metric| metric.name == "score"),
+                previous_formula == Some(current_score.formula_version),
+                "previous formula: {previous_formula:?}"
+            );
+            assert!(
+                trend
+                    .metrics
+                    .iter()
+                    .any(|metric| metric.name == "avg_cyclomatic")
+            );
+            assert_eq!(trend.compared_to.score, previous.score);
+            assert_eq!(trend.compared_to.grade, previous.grade);
+            assert_eq!(trend.compared_to.score_formula_version, previous_formula);
+        }
+    }
+
+    #[test]
+    fn trend_uses_actual_current_formula_and_keeps_raw_direction_on_mismatch() {
+        let current_vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        let mut current_score = compute_health_score(&current_vs, counts.total_files);
+        current_score.formula_version = HEALTH_SCORE_FORMULA_VERSION + 1;
+        current_score.score = 90.0;
+        let mut previous = make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0));
+        previous.vital_signs = current_vs.clone();
+        previous.counts = counts.clone();
+        previous.vital_signs.avg_cyclomatic = current_vs.avg_cyclomatic - 2.0;
+
+        let incompatible =
+            compute_trend_against(&previous, 1, &current_vs, &counts, Some(&current_score));
+        assert!(
+            !incompatible
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "score")
+        );
+        assert_eq!(incompatible.overall_direction, TrendDirection::Declining);
+
+        previous.score_formula_version = Some(current_score.formula_version);
+        let compatible =
+            compute_trend_against(&previous, 1, &current_vs, &counts, Some(&current_score));
+        assert!(
+            compatible
+                .metrics
+                .iter()
+                .any(|metric| metric.name == "score")
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_retains_unknown_formula_without_tool_version_inference() {
+        let mut value =
+            serde_json::to_value(make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0))).unwrap();
+        value["snapshot_schema_version"] = serde_json::json!(11);
+        value["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("score_formula_version");
+        let previous: VitalSignsSnapshot = serde_json::from_value(value).unwrap();
+        assert!(previous.score_formula_version.is_none());
+        let current_vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        let health = compute_health_score(&current_vs, counts.total_files);
+        let trend = compute_trend_against(&previous, 1, &current_vs, &counts, Some(&health));
+        assert!(!trend.metrics.iter().any(|metric| metric.name == "score"));
+        assert!(!trend.metrics.is_empty());
+    }
+
+    #[test]
+    fn group_trend_uses_snapshot_level_formula_identity() {
+        let current_vs = make_test_vital_signs();
+        let counts = make_test_counts();
+        let health = compute_health_score(&current_vs, counts.total_files);
+        let group = group_snapshot("@team/a", 70.0);
+        for formula in [
+            None,
+            Some(HEALTH_SCORE_FORMULA_VERSION - 1),
+            Some(health.formula_version),
+        ] {
+            let mut previous = make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0));
+            previous.score_formula_version = formula;
+            let trend =
+                compute_group_trend(&previous, 1, &group, &current_vs, &counts, Some(&health));
+            assert_eq!(
+                trend.metrics.iter().any(|metric| metric.name == "score"),
+                formula == Some(health.formula_version),
+            );
+            assert_eq!(trend.compared_to.score, group.score);
+            assert_eq!(trend.compared_to.grade, group.grade);
+            assert_eq!(trend.compared_to.score_formula_version, formula);
+            assert!(!trend.metrics.is_empty());
+        }
+    }
+
+    #[test]
     fn compute_trend_no_snapshots() {
         let vs = make_test_vital_signs();
         let counts = make_test_counts();
@@ -1746,13 +2268,24 @@ mod tests {
     #[test]
     fn compute_trend_uses_most_recent_snapshot() {
         let older = make_test_snapshot("2026-01-01T00:00:00Z", Some(60.0));
-        let newer = make_test_snapshot("2026-03-01T00:00:00Z", Some(72.0));
         let vs = make_test_vital_signs();
         let counts = make_test_counts();
 
-        let trend = compute_trend(&vs, &counts, Some(78.0), &[older, newer]).unwrap();
-        assert_eq!(trend.compared_to.score, Some(72.0));
-        assert_eq!(trend.snapshots_loaded, 2);
+        for newest_formula in [
+            None,
+            Some(HEALTH_SCORE_FORMULA_VERSION - 1),
+            Some(HEALTH_SCORE_FORMULA_VERSION),
+        ] {
+            let mut newer = make_test_snapshot("2026-03-01T00:00:00Z", Some(72.0));
+            newer.score_formula_version = newest_formula;
+            let trend = compute_trend(&vs, &counts, Some(78.0), &[older.clone(), newer]).unwrap();
+            assert_eq!(trend.compared_to.score, Some(72.0));
+            assert_eq!(trend.snapshots_loaded, 2);
+            assert_eq!(
+                trend.metrics.iter().any(|metric| metric.name == "score"),
+                newest_formula == Some(HEALTH_SCORE_FORMULA_VERSION)
+            );
+        }
     }
 
     #[test]
@@ -1799,6 +2332,7 @@ mod tests {
 
     fn make_test_snapshot(timestamp: &str, score: Option<f64>) -> VitalSignsSnapshot {
         VitalSignsSnapshot {
+            groups: None,
             snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
             version: "2.5.5".into(),
             timestamp: timestamp.into(),
@@ -1827,8 +2361,170 @@ mod tests {
             },
             score,
             grade: score.map(|s| letter_grade(s).to_string()),
+            score_formula_version: score.map(|_| HEALTH_SCORE_FORMULA_VERSION),
             coverage_model: None,
             analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
         }
+    }
+
+    fn group_snapshot(key: &str, score: f64) -> fallow_output::GroupSnapshot {
+        fallow_output::GroupSnapshot {
+            key: key.to_owned(),
+            files_analyzed: 10,
+            vital_signs: VitalSigns {
+                avg_cyclomatic: 3.0,
+                p90_cyclomatic: 8,
+                ..Default::default()
+            },
+            counts: VitalSignsCounts {
+                total_files: 10,
+                ..Default::default()
+            },
+            score: Some(score),
+            grade: Some(letter_grade(score).to_string()),
+            severity_critical_count: 2,
+            hotspot_count: 1,
+        }
+    }
+
+    #[test]
+    fn v10_snapshot_without_groups_still_deserializes() {
+        let mut value =
+            serde_json::to_value(make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0))).unwrap();
+        value["snapshot_schema_version"] = serde_json::json!(10);
+        value.as_object_mut().unwrap().remove("groups");
+        let snapshot: VitalSignsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.snapshot_schema_version, 10);
+        assert!(snapshot.groups.is_none());
+    }
+
+    #[test]
+    fn v11_snapshot_round_trips_group_data() {
+        let mut snapshot = make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0));
+        snapshot.groups = Some(fallow_output::SnapshotGrouping {
+            grouped_by: "owner".to_owned(),
+            group_filter: Some(vec!["@team/*".to_owned()]),
+            groups: vec![group_snapshot("@team/a", 81.5)],
+        });
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let loaded: VitalSignsSnapshot = serde_json::from_str(&json).unwrap();
+        let groups = loaded.groups.expect("groups survive the round trip");
+        assert_eq!(groups.grouped_by, "owner");
+        assert_eq!(groups.group_filter, Some(vec!["@team/*".to_owned()]));
+        assert_eq!(groups.groups[0].key, "@team/a");
+        assert_eq!(groups.groups[0].score, Some(81.5));
+        assert_eq!(groups.groups[0].severity_critical_count, 2);
+        let ungrouped =
+            serde_json::to_value(make_test_snapshot("2026-01-01T00:00:00Z", None)).unwrap();
+        assert!(
+            ungrouped.get("groups").is_none(),
+            "ungrouped snapshot omits groups"
+        );
+    }
+
+    #[test]
+    fn explicit_trend_baseline_reads_that_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let snap_dir = root.join(".fallow/snapshots");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join("newer.json"),
+            serde_json::to_string(&make_test_snapshot("2026-09-01T00:00:00Z", Some(90.0))).unwrap(),
+        )
+        .unwrap();
+        let explicit = root.join("restored.json");
+        std::fs::write(
+            &explicit,
+            serde_json::to_string(&make_test_snapshot("2026-01-01T00:00:00Z", Some(60.0))).unwrap(),
+        )
+        .unwrap();
+
+        let baseline = load_trend_baseline(root, Some(&explicit))
+            .unwrap()
+            .expect("explicit baseline");
+        assert_eq!(baseline.snapshot.timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(baseline.snapshots_loaded, 1);
+        assert_eq!(baseline.path, explicit);
+
+        let directory = load_trend_baseline(root, None).unwrap().expect("newest");
+        assert_eq!(directory.snapshot.timestamp, "2026-09-01T00:00:00Z");
+        assert_eq!(directory.snapshots_loaded, 1);
+    }
+
+    #[test]
+    fn explicit_trend_baseline_fails_on_missing_or_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let missing = load_trend_baseline(root, Some(&root.join("absent.json"))).unwrap_err();
+        assert!(
+            missing.contains("failed to read --trend-from snapshot"),
+            "{missing}"
+        );
+        let invalid_path = root.join("invalid.json");
+        std::fs::write(&invalid_path, "{\"not\": \"a snapshot\"}").unwrap();
+        let invalid = load_trend_baseline(root, Some(&invalid_path)).unwrap_err();
+        assert!(
+            invalid.contains("is not a fallow health snapshot"),
+            "{invalid}"
+        );
+        assert!(load_trend_baseline(root, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_trend_baseline_error_does_not_echo_file_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (index, content) in [r#"{"timestamp": "private-value"}"#, r#"["private-value"]"#]
+            .into_iter()
+            .enumerate()
+        {
+            let path = root.join(format!("leak-{index}.json"));
+            std::fs::write(&path, content).unwrap();
+            let error = load_trend_baseline(root, Some(&path)).unwrap_err();
+            assert!(error.contains("is not a fallow health snapshot"), "{error}");
+            assert!(error.contains("line 1, column"), "{error}");
+            assert!(!error.contains("private-value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn group_trend_compares_against_the_stored_group() {
+        let baseline = TrendBaseline {
+            snapshot: make_test_snapshot("2026-01-01T00:00:00Z", Some(70.0)),
+            path: PathBuf::from("baseline.json"),
+            snapshots_loaded: 1,
+        };
+        let current = VitalSigns {
+            avg_cyclomatic: 3.0,
+            p90_cyclomatic: 8,
+            ..Default::default()
+        };
+        let counts = VitalSignsCounts {
+            total_files: 10,
+            ..Default::default()
+        };
+        let current_score = HealthScore {
+            score: 84.0,
+            ..compute_health_score(&current, counts.total_files)
+        };
+        let trend = compute_group_trend(
+            &baseline.without_groups(),
+            baseline.snapshots_loaded,
+            &group_snapshot("@team/a", 80.0),
+            &current,
+            &counts,
+            Some(&current_score),
+        );
+        let score = trend
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "score")
+            .expect("score metric");
+        assert!((score.previous - 80.0).abs() < f64::EPSILON);
+        assert!((score.delta - 4.0).abs() < 1e-9);
+        assert_eq!(score.direction, TrendDirection::Improving);
+        assert_eq!(trend.compared_to.timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(trend.compared_to.score, Some(80.0));
     }
 }

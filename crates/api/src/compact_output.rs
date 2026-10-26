@@ -3,6 +3,7 @@ use std::path::Path;
 use fallow_engine::duplicates::CloneFingerprintSet;
 use fallow_output::normalize_uri;
 use fallow_types::duplicates::DuplicationReport;
+use fallow_types::output_dead_code::ReachabilityCaveat;
 use fallow_types::results::{AnalysisResults, UnusedExport, UnusedMember};
 
 use crate::ResultGroup;
@@ -15,21 +16,42 @@ fn compact_path(path: &Path, root: &Path) -> String {
     normalize_uri(&relative_path(path, root).display().to_string())
 }
 
+/// The trailing `,caveat=<tokens>` field a compact record carries when the
+/// verdict behind it rests on a file this run never fully analyzed, or an empty
+/// string when it does not.
+///
+/// Compact records are not fixed at four colon-separated fields: duplication
+/// already appends `,fingerprint=...,group=...,tokens=...` after its location,
+/// so a trailing `,key=value` is the format's existing extension point and a
+/// parser that splits on the leading `:` fields is unaffected. Wire tokens are
+/// used rather than the prose labels the human report shows, because compact is
+/// consumed by scripts: `caveat=incomplete-import-graph` greps exactly.
+/// Multiple caveats join with `+`, since `,` already separates fields.
+fn compact_caveat_field(caveats: &[ReachabilityCaveat]) -> String {
+    if caveats.is_empty() {
+        return String::new();
+    }
+    let tokens: Vec<&str> = caveats
+        .iter()
+        .map(|caveat| ReachabilityCaveat::token(*caveat))
+        .collect();
+    format!(",caveat={}", tokens.join("+"))
+}
+
 fn compact_circular_dependency_line(
     cycle: &fallow_types::output_dead_code::CircularDependencyFinding,
     root: &Path,
 ) -> String {
-    let chain: Vec<String> = cycle
+    let mut display_chain: Vec<String> = cycle
         .cycle
         .files
         .iter()
         .map(|path| compact_path(path, root))
         .collect();
-    let mut display_chain = chain.clone();
-    if let Some(first) = chain.first() {
+    if let Some(first) = display_chain.first() {
         display_chain.push(first.clone());
     }
-    let first_file = chain.first().map_or_else(String::new, Clone::clone);
+    let first_file = display_chain.first().map_or("", String::as_str);
     let cross_pkg_tag = if cycle.cycle.is_cross_package {
         " (cross-package)"
     } else {
@@ -54,7 +76,7 @@ fn compact_re_export_cycle_line(
         .iter()
         .map(|path| compact_path(path, root))
         .collect();
-    let first_file = chain.first().map_or_else(String::new, Clone::clone);
+    let first_file = chain.first().map_or("", String::as_str);
     let kind_tag = match cycle.cycle.kind {
         fallow_types::results::ReExportCycleKind::SelfLoop => " (self-loop)",
         fallow_types::results::ReExportCycleKind::MultiNode => "",
@@ -65,6 +87,26 @@ fn compact_re_export_cycle_line(
         chain.join(" <-> "),
         kind_tag
     )
+}
+
+fn compact_package_cycle_line(
+    cycle: &fallow_types::output_dead_code::PackageCycleFinding,
+    root: &Path,
+) -> String {
+    let (anchor, line) = cycle.cycle.edges.first().map_or_else(
+        || (String::new(), 0),
+        |edge| (compact_path(&edge.path, root), edge.line),
+    );
+    let chain = cycle.cycle.chain(" \u{2192} ");
+    let note = if cycle.cycle.group_truncated {
+        format!(
+            " ({})",
+            fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+        )
+    } else {
+        String::new()
+    };
+    format!("package-cycle:{anchor}:{line}:{chain}{note}")
 }
 
 fn compact_boundary_violation_line(
@@ -193,57 +235,70 @@ impl<'a> CompactLineBuilder<'a> {
         compact_path(path, self.root)
     }
 
-    fn unused_export_line(&self, export: &UnusedExport) -> String {
+    fn unused_export_line(&self, export: &UnusedExport, caveats: &[ReachabilityCaveat]) -> String {
         let tag = if export.is_re_export {
             "unused-re-export"
         } else {
             "unused-export"
         };
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}{}",
             tag,
             self.rel(&export.path),
             export.line,
-            export.export_name
+            export.export_name,
+            compact_caveat_field(caveats)
         )
     }
 
-    fn unused_type_line(&self, export: &UnusedExport) -> String {
+    fn unused_type_line(&self, export: &UnusedExport, caveats: &[ReachabilityCaveat]) -> String {
         let tag = if export.is_re_export {
             "unused-re-export-type"
         } else {
             "unused-type"
         };
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}{}",
             tag,
             self.rel(&export.path),
             export.line,
-            export.export_name
+            export.export_name,
+            compact_caveat_field(caveats)
         )
     }
 
-    fn compact_member(&self, member: &UnusedMember, kind: &str) -> String {
+    fn compact_member(
+        &self,
+        member: &UnusedMember,
+        kind: &str,
+        caveats: &[ReachabilityCaveat],
+    ) -> String {
         format!(
-            "{}:{}:{}:{}.{}",
+            "{}:{}:{}:{}.{}{}",
             kind,
             self.rel(&member.path),
             member.line,
             member.parent_name,
-            member.member_name
+            member.member_name,
+            compact_caveat_field(caveats)
         )
     }
 
     fn push_core_lines(&mut self) {
         for file in &self.results.unused_files {
-            self.lines
-                .push(format!("unused-file:{}", self.rel(&file.file.path)));
+            self.lines.push(format!(
+                "unused-file:{}{}",
+                self.rel(&file.file.path),
+                compact_caveat_field(&file.reachability_caveats)
+            ));
         }
         for export in &self.results.unused_exports {
-            self.lines.push(self.unused_export_line(&export.export));
+            self.lines
+                .push(self.unused_export_line(&export.export, &export.reachability_caveats));
         }
         for export in &self.results.unused_types {
-            self.lines.push(self.unused_type_line(&export.export));
+            self.lines
+                .push(self.unused_type_line(&export.export, &export.reachability_caveats));
         }
         for leak in &self.results.private_type_leaks {
             self.lines.push(format!(
@@ -254,35 +309,61 @@ impl<'a> CompactLineBuilder<'a> {
                 leak.leak.type_name
             ));
         }
+        for finding in &self.results.deprecated_exports_in_use {
+            self.lines.push(format!(
+                "deprecated-export-in-use:{}:{}:{}",
+                self.rel(&finding.export.path),
+                finding.export.line,
+                finding.export.export_name
+            ));
+        }
     }
 
     fn push_unused_dependency_lines(&mut self) {
         for dep in &self.results.unused_dependencies {
-            self.lines
-                .push(format!("unused-dep:{}", dep.dep.package_name));
+            self.lines.push(format!(
+                "unused-dep:{}{}",
+                dep.dep.package_name,
+                compact_caveat_field(&dep.reachability_caveats)
+            ));
         }
         for dep in &self.results.unused_dev_dependencies {
-            self.lines
-                .push(format!("unused-devdep:{}", dep.dep.package_name));
+            self.lines.push(format!(
+                "unused-devdep:{}{}",
+                dep.dep.package_name,
+                compact_caveat_field(&dep.reachability_caveats)
+            ));
         }
         for dep in &self.results.unused_optional_dependencies {
-            self.lines
-                .push(format!("unused-optionaldep:{}", dep.dep.package_name));
+            self.lines.push(format!(
+                "unused-optionaldep:{}{}",
+                dep.dep.package_name,
+                compact_caveat_field(&dep.reachability_caveats)
+            ));
         }
     }
 
     fn push_member_lines(&mut self) {
         for member in &self.results.unused_enum_members {
-            self.lines
-                .push(self.compact_member(&member.member, "unused-enum-member"));
+            self.lines.push(self.compact_member(
+                &member.member,
+                "unused-enum-member",
+                &member.reachability_caveats,
+            ));
         }
         for member in &self.results.unused_class_members {
-            self.lines
-                .push(self.compact_member(&member.member, "unused-class-member"));
+            self.lines.push(self.compact_member(
+                &member.member,
+                "unused-class-member",
+                &member.reachability_caveats,
+            ));
         }
         for member in &self.results.unused_store_members {
-            self.lines
-                .push(self.compact_member(&member.member, "unused-store-member"));
+            self.lines.push(self.compact_member(
+                &member.member,
+                "unused-store-member",
+                &member.reachability_caveats,
+            ));
         }
         for import in &self.results.unresolved_imports {
             self.lines.push(format!(
@@ -333,6 +414,10 @@ impl<'a> CompactLineBuilder<'a> {
         for cycle in &self.results.re_export_cycles {
             self.lines
                 .push(compact_re_export_cycle_line(cycle, self.root));
+        }
+        for cycle in &self.results.package_cycles {
+            self.lines
+                .push(compact_package_cycle_line(cycle, self.root));
         }
         for violation in &self.results.boundary_violations {
             self.lines
@@ -398,6 +483,50 @@ impl<'a> CompactLineBuilder<'a> {
     fn push_component_lines(&mut self) {
         self.push_component_member_lines();
         self.push_component_framework_lines();
+        self.push_component_health_lines();
+    }
+
+    /// Push compact lines for component health findings. Advisory findings stay
+    /// outside `total_issues`; explicit prop enforcement contributes to it.
+    fn push_component_health_lines(&mut self) {
+        for finding in &self.results.prop_drilling_chains {
+            let chain = &finding.chain;
+            let (path, line) = chain
+                .hops
+                .first()
+                .map_or((String::new(), 0), |hop| (self.rel(&hop.file), hop.line));
+            let trail = chain
+                .hops
+                .iter()
+                .map(|hop| hop.component.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            self.lines.push(format!(
+                "prop-drilling:{path}:{line}:{} (through {trail}, depth {})",
+                chain.prop, chain.depth,
+            ));
+        }
+        for finding in &self.results.thin_wrappers {
+            let wrapper = &finding.wrapper;
+            self.lines.push(format!(
+                "thin-wrapper:{}:{}:{} (wraps {})",
+                self.rel(&wrapper.file),
+                wrapper.line,
+                wrapper.component,
+                wrapper.child_component,
+            ));
+        }
+        for finding in &self.results.duplicate_prop_shapes {
+            let shape = &finding.shape;
+            self.lines.push(format!(
+                "duplicate-prop-shape:{}:{}:{} (shape {{{}}} shared with {} other components)",
+                self.rel(&shape.file),
+                shape.line,
+                shape.component,
+                shape.shape.join(", "),
+                shape.group_size.saturating_sub(1),
+            ));
+        }
     }
 
     /// Push compact lines for unrendered components, props, emits, inputs, and outputs.
@@ -408,6 +537,15 @@ impl<'a> CompactLineBuilder<'a> {
                 self.rel(&finding.component.path),
                 finding.component.line,
                 finding.component.component_name,
+            ));
+        }
+        for finding in &self.results.absent_component_props {
+            self.lines.push(format!(
+                "absent-component-prop:{}:{}:{}.{} (review candidate)",
+                self.rel(&finding.prop.path),
+                finding.prop.line,
+                finding.prop.component_name,
+                finding.prop.prop_name
             ));
         }
         for finding in &self.results.unused_component_props {
@@ -444,7 +582,8 @@ impl<'a> CompactLineBuilder<'a> {
         }
     }
 
-    /// Push compact lines for Svelte events, server actions, and load-data keys.
+    /// Push compact lines for Svelte events, Effect findings, server actions,
+    /// and load-data keys.
     fn push_component_framework_lines(&mut self) {
         for finding in &self.results.unused_svelte_events {
             self.lines.push(format!(
@@ -452,6 +591,30 @@ impl<'a> CompactLineBuilder<'a> {
                 self.rel(&finding.event.path),
                 finding.event.line,
                 finding.event.event_name,
+            ));
+        }
+        for finding in &self.results.unused_effect_layers {
+            self.lines.push(format!(
+                "unused-effect-layer:{}:{}:{}",
+                self.rel(&finding.layer.path),
+                finding.layer.line,
+                finding.layer.name,
+            ));
+        }
+        for finding in &self.results.unused_tagged_errors {
+            self.lines.push(format!(
+                "unused-tagged-error:{}:{}:{}",
+                self.rel(&finding.error.path),
+                finding.error.line,
+                finding.error.name,
+            ));
+        }
+        for finding in &self.results.unproduced_catch_tags {
+            self.lines.push(format!(
+                "unproduced-catch-tag:{}:{}:{}",
+                self.rel(&finding.catch_tag.path),
+                finding.catch_tag.line,
+                finding.catch_tag.tag,
             ));
         }
         for finding in &self.results.unused_server_actions {
@@ -563,6 +726,7 @@ pub fn build_health_compact_lines(
     push_coverage_gaps_compact(&mut lines, report, root);
     push_runtime_sections_compact(&mut lines, report, root);
     push_hotspots_compact(&mut lines, &report.hotspots, root);
+    push_change_coupling_compact(&mut lines, report.change_coupling.as_ref(), root);
     push_health_trend_compact(&mut lines, report);
     push_refactoring_targets_compact(&mut lines, &report.targets, root);
     lines
@@ -574,7 +738,7 @@ fn push_styling_findings_compact(
     root: &Path,
 ) {
     for finding in findings {
-        let relative = health_compact_path(Path::new(&finding.path), root);
+        let relative = compact_path(Path::new(&finding.path), root);
         let severity = match finding.effective_severity {
             fallow_output::StylingFindingSeverity::Error => "error",
             fallow_output::StylingFindingSeverity::Warn => "warn",
@@ -585,6 +749,32 @@ fn push_styling_findings_compact(
             finding.code, relative, finding.line, finding.sub_kind, severity, value
         ));
     }
+}
+
+/// Compact records for the diff-risk findings of `fallow audit`.
+///
+/// Format: `<rule>:<path>:<line>:<evidence>,severity=<severity>[,kind=<kind>]`.
+/// The paths are already root-relative. The line is `0` when the finding is
+/// about the whole file.
+#[must_use]
+pub fn build_diff_risk_compact_lines(report: &fallow_output::DiffRiskReport) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .map(|finding| {
+            let kind = finding
+                .kind
+                .map_or_else(String::new, |kind| format!(",kind={}", kind.code()));
+            format!(
+                "{}:{}:{}:{},severity={}{kind}",
+                finding.rule.code(),
+                normalize_uri(&finding.path),
+                finding.line.unwrap_or(0),
+                compact_field_value(&finding.evidence),
+                finding.severity.code(),
+            )
+        })
+        .collect()
 }
 
 fn compact_field_value(value: &str) -> String {
@@ -609,7 +799,7 @@ fn push_threshold_overrides_compact(
         };
         let target = entry.path.as_ref().map_or_else(
             || "no-match".to_string(),
-            |path| entry.target_label(&health_compact_path(path, root)),
+            |path| entry.target_label(&compact_path(path, root)),
         );
         let dimension = threshold_override_dimension_label(entry.dimension);
         let metrics = entry.metrics.map_or(String::new(), |metrics| {
@@ -686,11 +876,27 @@ fn push_vital_signs_compact(lines: &mut Vec<String>, report: &fallow_output::Hea
             parts.push(format!("unused_dep_count={v}"));
         }
         lines.push(format!("vital-signs:{}", parts.join(",")));
+        push_cyclomatic_population_compact(lines, vs);
     }
 }
 
-fn health_compact_path(path: &Path, root: &Path) -> String {
-    normalize_uri(&relative_path(path, root).display().to_string())
+fn push_cyclomatic_population_compact(lines: &mut Vec<String>, vs: &fallow_output::VitalSigns) {
+    let Some(population) = &vs.cyclomatic_population else {
+        return;
+    };
+    for (kind, group) in [
+        ("functions", &population.functions),
+        ("modules", &population.modules),
+        ("templates", &population.templates),
+    ] {
+        let max = group
+            .max
+            .map_or_else(|| "null".to_string(), |value| value.to_string());
+        lines.push(format!(
+            "cyclomatic-population:{kind}:count={},sum={},max={max}",
+            group.count, group.sum
+        ));
+    }
 }
 
 /// Serde-name mirror of `ExceededThreshold` for the compact line grammar.
@@ -712,7 +918,7 @@ fn push_health_findings_compact(
     root: &Path,
 ) {
     for finding in findings {
-        let relative = health_compact_path(&finding.path, root);
+        let relative = compact_path(&finding.path, root);
         let severity = match finding.severity {
             fallow_output::FindingSeverity::Critical => "critical",
             fallow_output::FindingSeverity::High => "high",
@@ -752,7 +958,7 @@ fn push_file_scores_compact(
     root: &Path,
 ) {
     for score in scores {
-        let relative = health_compact_path(&score.path, root);
+        let relative = compact_path(&score.path, root);
         lines.push(format!(
             "file-score:{}:mi={:.1},fan_in={},fan_out={},dead={:.2},density={:.2},crap_max={:.1},crap_above={}",
             relative,
@@ -782,14 +988,14 @@ fn push_coverage_gaps_compact(
             gaps.summary.untested_exports,
         ));
         for item in &gaps.files {
-            let relative = health_compact_path(&item.file.path, root);
+            let relative = compact_path(&item.file.path, root);
             lines.push(format!(
                 "untested-file:{}:value_exports={}",
                 relative, item.file.value_export_count,
             ));
         }
         for item in &gaps.exports {
-            let relative = health_compact_path(&item.export.path, root);
+            let relative = compact_path(&item.export.path, root);
             lines.push(format!(
                 "untested-export:{}:{}:{}",
                 relative, item.export.line, item.export.export_name,
@@ -848,7 +1054,7 @@ fn push_hotspots_compact(
     root: &Path,
 ) {
     for entry in hotspots {
-        let relative = health_compact_path(&entry.path, root);
+        let relative = compact_path(&entry.path, root);
         let ownership_suffix = compact_ownership_suffix(entry.ownership.as_ref());
         lines.push(format!(
             "hotspot:{}:score={:.1},commits={},churn={},density={:.2},fan_in={},trend={}{}",
@@ -864,8 +1070,50 @@ fn push_hotspots_compact(
     }
 }
 
+/// One line per hidden change-coupling pair:
+/// `change-coupling:<path_a>:<path_b>:degree=..,shared=..,commits_a=..,commits_b=..,strong=..`.
+fn push_change_coupling_compact(
+    lines: &mut Vec<String>,
+    coupling: Option<&fallow_output::ChangeCouplingReport>,
+    root: &Path,
+) {
+    let Some(coupling) = coupling else {
+        return;
+    };
+    for pair in &coupling.pairs {
+        lines.push(format!(
+            "change-coupling:{}:{}:degree={:.2},shared={},commits_a={},commits_b={},strong={}",
+            compact_path(&pair.path_a, root),
+            compact_path(&pair.path_b, root),
+            pair.degree,
+            pair.shared_revisions,
+            pair.revisions_a,
+            pair.revisions_b,
+            pair.strong,
+        ));
+    }
+}
+
 fn push_health_trend_compact(lines: &mut Vec<String>, report: &fallow_output::HealthReport) {
     if let Some(ref trend) = report.health_trend {
+        if let Some(current) = report.health_score.as_ref()
+            && trend.compared_to.score.is_some()
+            && !trend.metrics.iter().any(|metric| metric.name == "score")
+            && fallow_output::health_score_comparison_note(
+                trend.compared_to.score_formula_version,
+                Some(current.formula_version),
+            )
+            .is_some()
+        {
+            let previous_formula = trend
+                .compared_to
+                .score_formula_version
+                .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+            lines.push(format!(
+                "trend:score-omitted:previous_formula={previous_formula},current_formula={}",
+                current.formula_version,
+            ));
+        }
         lines.push(format!(
             "trend:overall:direction={}",
             trend.overall_direction.label()
@@ -889,7 +1137,7 @@ fn push_refactoring_targets_compact(
     root: &Path,
 ) {
     for target in targets {
-        let relative = health_compact_path(&target.path, root);
+        let relative = compact_path(&target.path, root);
         let category = target.category.compact_label();
         let effort = target.effort.label();
         let confidence = target.confidence.label();
@@ -922,7 +1170,7 @@ fn build_runtime_coverage_compact_lines(
         production.summary.deployments_seen,
     )];
     for finding in &production.findings {
-        let relative = normalize_uri(&relative_path(&finding.path, root).display().to_string());
+        let relative = compact_path(&finding.path, root);
         let invocations = finding
             .invocations
             .map_or_else(|| "null".to_owned(), |hits| hits.to_string());
@@ -938,7 +1186,7 @@ fn build_runtime_coverage_compact_lines(
         ));
     }
     for entry in &production.hot_paths {
-        let relative = normalize_uri(&relative_path(&entry.path, root).display().to_string());
+        let relative = compact_path(&entry.path, root);
         lines.push(format!(
             "production-hot-path:{}:{}:{}:id={},invocations={},percentile={}",
             relative, entry.line, entry.function, entry.id, entry.invocations, entry.percentile,
@@ -962,7 +1210,7 @@ fn build_coverage_intelligence_compact_lines(
         intelligence.summary.skipped_ambiguous_matches,
     )];
     for finding in &intelligence.findings {
-        let relative = normalize_uri(&relative_path(&finding.path, root).display().to_string());
+        let relative = compact_path(&finding.path, root);
         let identity = finding.identity.as_deref().unwrap_or("-");
         let signals = finding
             .signals
@@ -994,7 +1242,7 @@ pub fn build_duplication_compact_lines(report: &DuplicationReport, root: &Path) 
         let fingerprint = fingerprints.fingerprint_for_group(group);
         for instance in &group.instances {
             lines.push(format!(
-                "code-duplication:{}:{}-{}:fingerprint={},group={},tokens={},lines={},instances={}",
+                "code-duplication:{}:{}-{}:fingerprint={},group={},tokens={},lines={},instances={}{}",
                 compact_path(&instance.file, root),
                 instance.start_line,
                 instance.end_line,
@@ -1003,6 +1251,11 @@ pub fn build_duplication_compact_lines(report: &DuplicationReport, root: &Path) 
                 group.token_count,
                 group.line_count,
                 group.instances.len(),
+                if instance.is_symlink {
+                    ",symlink=true"
+                } else {
+                    ""
+                },
             ));
         }
     }
@@ -1018,6 +1271,229 @@ mod tests {
     use fallow_types::results::{AnalysisResults, UnusedFile};
 
     use super::*;
+
+    fn diff_risk_finding(
+        rule: fallow_output::DiffRiskRule,
+        kind: Option<fallow_output::WeakenedTestsKind>,
+        path: &str,
+        line: Option<u32>,
+        evidence: &str,
+        severity: fallow_output::DiffRiskSeverity,
+    ) -> fallow_output::DiffRiskFinding {
+        fallow_output::DiffRiskFinding {
+            rule,
+            kind,
+            path: path.to_owned(),
+            line,
+            message: "m".to_owned(),
+            evidence: evidence.to_owned(),
+            severity,
+            introduced: true,
+            related: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diff_risk_compact_lines_follow_the_tag_path_line_subject_grammar() {
+        let report = fallow_output::DiffRiskReport {
+            findings: vec![
+                diff_risk_finding(
+                    fallow_output::DiffRiskRule::WeakenedTests,
+                    Some(fallow_output::WeakenedTestsKind::SkipOnly),
+                    "src/a.test.ts",
+                    Some(4),
+                    "it.skip",
+                    fallow_output::DiffRiskSeverity::Warn,
+                ),
+                diff_risk_finding(
+                    fallow_output::DiffRiskRule::WeakenedTests,
+                    Some(fallow_output::WeakenedTestsKind::RemovedTests),
+                    "src/b.test.ts",
+                    None,
+                    "test cases: 3 -> 1",
+                    fallow_output::DiffRiskSeverity::Error,
+                ),
+                diff_risk_finding(
+                    fallow_output::DiffRiskRule::AddedDependency,
+                    None,
+                    "package.json",
+                    Some(7),
+                    "left-pad@^1.3.0 (dependencies)",
+                    fallow_output::DiffRiskSeverity::Warn,
+                ),
+            ],
+        };
+        assert_eq!(
+            build_diff_risk_compact_lines(&report),
+            vec![
+                "weakened-tests:src/a.test.ts:4:it.skip,severity=warn,kind=skip-only".to_owned(),
+                "weakened-tests:src/b.test.ts:0:test cases 3 -> 1,severity=error,kind=removed-tests"
+                    .to_owned(),
+                "added-dependency:package.json:7:left-pad@^1.3.0 (dependencies),severity=warn"
+                    .to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_cycles_preserve_empty_self_loop_and_cross_package_output() {
+        use fallow_types::output_dead_code::{CircularDependencyFinding, ReExportCycleFinding};
+        use fallow_types::results::{CircularDependency, ReExportCycle, ReExportCycleKind};
+
+        let root = Path::new("/project");
+        for (files, cross_package, expected) in [
+            (vec![], false, "circular-dependency::7:"),
+            (
+                vec![root.join("src/a.ts")],
+                false,
+                "circular-dependency:src/a.ts:7:src/a.ts → src/a.ts",
+            ),
+            (
+                vec![root.join("src/a.ts"), root.join("src/b.ts")],
+                true,
+                "circular-dependency:src/a.ts:7:src/a.ts → src/b.ts → src/a.ts (cross-package)",
+            ),
+        ] {
+            let mut results = AnalysisResults::default();
+            results
+                .circular_dependencies
+                .push(CircularDependencyFinding {
+                    finding_id: None,
+                    cycle: CircularDependency {
+                        length: files.len(),
+                        files,
+                        line: 7,
+                        col: 0,
+                        edges: vec![],
+                        is_cross_package: cross_package,
+                    },
+                    actions: vec![],
+                    introduced: None,
+                    effective_severity: None,
+                });
+            assert_eq!(build_compact_lines(&results, root), vec![expected]);
+        }
+        for (files, kind, expected) in [
+            (vec![], ReExportCycleKind::MultiNode, "re-export-cycle::"),
+            (
+                vec![root.join("src/a.ts")],
+                ReExportCycleKind::SelfLoop,
+                "re-export-cycle:src/a.ts:src/a.ts (self-loop)",
+            ),
+            (
+                vec![root.join("src/a.ts"), root.join("src/b.ts")],
+                ReExportCycleKind::MultiNode,
+                "re-export-cycle:src/a.ts:src/a.ts <-> src/b.ts",
+            ),
+        ] {
+            let mut results = AnalysisResults::default();
+            results.re_export_cycles.push(ReExportCycleFinding {
+                finding_id: None,
+                cycle: ReExportCycle { files, kind },
+                actions: vec![],
+                introduced: None,
+                effective_severity: None,
+            });
+            assert_eq!(build_compact_lines(&results, root), vec![expected]);
+        }
+    }
+
+    /// A compact record is what a CI script greps to decide what to delete, so
+    /// a verdict resting on a file the run never read has to say so on the same
+    /// line. The field rides in the trailing `,key=value` slot duplication
+    /// records already use, so the leading colon-separated fields a parser
+    /// splits on are untouched.
+    #[test]
+    fn a_caveated_finding_carries_a_trailing_caveat_field() {
+        use fallow_types::extract::MemberKind;
+        use fallow_types::output_dead_code::{ReachabilityCaveat, UnusedDependencyFinding};
+        use fallow_types::results::{UnusedDependency, UnusedExport};
+
+        let root = PathBuf::from("/project");
+        let mut results = AnalysisResults::default();
+
+        let mut file = UnusedFileFinding::with_actions(UnusedFile {
+            path: root.join("src/dead.ts"),
+        });
+        file.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_files.push(file);
+
+        let mut export =
+            fallow_types::output_dead_code::UnusedExportFinding::with_actions(UnusedExport {
+                path: root.join("src/lib.ts"),
+                export_name: "needed".to_owned(),
+                is_type_only: false,
+                line: 3,
+                col: 0,
+                span_start: 0,
+                is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
+            });
+        export.reachability_caveats = vec![
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ];
+        results.unused_exports.push(export);
+
+        let mut dep = UnusedDependencyFinding::with_actions(UnusedDependency {
+            package_name: "left-pad".to_owned(),
+            location: fallow_types::results::DependencyLocation::Dependencies,
+            path: root.join("package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        });
+        dep.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_dependencies.push(dep);
+
+        let member = |parent: &str, name: &str, kind| fallow_types::results::UnusedMember {
+            path: root.join("src/lib.ts"),
+            parent_name: parent.to_owned(),
+            member_name: name.to_owned(),
+            kind,
+            line: 7,
+            col: 2,
+        };
+        let mut enum_member = fallow_types::output_dead_code::UnusedEnumMemberFinding::with_actions(
+            member("Mode", "Legacy", MemberKind::EnumMember),
+        );
+        enum_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_enum_members.push(enum_member);
+
+        let mut class_member =
+            fallow_types::output_dead_code::UnusedClassMemberFinding::with_actions(member(
+                "Widget",
+                "render",
+                MemberKind::ClassMethod,
+            ));
+        class_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_class_members.push(class_member);
+
+        let mut store_member =
+            fallow_types::output_dead_code::UnusedStoreMemberFinding::with_actions(member(
+                "useCart",
+                "subtotal",
+                MemberKind::StoreMember,
+            ));
+        store_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_store_members.push(store_member);
+
+        let lines = build_compact_lines(&results, &root);
+
+        assert_eq!(
+            lines,
+            vec![
+                "unused-file:src/dead.ts,caveat=incomplete-import-graph",
+                "unused-export:src/lib.ts:3:needed,caveat=incomplete-file-analysis+incomplete-import-graph",
+                "unused-dep:left-pad,caveat=incomplete-import-graph",
+                "unused-enum-member:src/lib.ts:7:Mode.Legacy,caveat=incomplete-import-graph",
+                "unused-class-member:src/lib.ts:7:Widget.render,caveat=incomplete-import-graph",
+                "unused-store-member:src/lib.ts:7:useCart.subtotal,caveat=incomplete-import-graph",
+            ]
+        );
+    }
 
     #[test]
     fn compact_unused_file_format_uses_relative_paths() {
@@ -1060,6 +1536,7 @@ mod tests {
         let report = DuplicationReport {
             clone_groups: vec![CloneGroup {
                 instances: vec![CloneInstance {
+                    is_symlink: false,
                     file: root.join("src/a.ts"),
                     start_line: 2,
                     end_line: 6,
@@ -1081,6 +1558,41 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("code-duplication:src/a.ts:2-6:fingerprint="));
         assert!(lines[0].contains(",group=1,tokens=12,lines=5,instances=1"));
+        assert!(!lines[0].contains("symlink"));
+    }
+
+    #[test]
+    fn duplication_compact_lines_mark_symlinked_instances() {
+        let root = PathBuf::from("/project");
+        let instance = |path: &str, is_symlink: bool| CloneInstance {
+            is_symlink,
+            file: root.join(path),
+            start_line: 1,
+            end_line: 5,
+            start_col: 0,
+            end_col: 0,
+            fragment: String::new(),
+        };
+        let report = DuplicationReport {
+            clone_groups: vec![CloneGroup {
+                instances: vec![
+                    instance("src/link.ts", true),
+                    instance("src/real.ts", false),
+                ],
+                token_count: 12,
+                line_count: 5,
+                similarity: None,
+            }],
+            clone_families: Vec::new(),
+            mirrored_directories: Vec::new(),
+            stats: DuplicationStats::default(),
+        };
+
+        let lines = build_duplication_compact_lines(&report, &root);
+
+        assert!(lines[0].starts_with("code-duplication:src/link.ts:1-5:"));
+        assert!(lines[0].ends_with(",instances=2,symlink=true"));
+        assert!(lines[1].ends_with(",instances=2"));
     }
 
     #[test]
@@ -1121,6 +1633,77 @@ mod tests {
         assert_eq!(
             lines[1],
             "vital-signs:total_loc=120,avg_cyclomatic=3.4,p90_cyclomatic=8"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.starts_with("cyclomatic-population:"))
+        );
+    }
+
+    #[test]
+    fn health_compact_population_rows_preserve_vital_signs_and_order() {
+        let root = PathBuf::from("/project");
+        let vitals = fallow_output::VitalSigns {
+            avg_cyclomatic: 16.0,
+            p90_cyclomatic: 31,
+            ..Default::default()
+        };
+        let legacy = build_health_compact_lines(
+            &fallow_output::HealthReport {
+                vital_signs: Some(vitals.clone()),
+                ..Default::default()
+            },
+            &root,
+        );
+        let report = fallow_output::HealthReport {
+            vital_signs: Some(fallow_output::VitalSigns {
+                cyclomatic_population: Some(fallow_output::CyclomaticPopulation {
+                    functions: fallow_output::CyclomaticUnitPopulation {
+                        count: 1,
+                        sum: 1,
+                        max: Some(1),
+                    },
+                    modules: fallow_output::CyclomaticUnitPopulation {
+                        count: 1,
+                        sum: 31,
+                        max: Some(31),
+                    },
+                    templates: fallow_output::CyclomaticUnitPopulation::default(),
+                }),
+                ..vitals
+            }),
+            ..Default::default()
+        };
+        let lines = build_health_compact_lines(&report, &root);
+        assert_eq!(lines[0], legacy[0]);
+        assert_eq!(
+            &lines[1..],
+            [
+                "cyclomatic-population:functions:count=1,sum=1,max=1",
+                "cyclomatic-population:modules:count=1,sum=31,max=31",
+                "cyclomatic-population:templates:count=0,sum=0,max=null",
+            ]
+        );
+    }
+
+    #[test]
+    fn health_compact_measured_empty_populations_keep_null_maxima() {
+        let report = fallow_output::HealthReport {
+            vital_signs: Some(fallow_output::VitalSigns {
+                cyclomatic_population: Some(fallow_output::CyclomaticPopulation::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = build_health_compact_lines(&report, &PathBuf::from("/project"));
+        assert_eq!(
+            &lines[1..],
+            [
+                "cyclomatic-population:functions:count=0,sum=0,max=null",
+                "cyclomatic-population:modules:count=0,sum=0,max=null",
+                "cyclomatic-population:templates:count=0,sum=0,max=null",
+            ]
         );
     }
 

@@ -1,6 +1,6 @@
 //! Score types, grade boundaries, file health metrics, and findings.
 
-use crate::CoverageModel;
+use crate::{CoverageInputFormat, CoverageModel};
 
 /// Minimum churn-times-complexity hotspot score for an entry to count toward
 /// the vital-signs `hotspot_count`; lower-scoring entries still appear in the
@@ -39,8 +39,10 @@ pub const MI_DENSITY_MIN_LINES: f64 = 50.0;
 /// (critical-complexity share, per-thousand-file dependency rates, top-1%
 /// hotspot share) so scores are comparable across repository sizes; older
 /// snapshots that lack the density fields fall back to the v1 aggregators.
+/// v3 counts only hotspots meeting [`HOTSPOT_SCORE_THRESHOLD`] against the
+/// top-1% file population, rather than penalizing every positive ranked entry.
 /// See `engine::vital_signs` for the full penalty formula.
-pub const HEALTH_SCORE_FORMULA_VERSION: u32 = 2;
+pub const HEALTH_SCORE_FORMULA_VERSION: u32 = 3;
 
 /// Formula version for the styling-health score (the CSS / design-system axis).
 /// Bumped independently of [`HEALTH_SCORE_FORMULA_VERSION`] whenever the styling
@@ -76,7 +78,7 @@ fn is_zero_usize(value: &usize) -> bool {
 }
 
 /// Overall project health score: 100 minus capped per-category penalties.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthScore {
     /// Score formula version; see [`HEALTH_SCORE_FORMULA_VERSION`].
@@ -84,13 +86,14 @@ pub struct HealthScore {
     /// Health score in `[0, 100]`; higher is healthier.
     pub score: f64,
     /// Letter grade from [`letter_grade`] (A>=85, B>=70, C>=55, D>=40, F<40).
-    pub grade: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub grade: crate::static_str::StaticStr,
     /// Per-component penalty breakdown.
     pub penalties: HealthScorePenalties,
 }
 
 /// Per-component penalty breakdown for the health score.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthScorePenalties {
     /// Points subtracted for unreachable files; absent when dead-code data
@@ -152,7 +155,7 @@ pub struct HealthScorePenalties {
 /// Like [`HealthScore`], the score starts at 100 and subtracts capped per-category
 /// penalties; the grade reuses the shared [`letter_grade`] thresholds verbatim
 /// (A>=85, B>=70, C>=55, D>=40, F<40), so the two axes are read on one scale.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StylingHealth {
     /// Styling formula version; see [`STYLING_HEALTH_FORMULA_VERSION`].
@@ -160,7 +163,8 @@ pub struct StylingHealth {
     /// Styling-health score in `[0, 100]`; higher is healthier.
     pub score: f64,
     /// Letter grade from the shared [`letter_grade`] thresholds.
-    pub grade: &'static str,
+    #[serde(deserialize_with = "crate::static_str::deserialize")]
+    pub grade: crate::static_str::StaticStr,
     /// Per-category penalty breakdown.
     pub penalties: StylingHealthPenalties,
     /// How much to trust the grade. `Low` in either of two cases, `High`
@@ -192,7 +196,7 @@ pub struct StylingHealth {
 /// analyzed surface or it is not), not three distinct evidence tiers, so a
 /// never-emitted `Medium` would be dead surface. Serializes lowercase (`"high"` /
 /// `"low"`), matching the sibling confidence enums' vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StylingHealthConfidence {
@@ -213,7 +217,7 @@ pub enum StylingHealthConfidence {
 /// evaluated and clean"; the whole struct is only ever built when CSS analytics
 /// were produced, so there is no "missing pipeline" ambiguity to model with
 /// `Option` here (the parent `StylingHealth` is itself `Option` on the report).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StylingHealthPenalties {
     /// Copy-paste declaration blocks (`duplicate_declaration_blocks`), scaled by
@@ -245,6 +249,7 @@ pub struct StylingHealthPenalties {
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
     reason = "score is 0-100, fits in u32"
 )]
 pub const fn letter_grade(score: f64) -> &'static str {
@@ -297,7 +302,9 @@ impl CoverageTier {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageSource {
-    /// Measured from Istanbul runtime coverage data.
+    /// Measured from a coverage map: Istanbul JSON, or raw V8 coverage that
+    /// fallow converts to the same model. `summary.coverage_input_format`
+    /// names which one.
     Istanbul,
     /// Estimated from static test reachability.
     Estimated,
@@ -346,7 +353,7 @@ pub fn summarize_coverage_source_consistency(
 /// counted in `react_hook_count` but NOT here, so the breakdown can sum to LESS
 /// than `react_hook_count`. `react_hook_count` remains the headline total; this
 /// is an additive refinement.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReactHookProfile {
     /// `useState` call count attributed to this component.
@@ -387,7 +394,7 @@ impl ReactHookProfile {
 }
 
 /// Inner complexity-violation payload.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComplexityViolation {
     /// File path relative to the project root.
@@ -399,8 +406,15 @@ pub struct ComplexityViolation {
     pub line: u32,
     /// 1-based column the function starts on.
     pub col: u32,
-    /// Cyclomatic complexity of the function.
+    /// Cyclomatic complexity of the function, as the cyclomatic gate and the
+    /// CRAP score read it. Under the `literal-membership` value of
+    /// `health.cyclomaticPolicy`, this is the value after literal membership
+    /// chains count as one predicate.
     pub cyclomatic: u16,
+    /// Standard `McCabe` cyclomatic complexity, present only when the
+    /// `health.cyclomaticPolicy` value gave `cyclomatic` a different value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_cyclomatic: Option<u16>,
     /// Cognitive complexity of the function.
     pub cognitive: u16,
     /// Lines of code in the function body.
@@ -431,9 +445,24 @@ pub struct ComplexityViolation {
     pub exceeded: ExceededThreshold,
     /// Finding severity derived from how far thresholds were crossed.
     pub severity: FindingSeverity,
+    /// Gate severity after the `complexity-*` rules and their
+    /// `overrides[].rules` entries: `error` fails the run, `warn` does not.
+    /// The most severe rule of the kinds in `exceeded` wins. It is separate
+    /// from the band in `severity`, which ranks the finding and does not gate
+    /// it. Under `audit --gate new-only`, a finding that exceeds only CRAP
+    /// from estimated coverage has `warn`. Absent in reports from older
+    /// versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_severity: Option<fallow_types::output_dead_code::EffectiveSeverity>,
     /// CRAP score (change risk anti-pattern), when coverage data exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crap: Option<f64>,
+    /// Mutation evidence of the function from a saved `fallow mutation`
+    /// report (`fallow health --mutation-report`). A separate value: it never
+    /// changes `crap` or the health score. Absent without the flag, and when
+    /// no function result of the report matches the finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<crate::HealthFindingMutation>,
     /// Test coverage percentage (0-100) backing the CRAP score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_pct: Option<f64>,
@@ -474,7 +503,51 @@ pub struct ComplexityViolation {
     pub threshold_source: Option<ThresholdSource>,
 }
 
+/// An empty cyclomatic finding in the moderate band. Builders and tests start
+/// from it and set the fields they need.
+impl Default for ComplexityViolation {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::new(),
+            name: String::new(),
+            line: 0,
+            col: 0,
+            cyclomatic: 0,
+            standard_cyclomatic: None,
+            cognitive: 0,
+            line_count: 0,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            react_hook_profile: None,
+            exceeded: ExceededThreshold::Cyclomatic,
+            severity: FindingSeverity::Moderate,
+            effective_severity: None,
+            crap: None,
+            mutation: None,
+            coverage_pct: None,
+            coverage_tier: None,
+            coverage_source: None,
+            inherited_from: None,
+            component_rollup: None,
+            contributions: Vec::new(),
+            effective_thresholds: None,
+            threshold_source: None,
+        }
+    }
+}
+
 impl ComplexityViolation {
+    /// Whether the finding fails the run.
+    ///
+    /// A `warn` gate severity does not block. A finding without the field, for
+    /// example from an older saved report, blocks as before.
+    #[must_use]
+    pub fn blocks(&self) -> bool {
+        self.effective_severity != Some(fallow_types::output_dead_code::EffectiveSeverity::Warn)
+    }
+
     /// Ceilings this finding was actually evaluated against: the per-file
     /// `thresholdOverrides` result when an override matched, otherwise the
     /// run's global summary ceilings.
@@ -520,7 +593,7 @@ pub struct HealthEffectiveThresholds {
 }
 
 /// Threshold values configured by a single override entry.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[allow(
     clippy::struct_field_names,
@@ -551,7 +624,7 @@ pub enum ThresholdSource {
 }
 
 /// Lifecycle state for a configured threshold override.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ThresholdOverrideStatus {
@@ -576,7 +649,9 @@ pub enum ThresholdOverrideStatus {
 /// because the complexity ceilings and the CRAP ceiling are evaluated
 /// independently: raising `maxCyclomatic` says nothing about whether the unit
 /// still breaches `maxCrap`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ThresholdOverrideDimension {
@@ -588,7 +663,7 @@ pub enum ThresholdOverrideDimension {
 }
 
 /// Current complexity metrics for a matched threshold override entry.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ThresholdOverrideMetrics {
     /// Current cyclomatic complexity of the matched function.
@@ -607,7 +682,7 @@ pub struct ThresholdOverrideMetrics {
 
 /// Report entry describing whether a threshold override is active, stale, or
 /// no longer matching any analyzed file or function.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ThresholdOverrideState {
     /// Lifecycle state of the override.
@@ -678,7 +753,7 @@ impl ThresholdOverrideState {
 
 /// Component-level aggregate attached to a template complexity finding,
 /// pairing the template's scores with the worst class-side function.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ComponentRollup {
     /// Component name.
@@ -699,7 +774,7 @@ pub struct ComponentRollup {
 }
 
 /// Which complexity threshold was exceeded.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ExceededThreshold {
@@ -843,7 +918,7 @@ pub fn compute_finding_severity(
 }
 
 /// A function exceeding the very-high-risk size threshold (>60 LOC).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LargeFunctionEntry {
     /// File path relative to the project root.
@@ -857,50 +932,26 @@ pub struct LargeFunctionEntry {
     pub line_count: u32,
 }
 
-/// Staleness of a loaded health baseline.
-///
-/// Reports how many saved complexity and CRAP finding entries still matched a
-/// current finding on this run, so consumers can see a rotting baseline before
-/// it degrades to zero overlap. Runtime-coverage suppressions and refactoring
-/// target keys carried by the same baseline are not counted here. Present in
-/// the summary only when a baseline was loaded.
-#[derive(Debug, Clone, serde::Serialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct HealthBaselineStaleness {
-    /// Complexity and CRAP finding entries carried by the loaded baseline.
-    pub baseline_entries: usize,
-    /// Entries that matched a current finding in the active baseline mode,
-    /// including entries matched through a followed file move.
-    pub matched_entries: usize,
-    /// Entries that matched no current finding on this run.
-    pub stale_entries: usize,
-    /// Entries that matched only by following a file move in identity mode.
-    /// Always zero in count mode.
-    pub moved_entries: usize,
-    /// True when this run analyzed a subset of the project (changed-file,
-    /// diff, or workspace scoping), so the baseline was compared against a
-    /// narrowed finding set and staleness cannot be judged. `stale` is always
-    /// false on scoped runs.
-    pub change_scoped: bool,
-    /// True exactly when the run was not change-scoped, at least one current
-    /// finding existed before baseline filtering, and `stale_entries` reached
-    /// a quarter of `baseline_entries`. Mirrors the human warning so machine
-    /// consumers do not have to reimplement the threshold.
-    pub stale: bool,
-}
-
 /// Summary statistics for the health report.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HealthSummary {
     /// Files included in the health analysis.
     pub files_analyzed: usize,
-    /// Functions scored across the analyzed files.
+    /// Functions and template units checked for threshold findings across the
+    /// analyzed files. Synthetic module-scope units are excluded. Cyclomatic
+    /// aggregates include module units too; `vital_signs.cyclomatic_population`
+    /// reports the disjoint authored-function, module, and template populations
+    /// behind those aggregates.
     pub functions_analyzed: usize,
     /// Functions exceeding at least one complexity or CRAP threshold.
     pub functions_above_threshold: usize,
     /// Global cyclomatic-complexity ceiling for this run.
     pub max_cyclomatic_threshold: u16,
+    /// Cyclomatic policy of the gates (`health.cyclomaticPolicy`). Absent
+    /// under the default `standard` policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cyclomatic_policy: Option<fallow_config::CyclomaticPolicy>,
     /// Global cognitive-complexity ceiling for this run.
     pub max_cognitive_threshold: u16,
     /// Global CRAP-score ceiling for this run.
@@ -921,6 +972,10 @@ pub struct HealthSummary {
     /// Coverage model behind the CRAP scores, when coverage was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_model: Option<CoverageModel>,
+    /// Input format of the measured coverage (`istanbul` or `v8`). Present
+    /// only with `coverage_model: "istanbul"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_input_format: Option<CoverageInputFormat>,
     /// Whether CRAP findings mix coverage sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_source_consistency: Option<CoverageSourceConsistency>,
@@ -946,7 +1001,7 @@ pub struct HealthSummary {
     pub severity_moderate_count: usize,
     /// Baseline staleness data, present only when a baseline was loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub baseline_staleness: Option<HealthBaselineStaleness>,
+    pub baseline_staleness: Option<crate::BaselineStaleness>,
 }
 
 impl Default for HealthSummary {
@@ -956,12 +1011,14 @@ impl Default for HealthSummary {
             functions_analyzed: 0,
             functions_above_threshold: 0,
             max_cyclomatic_threshold: 20,
+            cyclomatic_policy: None,
             max_cognitive_threshold: 15,
             max_crap_threshold: 30.0,
             max_unit_size_threshold: DEFAULT_MAX_UNIT_SIZE,
             files_scored: None,
             average_maintainability: None,
             coverage_model: None,
+            coverage_input_format: None,
             coverage_source_consistency: None,
             istanbul_matched: None,
             istanbul_total: None,
@@ -976,7 +1033,7 @@ impl Default for HealthSummary {
 }
 
 /// Per-file health score combining complexity, coupling, and dead code metrics.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileHealthScore {
     /// File path relative to the project root.
@@ -992,18 +1049,18 @@ pub struct FileHealthScore {
     pub complexity_density: f64,
     /// Maintainability index (0-100); higher is healthier.
     pub maintainability_index: f64,
-    /// Summed cyclomatic complexity over the file's functions.
+    /// Summed cyclomatic complexity over all units, including module and template scope.
     pub total_cyclomatic: u32,
-    /// Summed cognitive complexity over the file's functions.
+    /// Summed cognitive complexity over all units, including module and template scope.
     pub total_cognitive: u32,
-    /// Functions in the file.
+    /// Complexity units in the file, including synthetic module and template units.
     pub function_count: usize,
     /// Lines of code in the file.
     pub lines: u32,
     /// Highest CRAP score among the file's functions. Always the raw measured
-    /// value; threshold overrides never rewrite it.
+    /// value; threshold overrides and suppressions never rewrite it.
     pub crap_max: f64,
-    /// Functions whose rounded CRAP score meets or exceeds their effective
+    /// Unsuppressed functions whose rounded CRAP score meets or exceeds their effective
     /// ceiling, resolved from `health.thresholdOverrides` over the global
     /// `maxCrap` / `--max-crap` value. Zero when CRAP enforcement is disabled
     /// (global ceiling `0`).
@@ -1016,6 +1073,24 @@ pub struct FileHealthScore {
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     #[cfg_attr(feature = "schema", schemars(default))]
     pub crap_exempted: usize,
+    /// Concrete scored functions accepted by a complexity suppression, including
+    /// subthreshold functions and disabled-enforcement runs. Omitted when zero.
+    /// May overlap with configured exemptions; the counts are not a partition.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub crap_suppressed: usize,
+    /// Highest rounded CRAP among unsuppressed scored functions, including
+    /// subthreshold and configured-exempt functions. Present with the paired
+    /// unsuppressed threshold whenever a scored suppression exists. Explicitly
+    /// zero when every scored function is suppressed; raw crap_max is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crap_unsuppressed_max: Option<f64>,
+    /// Lowest effective ceiling among unsuppressed scored functions, or the run
+    /// global when none remain. Emitted with crap_unsuppressed_max. Consumers
+    /// receiving an absent or partial pair fall back to the complete legacy pair:
+    /// crap_max and crap_effective_threshold (or the run global when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crap_unsuppressed_effective_threshold: Option<f64>,
     /// Lowest effective CRAP ceiling among the file's functions, present only
     /// when it differs from the run global (`summary.max_crap_threshold`).
     /// Consumers fall back to `summary.max_crap_threshold` when absent.
@@ -1024,7 +1099,7 @@ pub struct FileHealthScore {
 }
 
 /// A hotspot: a file that is both complex and frequently changing.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HotspotEntry {
     /// File path relative to the project root.
@@ -1046,17 +1121,28 @@ pub struct HotspotEntry {
     pub fan_in: usize,
     /// Whether churn is rising, falling, or steady over the window.
     pub trend: fallow_types::churn::ChurnTrend,
+    /// Change dispersion: the median number of analyzed files in the commits
+    /// that changed this file, over the change coupling history window. Bulk
+    /// commits above the coupling file cap are not counted. Absent when the
+    /// history has no commit ids (for example imported churn without them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_files_per_commit: Option<f64>,
+    /// Change dispersion: the median number of changed lines (added plus
+    /// deleted, analyzed files only) in the commits that changed this file.
+    /// Same window and rules as `median_files_per_commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_lines_per_commit: Option<f64>,
     /// Ownership metrics, when ownership analysis ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership: Option<OwnershipMetrics>,
     /// True for files matched by test-path patterns; omitted when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "schema", schemars(default))]
     pub is_test_path: bool,
 }
 
 /// One contributor row in ownership metrics.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ContributorEntry {
     /// Contributor identifier, encoded per `format`.
@@ -1072,7 +1158,7 @@ pub struct ContributorEntry {
 }
 
 /// Encoding applied to a [`ContributorEntry::identifier`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum ContributorIdentifierFormat {
@@ -1087,7 +1173,7 @@ pub enum ContributorIdentifierFormat {
 }
 
 /// Ownership lifecycle state of a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipState {
@@ -1103,7 +1189,7 @@ pub enum OwnershipState {
 
 /// Ownership metrics for a hotspot file, derived from git history and
 /// CODEOWNERS declarations.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct OwnershipMetrics {
     /// Minimum contributors covering half the file's commits.
@@ -1144,8 +1230,44 @@ pub struct OwnershipMetrics {
     pub drift_reason: Option<String>,
 }
 
+/// Where the run's reference epoch came from.
+///
+/// Churn recency weighting and ownership staleness are measured against one
+/// instant. `head_commit` and `environment` resolve to the same value on every
+/// run over the same commit; `wall_clock` does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSource {
+    /// Pinned by the `FALLOW_CLOCK_EPOCH` environment variable.
+    Environment,
+    /// HEAD's committer timestamp.
+    HeadCommit,
+    /// The system wall clock, because no commit timestamp was readable.
+    WallClock,
+}
+
+/// The instant a run measured commit ages and staleness against.
+///
+/// A consumer reading `weighted_commits`, `stale_days`, or anything derived
+/// from them needs to know whether re-running over the same commit yields the
+/// same number. The human report says so in a warning that `--quiet` removes,
+/// which left the JSON consumer, who cannot see stderr at all, with no way to
+/// find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ClockProvenance {
+    /// Which of the three sources supplied the epoch.
+    pub source: ClockSource,
+    /// The reference epoch itself, in unix seconds. Pass it back as
+    /// `FALLOW_CLOCK_EPOCH` to reproduce this run's churn-derived numbers.
+    pub epoch_secs: u64,
+    /// False only for `wall_clock`, where the numbers drift between runs.
+    pub reproducible: bool,
+}
+
 /// Scope metadata for the hotspot analysis.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HotspotSummary {
     /// Start of the churn window, as passed to `git log --since`.
@@ -1159,11 +1281,93 @@ pub struct HotspotSummary {
     /// True when the repository is a shallow clone, so churn counts are
     /// truncated.
     pub shallow_clone: bool,
+    /// Provenance of the instant every churn and staleness number was measured
+    /// against. Absent only when a caller assembled a summary without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<ClockProvenance>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_score_suppression_metadata_preserves_legacy_and_explicit_zero() {
+        let legacy = serde_json::json!({
+            "path": "src/legacy.ts", "fan_in": 1, "fan_out": 0,
+            "dead_code_ratio": 0.0, "complexity_density": 0.77, "maintainability_index": 88.0,
+            "total_cyclomatic": 20, "total_cognitive": 18, "function_count": 2, "lines": 26,
+            "crap_max": 110.0, "crap_above_threshold": 0
+        });
+        let restored: FileHealthScore =
+            serde_json::from_value(legacy.clone()).expect("legacy file score");
+        assert_eq!(restored.crap_suppressed, 0);
+        assert_eq!(
+            serde_json::to_value(restored).expect("serialize legacy file score"),
+            legacy
+        );
+
+        let mut suppressed = legacy;
+        suppressed["crap_suppressed"] = serde_json::json!(2);
+        suppressed["crap_unsuppressed_max"] = serde_json::json!(0.0);
+        suppressed["crap_unsuppressed_effective_threshold"] = serde_json::json!(30.0);
+        suppressed["crap_exempted"] = serde_json::json!(1);
+        suppressed["crap_effective_threshold"] = serde_json::json!(500.0);
+        let restored: FileHealthScore =
+            serde_json::from_value(suppressed.clone()).expect("suppressed file score");
+        assert_eq!(restored.crap_max, 110.0);
+        assert_eq!(restored.crap_unsuppressed_max, Some(0.0));
+        assert_eq!(restored.crap_unsuppressed_effective_threshold, Some(30.0));
+        assert_eq!(
+            serde_json::to_value(restored).expect("serialize suppressed file score"),
+            suppressed
+        );
+    }
+
+    /// The three tokens are the wire contract a consumer branches on, so they
+    /// are pinned here rather than left to the derive.
+    #[test]
+    fn clock_source_serializes_as_snake_case_tokens() {
+        let tokens: Vec<String> = [
+            ClockSource::Environment,
+            ClockSource::HeadCommit,
+            ClockSource::WallClock,
+        ]
+        .into_iter()
+        .map(|source| serde_json::to_string(&source).expect("clock source should serialize"))
+        .collect();
+        assert_eq!(
+            tokens,
+            [r#""environment""#, r#""head_commit""#, r#""wall_clock""#]
+        );
+    }
+
+    /// A summary without a clock stays byte-identical to the shape consumers
+    /// already parse; one with a clock publishes all three members.
+    #[test]
+    fn hotspot_summary_clock_is_omitted_when_absent_and_complete_when_present() {
+        let mut summary = HotspotSummary {
+            since: "6 months".to_owned(),
+            min_commits: 3,
+            files_analyzed: 4,
+            files_excluded: 1,
+            shallow_clone: false,
+            clock: None,
+        };
+        let json = serde_json::to_string(&summary).expect("summary should serialize");
+        assert!(!json.contains("clock"), "{json}");
+
+        summary.clock = Some(ClockProvenance {
+            source: ClockSource::WallClock,
+            epoch_secs: 1_788_782_400,
+            reproducible: false,
+        });
+        let value: serde_json::Value =
+            serde_json::to_value(&summary).expect("summary should serialize");
+        assert_eq!(value["clock"]["source"], "wall_clock");
+        assert_eq!(value["clock"]["epoch_secs"], 1_788_782_400_u64);
+        assert_eq!(value["clock"]["reproducible"], false);
+    }
 
     #[test]
     fn exceeded_threshold_serializes_as_snake_case() {

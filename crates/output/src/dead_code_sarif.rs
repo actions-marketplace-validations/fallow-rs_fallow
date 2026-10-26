@@ -14,14 +14,14 @@ use fallow_types::{
     output_dead_code::*,
     results::{
         AnalysisResults, BoundaryCallViolation, BoundaryCoverageViolation, BoundaryViolation,
-        CircularDependency, DevDependencyInProduction, DuplicatePropShape,
+        CircularDependency, DeprecatedExportInUse, DevDependencyInProduction, DuplicatePropShape,
         DynamicSegmentNameConflict, InvalidClientExport, MisplacedDirective,
         MixedClientServerBarrel, PolicyViolation, PolicyViolationSeverity, PrivateTypeLeak,
         PropDrillingChain, RouteCollision, StaleSuppression, TestOnlyDependency, ThinWrapper,
-        TypeOnlyDependency, UnprovidedInject, UnrenderedComponent, UnresolvedImport,
-        UnusedComponentEmit, UnusedComponentInput, UnusedComponentOutput, UnusedComponentProp,
-        UnusedDependency, UnusedExport, UnusedFile, UnusedMember, UnusedServerAction,
-        UnusedSvelteEvent,
+        TypeOnlyDependency, UnproducedCatchTag, UnprovidedInject, UnrenderedComponent,
+        UnresolvedImport, UnusedComponentEmit, UnusedComponentInput, UnusedComponentOutput,
+        UnusedComponentProp, UnusedDependency, UnusedEffectLayer, UnusedExport, UnusedFile,
+        UnusedMember, UnusedServerAction, UnusedSvelteEvent, UnusedTaggedError,
     },
 };
 
@@ -53,10 +53,52 @@ fn severity_to_sarif_level(s: Severity) -> &'static str {
     }
 }
 
+/// The CI severity of a type that never gates the exit code.
+///
+/// Thin-wrapper and duplicate-prop-shape findings are health
+/// signals: they never fail the run. An `error` rule is capped at `warn`, so
+/// a CI system that reads the level never shows an error for a run that
+/// passed. `off` stays `off`.
+const fn non_gating_severity(rule: Severity) -> Severity {
+    match rule {
+        Severity::Error => Severity::Warn,
+        other => other,
+    }
+}
+
+/// The SARIF level for one finding: its saved severity when the finding
+/// carries one, otherwise the configured rule severity (a saved report from an
+/// older version has no saved severity).
+///
+/// A saved finding exists, so its rule was on when it was reported. When the
+/// config at render time sets the rule `off`, the level is `warning`.
+fn finding_level(finding: &impl GatedFinding, rule: Severity) -> &'static str {
+    match finding.effective_severity() {
+        Some(EffectiveSeverity::Error) => "error",
+        Some(EffectiveSeverity::Warn) => "warning",
+        None => match rule {
+            Severity::Off => "warning",
+            Severity::Error | Severity::Warn => severity_to_sarif_level(rule),
+        },
+    }
+}
+
 fn configured_sarif_level(s: Severity) -> &'static str {
     match s {
         Severity::Error | Severity::Warn => severity_to_sarif_level(s),
         Severity::Off => "none",
+    }
+}
+
+/// The SARIF level of a finding type that never gates the exit code: its
+/// saved level, capped at `warning` (see [`non_gating_severity`]).
+///
+/// The cap applies to the saved severity too, because a saved `error` of
+/// these types still never failed the run.
+fn non_gating_level(finding: &impl GatedFinding, rule: Severity) -> &'static str {
+    match finding_level(finding, non_gating_severity(rule)) {
+        "error" => "warning",
+        level => level,
     }
 }
 
@@ -107,6 +149,67 @@ fn sarif_private_type_leak_fields(
     }
 }
 
+fn sarif_deprecated_export_fields(
+    export: &DeprecatedExportInUse,
+    root: &Path,
+    level: &'static str,
+) -> SarifFields {
+    SarifFields {
+        rule_id: "fallow/deprecated-export-in-use",
+        level,
+        message: export.description(),
+        uri: relative_uri(&export.path, root),
+        region: Some((export.line, export.col + 1)),
+        source_path: Some(export.path.clone()),
+        properties: Some(serde_json::json!({
+            "consumer_count": export.consumer_count,
+            "public_api": export.public_api,
+        })),
+    }
+}
+
+/// 1-based column of the `"<name>"` key inside the manifest line a dependency
+/// finding points at, falling back to 1 when the line cannot be read.
+///
+/// Every dependency declared on one line otherwise reports the same location,
+/// and a SARIF fingerprint is rule id plus location plus source snippet: a
+/// compact `package.json` collapsed all of its unused dependencies into one
+/// GitHub code scanning alert.
+fn manifest_key_column(
+    snippets: &mut SourceSnippetCache,
+    path: &Path,
+    line: u32,
+    name: &str,
+) -> u32 {
+    snippets
+        .line(path, line)
+        .and_then(|text| text.find(&format!("\"{name}\"")))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .map_or(1, |offset| offset.saturating_add(1))
+}
+
+/// The manifest coordinates `manifest_key_column` needs from a dependency.
+fn dep_key(dep: &UnusedDependency) -> (&Path, u32, &str) {
+    (dep.path.as_path(), dep.line, dep.package_name.as_str())
+}
+
+/// Resolve one manifest column per finding up front, so the result closure that
+/// needs them does not have to borrow the snippet cache it reads.
+fn manifest_key_columns<'a, T: 'a>(
+    findings: &'a [T],
+    snippets: &mut SourceSnippetCache,
+    key_of: impl Fn(&'a T) -> (&'a Path, u32, &'a str),
+) -> std::vec::IntoIter<u32> {
+    findings
+        .iter()
+        .map(|finding| {
+            let (path, line, name) = key_of(finding);
+            manifest_key_column(snippets, path, line, name)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
 /// Extract SARIF fields for an unused dependency.
 fn sarif_dep_fields(
     dep: &UnusedDependency,
@@ -114,17 +217,27 @@ fn sarif_dep_fields(
     rule_id: &'static str,
     level: &'static str,
     section: &str,
+    col: u32,
 ) -> SarifFields {
-    let workspace_context = if dep.used_in_workspaces.is_empty() {
-        String::new()
-    } else {
-        let workspaces = dep
-            .used_in_workspaces
+    let join_workspaces = |paths: &[std::path::PathBuf]| {
+        paths
             .iter()
             .map(|path| relative_uri(path, root))
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("; imported in other workspaces: {workspaces}")
+            .join(", ")
+    };
+    let workspace_context = if !dep.used_in_workspaces.is_empty() {
+        format!(
+            "; imported in other workspaces: {}",
+            join_workspaces(&dep.used_in_workspaces)
+        )
+    } else if !dep.declared_and_imported_in.is_empty() {
+        format!(
+            "; declared and imported in other workspaces: {}",
+            join_workspaces(&dep.declared_and_imported_in)
+        )
+    } else {
+        String::new()
     };
     SarifFields {
         rule_id,
@@ -135,7 +248,7 @@ fn sarif_dep_fields(
         ),
         uri: relative_uri(&dep.path, root),
         region: if dep.line > 0 {
-            Some((dep.line, 1))
+            Some((dep.line, col))
         } else {
             None
         },
@@ -166,6 +279,18 @@ fn sarif_member_fields(
     }
 }
 
+/// Append the degraded-parse caveat to a SARIF result message, so a reviewer
+/// reading an annotation in CI sees the same qualifier the JSON envelope and
+/// the human report carry. Byte-identical when the finding has no caveat.
+fn with_caveats(mut fields: SarifFields, caveats: &[ReachabilityCaveat]) -> SarifFields {
+    if let Some(labels) = caveat_labels(caveats) {
+        fields.message.push_str(" (caveat: ");
+        fields.message.push_str(&labels);
+        fields.message.push(')');
+    }
+    fields
+}
+
 fn sarif_unused_file_fields(file: &UnusedFile, root: &Path, level: &'static str) -> SarifFields {
     SarifFields {
         rule_id: "fallow/unused-file",
@@ -182,6 +307,7 @@ fn sarif_type_only_dep_fields(
     dep: &TypeOnlyDependency,
     root: &Path,
     level: &'static str,
+    col: u32,
 ) -> SarifFields {
     SarifFields {
         rule_id: "fallow/type-only-dependency",
@@ -192,7 +318,7 @@ fn sarif_type_only_dep_fields(
         ),
         uri: relative_uri(&dep.path, root),
         region: if dep.line > 0 {
-            Some((dep.line, 1))
+            Some((dep.line, col))
         } else {
             None
         },
@@ -205,6 +331,7 @@ fn sarif_test_only_dep_fields(
     dep: &TestOnlyDependency,
     root: &Path,
     level: &'static str,
+    col: u32,
 ) -> SarifFields {
     SarifFields {
         rule_id: "fallow/test-only-dependency",
@@ -215,7 +342,7 @@ fn sarif_test_only_dep_fields(
         ),
         uri: relative_uri(&dep.path, root),
         region: if dep.line > 0 {
-            Some((dep.line, 1))
+            Some((dep.line, col))
         } else {
             None
         },
@@ -228,6 +355,7 @@ fn sarif_dev_dep_in_prod_fields(
     dep: &DevDependencyInProduction,
     root: &Path,
     level: &'static str,
+    col: u32,
 ) -> SarifFields {
     SarifFields {
         rule_id: "fallow/dev-dependency-in-production",
@@ -238,7 +366,7 @@ fn sarif_dev_dep_in_prod_fields(
         ),
         uri: relative_uri(&dep.path, root),
         region: if dep.line > 0 {
-            Some((dep.line, 1))
+            Some((dep.line, col))
         } else {
             None
         },
@@ -321,6 +449,40 @@ fn sarif_re_export_cycle_fields(
     }
 }
 
+fn sarif_package_cycle_fields(
+    cycle: &fallow_types::results::PackageCycle,
+    root: &Path,
+    level: &'static str,
+) -> SarifFields {
+    let anchor = cycle.edges.first();
+    let note = if cycle.group_truncated {
+        format!(
+            " ({})",
+            fallow_types::results::PackageCycle::GROUP_TRUNCATED_NOTE
+        )
+    } else {
+        String::new()
+    };
+    let package_roots: Vec<String> = cycle
+        .package_roots
+        .iter()
+        .map(|package_root| relative_uri(package_root, root))
+        .collect();
+    SarifFields {
+        rule_id: "fallow/package-cycle",
+        level,
+        message: format!("Package cycle: {}{note}", cycle.chain(" \u{2192} ")),
+        uri: anchor.map_or_else(String::new, |edge| relative_uri(&edge.path, root)),
+        region: anchor.map(|edge| (edge.line, edge.col + 1)),
+        source_path: anchor.map(|edge| edge.path.clone()),
+        properties: Some(serde_json::json!({
+            "packages": cycle.packages,
+            "package_roots": package_roots,
+            "group_truncated": cycle.group_truncated,
+        })),
+    }
+}
+
 fn sarif_boundary_violation_fields(
     violation: &BoundaryViolation,
     root: &Path,
@@ -328,12 +490,15 @@ fn sarif_boundary_violation_fields(
 ) -> SarifFields {
     let from_uri = relative_uri(&violation.from_path, root);
     let to_uri = relative_uri(&violation.to_path, root);
+    let via = violation.via_path.as_ref().map_or_else(String::new, |via| {
+        format!(", via {}", relative_uri(via, root))
+    });
     SarifFields {
         rule_id: "fallow/boundary-violation",
         level,
         message: format!(
-            "Import from zone '{}' to zone '{}' is not allowed ({})",
-            violation.from_zone, violation.to_zone, to_uri,
+            "Import from zone '{}' to zone '{}' is not allowed ({}{})",
+            violation.from_zone, violation.to_zone, to_uri, via,
         ),
         uri: from_uri,
         region: if violation.line > 0 {
@@ -547,6 +712,83 @@ fn sarif_unused_component_emit_fields(
     }
 }
 
+fn sarif_unused_effect_layer_fields(
+    layer: &UnusedEffectLayer,
+    root: &Path,
+    level: &'static str,
+) -> SarifFields {
+    SarifFields {
+        rule_id: "fallow/unused-effect-layer",
+        level,
+        message: format!(
+            "layer \"{}\" is composed only into layers that nothing uses ({}); compose it into a live layer or remove it",
+            layer.name,
+            layer.dead_consumers.join(", ")
+        ),
+        uri: relative_uri(&layer.path, root),
+        region: Some((layer.line, layer.col + 1)),
+        source_path: Some(layer.path.clone()),
+        properties: Some(serde_json::json!({
+            "dead_consumers": layer.dead_consumers,
+        })),
+    }
+}
+
+fn sarif_unused_tagged_error_fields(
+    error: &UnusedTaggedError,
+    root: &Path,
+    level: &'static str,
+) -> SarifFields {
+    SarifFields {
+        rule_id: "fallow/unused-tagged-error",
+        level,
+        message: format!(
+            "tagged error \"{}\" (tag \"{}\") is never constructed or failed with; fail with it or remove it and its {} catchTag handler(s)",
+            error.name,
+            error.tag,
+            error.catch_sites.len()
+        ),
+        uri: relative_uri(&error.path, root),
+        region: Some((error.line, error.col + 1)),
+        source_path: Some(error.path.clone()),
+        properties: Some(serde_json::json!({
+            "tag": error.tag,
+            "catch_sites": error
+                .catch_sites
+                .iter()
+                .map(|site| serde_json::json!({
+                    "uri": relative_uri(&site.path, root),
+                    "line": site.line,
+                    "column": site.col + 1,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+    }
+}
+
+fn sarif_unproduced_catch_tag_fields(
+    catch_tag: &UnproducedCatchTag,
+    root: &Path,
+    level: &'static str,
+) -> SarifFields {
+    SarifFields {
+        rule_id: "fallow/unproduced-catch-tag",
+        level,
+        message: format!(
+            "catchTag handler for \"{}\" never runs: no code produces {}; remove the handler or fail with the error",
+            catch_tag.tag,
+            catch_tag.candidate_classes.join(", ")
+        ),
+        uri: relative_uri(&catch_tag.path, root),
+        region: Some((catch_tag.line, catch_tag.col + 1)),
+        source_path: Some(catch_tag.path.clone()),
+        properties: Some(serde_json::json!({
+            "tag": catch_tag.tag,
+            "candidate_classes": catch_tag.candidate_classes,
+        })),
+    }
+}
+
 fn sarif_unused_svelte_event_fields(
     event: &UnusedSvelteEvent,
     root: &Path,
@@ -651,7 +893,6 @@ fn sarif_prop_drilling_fields(
     // hop; the message names the depth and the consumer at the chain tail.
     let source = chain.hops.first();
     let consumer = chain.hops.last();
-    let (path, line) = source.map_or((std::path::PathBuf::new(), 1), |h| (h.file.clone(), h.line));
     let consumer_name = consumer.map_or("a distant component", |h| h.component.as_str());
     SarifFields {
         rule_id: "fallow/prop-drilling",
@@ -660,9 +901,9 @@ fn sarif_prop_drilling_fields(
             "prop \"{}\" is forwarded unchanged through {} component(s) before \"{}\" consumes it; colocate, lift to context, or compose",
             chain.prop, chain.depth, consumer_name
         ),
-        uri: relative_uri(&path, root),
-        region: Some((line, 1)),
-        source_path: Some(path),
+        uri: source.map_or_else(String::new, |hop| relative_uri(&hop.file, root)),
+        region: source.map(|hop| (hop.line, 1)),
+        source_path: source.map(|hop| hop.file.clone()),
         properties: None,
     }
 }
@@ -914,10 +1155,11 @@ fn push_sarif_unlisted_deps(
     sarif_results: &mut Vec<serde_json::Value>,
     deps: &[UnlistedDependencyFinding],
     root: &Path,
-    level: &'static str,
+    rule: Severity,
     snippets: &mut SourceSnippetCache,
 ) {
     for entry in deps {
+        let level = finding_level(entry, rule);
         let dep = &entry.dep;
         for site in &dep.imported_from {
             let uri = relative_uri(&site.path, root);
@@ -943,10 +1185,11 @@ fn push_sarif_duplicate_exports(
     sarif_results: &mut Vec<serde_json::Value>,
     dups: &[DuplicateExportFinding],
     root: &Path,
-    level: &'static str,
+    rule: Severity,
     snippets: &mut SourceSnippetCache,
 ) {
     for dup in dups {
+        let level = finding_level(dup, rule);
         let dup = &dup.export;
         for loc in &dup.locations {
             let uri = relative_uri(&loc.path, root);
@@ -999,6 +1242,7 @@ fn dead_code_rule_severity(rules: &RulesConfig, issue_code: &str) -> Option<Seve
         "unused-export" => rules.unused_exports,
         "unused-type" => rules.unused_types,
         "private-type-leak" => rules.private_type_leaks,
+        "deprecated-export-in-use" => rules.deprecated_exports_in_use,
         "unused-dependency" => rules.unused_dependencies,
         "unused-dev-dependency" => rules.unused_dev_dependencies,
         "unused-optional-dependency" => rules.unused_optional_dependencies,
@@ -1013,6 +1257,7 @@ fn dead_code_rule_severity(rules: &RulesConfig, issue_code: &str) -> Option<Seve
         "duplicate-export" => rules.duplicate_exports,
         "circular-dependency" => rules.circular_dependencies,
         "re-export-cycle" => rules.re_export_cycle,
+        "package-cycle" => rules.package_cycle,
         "boundary-violation" | "boundary-coverage" | "boundary-call-violation" => {
             rules.boundary_violation
         }
@@ -1023,15 +1268,19 @@ fn dead_code_rule_severity(rules: &RulesConfig, issue_code: &str) -> Option<Seve
         "unprovided-inject" => rules.unprovided_injects,
         "unrendered-component" => rules.unrendered_components,
         "unused-component-prop" => rules.unused_component_props,
+        "absent-component-prop" => rules.absent_component_props,
         "unused-component-emit" => rules.unused_component_emits,
         "unused-component-input" => rules.unused_component_inputs,
         "unused-component-output" => rules.unused_component_outputs,
         "unused-svelte-event" => rules.unused_svelte_events,
+        "unused-effect-layer" => rules.unused_effect_layers,
+        "unused-tagged-error" => rules.unused_tagged_errors,
+        "unproduced-catch-tag" => rules.unproduced_catch_tags,
         "unused-server-action" => rules.unused_server_actions,
         "unused-load-data-key" => rules.unused_load_data_keys,
         "prop-drilling" => rules.prop_drilling,
-        "thin-wrapper" => rules.thin_wrapper,
-        "duplicate-prop-shape" => rules.duplicate_prop_shape,
+        "thin-wrapper" => non_gating_severity(rules.thin_wrapper),
+        "duplicate-prop-shape" => non_gating_severity(rules.duplicate_prop_shape),
         "route-collision" => rules.route_collision,
         "dynamic-segment-name-conflict" => rules.dynamic_segment_name_conflict,
         "stale-suppression" => rules.stale_suppressions,
@@ -1077,7 +1326,7 @@ pub fn build_dead_code_sarif(
             sarif_unresolved_import_fields(
                 &i.import,
                 root,
-                severity_to_sarif_level(rules.unresolved_imports),
+                finding_level(i, rules.unresolved_imports),
             )
         },
     );
@@ -1086,7 +1335,32 @@ pub fn build_dead_code_sarif(
     push_catalog_sarif_results(&mut sarif_results, &ctx, &mut snippets);
 
     let sarif_rules = build_sarif_rules(rules, rule_builder);
-    sarif_document(&sarif_results, &sarif_rules)
+    let mut sarif = sarif_document(&sarif_results, &sarif_rules);
+    annotate_cascade_hidden(&mut sarif, results.cascade_hidden);
+    sarif
+}
+
+/// Record the number of findings that the cascade filter hid in the run
+/// `properties`, as `cascadeHidden`. SARIF has no result for a hidden
+/// finding, so this property is the only sign of them. Absent when zero.
+fn annotate_cascade_hidden(sarif: &mut serde_json::Value, hidden: usize) {
+    if hidden == 0 {
+        return;
+    }
+    let Some(run) = sarif
+        .get_mut("runs")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|runs| runs.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let properties = run
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert("cascadeHidden".to_owned(), serde_json::json!(hidden));
+    }
 }
 
 fn push_primary_dead_code_sarif_results(
@@ -1101,10 +1375,13 @@ fn push_primary_dead_code_sarif_results(
     } = *ctx;
 
     push_sarif_results(sarif_results, &results.unused_files, snippets, |finding| {
-        sarif_unused_file_fields(
-            &finding.file,
-            root,
-            severity_to_sarif_level(rules.unused_files),
+        with_caveats(
+            sarif_unused_file_fields(
+                &finding.file,
+                root,
+                finding_level(finding, rules.unused_files),
+            ),
+            &finding.reachability_caveats,
         )
     });
     push_sarif_results(
@@ -1112,24 +1389,30 @@ fn push_primary_dead_code_sarif_results(
         &results.unused_exports,
         snippets,
         |finding| {
-            sarif_export_fields(
-                &finding.export,
-                root,
-                "fallow/unused-export",
-                severity_to_sarif_level(rules.unused_exports),
-                "Export",
-                "Re-export",
+            with_caveats(
+                sarif_export_fields(
+                    &finding.export,
+                    root,
+                    "fallow/unused-export",
+                    finding_level(finding, rules.unused_exports),
+                    "Export",
+                    "Re-export",
+                ),
+                &finding.reachability_caveats,
             )
         },
     );
     push_sarif_results(sarif_results, &results.unused_types, snippets, |finding| {
-        sarif_export_fields(
-            &finding.export,
-            root,
-            "fallow/unused-type",
-            severity_to_sarif_level(rules.unused_types),
-            "Type export",
-            "Type re-export",
+        with_caveats(
+            sarif_export_fields(
+                &finding.export,
+                root,
+                "fallow/unused-type",
+                finding_level(finding, rules.unused_types),
+                "Type export",
+                "Type re-export",
+            ),
+            &finding.reachability_caveats,
         )
     });
     push_sarif_results(
@@ -1140,7 +1423,19 @@ fn push_primary_dead_code_sarif_results(
             sarif_private_type_leak_fields(
                 &finding.leak,
                 root,
-                severity_to_sarif_level(rules.private_type_leaks),
+                finding_level(finding, rules.private_type_leaks),
+            )
+        },
+    );
+    push_sarif_results(
+        sarif_results,
+        &results.deprecated_exports_in_use,
+        snippets,
+        |finding| {
+            sarif_deprecated_export_fields(
+                &finding.export,
+                root,
+                finding_level(finding, rules.deprecated_exports_in_use),
             )
         },
     );
@@ -1178,40 +1473,60 @@ fn push_unused_dependency_sarif_results(
         rules,
     } = *ctx;
 
+    let mut columns =
+        manifest_key_columns(&results.unused_dependencies, snippets, |f| dep_key(&f.dep));
     push_sarif_results(sarif_results, &results.unused_dependencies, snippets, |d| {
-        sarif_dep_fields(
-            &d.dep,
-            root,
-            "fallow/unused-dependency",
-            severity_to_sarif_level(rules.unused_dependencies),
-            "dependencies",
+        with_caveats(
+            sarif_dep_fields(
+                &d.dep,
+                root,
+                "fallow/unused-dependency",
+                finding_level(d, rules.unused_dependencies),
+                "dependencies",
+                columns.next().unwrap_or(1),
+            ),
+            &d.reachability_caveats,
         )
+    });
+    let mut columns = manifest_key_columns(&results.unused_dev_dependencies, snippets, |f| {
+        dep_key(&f.dep)
     });
     push_sarif_results(
         sarif_results,
         &results.unused_dev_dependencies,
         snippets,
         |d| {
-            sarif_dep_fields(
-                &d.dep,
-                root,
-                "fallow/unused-dev-dependency",
-                severity_to_sarif_level(rules.unused_dev_dependencies),
-                "devDependencies",
+            with_caveats(
+                sarif_dep_fields(
+                    &d.dep,
+                    root,
+                    "fallow/unused-dev-dependency",
+                    finding_level(d, rules.unused_dev_dependencies),
+                    "devDependencies",
+                    columns.next().unwrap_or(1),
+                ),
+                &d.reachability_caveats,
             )
         },
     );
+    let mut columns = manifest_key_columns(&results.unused_optional_dependencies, snippets, |f| {
+        dep_key(&f.dep)
+    });
     push_sarif_results(
         sarif_results,
         &results.unused_optional_dependencies,
         snippets,
         |d| {
-            sarif_dep_fields(
-                &d.dep,
-                root,
-                "fallow/unused-optional-dependency",
-                severity_to_sarif_level(rules.unused_optional_dependencies),
-                "optionalDependencies",
+            with_caveats(
+                sarif_dep_fields(
+                    &d.dep,
+                    root,
+                    "fallow/unused-optional-dependency",
+                    finding_level(d, rules.unused_optional_dependencies),
+                    "optionalDependencies",
+                    columns.next().unwrap_or(1),
+                ),
+                &d.reachability_caveats,
             )
         },
     );
@@ -1229,6 +1544,13 @@ fn push_classified_dependency_sarif_results(
         rules,
     } = *ctx;
 
+    let mut columns = manifest_key_columns(&results.type_only_dependencies, snippets, |f| {
+        (
+            f.dep.path.as_path(),
+            f.dep.line,
+            f.dep.package_name.as_str(),
+        )
+    });
     push_sarif_results(
         sarif_results,
         &results.type_only_dependencies,
@@ -1237,10 +1559,18 @@ fn push_classified_dependency_sarif_results(
             sarif_type_only_dep_fields(
                 &d.dep,
                 root,
-                severity_to_sarif_level(rules.type_only_dependencies),
+                finding_level(d, rules.type_only_dependencies),
+                columns.next().unwrap_or(1),
             )
         },
     );
+    let mut columns = manifest_key_columns(&results.test_only_dependencies, snippets, |f| {
+        (
+            f.dep.path.as_path(),
+            f.dep.line,
+            f.dep.package_name.as_str(),
+        )
+    });
     push_sarif_results(
         sarif_results,
         &results.test_only_dependencies,
@@ -1249,10 +1579,19 @@ fn push_classified_dependency_sarif_results(
             sarif_test_only_dep_fields(
                 &d.dep,
                 root,
-                severity_to_sarif_level(rules.test_only_dependencies),
+                finding_level(d, rules.test_only_dependencies),
+                columns.next().unwrap_or(1),
             )
         },
     );
+    let mut columns =
+        manifest_key_columns(&results.dev_dependencies_in_production, snippets, |f| {
+            (
+                f.dep.path.as_path(),
+                f.dep.line,
+                f.dep.package_name.as_str(),
+            )
+        });
     push_sarif_results(
         sarif_results,
         &results.dev_dependencies_in_production,
@@ -1261,7 +1600,8 @@ fn push_classified_dependency_sarif_results(
             sarif_dev_dep_in_prod_fields(
                 &d.dep,
                 root,
-                severity_to_sarif_level(rules.dev_dependencies_in_production),
+                finding_level(d, rules.dev_dependencies_in_production),
+                columns.next().unwrap_or(1),
             )
         },
     );
@@ -1279,12 +1619,15 @@ fn push_member_sarif_results(
     } = *ctx;
 
     push_sarif_results(sarif_results, &results.unused_enum_members, snippets, |m| {
-        sarif_member_fields(
-            &m.member,
-            root,
-            "fallow/unused-enum-member",
-            severity_to_sarif_level(rules.unused_enum_members),
-            "Enum",
+        with_caveats(
+            sarif_member_fields(
+                &m.member,
+                root,
+                "fallow/unused-enum-member",
+                finding_level(m, rules.unused_enum_members),
+                "Enum",
+            ),
+            &m.reachability_caveats,
         )
     });
     push_sarif_results(
@@ -1292,12 +1635,15 @@ fn push_member_sarif_results(
         &results.unused_class_members,
         snippets,
         |m| {
-            sarif_member_fields(
-                &m.member,
-                root,
-                "fallow/unused-class-member",
-                severity_to_sarif_level(rules.unused_class_members),
-                "Class",
+            with_caveats(
+                sarif_member_fields(
+                    &m.member,
+                    root,
+                    "fallow/unused-class-member",
+                    finding_level(m, rules.unused_class_members),
+                    "Class",
+                ),
+                &m.reachability_caveats,
             )
         },
     );
@@ -1306,12 +1652,15 @@ fn push_member_sarif_results(
         &results.unused_store_members,
         snippets,
         |m| {
-            sarif_member_fields(
-                &m.member,
-                root,
-                "fallow/unused-store-member",
-                severity_to_sarif_level(rules.unused_store_members),
-                "Store",
+            with_caveats(
+                sarif_member_fields(
+                    &m.member,
+                    root,
+                    "fallow/unused-store-member",
+                    finding_level(m, rules.unused_store_members),
+                    "Store",
+                ),
+                &m.reachability_caveats,
             )
         },
     );
@@ -1333,7 +1682,7 @@ fn push_misc_sarif_results(
             sarif_results,
             &results.unlisted_dependencies,
             root,
-            severity_to_sarif_level(rules.unlisted_dependencies),
+            rules.unlisted_dependencies,
             snippets,
         );
     }
@@ -1342,7 +1691,7 @@ fn push_misc_sarif_results(
             sarif_results,
             &results.duplicate_exports,
             root,
-            severity_to_sarif_level(rules.duplicate_exports),
+            rules.duplicate_exports,
             snippets,
         );
     }
@@ -1362,6 +1711,68 @@ fn push_component_contract_sarif_results(
 }
 
 /// Push SARIF results for unused component props, emits, inputs, and outputs.
+fn candidate_sarif_region(
+    snippets: &mut SourceSnippetCache,
+    path: &Path,
+    line: u32,
+    byte_col: u32,
+) -> serde_json::Value {
+    let mut region = serde_json::json!({"startLine":line});
+    if let Some(source) = snippets.line(path, line)
+        && let Some(prefix) = source.get(..byte_col as usize)
+    {
+        // SARIF defaults to UTF-16 code units when the run omits columnKind.
+        region["startColumn"] = serde_json::json!(prefix.encode_utf16().count() + 1);
+    }
+    region
+}
+
+fn push_absent_component_prop_sarif_results(
+    sarif_results: &mut Vec<serde_json::Value>,
+    ctx: &SarifCtx<'_>,
+    snippets: &mut SourceSnippetCache,
+) {
+    let start = sarif_results.len();
+    push_sarif_results(
+        sarif_results,
+        &ctx.results.absent_component_props,
+        snippets,
+        |finding| {
+            let prop = &finding.prop;
+            SarifFields {
+                rule_id: "fallow/absent-component-prop",
+                level: finding_level(finding, ctx.rules.absent_component_props),
+                message: format!(
+                    "Optional prop '{}.{}' is absent from inspected callers. {}",
+                    prop.component_name, prop.prop_name, prop.explanation
+                ),
+                uri: relative_uri(&prop.path, ctx.root),
+                region: Some((prop.line, prop.col + 1)),
+                source_path: Some(prop.path.clone()),
+                properties: Some(
+                    serde_json::json!({"framework":prop.framework,"hasDefault":prop.has_default}),
+                ),
+            }
+        },
+    );
+    for (result, finding) in sarif_results[start..]
+        .iter_mut()
+        .zip(&ctx.results.absent_component_props)
+    {
+        result["locations"][0]["physicalLocation"]["region"] = candidate_sarif_region(
+            snippets,
+            &finding.prop.path,
+            finding.prop.line,
+            finding.prop.col,
+        );
+        result["relatedLocations"] = serde_json::Value::Array(finding.prop.inspected_call_sites.iter().enumerate().map(|(index, site)| serde_json::json!({
+            "id": index + 1,
+            "message": {"text":"Inspected caller does not supply this optional prop"},
+            "physicalLocation": {"artifactLocation":{"uri":relative_uri(&site.path,ctx.root)},"region":candidate_sarif_region(snippets,&site.path,site.line,site.col)},
+        })).collect());
+    }
+}
+
 fn push_component_member_sarif_results(
     sarif_results: &mut Vec<serde_json::Value>,
     ctx: &SarifCtx<'_>,
@@ -1372,6 +1783,7 @@ fn push_component_member_sarif_results(
         root,
         rules,
     } = *ctx;
+    push_absent_component_prop_sarif_results(sarif_results, ctx, snippets);
 
     push_sarif_results(
         sarif_results,
@@ -1381,7 +1793,7 @@ fn push_component_member_sarif_results(
             sarif_unused_component_prop_fields(
                 &p.prop,
                 root,
-                severity_to_sarif_level(rules.unused_component_props),
+                finding_level(p, rules.unused_component_props),
             )
         },
     );
@@ -1393,7 +1805,7 @@ fn push_component_member_sarif_results(
             sarif_unused_component_emit_fields(
                 &e.emit,
                 root,
-                severity_to_sarif_level(rules.unused_component_emits),
+                finding_level(e, rules.unused_component_emits),
             )
         },
     );
@@ -1405,7 +1817,7 @@ fn push_component_member_sarif_results(
             sarif_unused_component_input_fields(
                 &i.input,
                 root,
-                severity_to_sarif_level(rules.unused_component_inputs),
+                finding_level(i, rules.unused_component_inputs),
             )
         },
     );
@@ -1417,7 +1829,7 @@ fn push_component_member_sarif_results(
             sarif_unused_component_output_fields(
                 &o.output,
                 root,
-                severity_to_sarif_level(rules.unused_component_outputs),
+                finding_level(o, rules.unused_component_outputs),
             )
         },
     );
@@ -1443,7 +1855,43 @@ fn push_component_framework_sarif_results(
             sarif_unused_svelte_event_fields(
                 &e.event,
                 root,
-                severity_to_sarif_level(rules.unused_svelte_events),
+                finding_level(e, rules.unused_svelte_events),
+            )
+        },
+    );
+    push_sarif_results(
+        sarif_results,
+        &results.unused_effect_layers,
+        snippets,
+        |e| {
+            sarif_unused_effect_layer_fields(
+                &e.layer,
+                root,
+                finding_level(e, rules.unused_effect_layers),
+            )
+        },
+    );
+    push_sarif_results(
+        sarif_results,
+        &results.unused_tagged_errors,
+        snippets,
+        |e| {
+            sarif_unused_tagged_error_fields(
+                &e.error,
+                root,
+                finding_level(e, rules.unused_tagged_errors),
+            )
+        },
+    );
+    push_sarif_results(
+        sarif_results,
+        &results.unproduced_catch_tags,
+        snippets,
+        |e| {
+            sarif_unproduced_catch_tag_fields(
+                &e.catch_tag,
+                root,
+                finding_level(e, rules.unproduced_catch_tags),
             )
         },
     );
@@ -1455,7 +1903,7 @@ fn push_component_framework_sarif_results(
             sarif_unused_server_action_fields(
                 &a.action,
                 root,
-                severity_to_sarif_level(rules.unused_server_actions),
+                finding_level(a, rules.unused_server_actions),
             )
         },
     );
@@ -1467,7 +1915,7 @@ fn push_component_framework_sarif_results(
             sarif_unused_load_data_key_fields(
                 &k.key,
                 root,
-                severity_to_sarif_level(rules.unused_load_data_keys),
+                finding_level(k, rules.unused_load_data_keys),
             )
         },
     );
@@ -1489,16 +1937,10 @@ fn push_component_shape_sarif_results(
         sarif_results,
         &results.prop_drilling_chains,
         snippets,
-        |c| {
-            sarif_prop_drilling_fields(&c.chain, root, severity_to_sarif_level(rules.prop_drilling))
-        },
+        |c| sarif_prop_drilling_fields(&c.chain, root, finding_level(c, rules.prop_drilling)),
     );
     push_sarif_results(sarif_results, &results.thin_wrappers, snippets, |w| {
-        sarif_thin_wrapper_fields(
-            &w.wrapper,
-            root,
-            severity_to_sarif_level(rules.thin_wrapper),
-        )
+        sarif_thin_wrapper_fields(&w.wrapper, root, non_gating_level(w, rules.thin_wrapper))
     });
     push_sarif_results(
         sarif_results,
@@ -1508,7 +1950,7 @@ fn push_component_shape_sarif_results(
             sarif_duplicate_prop_shape_fields(
                 &d.shape,
                 root,
-                severity_to_sarif_level(rules.duplicate_prop_shape),
+                non_gating_level(d, rules.duplicate_prop_shape),
             )
         },
     );
@@ -1534,7 +1976,8 @@ fn push_structure_sarif_results(
     push_boundary_sarif_results(sarif_results, ctx, snippets);
 }
 
-/// Push SARIF results for circular dependencies and re-export cycles.
+/// Push SARIF results for circular dependencies, re-export cycles and
+/// package cycles.
 fn push_cycle_sarif_results(
     sarif_results: &mut Vec<serde_json::Value>,
     ctx: &SarifCtx<'_>,
@@ -1554,16 +1997,15 @@ fn push_cycle_sarif_results(
             sarif_circular_dep_fields(
                 &c.cycle,
                 root,
-                severity_to_sarif_level(rules.circular_dependencies),
+                finding_level(c, rules.circular_dependencies),
             )
         },
     );
     push_sarif_results(sarif_results, &results.re_export_cycles, snippets, |c| {
-        sarif_re_export_cycle_fields(
-            &c.cycle,
-            root,
-            severity_to_sarif_level(rules.re_export_cycle),
-        )
+        sarif_re_export_cycle_fields(&c.cycle, root, finding_level(c, rules.re_export_cycle))
+    });
+    push_sarif_results(sarif_results, &results.package_cycles, snippets, |c| {
+        sarif_package_cycle_fields(&c.cycle, root, finding_level(c, rules.package_cycle))
     });
 }
 
@@ -1583,7 +2025,7 @@ fn push_boundary_sarif_results(
         sarif_boundary_violation_fields(
             &v.violation,
             root,
-            severity_to_sarif_level(rules.boundary_violation),
+            finding_level(v, rules.boundary_violation),
         )
     });
     push_sarif_results(
@@ -1594,7 +2036,7 @@ fn push_boundary_sarif_results(
             sarif_boundary_coverage_fields(
                 &v.violation,
                 root,
-                severity_to_sarif_level(rules.boundary_violation),
+                finding_level(v, rules.boundary_violation),
             )
         },
     );
@@ -1606,7 +2048,7 @@ fn push_boundary_sarif_results(
             sarif_boundary_call_fields(
                 &v.violation,
                 root,
-                severity_to_sarif_level(rules.boundary_violation),
+                finding_level(v, rules.boundary_violation),
             )
         },
     );
@@ -1644,7 +2086,7 @@ fn push_framework_boundary_sarif_results(
             sarif_invalid_client_export_fields(
                 &e.export,
                 root,
-                severity_to_sarif_level(rules.invalid_client_export),
+                finding_level(e, rules.invalid_client_export),
             )
         },
     );
@@ -1656,7 +2098,7 @@ fn push_framework_boundary_sarif_results(
             sarif_mixed_client_server_barrel_fields(
                 &b.barrel,
                 root,
-                severity_to_sarif_level(rules.mixed_client_server_barrel),
+                finding_level(b, rules.mixed_client_server_barrel),
             )
         },
     );
@@ -1668,7 +2110,7 @@ fn push_framework_boundary_sarif_results(
             sarif_misplaced_directive_fields(
                 &d.directive_site,
                 root,
-                severity_to_sarif_level(rules.misplaced_directive),
+                finding_level(d, rules.misplaced_directive),
             )
         },
     );
@@ -1687,11 +2129,7 @@ fn push_framework_render_sarif_results(
     } = *ctx;
 
     push_sarif_results(sarif_results, &results.unprovided_injects, snippets, |i| {
-        sarif_unprovided_inject_fields(
-            &i.inject,
-            root,
-            severity_to_sarif_level(rules.unprovided_injects),
-        )
+        sarif_unprovided_inject_fields(&i.inject, root, finding_level(i, rules.unprovided_injects))
     });
     push_sarif_results(
         sarif_results,
@@ -1701,7 +2139,7 @@ fn push_framework_render_sarif_results(
             sarif_unrendered_component_fields(
                 &c.component,
                 root,
-                severity_to_sarif_level(rules.unrendered_components),
+                finding_level(c, rules.unrendered_components),
             )
         },
     );
@@ -1719,11 +2157,7 @@ fn push_route_sarif_results(
     } = *ctx;
 
     push_sarif_results(sarif_results, &results.route_collisions, snippets, |c| {
-        sarif_route_collision_fields(
-            &c.collision,
-            root,
-            severity_to_sarif_level(rules.route_collision),
-        )
+        sarif_route_collision_fields(&c.collision, root, finding_level(c, rules.route_collision))
     });
     push_sarif_results(
         sarif_results,
@@ -1733,7 +2167,7 @@ fn push_route_sarif_results(
             sarif_dynamic_segment_name_conflict_fields(
                 &c.conflict,
                 root,
-                severity_to_sarif_level(rules.dynamic_segment_name_conflict),
+                finding_level(c, rules.dynamic_segment_name_conflict),
             )
         },
     );
@@ -1754,7 +2188,7 @@ fn push_suppression_sarif_results(
         sarif_stale_suppression_fields(
             s,
             root,
-            severity_to_sarif_level(stale_suppression_severity(s, rules)),
+            finding_level(s, stale_suppression_severity(s, rules)),
         )
     });
 }
@@ -1788,7 +2222,7 @@ fn push_catalog_entry_sarif_results(
             sarif_unused_catalog_entry_fields(
                 e,
                 root,
-                severity_to_sarif_level(rules.unused_catalog_entries),
+                finding_level(e, rules.unused_catalog_entries),
             )
         },
     );
@@ -1796,13 +2230,7 @@ fn push_catalog_entry_sarif_results(
         sarif_results,
         &results.empty_catalog_groups,
         snippets,
-        |g| {
-            sarif_empty_catalog_group_fields(
-                g,
-                root,
-                severity_to_sarif_level(rules.empty_catalog_groups),
-            )
-        },
+        |g| sarif_empty_catalog_group_fields(g, root, finding_level(g, rules.empty_catalog_groups)),
     );
     push_sarif_results(
         sarif_results,
@@ -1812,7 +2240,7 @@ fn push_catalog_entry_sarif_results(
             sarif_unresolved_catalog_reference_fields(
                 f,
                 root,
-                severity_to_sarif_level(rules.unresolved_catalog_references),
+                finding_level(f, rules.unresolved_catalog_references),
             )
         },
     );
@@ -1838,7 +2266,7 @@ fn push_dependency_override_sarif_results(
             sarif_unused_dependency_override_fields(
                 f,
                 root,
-                severity_to_sarif_level(rules.unused_dependency_overrides),
+                finding_level(f, rules.unused_dependency_overrides),
             )
         },
     );
@@ -1850,7 +2278,7 @@ fn push_dependency_override_sarif_results(
             sarif_misconfigured_dependency_override_fields(
                 f,
                 root,
-                severity_to_sarif_level(rules.misconfigured_dependency_overrides),
+                finding_level(f, rules.misconfigured_dependency_overrides),
             )
         },
     );
@@ -1872,6 +2300,298 @@ mod tests {
             "shortDescription": { "text": description },
             "defaultConfiguration": { "level": level }
         })
+    }
+
+    /// A SARIF consumer reads the message text, not the JSON envelope, so the
+    /// degraded-parse caveat has to travel in the message. A clean finding
+    /// keeps the previous text byte-for-byte.
+    #[test]
+    fn sarif_messages_name_the_degraded_parse_caveat() {
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: Path::new("/p/src/clean.ts").to_path_buf(),
+            }));
+        let mut flagged = UnusedFileFinding::with_actions(UnusedFile {
+            path: Path::new("/p/src/orphan.ts").to_path_buf(),
+        });
+        flagged.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_files.push(flagged);
+
+        // Every member array carries the same caveat off the same
+        // reachability-free access walk, so all three have to reach the
+        // message. Store members were rendered bare while the array itself was
+        // stamped.
+        let member = |parent: &str, name: &str, kind| UnusedMember {
+            path: Path::new("/p/src/lib.ts").to_path_buf(),
+            parent_name: parent.to_owned(),
+            member_name: name.to_owned(),
+            kind,
+            line: 7,
+            col: 2,
+        };
+        let mut enum_member = UnusedEnumMemberFinding::with_actions(member(
+            "Mode",
+            "Legacy",
+            fallow_types::extract::MemberKind::EnumMember,
+        ));
+        enum_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_enum_members.push(enum_member);
+        let mut class_member = UnusedClassMemberFinding::with_actions(member(
+            "Widget",
+            "render",
+            fallow_types::extract::MemberKind::ClassMethod,
+        ));
+        class_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_class_members.push(class_member);
+        let mut store_member = UnusedStoreMemberFinding::with_actions(member(
+            "useCart",
+            "subtotal",
+            fallow_types::extract::MemberKind::StoreMember,
+        ));
+        store_member.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+        results.unused_store_members.push(store_member);
+
+        let sarif = build_dead_code_sarif(
+            &results,
+            Path::new("/p"),
+            &RulesConfig::default(),
+            &test_rule_builder,
+        );
+        let messages: Vec<String> = sarif
+            .pointer("/runs/0/results")
+            .and_then(serde_json::Value::as_array)
+            .expect("SARIF results")
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .pointer("/message/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        assert!(
+            messages.contains(&"File is not reachable from any entry point".to_owned()),
+            "a clean finding keeps its exact message: {messages:?}"
+        );
+        assert!(
+            messages.contains(
+                &"File is not reachable from any entry point (caveat: incomplete import graph)"
+                    .to_owned()
+            ),
+            "a caveated finding names it in the message: {messages:?}"
+        );
+        for expected in [
+            "Enum member 'Mode.Legacy' is never referenced (caveat: incomplete import graph)",
+            "Class member 'Widget.render' is never referenced (caveat: incomplete import graph)",
+            "Store member 'useCart.subtotal' is never referenced (caveat: incomplete import graph)",
+        ] {
+            assert!(
+                messages.contains(&expected.to_owned()),
+                "every member kind names the caveat: {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_dependency_message_names_the_workspaces_that_declare_and_import_it() {
+        let root = Path::new("/project");
+        let mut results = AnalysisResults::default();
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "left-pad".to_owned(),
+                location: fallow_types::results::DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 0,
+                used_in_workspaces: Vec::new(),
+                declared_and_imported_in: vec![root.join("packages/app")],
+            }));
+
+        let sarif =
+            build_dead_code_sarif(&results, root, &RulesConfig::default(), &test_rule_builder);
+        let message = sarif
+            .pointer("/runs/0/results/0/message/text")
+            .and_then(serde_json::Value::as_str)
+            .expect("SARIF message");
+        assert_eq!(
+            message,
+            "Package 'left-pad' is in dependencies but never imported; declared and imported in other workspaces: packages/app"
+        );
+    }
+
+    /// The reported defect: `npm init -y` writes a `package.json` whose
+    /// dependency block can sit on one line, and `find_dep_line_in_json` also
+    /// falls back to line 1 for a key it cannot locate. Every unused dependency
+    /// then reported the same rule id, the same URI, and the same source
+    /// snippet, which is the whole of a SARIF fingerprint, so GitHub code
+    /// scanning showed one alert for all of them. CodeClimate never had the
+    /// defect: it keys on the package name.
+    #[test]
+    fn two_dependencies_on_one_manifest_line_are_two_alerts() {
+        let dir = tempfile::tempdir().expect("temporary project");
+        let root = dir.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"compact","dependencies":{"lodash":"^4.17.21","chalk":"^5.3.0"}}"#,
+        )
+        .expect("write manifest");
+
+        let mut results = AnalysisResults::default();
+        for name in ["lodash", "chalk"] {
+            results
+                .unused_dependencies
+                .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                    package_name: name.to_owned(),
+                    location: fallow_types::results::DependencyLocation::Dependencies,
+                    path: root.join("package.json"),
+                    line: 1,
+                    used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
+                }));
+        }
+
+        let sarif =
+            build_dead_code_sarif(&results, root, &RulesConfig::default(), &test_rule_builder);
+        let entries = sarif
+            .pointer("/runs/0/results")
+            .and_then(serde_json::Value::as_array)
+            .expect("SARIF results");
+
+        let fingerprints = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .pointer("/partialFingerprints/tools.fallow.fingerprint~1v1")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("fingerprint")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fingerprints.len(),
+            entries.len(),
+            "two dependencies declared on one line are two alerts: {entries:#?}"
+        );
+
+        let columns = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .pointer("/locations/0/physicalLocation/region/startColumn")
+                    .and_then(serde_json::Value::as_u64)
+                    .expect("start column")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            columns.len(),
+            entries.len(),
+            "each dependency points at its own key in the manifest line: {entries:#?}"
+        );
+    }
+
+    /// Why the column and not only the run-level uniqueness pass: that pass
+    /// separates repeats by occurrence index, so a dependency's identity would
+    /// depend on its siblings and fixing the first one would renumber, and
+    /// close, the alert on the second. The column is the dependency's own
+    /// position, so an unrelated dependency added above it moves neither.
+    #[test]
+    fn a_dependency_added_above_leaves_the_others_alert_alone() {
+        let dir = tempfile::tempdir().expect("temporary project");
+        let root = dir.path();
+        let manifest = root.join("package.json");
+
+        let chalk_fingerprint = |manifest_text: &str, chalk_line: u32| {
+            std::fs::write(&manifest, manifest_text).expect("write manifest");
+            let mut results = AnalysisResults::default();
+            results
+                .unused_dependencies
+                .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                    package_name: "chalk".to_owned(),
+                    location: fallow_types::results::DependencyLocation::Dependencies,
+                    path: manifest.clone(),
+                    line: chalk_line,
+                    used_in_workspaces: Vec::new(),
+                    declared_and_imported_in: Vec::new(),
+                }));
+            build_dead_code_sarif(&results, root, &RulesConfig::default(), &test_rule_builder)
+                .pointer("/runs/0/results/0/partialFingerprints/tools.fallow.fingerprint~1v1")
+                .and_then(serde_json::Value::as_str)
+                .expect("chalk fingerprint")
+                .to_owned()
+        };
+
+        let before = "{\n  \"dependencies\": {\n    \"chalk\": \"^5.3.0\"\n  }\n}\n";
+        let after = "{\n  \"dependencies\": {\n    \"lodash\": \"^4.17.21\",\n    \"chalk\": \"^5.3.0\"\n  }\n}\n";
+
+        assert_eq!(
+            chalk_fingerprint(before, 3),
+            chalk_fingerprint(after, 4),
+            "a dependency declared above it must not move chalk's alert"
+        );
+    }
+
+    /// `partialFingerprints` is the alert identity GitHub code scanning uses to
+    /// carry a finding across runs. It is built from rule id plus location (or a
+    /// normalized snippet), never from the message, so a finding that gains the
+    /// caveat must keep its fingerprint. If the caveat ever reached the
+    /// fingerprint inputs, every open alert on a degraded repository would close
+    /// and reopen as new on the next scan.
+    #[test]
+    fn the_caveat_does_not_move_the_sarif_fingerprint() {
+        let build = |caveated: bool| {
+            let mut results = AnalysisResults::default();
+            let mut finding = UnusedFileFinding::with_actions(UnusedFile {
+                path: Path::new("/p/src/orphan.ts").to_path_buf(),
+            });
+            if caveated {
+                finding.reachability_caveats = vec![ReachabilityCaveat::IncompleteImportGraph];
+            }
+            results.unused_files.push(finding);
+            build_dead_code_sarif(
+                &results,
+                Path::new("/p"),
+                &RulesConfig::default(),
+                &test_rule_builder,
+            )
+        };
+
+        let read = |sarif: &serde_json::Value, pointer: &str| {
+            sarif
+                .pointer("/runs/0/results")
+                .and_then(serde_json::Value::as_array)
+                .expect("SARIF results")
+                .iter()
+                .map(|entry| {
+                    entry
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_str)
+                        .expect("SARIF field")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let clean = build(false);
+        let caveated = build(true);
+
+        for key in [
+            "/partialFingerprints/tools.fallow.fingerprint~1v1",
+            "/partialFingerprints/primaryLocationLineHash~1v1",
+        ] {
+            assert_eq!(
+                read(&clean, key),
+                read(&caveated, key),
+                "the caveat must not move {key}"
+            );
+        }
+
+        assert_ne!(
+            read(&clean, "/message/text"),
+            read(&caveated, "/message/text"),
+            "the guard is only meaningful while the message actually changed"
+        );
     }
 
     #[test]
@@ -1915,6 +2635,197 @@ mod tests {
             assert_eq!(
                 description,
                 issue_sarif_rule_description(id).expect("SARIF rule description should resolve")
+            );
+        }
+    }
+
+    const FINDING_ID_POINTER: &str = "/partialFingerprints/fallowFinding~1v1";
+
+    /// One finding per single-result kind, plus the two kinds that fan out to
+    /// one SARIF result per location.
+    fn identity_results(root: &Path) -> AnalysisResults {
+        let mut results = AnalysisResults::default();
+        results
+            .unused_files
+            .push(UnusedFileFinding::with_actions(UnusedFile {
+                path: root.join("src/orphan.ts"),
+            }));
+        results
+            .unused_dependencies
+            .push(UnusedDependencyFinding::with_actions(UnusedDependency {
+                package_name: "lodash".to_owned(),
+                location: fallow_types::results::DependencyLocation::Dependencies,
+                path: root.join("package.json"),
+                line: 3,
+                used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
+            }));
+        results
+            .unlisted_dependencies
+            .push(UnlistedDependencyFinding::with_actions(
+                fallow_types::results::UnlistedDependency {
+                    package_name: "chalk".to_owned(),
+                    imported_from: vec![
+                        fallow_types::results::ImportSite {
+                            path: root.join("src/a.ts"),
+                            line: 1,
+                            col: 0,
+                        },
+                        fallow_types::results::ImportSite {
+                            path: root.join("src/b.ts"),
+                            line: 2,
+                            col: 0,
+                        },
+                    ],
+                },
+            ));
+        results
+            .duplicate_exports
+            .push(DuplicateExportFinding::with_actions(
+                fallow_types::results::DuplicateExport {
+                    export_name: "Button".to_owned(),
+                    locations: vec![
+                        fallow_types::results::DuplicateLocation {
+                            path: root.join("src/a.ts"),
+                            line: 4,
+                            col: 0,
+                        },
+                        fallow_types::results::DuplicateLocation {
+                            path: root.join("src/b.ts"),
+                            line: 5,
+                            col: 0,
+                        },
+                    ],
+                },
+            ));
+        results
+    }
+
+    fn sarif_entries(sarif: &serde_json::Value) -> Vec<serde_json::Value> {
+        sarif
+            .pointer("/runs/0/results")
+            .and_then(serde_json::Value::as_array)
+            .expect("SARIF results")
+            .clone()
+    }
+
+    /// A finding that maps to one SARIF result carries its `finding_id` under
+    /// `fallowFinding/v1`, next to the location-based keys.
+    #[test]
+    fn a_single_result_finding_carries_its_id_as_a_partial_fingerprint() {
+        let root = Path::new("/p");
+        let mut results = identity_results(root);
+        fallow_types::identity::stamp_dead_code_finding_ids(&mut results, root);
+        let sarif =
+            build_dead_code_sarif(&results, root, &RulesConfig::default(), &test_rule_builder);
+        let entries = sarif_entries(&sarif);
+
+        let id_of_rule = |rule: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["ruleId"] == rule)
+                .and_then(|entry| entry.pointer(FINDING_ID_POINTER))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            id_of_rule("fallow/unused-file").as_deref(),
+            results.unused_files[0].finding_id.as_deref(),
+        );
+        assert_eq!(
+            id_of_rule("fallow/unused-dependency").as_deref(),
+            results.unused_dependencies[0].finding_id.as_deref(),
+        );
+        assert!(
+            id_of_rule("fallow/unused-file").is_some_and(|id| id.starts_with("dc1:unused-file:")),
+            "the key holds the finding id: {entries:#?}"
+        );
+    }
+
+    /// A partial fingerprint must identify one result. An unlisted dependency
+    /// and a duplicate export give one result per location, so one id would
+    /// name several results. These results do not carry the key.
+    #[test]
+    fn a_fanned_out_finding_does_not_carry_the_id() {
+        let root = Path::new("/p");
+        let mut results = identity_results(root);
+        fallow_types::identity::stamp_dead_code_finding_ids(&mut results, root);
+        let sarif =
+            build_dead_code_sarif(&results, root, &RulesConfig::default(), &test_rule_builder);
+
+        for entry in sarif_entries(&sarif) {
+            let rule = entry["ruleId"].as_str().expect("rule id");
+            if matches!(
+                rule,
+                "fallow/unlisted-dependency" | "fallow/duplicate-export"
+            ) {
+                assert!(
+                    entry.pointer(FINDING_ID_POINTER).is_none(),
+                    "{rule} fans out and must not carry the id: {entry:#?}"
+                );
+            }
+        }
+    }
+
+    /// GitHub code scanning matches alerts on the location-based keys. The new
+    /// key must not change any other byte of the document, or open alerts
+    /// close and reopen on the next upload.
+    #[test]
+    fn the_finding_id_key_leaves_every_other_sarif_byte_alone() {
+        let root = Path::new("/p");
+        let without_ids = identity_results(root);
+        let mut with_ids = without_ids.clone();
+        fallow_types::identity::stamp_dead_code_finding_ids(&mut with_ids, root);
+
+        let before = build_dead_code_sarif(
+            &without_ids,
+            root,
+            &RulesConfig::default(),
+            &test_rule_builder,
+        );
+        let mut after =
+            build_dead_code_sarif(&with_ids, root, &RulesConfig::default(), &test_rule_builder);
+
+        let mut removed = 0;
+        for entry in after
+            .pointer_mut("/runs/0/results")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("SARIF results")
+        {
+            let prints = entry["partialFingerprints"]
+                .as_object_mut()
+                .expect("partial fingerprints");
+            if prints.remove("fallowFinding/v1").is_some() {
+                removed += 1;
+            }
+        }
+        assert!(
+            removed > 0,
+            "the guard needs at least one result with the key"
+        );
+        assert_eq!(
+            serde_json::to_string(&before).expect("serialize"),
+            serde_json::to_string(&after).expect("serialize"),
+        );
+    }
+
+    /// A saved envelope from an older version has no ids. The key is then
+    /// absent, not empty and not null.
+    #[test]
+    fn a_finding_without_an_id_has_no_finding_id_key() {
+        let root = Path::new("/p");
+        let sarif = build_dead_code_sarif(
+            &identity_results(root),
+            root,
+            &RulesConfig::default(),
+            &test_rule_builder,
+        );
+        for entry in sarif_entries(&sarif) {
+            assert!(
+                entry["partialFingerprints"]
+                    .get("fallowFinding/v1")
+                    .is_none(),
+                "no id, no key: {entry:#?}"
             );
         }
     }

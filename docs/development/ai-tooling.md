@@ -9,13 +9,17 @@ Fallow supports multiple agent hosts through one canonical knowledge model.
 - `docs/` contains durable, host-neutral knowledge.
 - `.agents/skills/<name>/SKILL.md` contains the authored maintainer workflow.
 - `.claude/skills/<name>/SKILL.md` is a generated Claude adapter.
+- `.agents/agents/<name>.md` contains the authored reviewer agent definitions.
+- `.claude/agents/<name>.md` is a generated Claude adapter.
+- `.agents/rules/` contains shared review constraints and routes loaded by skills.
 - `.claude/rules/` contains curated, short Claude constraints and routes.
+  Both rule trees are classified and checked by the knowledge manifest.
 - `docs/reference/` contains durable implementation detail extracted from
   runtime rules.
 - Nested `AGENTS.md` files add subsystem-specific instructions.
 
-Codex reads `.agents/skills` directly. There is no `.codex/skills` source and
-no sibling-checkout dependency.
+Codex reads `.agents/skills` and `.agents/agents` directly. There is no
+`.codex/skills` source and no sibling-checkout dependency.
 
 ## Adapter contract
 
@@ -27,11 +31,69 @@ npm run check:agent-adapters
 ```
 
 The generator owns the Claude adapter bytes and marks them as generated.
-Hand-edit the canonical `.agents/skills` source, regenerate, then commit both
-surfaces. CI runs check mode and rejects drift.
+Hand-edit the canonical `.agents/skills` or `.agents/agents` source, regenerate,
+then commit both surfaces. CI runs check mode and rejects drift.
+
+The generator writes expected adapter destinations from canonical sources,
+whether or not Git tracks those destinations. For generated files under
+`.claude` that no longer have a canonical source, tracked status controls
+cleanup. Check mode reports untracked stale files, and generate mode leaves
+them alone. These files may belong to a local host installation.
+
+A generated marker does not prove that a file belongs to the repository.
+A directory copied from a released skill contract has the same marker.
+When Git cannot determine ownership, the generator treats every marked file
+as repository content.
 
 Do not hand-maintain equivalent Claude and Codex workflow prose. Host-specific
 frontmatter or discovery metadata belongs in the generator.
+
+## Released Fallow skill mirror
+
+Each directory under `npm/fallow/skills/` with a `SKILL.md` is a released
+skill: `fallow` for analysis and `fallow-setup` for tooling setup. Together they
+are the released skill contract. The maintainer copy under
+`.agents/skills/<name>/` is not authored. The same generator copies `SKILL.md`
+and every file under `references/` from each released tree, byte for byte, and
+removes a reference that only the maintainer copy has. Host interface files
+such as `agents/openai.yaml` stay in the released tree.
+
+- Edit the released tree, then run `npm run generate:agent-adapters`. The run
+  refreshes `.agents/skills/<name>/` and then its Claude adapter.
+- The generator stops, and writes nothing, when a maintainer copy has an
+  uncommitted edit that its released file does not have. It names the released
+  file that should take the edit.
+- A new released skill also needs an entry in `SKILLS` in
+  `crates/cli/build.rs` and in `RELEASED_SKILLS` in
+  `crates/cli/src/agent_install/skill.rs`. `scripts/repository-policy.test.mjs`
+  fails when the three lists differ.
+- `npm run generate:contracts` writes the generated tables into the released
+  tree only. It then runs the same mirror, so the maintainer copy has one
+  writer.
+- `npm run check:agent-adapters` fails when the two copies differ.
+
+## Curated agent-doc cells
+
+`scripts/generate-agent-docs.mjs` regenerates the tables in the published
+fallow skill tree from the `fallow schema` capability manifest. Identity columns
+regenerate on every run. Curated columns (command `Purpose` and `Key Flags`,
+the `Description` on issue types, MCP tools, MCP resources, and CLI flags, and
+the dead-code filter `Issue Type`) are hand-owned: an existing cell is preserved
+verbatim and only a new row is seeded from the manifest.
+
+A preserved cell can become stale when the manifest text changes.
+`scripts/agent-doc-curated-seeds.json` records the seed each curated cell was
+last accepted against. It lives beside the generator, outside the vendored
+skill tree, so the gate never modifies the published skills.
+
+- `npm run generate:contracts:check` fails when a recorded seed no longer
+  matches. It names the cell as `section / row / column` and prints both the
+  recorded and the current seed.
+- `npm run generate:contracts` re-records the seeds, so accepting a moved seed
+  is one command.
+
+A drifted seed is a prompt to review, not an automatic rewrite. Read the
+published cell, correct the prose when it no longer holds, then re-record.
 
 ## Fresh-clone contract
 

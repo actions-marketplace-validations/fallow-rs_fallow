@@ -13,6 +13,7 @@ vi.mock("vscode", async () => {
 import { countCheckIssues } from "../src/analysis-utils.js";
 import { DIAGNOSTIC_CATEGORIES } from "../src/diagnosticFilter.js";
 import { ISSUE_CATEGORY_LABELS, type IssueCategory } from "../src/labels.js";
+import { buildParamsFromCli, buildStatusBarPartsFromLsp } from "../src/statusBar-utils.js";
 import { DeadCodeTreeProvider } from "../src/treeView.js";
 import type { CheckOutput, FallowCheckResult } from "../src/types.js";
 import { emptyCheck } from "./checkFixtures.js";
@@ -40,6 +41,13 @@ import type { TestTreeItem } from "./vscodeTreeMock.js";
 const NON_DEAD_CODE_CODES = new Set<string>(["code-duplication"]);
 
 /**
+ * Dead-code codes that the sidebar renders but does not count. The opt-in
+ * component health signals are advisory: the CLI keeps them out of
+ * `total_issues`, so `countCheckIssues` keeps them out of the status bar too.
+ */
+const ADVISORY_CODES = new Set<string>(["prop-drilling", "thin-wrapper", "duplicate-prop-shape"]);
+
+/**
  * One synthetic dead-code finding plus the wiring it must light up:
  * - `field` is the `CheckOutput` result array that carries findings of this
  *   kind. Typing it as `keyof CheckOutput` makes TypeScript compilation FAIL if
@@ -61,6 +69,27 @@ interface KindWiring {
 const loc = { path: "src/x.ts", line: 1, col: 0 };
 const pkg = { package_name: "left-pad", path: "package.json", line: 3 };
 const member = { parent_name: "Widget", member_name: "render", ...loc };
+const absentProp = {
+  path: "src/Button.vue",
+  line: 7,
+  col: 2,
+  component_name: "Button",
+  prop_name: "highlight",
+  framework: "vue",
+  has_default: true,
+  inspected_call_sites: [{ path: "src/App.vue", line: 12, col: 4 }],
+  explanation:
+    "Known reachable callers omit this consumed optional prop. Review its default before changing it.",
+  finding_id: "dc1:absent-component-prop:0123456789abcdef",
+  effective_severity: "warn",
+  actions: [
+    {
+      type: "review-component-prop",
+      auto_fixable: false,
+      description: "Review the component contract",
+    },
+  ],
+} satisfies NonNullable<FallowCheckResult["absent_component_props"]>[number];
 
 /**
  * Code -> wiring. Keyed by the dead-code subset of `DIAGNOSTIC_CATEGORIES`
@@ -135,6 +164,11 @@ const DEAD_CODE_WIRING = {
     category: "unused-component-prop",
     finding: { ...loc, component_name: "Btn", prop_name: "size", actions: [] },
   },
+  "absent-component-prop": {
+    field: "absent_component_props",
+    category: "absent-component-prop",
+    finding: absentProp,
+  },
   "unused-component-emit": {
     field: "unused_component_emits",
     category: "unused-component-emit",
@@ -154,6 +188,21 @@ const DEAD_CODE_WIRING = {
     field: "unused_svelte_events",
     category: "unused-svelte-event",
     finding: { ...loc, component_name: "Btn", event_name: "change", actions: [] },
+  },
+  "unused-effect-layer": {
+    field: "unused_effect_layers",
+    category: "unused-effect-layer",
+    finding: { ...loc, name: "CacheLive", kind: "top_level", dead_consumers: ["OrphanLive"], actions: [] },
+  },
+  "unused-tagged-error": {
+    field: "unused_tagged_errors",
+    category: "unused-tagged-error",
+    finding: { ...loc, name: "Expired", tag: "Expired", catch_sites: [], actions: [] },
+  },
+  "unproduced-catch-tag": {
+    field: "unproduced_catch_tags",
+    category: "unproduced-catch-tag",
+    finding: { ...loc, tag: "Expired", candidate_classes: ["Expired"], actions: [] },
   },
   "unrendered-component": {
     field: "unrendered_components",
@@ -243,6 +292,37 @@ const DEAD_CODE_WIRING = {
     category: "re-export-cycles",
     finding: { kind: "cycle", files: ["a.ts", "b.ts"], actions: [] },
   },
+  "package-cycle": {
+    field: "package_cycles",
+    category: "package-cycles",
+    finding: {
+      packages: ["a", "b"],
+      package_roots: ["a", "b"],
+      length: 2,
+      edges: [
+        {
+          from_package: "a",
+          to_package: "b",
+          path: "a/x.ts",
+          target_path: "b/y.ts",
+          line: 1,
+          col: 0,
+          type_only: false,
+        },
+        {
+          from_package: "b",
+          to_package: "a",
+          path: "b/z.ts",
+          target_path: "a/w.ts",
+          line: 1,
+          col: 0,
+          type_only: false,
+        },
+      ],
+      group_truncated: false,
+      actions: [],
+    },
+  },
   "boundary-violation": {
     field: "boundary_violations",
     category: "boundary-violation",
@@ -306,7 +386,13 @@ const DEAD_CODE_WIRING = {
   "unused-catalog-entry": {
     field: "unused_catalog_entries",
     category: "unused-catalog-entries",
-    finding: { path: "pnpm-workspace.yaml", line: 2, catalog_name: "default", entry_name: "react", actions: [] },
+    finding: {
+      path: "pnpm-workspace.yaml",
+      line: 2,
+      catalog_name: "default",
+      entry_name: "react",
+      actions: [],
+    },
   },
   "empty-catalog-group": {
     field: "empty_catalog_groups",
@@ -316,17 +402,67 @@ const DEAD_CODE_WIRING = {
   "unresolved-catalog-reference": {
     field: "unresolved_catalog_references",
     category: "unresolved-catalog-references",
-    finding: { path: "package.json", line: 2, catalog_name: "default", entry_name: "react", actions: [] },
+    finding: {
+      path: "package.json",
+      line: 2,
+      catalog_name: "default",
+      entry_name: "react",
+      actions: [],
+    },
   },
   "unused-dependency-override": {
     field: "unused_dependency_overrides",
     category: "unused-dependency-overrides",
-    finding: { path: "package.json", line: 2, raw_key: "react", source: "pnpm.overrides", actions: [] },
+    finding: {
+      path: "package.json",
+      line: 2,
+      raw_key: "react",
+      source: "pnpm.overrides",
+      actions: [],
+    },
   },
   "misconfigured-dependency-override": {
     field: "misconfigured_dependency_overrides",
     category: "misconfigured-dependency-overrides",
     finding: { path: "package.json", line: 2, raw_key: "", source: "pnpm.overrides", actions: [] },
+  },
+  "prop-drilling": {
+    field: "prop_drilling_chains",
+    category: "prop-drilling",
+    finding: {
+      prop: "user",
+      depth: 3,
+      hops: [
+        { file: "src/App.tsx", line: 4, component: "App" },
+        { file: "src/Page.tsx", line: 2, component: "Page" },
+        { file: "src/Avatar.tsx", line: 7, component: "Avatar" },
+      ],
+      actions: [],
+    },
+  },
+  "thin-wrapper": {
+    field: "thin_wrappers",
+    category: "thin-wrapper",
+    finding: {
+      file: "src/Wrapper.tsx",
+      line: 3,
+      component: "Wrapper",
+      child_component: "Button",
+      actions: [],
+    },
+  },
+  "duplicate-prop-shape": {
+    field: "duplicate_prop_shapes",
+    category: "duplicate-prop-shape",
+    finding: {
+      file: "src/Card.tsx",
+      line: 3,
+      component: "Card",
+      shape: ["body", "title"],
+      group_size: 3,
+      sharing_components: [],
+      actions: [],
+    },
   },
 } satisfies Record<string, KindWiring>;
 
@@ -346,6 +482,37 @@ const canonicalLabel = (code: string): string => {
 };
 
 describe("dead-code IssueKind drift guard", () => {
+  it("renders an absent optional prop candidate at its declaration for manual review", () => {
+    const provider = new DeadCodeTreeProvider();
+    const check = checkWith("absent_component_props", absentProp);
+    expect(buildStatusBarPartsFromLsp(buildParamsFromCli(check, null, null))).toEqual([
+      "1 issues",
+      "0.0% duplication",
+    ]);
+    provider.update(check);
+    const categories = provider.getChildren();
+    expect(categories).toHaveLength(1);
+    const category = categories[0]!;
+    expect(category.label).toBe("Absent Optional Component Props (1)");
+    const items = provider.getChildren(category) as TestTreeItem[];
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      label: "Button.highlight (review)",
+      description: "src/Button.vue:7",
+      iconPath: { id: "symbol-property" },
+      command: {
+        command: "fallow.openFile",
+        arguments: [
+          { absolutePath: "/workspace/src/Button.vue", line: 7, col: 2, endLine: 7, endCol: 2 },
+        ],
+      },
+    });
+    provider.update(emptyCheck());
+    expect(provider.getChildren()).toEqual([]);
+    expect(countCheckIssues(emptyCheck())).toBe(0);
+    provider.dispose();
+  });
+
   it("every DIAGNOSTIC_CATEGORIES code is either dead-code-mapped or documented non-dead-code", () => {
     // Chains to the existing `diagnosticFilter` drift test ("includes every
     // diagnostic code"): that test pins DIAGNOSTIC_CATEGORIES to the LSP's
@@ -374,8 +541,12 @@ describe("dead-code IssueKind drift guard", () => {
     const { field, category, diagnosticCode, finding } = wiring;
     const check = checkWith(field, finding);
 
-    // (a) countCheckIssues counts it.
-    expect(countCheckIssues(check)).toBeGreaterThanOrEqual(1);
+    // (a) countCheckIssues counts it, unless the code is advisory.
+    if (ADVISORY_CODES.has(code)) {
+      expect(countCheckIssues(check)).toBe(0);
+    } else {
+      expect(countCheckIssues(check)).toBeGreaterThanOrEqual(1);
+    }
 
     // (b) DeadCodeTreeProvider renders a category node for it.
     const provider = new DeadCodeTreeProvider();

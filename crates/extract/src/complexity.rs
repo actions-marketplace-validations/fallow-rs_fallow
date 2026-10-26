@@ -24,6 +24,14 @@
 /// into cognitive. Only props beyond this floor are counted.
 const PROP_COUNT_FLOOR: u16 = 4;
 
+/// Arguments that take the span name of `Effect.fn("span")(...)`: only the
+/// body. The later arguments are pipeline transforms.
+const SPAN_NAMED_ARGUMENTS: std::ops::Range<usize> = 0..1;
+
+/// Arguments that take the name of a call with a string-literal first
+/// argument: every argument after that literal.
+const STRING_KEYED_ARGUMENTS: std::ops::RangeFrom<usize> = 1..;
+
 #[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
@@ -33,8 +41,11 @@ use oxc_span::GetSpan;
 use oxc_span::Span;
 
 use fallow_types::extract::{
-    ComplexityContribution, ComplexityContributionKind, ComplexityMetric, FunctionComplexity,
+    ANONYMOUS_ARROW_NAME, ANONYMOUS_FUNCTION_NAME, AnonymousFunctionKind, ComplexityContribution,
+    ComplexityContributionKind, ComplexityMetric, FunctionComplexity,
 };
+
+use crate::{complexity_names, js_text::JsText};
 
 /// Per-function state on the scope stack.
 struct FunctionFrame {
@@ -62,11 +73,18 @@ struct FunctionFrame {
     prop_count: u16,
     /// Per-increment breakdown accumulated as the function body is walked.
     contributions: Vec<ComplexityContribution>,
+    /// Levels of nested functions below this one (`function_hash`).
+    height: u32,
 }
 
+#[derive(Clone)]
 struct FunctionIdentity {
     name: String,
     is_private_member: bool,
+    /// The name comes from the call or the function that holds this function
+    /// (see `FunctionComplexity::context_named`). The kind starts as
+    /// `Function` and an arrow sets `Arrow` when it takes the identity.
+    context_named: Option<AnonymousFunctionKind>,
 }
 
 impl FunctionIdentity {
@@ -74,6 +92,7 @@ impl FunctionIdentity {
         Self {
             name: name.into(),
             is_private_member: false,
+            context_named: None,
         }
     }
 
@@ -81,6 +100,15 @@ impl FunctionIdentity {
         Self {
             name: name.into(),
             is_private_member: true,
+            context_named: None,
+        }
+    }
+
+    fn from_context(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            is_private_member: false,
+            context_named: Some(AnonymousFunctionKind::Function),
         }
     }
 }
@@ -97,6 +125,18 @@ pub struct ComplexityVisitor<'a> {
     /// Identity override from a parent node (e.g., method identity from
     /// `MethodDefinition`, variable name from `const foo = function() {}`).
     pending_identity: Option<FunctionIdentity>,
+    /// A call whose anonymous generator arguments take a context name, keyed
+    /// by the call span: the `Effect.gen(...)` call that a named function
+    /// returns, or one passed to a string-keyed call.
+    named_generator_call: Option<(Span, FunctionIdentity)>,
+    /// Span of the outermost `||` chain under the cursor that is a literal
+    /// membership chain. Its cyclomatic `||` increments carry the
+    /// `literal_membership` flag.
+    literal_membership_chain: Option<Span>,
+    /// Spans of `||` expressions that are direct operands of an enclosing
+    /// `||` expression. Such an expression is part of a longer chain, so it
+    /// cannot open a literal membership chain of its own.
+    nested_or_operands: Vec<Span>,
 }
 
 impl<'a> ComplexityVisitor<'a> {
@@ -107,21 +147,10 @@ impl<'a> ComplexityVisitor<'a> {
             line_offsets,
             source,
             pending_identity: None,
+            named_generator_call: None,
+            literal_membership_chain: None,
+            nested_or_operands: Vec::new(),
         }
-    }
-
-    /// Compute the content digest for a function's full-span byte slice.
-    ///
-    /// The slice (`&source[span.start..span.end]`) is the canonical body bytes
-    /// (signature line + body + closing brace, no whitespace normalization).
-    /// Returns `None` if the span falls outside the source or on a non-char
-    /// boundary; valid AST spans never do, but we clamp defensively rather than
-    /// panic, mirroring `line_col_utf16` in the inventory walker.
-    fn source_hash_for_span(&self, span: Span) -> Option<String> {
-        let start = span.start as usize;
-        let end = span.end as usize;
-        let slice = self.source.get(start..end)?;
-        Some(fallow_cov_protocol::source_hash_for(slice.as_bytes()))
     }
 
     fn push_function(
@@ -144,6 +173,7 @@ impl<'a> ComplexityVisitor<'a> {
             hook_count: 0,
             prop_count,
             contributions: Vec::new(),
+            height: 0,
         });
     }
 
@@ -157,10 +187,15 @@ impl<'a> ComplexityVisitor<'a> {
                 fallow_types::extract::byte_offset_to_line_col(self.line_offsets, frame.span.start);
             let end_line =
                 fallow_types::extract::byte_offset_to_line_col(self.line_offsets, frame.span.end).0;
-            let source_hash = self.source_hash_for_span(frame.span);
+            let source_hash =
+                crate::function_hash::function_source_hash(self.source, frame.span, frame.height);
+            if let Some(parent) = self.stack.last_mut() {
+                parent.height = parent.height.max(frame.height + 1);
+            }
             self.results.push(FunctionComplexity {
                 name: frame.identity.name,
                 is_private_member: frame.identity.is_private_member,
+                context_named: frame.identity.context_named,
                 line,
                 col,
                 cyclomatic: frame.cyclomatic,
@@ -174,6 +209,64 @@ impl<'a> ComplexityVisitor<'a> {
                 contributions: frame.contributions,
             });
         }
+    }
+
+    /// Pop the root module frame and emit it as a synthetic `<module>` unit.
+    ///
+    /// Separate from [`Self::pop_function`] on three points:
+    ///
+    /// 1. No `fold_component_prop_count`. That fold is a component signal and
+    ///    the root frame is not a function, let alone a component.
+    /// 2. The unit is dropped when it never branched (`cyclomatic == 1 &&
+    ///    cognitive == 0`), mirroring the template unit's emission gate. A file
+    ///    with no module-scope decision point gets no new unit, so its existing
+    ///    numbers are untouched.
+    /// 3. It is anchored and sized by its own contributions rather than by the
+    ///    program span, matching the template unit's anchor convention. The
+    ///    anchor points at real branching instead of at line 1, and the size is
+    ///    the distance between the first and last decision point rather than
+    ///    the file's line count, which would otherwise push nearly every file
+    ///    into the very-high-risk unit-size bin.
+    ///
+    /// `source_hash` is `None` like the template unit's: a whole-file slice
+    /// joins nothing in the Istanbul or runtime-coverage function maps.
+    fn pop_module_frame(&mut self) {
+        let Some(frame) = self.stack.pop() else {
+            return;
+        };
+        if frame.cyclomatic == 1 && frame.cognitive == 0 {
+            return;
+        }
+        let Some((line, col)) = frame
+            .contributions
+            .iter()
+            .map(|contribution| (contribution.line, contribution.col))
+            .min()
+        else {
+            return;
+        };
+        let end_line = frame
+            .contributions
+            .iter()
+            .map(|contribution| contribution.line)
+            .max()
+            .unwrap_or(line);
+        self.results.push(FunctionComplexity {
+            name: fallow_types::extract::MODULE_UNIT_NAME.to_string(),
+            is_private_member: false,
+            context_named: None,
+            line,
+            col,
+            cyclomatic: frame.cyclomatic,
+            cognitive: frame.cognitive,
+            line_count: end_line.saturating_sub(line) + 1,
+            param_count: 0,
+            react_hook_count: 0,
+            react_jsx_max_depth: 0,
+            react_prop_count: 0,
+            source_hash: None,
+            contributions: frame.contributions,
+        });
     }
 
     /// Fold a component's prop count past [`PROP_COUNT_FLOOR`] into cognitive,
@@ -224,6 +317,7 @@ impl<'a> ComplexityVisitor<'a> {
                 kind,
                 weight,
                 nesting,
+                literal_membership: false,
             });
         }
     }
@@ -234,6 +328,20 @@ impl<'a> ComplexityVisitor<'a> {
         self.push_contribution(span, ComplexityMetric::Cyclomatic, kind, 1, 0);
         if let Some(frame) = self.stack.last_mut() {
             frame.cyclomatic = frame.cyclomatic.saturating_add(1);
+        }
+    }
+
+    /// Increment cyclomatic complexity for one `||` operator of a literal
+    /// membership chain. The count is the same as [`Self::inc_cyclomatic`];
+    /// only the recorded contribution carries the `literal_membership` flag.
+    fn inc_cyclomatic_literal_membership(&mut self, span: Span) {
+        self.inc_cyclomatic(span, ComplexityContributionKind::LogicalOr);
+        if let Some(contribution) = self
+            .stack
+            .last_mut()
+            .and_then(|frame| frame.contributions.last_mut())
+        {
+            contribution.literal_membership = true;
         }
     }
 
@@ -282,10 +390,10 @@ impl<'a> ComplexityVisitor<'a> {
     /// branching does. Gating on the name convention keeps a `use*` call inside an
     /// ordinary non-React function from accruing the penalty (zero-FP posture).
     fn record_hook(&mut self, span: Span) {
-        let react_shaped = self
-            .stack
-            .last()
-            .is_some_and(|frame| frame_name_is_react_shaped(&frame.identity.name));
+        let react_shaped = self.stack.last().is_some_and(|frame| {
+            frame.identity.context_named.is_none()
+                && frame_name_is_react_shaped(&frame.identity.name)
+        });
         if let Some(frame) = self.stack.last_mut() {
             frame.hook_count = frame.hook_count.saturating_add(1);
         }
@@ -383,6 +491,106 @@ impl<'a> ComplexityVisitor<'a> {
         matches!(expr, Expression::LogicalExpression(_))
     }
 
+    /// Mark the generator call that the current function returns, so that the
+    /// generator takes the name of that function. In
+    /// `const load = () => Effect.gen(function* () {...})` the generator is the
+    /// real body of `load`. A function with a placeholder name passes nothing.
+    fn name_returned_generator(&mut self, returned: &Expression<'_>) {
+        let Some(frame) = self.stack.last() else {
+            return;
+        };
+        if complexity_names::is_placeholder_name(&frame.identity.name) {
+            return;
+        }
+        if let Some(call) = complexity_names::returned_generator_call(returned) {
+            let identity = FunctionIdentity::from_context(frame.identity.name.clone());
+            self.named_generator_call = Some((call.span, identity));
+        }
+    }
+
+    fn take_named_generator_call(&mut self, span: Span) -> Option<FunctionIdentity> {
+        if self
+            .named_generator_call
+            .as_ref()
+            .is_some_and(|(call_span, _)| *call_span == span)
+        {
+            return self
+                .named_generator_call
+                .take()
+                .map(|(_, identity)| identity);
+        }
+        None
+    }
+
+    /// Walk a call and give `identity` to each anonymous generator argument.
+    fn visit_call_with_named_generators(
+        &mut self,
+        call: &CallExpression<'_>,
+        identity: &FunctionIdentity,
+    ) {
+        self.visit_expression(&call.callee);
+        for argument in &call.arguments {
+            let offered = self.pending_identity.is_none()
+                && complexity_names::is_anonymous_generator(argument);
+            if offered {
+                self.pending_identity = Some(identity.clone());
+            }
+            self.visit_argument(argument);
+            if offered {
+                self.pending_identity = None;
+            }
+        }
+    }
+
+    /// Walk a call and offer `identity` to the arguments in `named`. A
+    /// function argument takes it directly. A call argument passes it to its
+    /// anonymous generator (`.handle("get", Effect.fn(function* ...))`), and
+    /// to nothing else, so `it("x", wrap(() => ...))` keeps `<arrow>`.
+    ///
+    /// A binding or key name that waits for the first function keeps
+    /// priority: the offer happens only when no such name is pending, so only
+    /// a function that would get a placeholder takes the context name. In
+    /// `const setup = Command.make("setup", {...}, cb)` the object argument
+    /// consumes the binding name, so `cb` takes `Command.make("setup")`.
+    fn visit_call_with_context_name(
+        &mut self,
+        call: &CallExpression<'_>,
+        named: &impl std::ops::RangeBounds<usize>,
+        identity: &FunctionIdentity,
+    ) {
+        self.visit_expression(&call.callee);
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let offered = named.contains(&index)
+                && self.pending_identity.is_none()
+                && self.offer_context_name(argument, identity);
+            self.visit_argument(argument);
+            if offered {
+                self.pending_identity = None;
+                self.named_generator_call = None;
+            }
+        }
+    }
+
+    /// Offer `identity` to one argument. Returns whether the argument can take
+    /// it.
+    fn offer_context_name(&mut self, argument: &Argument<'_>, identity: &FunctionIdentity) -> bool {
+        if matches!(
+            argument,
+            Argument::FunctionExpression(_) | Argument::ArrowFunctionExpression(_)
+        ) {
+            self.pending_identity = Some(identity.clone());
+            return true;
+        }
+        let Some(call) = argument
+            .as_expression()
+            .and_then(complexity_names::returned_generator_call)
+        else {
+            return false;
+        };
+        self.named_generator_call = Some((call.span, identity.clone()));
+        true
+    }
+
     /// Walk an `if` (or an `else if` continuation) computing both metrics.
     ///
     /// `is_else_if` is `true` when the statement is the `alternate` of a parent
@@ -436,6 +644,24 @@ const fn logical_kind(op: LogicalOperator) -> ComplexityContributionKind {
 }
 
 impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
+    /// Open a root frame for module scope before walking the program.
+    ///
+    /// Every counter writer targets `self.stack.last_mut()` and silently drops
+    /// its increment when the stack is empty, so without this frame a top-level
+    /// `if` ladder, `??` default, or `?.` access contributed to no metric at
+    /// all. The frame is closed by [`ComplexityVisitor::pop_module_frame`],
+    /// which drops it again when nothing branched.
+    fn visit_program(&mut self, program: &Program<'ast>) {
+        self.push_function(
+            FunctionIdentity::public(fallow_types::extract::MODULE_UNIT_NAME),
+            program.span,
+            0,
+            0,
+        );
+        walk::walk_program(self, program);
+        self.pop_module_frame();
+    }
+
     fn visit_function(&mut self, func: &Function<'ast>, flags: ScopeFlags) {
         if func.body.is_none() {
             walk::walk_function(self, func, flags);
@@ -449,7 +675,7 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
                 FunctionIdentity::public(id.name.to_string())
             })
             .or_else(|| self.pending_identity.take())
-            .unwrap_or_else(|| FunctionIdentity::public("<anonymous>"));
+            .unwrap_or_else(|| FunctionIdentity::public(ANONYMOUS_FUNCTION_NAME));
 
         let is_nested = !self.stack.is_empty();
         if is_nested {
@@ -468,10 +694,15 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
     }
 
     fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'ast>) {
-        let identity = self
-            .pending_identity
-            .take()
-            .unwrap_or_else(|| FunctionIdentity::public("<arrow>"));
+        let identity = self.pending_identity.take().map_or_else(
+            || FunctionIdentity::public(ANONYMOUS_ARROW_NAME),
+            |mut identity| {
+                if identity.context_named.is_some() {
+                    identity.context_named = Some(AnonymousFunctionKind::Arrow);
+                }
+                identity
+            },
+        );
 
         let is_nested = !self.stack.is_empty();
         if is_nested {
@@ -481,7 +712,11 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
         let param_count = Self::count_params(&arrow.params);
         let prop_count = Self::count_props(&arrow.params);
         self.push_function(identity, arrow.span, param_count, prop_count);
+        if let Some(body) = arrow.get_expression() {
+            self.name_returned_generator(body);
+        }
         walk::walk_arrow_function_expression(self, arrow);
+        self.named_generator_call = None;
         self.pop_function();
 
         if is_nested {
@@ -493,7 +728,7 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
         // `static_name` has no answer for a private key, so `#work` would fall
         // through to `<anonymous>` and read as an unnamed unit in every report.
         if let Some(name) = method.key.static_name() {
-            self.pending_identity = Some(FunctionIdentity::public(name.to_string()));
+            self.pending_identity = Some(FunctionIdentity::public(name.text().into_owned()));
         } else if let PropertyKey::PrivateIdentifier(private) = &method.key {
             self.pending_identity = Some(FunctionIdentity::private(format!("#{}", private.name)));
         }
@@ -511,7 +746,7 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
 
     fn visit_property_definition(&mut self, prop: &PropertyDefinition<'ast>) {
         if let Some(name) = prop.key.static_name() {
-            self.pending_identity = Some(FunctionIdentity::public(name.to_string()));
+            self.pending_identity = Some(FunctionIdentity::public(name.text().into_owned()));
         } else if let PropertyKey::PrivateIdentifier(private) = &prop.key {
             self.pending_identity = Some(FunctionIdentity::private(format!("#{}", private.name)));
         }
@@ -521,7 +756,7 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
 
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
         if let Some(name) = prop.key.static_name() {
-            self.pending_identity = Some(FunctionIdentity::public(name.to_string()));
+            self.pending_identity = Some(FunctionIdentity::public(name.text().into_owned()));
         }
         walk::walk_object_property(self, prop);
         self.pending_identity = None;
@@ -628,7 +863,28 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
     }
 
     fn visit_logical_expression(&mut self, expr: &LogicalExpression<'ast>) {
-        self.inc_cyclomatic(expr.span, logical_kind(expr.operator));
+        let chain_root = !self.nested_or_operands.contains(&expr.span);
+        let opens_chain = chain_root
+            && self.literal_membership_chain.is_none()
+            && crate::literal_membership::is_literal_membership_chain(expr);
+        if opens_chain {
+            self.literal_membership_chain = Some(expr.span);
+        }
+        let nested_operands_before = self.nested_or_operands.len();
+        if expr.operator == LogicalOperator::Or {
+            for operand in [&expr.left, &expr.right] {
+                if let Expression::LogicalExpression(inner) = operand.without_parentheses()
+                    && inner.operator == LogicalOperator::Or
+                {
+                    self.nested_or_operands.push(inner.span);
+                }
+            }
+        }
+        if self.literal_membership_chain.is_some() && expr.operator == LogicalOperator::Or {
+            self.inc_cyclomatic_literal_membership(expr.span);
+        } else {
+            self.inc_cyclomatic(expr.span, logical_kind(expr.operator));
+        }
 
         self.handle_logical_operator(expr.operator, expr.span);
 
@@ -638,6 +894,11 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
 
         if !Self::is_nested_logical(&expr.right) && !Self::is_nested_logical(&expr.left) {
             self.reset_logical_operator();
+        }
+
+        self.nested_or_operands.truncate(nested_operands_before);
+        if opens_chain {
+            self.literal_membership_chain = None;
         }
     }
 
@@ -708,11 +969,35 @@ impl<'ast> Visit<'ast> for ComplexityVisitor<'_> {
         self.close_jsx();
     }
 
+    fn visit_return_statement(&mut self, stmt: &ReturnStatement<'ast>) {
+        if let Some(argument) = &stmt.argument {
+            self.name_returned_generator(argument);
+        }
+        walk::walk_return_statement(self, stmt);
+        self.named_generator_call = None;
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'ast>) {
         if let Expression::Identifier(callee) = &call.callee
             && is_hook_callee(callee.name.as_str())
         {
             self.record_hook(call.span);
+        }
+        if let Some(identity) = self.take_named_generator_call(call.span) {
+            let identity =
+                complexity_names::span_name(call).map_or(identity, FunctionIdentity::from_context);
+            self.visit_call_with_named_generators(call, &identity);
+            return;
+        }
+        if let Some(span) = complexity_names::span_name(call) {
+            let identity = FunctionIdentity::from_context(span);
+            self.visit_call_with_context_name(call, &SPAN_NAMED_ARGUMENTS, &identity);
+            return;
+        }
+        if let Some(name) = complexity_names::string_keyed_call_name(call) {
+            let identity = FunctionIdentity::from_context(name);
+            self.visit_call_with_context_name(call, &STRING_KEYED_ARGUMENTS, &identity);
+            return;
         }
         walk::walk_call_expression(self, call);
     }
@@ -755,1000 +1040,5 @@ pub fn compute_complexity(
 }
 
 #[cfg(all(test, not(miri)))]
-mod tests {
-    use super::*;
-    use fallow_types::extract::compute_line_offsets;
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
-    fn analyze(source: &str) -> Vec<FunctionComplexity> {
-        let allocator = Allocator::default();
-        let source_type = SourceType::tsx();
-        let parser_return = Parser::new(&allocator, source, source_type).parse();
-        let line_offsets = compute_line_offsets(source);
-        compute_complexity(&parser_return.program, source, &line_offsets)
-    }
-
-    fn find_fn<'a>(results: &'a [FunctionComplexity], name: &str) -> &'a FunctionComplexity {
-        results
-            .iter()
-            .find(|r| r.name == name)
-            .unwrap_or_else(|| panic!("function '{name}' not found in results: {results:?}"))
-    }
-
-    #[test]
-    fn empty_function_has_cyclomatic_1() {
-        let results = analyze("function foo() {}");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 1);
-    }
-
-    #[test]
-    fn overload_signatures_do_not_emit_complexity_units() {
-        let results = analyze(
-            "function parse(value: string): string;\n\
-             function parse(value: number): number;\n\
-             function parse(value: string | number) {\n\
-               if (typeof value === 'string') { return value; }\n\
-               return value.toString();\n\
-             }",
-        );
-        let parse_functions: Vec<_> = results
-            .iter()
-            .filter(|function| function.name == "parse")
-            .collect();
-
-        assert_eq!(parse_functions.len(), 1);
-        assert_eq!(parse_functions[0].line, 3);
-        assert_eq!(parse_functions[0].cyclomatic, 2);
-    }
-
-    #[test]
-    fn class_method_overload_signatures_do_not_emit_complexity_units() {
-        let results = analyze(
-            "class Parser {\n\
-               method(a: string): void;\n\
-               method(a: number): void;\n\
-               method(a: any) { if (a) { return; } }\n\
-             }",
-        );
-        let methods: Vec<_> = results
-            .iter()
-            .filter(|function| function.name == "method")
-            .collect();
-
-        assert_eq!(methods.len(), 1);
-        assert_eq!(methods[0].line, 4);
-        assert_eq!(methods[0].cyclomatic, 2);
-    }
-
-    #[test]
-    fn class_method_extraction_preserves_private_provenance() {
-        let results = analyze(
-            "class Vault {\n\
-               #wipe() {}\n\
-               '#archive'() {}\n\
-             }",
-        );
-        let private_method = find_fn(&results, "#wipe");
-        let quoted_public_method = find_fn(&results, "#archive");
-
-        assert!(private_method.is_private_member);
-        assert!(!quoted_public_method.is_private_member);
-    }
-
-    #[test]
-    fn abstract_class_methods_do_not_emit_complexity_units() {
-        let results = analyze(
-            "abstract class Shape {\n\
-               abstract area(): number;\n\
-               abstract describe(prefix: string): string;\n\
-               name() { return 'shape'; }\n\
-             }",
-        );
-
-        assert!(results.iter().all(|function| function.name != "area"));
-        assert!(results.iter().all(|function| function.name != "describe"));
-        let name = find_fn(&results, "name");
-        assert_eq!(name.line, 4);
-        assert_eq!(name.cyclomatic, 1);
-    }
-
-    #[test]
-    fn declare_function_does_not_emit_complexity_unit() {
-        let results = analyze(
-            "declare function ambient(value: string): void;\n\
-             function real(value: string) { return value; }",
-        );
-
-        assert!(results.iter().all(|function| function.name != "ambient"));
-        let real = find_fn(&results, "real");
-        assert_eq!(real.line, 2);
-        assert_eq!(real.cyclomatic, 1);
-    }
-
-    #[test]
-    fn if_statement_adds_1() {
-        let results = analyze("function foo(x) { if (x) { return 1; } return 0; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn if_else_if_else_adds_2() {
-        let results = analyze(
-            "function foo(x) { if (x > 0) { return 1; } else if (x < 0) { return -1; } else { return 0; } }",
-        );
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 3);
-    }
-
-    #[test]
-    fn for_loop_adds_1() {
-        let results = analyze("function foo() { for (let i = 0; i < 10; i++) {} }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn while_loop_adds_1() {
-        let results = analyze("function foo() { while (true) { break; } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn switch_case_adds_per_case() {
-        let results = analyze(
-            "function foo(x) { switch (x) { case 1: break; case 2: break; default: break; } }",
-        );
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 3);
-    }
-
-    #[test]
-    fn catch_adds_1() {
-        let results = analyze("function foo() { try { } catch (e) { } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn ternary_adds_1() {
-        let results = analyze("function foo(x) { return x ? 1 : 0; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn logical_and_adds_1() {
-        let results = analyze("function foo(a, b) { return a && b; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn logical_or_adds_1() {
-        let results = analyze("function foo(a, b) { return a || b; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn nullish_coalescing_adds_1() {
-        let results = analyze("function foo(a) { return a ?? 'default'; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn logical_assignment_adds_1() {
-        let results = analyze("function foo(a) { a &&= true; a ||= false; a ??= null; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 4);
-    }
-
-    #[test]
-    fn do_while_adds_1() {
-        let results = analyze("function foo() { do { } while (true); }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn for_of_adds_1() {
-        let results = analyze("function foo(arr) { for (const x of arr) { } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn for_in_adds_1() {
-        let results = analyze("function foo(obj) { for (const k in obj) { } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn optional_chaining_adds_1() {
-        let results = analyze("function foo(obj) { return obj?.value; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn optional_chaining_computed_member_adds_1() {
-        let results = analyze("function foo(obj) { return obj?.[0]; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn optional_chaining_not_cognitive() {
-        let results = analyze("function foo(obj) { return obj?.a?.b?.c; }");
-        let f = find_fn(&results, "foo");
-        assert!(
-            f.cyclomatic > 1,
-            "optional chaining should increment cyclomatic"
-        );
-        assert_eq!(
-            f.cognitive, 0,
-            "optional chaining should NOT increment cognitive"
-        );
-    }
-
-    #[test]
-    fn complex_function_cyclomatic() {
-        let results = analyze(
-            r"function complex(x, y) {
-                if (x > 0) {
-                    for (let i = 0; i < x; i++) {
-                        if (y && i > 5) {
-                            return true;
-                        }
-                    }
-                } else if (x < 0) {
-                    while (y) {
-                        y--;
-                    }
-                }
-                return x ? true : false;
-            }",
-        );
-        let f = find_fn(&results, "complex");
-        assert_eq!(f.cyclomatic, 8);
-    }
-
-    #[test]
-    fn empty_function_has_cognitive_0() {
-        let results = analyze("function foo() {}");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 0);
-    }
-
-    #[test]
-    fn simple_if_cognitive_1() {
-        let results = analyze("function foo(x) { if (x) { return 1; } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 1);
-    }
-
-    #[test]
-    fn nested_if_cognitive_with_nesting() {
-        let results = analyze("function foo(x, y) { if (x) { if (y) { return 1; } } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn if_else_cognitive() {
-        let results = analyze("function foo(x) { if (x) { return 1; } else { return 0; } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 2);
-    }
-
-    #[test]
-    fn if_else_if_else_cognitive() {
-        let results = analyze(
-            "function foo(x) { if (x > 0) { return 1; } else if (x < 0) { return -1; } else { return 0; } }",
-        );
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn boolean_sequence_same_operator() {
-        let results = analyze("function foo(a, b, c) { return a && b && c; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 1);
-    }
-
-    #[test]
-    fn boolean_sequence_mixed_operators() {
-        let results = analyze("function foo(a, b, c) { return a && b || c; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 2);
-    }
-
-    #[test]
-    fn for_loop_increases_nesting() {
-        let results =
-            analyze("function foo(arr) { for (const x of arr) { if (x) { return x; } } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn switch_cognitive_1() {
-        let results = analyze("function foo(x) { switch (x) { case 1: break; case 2: break; } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 1);
-    }
-
-    #[test]
-    fn nested_function_resets_nesting() {
-        let results = analyze(
-            r"function outer(x) {
-                if (x) {
-                    const inner = () => {
-                        if (x) { return 1; }
-                    };
-                }
-            }",
-        );
-        let outer = find_fn(&results, "outer");
-        let inner = find_fn(&results, "inner");
-        assert_eq!(outer.cognitive, 1);
-        assert_eq!(inner.cognitive, 1);
-    }
-
-    #[test]
-    fn break_with_label_adds_1() {
-        let results = analyze("function foo() { outer: for (;;) { break outer; } }");
-        let f = find_fn(&results, "foo");
-        assert!(f.cognitive >= 2);
-    }
-
-    #[test]
-    fn arrow_function_tracked() {
-        let results = analyze("const foo = (x) => x > 0 ? 1 : 0;");
-        assert!(!results.is_empty());
-        let f = &results[0];
-        assert_eq!(f.name, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn line_count_computed() {
-        let results =
-            analyze("function foo() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.line_count, 5);
-    }
-
-    #[test]
-    fn deeply_nested_cognitive() {
-        let results = analyze(
-            r"function deep(a, b, c, d) {
-                if (a) {
-                    for (;;) {
-                        if (b) {
-                            while (c) {
-                                if (d) {}
-                            }
-                        }
-                    }
-                }
-            }",
-        );
-        let f = find_fn(&results, "deep");
-        assert_eq!(f.cognitive, 15);
-    }
-
-    #[test]
-    fn object_method_shorthand_named() {
-        let results = analyze("const obj = { foo(x) { if (x) {} } };");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn object_arrow_property_named() {
-        let results = analyze("const obj = { bar: (x) => x ? 1 : 0 };");
-        let f = find_fn(&results, "bar");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn class_method_named() {
-        let results = analyze("class Foo { parse(x) { if (x) {} } }");
-        let f = find_fn(&results, "parse");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn export_default_function_named() {
-        let results = analyze("export default function() { if (true) {} }");
-        let f = find_fn(&results, "default");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn export_default_named_function_keeps_name() {
-        let results = analyze("export default function myFn() { if (true) {} }");
-        let f = find_fn(&results, "myFn");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn catch_cognitive_with_nesting() {
-        let results = analyze("function foo() { if (true) { try { } catch (e) { } } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn do_while_cognitive_with_nesting() {
-        let results = analyze("function foo() { if (true) { do { } while (true); } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn while_cognitive_with_nesting() {
-        let results = analyze("function foo() { if (true) { while (true) { break; } } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn ternary_cognitive_with_nesting() {
-        let results = analyze("function foo(x) { if (x) { return x ? 1 : 0; } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn continue_with_label_cognitive() {
-        let results =
-            analyze("function foo() { outer: for (let i = 0; i < 10; i++) { continue outer; } }");
-        let f = find_fn(&results, "foo");
-        assert!(f.cognitive >= 2);
-    }
-
-    #[test]
-    fn class_property_arrow_named() {
-        let results = analyze("class Foo { bar = (x: number) => x > 0 ? 1 : 0; }");
-        let f = find_fn(&results, "bar");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn nested_arrow_functions_independent_complexity() {
-        let results = analyze(
-            r"const outer = (x) => {
-                if (x) {
-                    const inner = (y) => {
-                        if (y) { return 1; }
-                        return 0;
-                    };
-                    return inner(x);
-                }
-                return 0;
-            };",
-        );
-        let outer = find_fn(&results, "outer");
-        let inner = find_fn(&results, "inner");
-        assert_eq!(outer.cyclomatic, 2);
-        assert_eq!(inner.cyclomatic, 2);
-    }
-
-    #[test]
-    fn method_definition_named() {
-        let results = analyze("class Foo { doWork(x) { if (x) { return 1; } return 0; } }");
-        let f = find_fn(&results, "doWork");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn logical_nullish_cognitive() {
-        let results = analyze("function foo(a, b) { return a ?? b; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 1);
-    }
-
-    #[test]
-    fn mixed_logical_operators_cognitive() {
-        let results = analyze("function foo(a, b, c, d) { return a && b || c ?? d; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn saturating_add_prevents_overflow() {
-        let mut source = "function foo() {".to_string();
-        for _ in 0..20 {
-            source.push_str("if (true) {");
-        }
-        for _ in 0..20 {
-            source.push('}');
-        }
-        source.push('}');
-        let results = analyze(&source);
-        assert!(!results.is_empty());
-    }
-
-    #[test]
-    fn empty_source_no_functions() {
-        let results = analyze("");
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn top_level_code_not_reported() {
-        let results = analyze("if (true) { console.log('hello'); }");
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn for_in_cognitive_with_nesting() {
-        let results = analyze("function foo(obj) { for (const k in obj) { if (k) {} } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn for_of_cognitive_with_nesting() {
-        let results = analyze("function foo(arr) { for (const x of arr) { if (x) {} } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn optional_call_expression_cyclomatic() {
-        let results = analyze("function foo(obj) { return obj?.method(); }");
-        let f = find_fn(&results, "foo");
-        assert!(f.cyclomatic >= 1);
-        assert_eq!(f.cognitive, 0);
-    }
-
-    #[test]
-    fn logical_assignment_not_cognitive() {
-        let results = analyze("function foo(a) { a &&= true; }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 2);
-    }
-
-    #[test]
-    fn multiple_switch_cases_cyclomatic() {
-        let results = analyze(
-            "function foo(x) { switch (x) { case 1: break; case 2: break; case 3: break; default: break; } }",
-        );
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cyclomatic, 4);
-    }
-
-    #[test]
-    fn switch_nested_in_if_cognitive() {
-        let results = analyze("function foo(x, y) { if (x) { switch (y) { case 1: break; } } }");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.cognitive, 3);
-    }
-
-    #[test]
-    fn line_and_col_computed_correctly() {
-        let results = analyze("\n\nfunction foo() {\n  if (true) {}\n}\n");
-        let f = find_fn(&results, "foo");
-        assert_eq!(f.line, 3);
-    }
-
-    #[test]
-    fn param_count_zero_for_no_params() {
-        let results = analyze("function foo() {}");
-        assert_eq!(find_fn(&results, "foo").param_count, 0);
-    }
-
-    #[test]
-    fn param_count_simple_params() {
-        let results = analyze("function foo(a, b, c) {}");
-        assert_eq!(find_fn(&results, "foo").param_count, 3);
-    }
-
-    #[test]
-    fn param_count_arrow_function() {
-        let results = analyze("const bar = (a, b, c, d, e) => {}");
-        assert_eq!(find_fn(&results, "bar").param_count, 5);
-    }
-
-    #[test]
-    fn param_count_excludes_ts_this_parameter() {
-        let results = analyze("function greet(this: Context, name: string) {}");
-        assert_eq!(find_fn(&results, "greet").param_count, 1);
-    }
-
-    #[test]
-    fn param_count_destructured_counts_as_one() {
-        let results = analyze("function foo({ a, b, c }: Options) {}");
-        assert_eq!(find_fn(&results, "foo").param_count, 1);
-    }
-
-    #[test]
-    fn param_count_rest_parameter() {
-        let results = analyze("function foo(a: number, ...rest: string[]) {}");
-        assert_eq!(find_fn(&results, "foo").param_count, 2);
-    }
-
-    #[test]
-    fn param_count_method_definition() {
-        let results = analyze("class Foo { bar(a: number, b: string) {} }");
-        assert_eq!(find_fn(&results, "bar").param_count, 2);
-    }
-
-    // --- Per-decision-point contribution breakdown ---
-
-    fn sum_weights(f: &FunctionComplexity, metric: ComplexityMetric) -> u16 {
-        f.contributions
-            .iter()
-            .filter(|c| c.metric == metric)
-            .map(|c| c.weight)
-            .sum()
-    }
-
-    /// The load-bearing invariant: the recorded breakdown must reconstruct the
-    /// aggregate metric exactly. `cyclomatic = 1 + sum(cyclomatic weights)`,
-    /// `cognitive = sum(cognitive weights)`. Asserted over an adversarial corpus
-    /// that stresses every kind, including nested `else if` inside loops and
-    /// `try` (the exact path whose arithmetic the else-if refactor rewrote).
-    #[test]
-    fn contributions_reconstruct_aggregate_metrics() {
-        let corpus = [
-            "function f(a,b){ if(a){} else if(b){} else {} }",
-            "function f(a){ for(let i=0;i<10;i++){ if(a){ while(a){} } } }",
-            "function f(a){ try { if(a){} } catch(e) { if(a){} else if(a){} } }",
-            "function f(a,b,c){ return a && b || c ?? a; }",
-            "function f(a){ switch(a){ case 1: break; case 2: return; default: return; } }",
-            "function f(a){ for(const x of a){ if(x){ if(x){ if(x){} } } } }",
-            "function f(a){ return a?.b?.c?.d; }",
-            "function f(a){ a ||= 1; a &&= 2; a ??= 3; }",
-            "function f(a){ outer: for(;;){ if(a){ break outer; } continue outer; } }",
-            "function f(a,b){ if(a){ if(b){} else if(a){} else {} } else if(b){ for(;;){} } }",
-            "const f = (a) => a ? (a ? 1 : 2) : 3;",
-            "function f(a){ do { if(a){} } while(a); }",
-            // React shapes: the JSX-depth, hook-density, and prop-count folds
-            // must reconstruct cognitive exactly like every other increment.
-            "function App({ a, b, c, d, e, f, g }) { return <div><span><b><i/></b></span></div>; }",
-            "function App() { useState(); useEffect(() => {}); return <div/>; }",
-            "const App = ({ a, b }) => (<ul><li><a><img/></a></li></ul>);",
-            "function App({ x }) { return x ? <div><p><em/></p></div> : <span/>; }",
-        ];
-        for src in corpus {
-            for func in analyze(src) {
-                assert_eq!(
-                    func.cyclomatic,
-                    1 + sum_weights(&func, ComplexityMetric::Cyclomatic),
-                    "cyclomatic mismatch for `{src}`: {:?}",
-                    func.contributions
-                );
-                assert_eq!(
-                    func.cognitive,
-                    sum_weights(&func, ComplexityMetric::Cognitive),
-                    "cognitive mismatch for `{src}`: {:?}",
-                    func.contributions
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn else_if_contribution_is_flat_one() {
-        // `else if` adds a flat +1 cognitive (no nesting penalty) and is recorded
-        // as the ElseIf kind on the else-if line, not the leading `if` line.
-        let results = analyze("function f(a, b) {\n  if (a) {\n  } else if (b) {\n  }\n}");
-        let f = find_fn(&results, "f");
-        let else_if = f
-            .contributions
-            .iter()
-            .find(|c| {
-                c.kind == ComplexityContributionKind::ElseIf
-                    && c.metric == ComplexityMetric::Cognitive
-            })
-            .expect("else-if cognitive contribution");
-        assert_eq!(else_if.weight, 1, "else-if cognitive is flat +1");
-        assert_eq!(else_if.nesting, 0);
-        assert_eq!(else_if.line, 3, "anchored on the `else if` line");
-    }
-
-    #[test]
-    fn nested_if_carries_nesting_weight() {
-        // An `if` nested one level deep inside another `if` gets cognitive +2
-        // (+1 base, +1 nesting), recorded with nesting == 1.
-        let results = analyze("function f(a, b) { if (a) { if (b) {} } }");
-        let f = find_fn(&results, "f");
-        let nested = f
-            .contributions
-            .iter()
-            .filter(|c| {
-                c.kind == ComplexityContributionKind::If && c.metric == ComplexityMetric::Cognitive
-            })
-            .max_by_key(|c| c.nesting)
-            .expect("a nested if cognitive contribution");
-        assert_eq!(nested.nesting, 1);
-        assert_eq!(nested.weight, 2, "+1 base, +1 nesting");
-    }
-
-    #[test]
-    fn cyclomatic_and_cognitive_logical_share_a_line() {
-        // The cyclomatic and cognitive contributions for a `&&` are anchored to
-        // the same node span, so a consumer grouping by line sees both together.
-        let results = analyze("function f(a, b) { return a && b; }");
-        let f = find_fn(&results, "f");
-        let cyc = f
-            .contributions
-            .iter()
-            .find(|c| {
-                c.kind == ComplexityContributionKind::LogicalAnd
-                    && c.metric == ComplexityMetric::Cyclomatic
-            })
-            .expect("cyclomatic &&");
-        let cog = f
-            .contributions
-            .iter()
-            .find(|c| {
-                c.kind == ComplexityContributionKind::LogicalAnd
-                    && c.metric == ComplexityMetric::Cognitive
-            })
-            .expect("cognitive &&");
-        assert_eq!(cyc.line, cog.line);
-    }
-
-    #[test]
-    fn simple_function_has_no_contributions() {
-        let results = analyze("function f(a) { return a; }");
-        assert!(find_fn(&results, "f").contributions.is_empty());
-    }
-
-    #[test]
-    fn default_case_emits_no_contribution() {
-        // A bare `default:` carries no test, so it adds nothing to cyclomatic and
-        // produces no Case contribution; only the two real cases do.
-        let results = analyze("function f(a) { switch(a) { case 1: break; default: break; } }");
-        let f = find_fn(&results, "f");
-        let cases = f
-            .contributions
-            .iter()
-            .filter(|c| c.kind == ComplexityContributionKind::Case)
-            .count();
-        assert_eq!(cases, 1, "only the `case 1` test, not `default`");
-    }
-
-    // --- React-aware complexity folding (Phase 2) ---
-
-    fn count_kind(f: &FunctionComplexity, kind: ComplexityContributionKind) -> usize {
-        f.contributions.iter().filter(|c| c.kind == kind).count()
-    }
-
-    #[test]
-    fn shallow_jsx_is_free() {
-        // A component with shallow host markup accrues no JSX cognitive penalty:
-        // a normal component must not surface as a hotspot.
-        let results = analyze("function App() { return <div><span/></div>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.cognitive, 0, "shallow JSX adds no cognitive load");
-        assert_eq!(count_kind(f, ComplexityContributionKind::JsxDepth), 0);
-        assert_eq!(f.react_jsx_max_depth, 2);
-    }
-
-    #[test]
-    fn deep_jsx_is_descriptive_only() {
-        // A deeply nested JSX tree records max depth for context, but pure layout
-        // depth must not score as cognitive control flow.
-        let deep = analyze("function App() { return <a><b><c><d><e/></d></c></b></a>; }");
-        let f = find_fn(&deep, "App");
-        assert_eq!(f.cognitive, 0, "deep JSX adds no cognitive load");
-        assert_eq!(count_kind(f, ComplexityContributionKind::JsxDepth), 0);
-        assert_eq!(f.react_jsx_max_depth, 5);
-    }
-
-    #[test]
-    fn deep_jsx_does_not_score_higher_than_flat() {
-        // Layout depth alone is not cognitive complexity, so a deeply nested
-        // component and a flat one with no control flow score the same.
-        let flat = analyze("function Flat() { return <div><span/></div>; }");
-        let deep = analyze("function Deep() { return <a><b><c><d><e><f/></e></d></c></b></a>; }");
-        let flat_cog = find_fn(&flat, "Flat").cognitive;
-        let deep_cog = find_fn(&deep, "Deep").cognitive;
-        assert_eq!(deep_cog, flat_cog);
-        assert_eq!(find_fn(&deep, "Deep").react_jsx_max_depth, 6);
-    }
-
-    #[test]
-    fn ternary_inside_deep_jsx_keeps_normal_weight() {
-        // A ternary rendered inside JSX keeps normal cognitive weight. Markup
-        // depth does not deepen the structural nesting level.
-        let shallow = analyze("function A({ x }) { return <div>{x ? <p/> : <span/>}</div>; }");
-        let deep = analyze(
-            "function B({ x }) { return <a><b><c><d>{x ? <p/> : <span/>}</d></c></b></a>; }",
-        );
-        let shallow_tern = find_fn(&shallow, "A")
-            .contributions
-            .iter()
-            .find(|c| {
-                c.kind == ComplexityContributionKind::Ternary
-                    && c.metric == ComplexityMetric::Cognitive
-            })
-            .expect("ternary in shallow")
-            .weight;
-        let deep_tern = find_fn(&deep, "B")
-            .contributions
-            .iter()
-            .find(|c| {
-                c.kind == ComplexityContributionKind::Ternary
-                    && c.metric == ComplexityMetric::Cognitive
-            })
-            .expect("ternary in deep")
-            .weight;
-        assert_eq!(shallow_tern, 1);
-        assert_eq!(deep_tern, shallow_tern);
-        assert_eq!(
-            count_kind(find_fn(&deep, "B"), ComplexityContributionKind::JsxDepth),
-            0
-        );
-    }
-
-    #[test]
-    fn presentational_skeleton_jsx_does_not_emit_complexity() {
-        let results = analyze(
-            "function SkeletonTable() { return <Card><CardContent><Table><TableBody><TableRow><TableCell><Skeleton/></TableCell></TableRow></TableBody></Table></CardContent></Card>; }",
-        );
-        let f = find_fn(&results, "SkeletonTable");
-        assert_eq!(f.cyclomatic, 1);
-        assert_eq!(f.cognitive, 0);
-        assert_eq!(f.react_jsx_max_depth, 7);
-        assert_eq!(count_kind(f, ComplexityContributionKind::JsxDepth), 0);
-        assert!(f.contributions.is_empty());
-    }
-
-    #[test]
-    fn hook_density_folds_into_cognitive() {
-        // Each hook call in a component body adds a flat HookDensity cognitive
-        // increment and is counted descriptively.
-        let results = analyze(
-            "function App() { const [a, setA] = useState(0); useEffect(() => {}, []); const v = useMemo(() => 1, []); return <div/>; }",
-        );
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_hook_count, 3, "three hook calls counted");
-        assert_eq!(count_kind(f, ComplexityContributionKind::HookDensity), 3);
-        assert!(f.cognitive >= 3, "three hooks add at least +3 cognitive");
-    }
-
-    #[test]
-    fn hook_heavy_component_scores_higher_than_flat() {
-        // The headline property for hooks: a hook-heavy component scores strictly
-        // higher cognitive than one with no hooks.
-        let flat = analyze("function Flat() { return <div/>; }");
-        let heavy = analyze(
-            "function Heavy() { useState(); useState(); useEffect(() => {}); useMemo(() => 1); return <div/>; }",
-        );
-        let flat_cog = find_fn(&flat, "Flat").cognitive;
-        let heavy_cog = find_fn(&heavy, "Heavy").cognitive;
-        assert!(
-            heavy_cog > flat_cog,
-            "hook-heavy ({heavy_cog}) must score higher than flat ({flat_cog})"
-        );
-    }
-
-    #[test]
-    fn custom_hook_callee_counts() {
-        // A custom `use*` hook call is folded just like a built-in hook.
-        let results = analyze("function App() { const data = useFetchUser(); return <div/>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_hook_count, 1);
-        assert_eq!(count_kind(f, ComplexityContributionKind::HookDensity), 1);
-    }
-
-    #[test]
-    fn use_prefixed_non_hook_not_counted() {
-        // `use` / `used` (no following uppercase) is not a hook and must not fold.
-        let results = analyze("function App() { use(); used(); return <div/>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_hook_count, 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::HookDensity), 0);
-    }
-
-    #[test]
-    fn hook_in_non_react_function_counts_but_does_not_fold() {
-        // A `use*` call inside an ordinary non-React function (not capitalized, not
-        // hook-named) is counted descriptively but does NOT fold into cognitive,
-        // keeping the zero-FP posture for non-React code.
-        let results = analyze("function helper() { useState(); return 1; }");
-        let f = find_fn(&results, "helper");
-        assert_eq!(f.react_hook_count, 1, "still counted for context");
-        assert_eq!(
-            count_kind(f, ComplexityContributionKind::HookDensity),
-            0,
-            "but not folded into cognitive"
-        );
-        assert_eq!(f.cognitive, 0);
-    }
-
-    #[test]
-    fn prop_count_under_floor_is_free() {
-        // A component with a small prop interface accrues no prop penalty.
-        let results = analyze("function App({ a, b, c }) { return <div/>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_prop_count, 3);
-        assert_eq!(count_kind(f, ComplexityContributionKind::PropCount), 0);
-        assert_eq!(f.cognitive, 0);
-    }
-
-    #[test]
-    fn wide_prop_interface_folds_excess_into_cognitive() {
-        // A wide prop interface folds the props past the floor into cognitive.
-        let results = analyze("function App({ a, b, c, d, e, f, g, h }) { return <div/>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_prop_count, 8);
-        let prop = f
-            .contributions
-            .iter()
-            .find(|c| c.kind == ComplexityContributionKind::PropCount)
-            .expect("a PropCount contribution");
-        assert_eq!(prop.weight, 8 - PROP_COUNT_FLOOR, "excess over the floor");
-        assert!(f.cognitive >= prop.weight);
-    }
-
-    #[test]
-    fn prop_count_not_folded_without_jsx() {
-        // A plain function destructuring a wide options bag (no JSX) is NOT a
-        // component and must not accrue the prop penalty.
-        let results = analyze("function configure({ a, b, c, d, e, f, g, h }) { return a + b; }");
-        let f = find_fn(&results, "configure");
-        assert_eq!(f.react_prop_count, 8, "still counted descriptively");
-        assert_eq!(
-            count_kind(f, ComplexityContributionKind::PropCount),
-            0,
-            "but not folded: not a component"
-        );
-    }
-
-    #[test]
-    fn bare_props_identifier_counts_zero_props() {
-        // A component taking a bare `props` identifier is not statically
-        // prop-countable; prop_count is 0 and nothing folds.
-        let results = analyze("function App(props) { return <div>{props.title}</div>; }");
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_prop_count, 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::PropCount), 0);
-    }
-
-    #[test]
-    fn arrow_component_folds_react_signals() {
-        // Arrow-bound components keep descriptive JSX depth while hook density
-        // and prop count still fold into cognitive complexity.
-        let results = analyze(
-            "const App = ({ a, b, c, d, e, f }) => { useState(); return <ul><li><span><b/></span></li></ul>; };",
-        );
-        let f = find_fn(&results, "App");
-        assert_eq!(f.react_prop_count, 6);
-        assert_eq!(f.react_hook_count, 1);
-        assert!(f.react_jsx_max_depth >= 4);
-        assert!(count_kind(f, ComplexityContributionKind::PropCount) > 0);
-        assert!(count_kind(f, ComplexityContributionKind::HookDensity) > 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::JsxDepth), 0);
-    }
-
-    #[test]
-    fn non_react_function_unaffected() {
-        // A plain function with no JSX/hooks/props is byte-identical to before:
-        // no React fields, no React contributions.
-        let results = analyze("function add(a, b) { if (a) { return a + b; } return b; }");
-        let f = find_fn(&results, "add");
-        assert_eq!(f.react_hook_count, 0);
-        assert_eq!(f.react_jsx_max_depth, 0);
-        assert_eq!(f.react_prop_count, 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::JsxDepth), 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::HookDensity), 0);
-        assert_eq!(count_kind(f, ComplexityContributionKind::PropCount), 0);
-        assert_eq!(f.cognitive, 1, "just the single if");
-    }
-}
+#[path = "complexity_tests.rs"]
+mod tests;

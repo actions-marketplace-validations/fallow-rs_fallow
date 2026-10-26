@@ -6,7 +6,7 @@ lint = "clippy --workspace --all-targets -- -D warnings"
 # match `crates/cli/src/rayon_pool.rs::WORKER_STACK_SIZE`. Without this,
 # the fallow binary's main thread (the entry point of every CLI
 # invocation, including the subprocess fork from
-# `crates/cli/tests/audit_tests.rs`) overflows on deep recursive paths
+# `crates/cli/tests/integration/audit_tests.rs`) overflows on deep recursive paths
 # (graph traversal, AST visitor, glob matching, git worktree
 # orchestration). POSIX hosts default to 8 MiB so the overflow only
 # ever manifests on Windows. /STACK reserves virtual address space
@@ -20,10 +20,17 @@ rustflags = ["-C", "link-arg=/STACK:16777216"]
 # libtest runs each `#[test]` on its own spawned thread, which sizes from
 # RUST_MIN_STACK (default ~2 MiB) rather than the main-thread `/STACK`
 # reserve set above. Constructing the full clap command tree
-# (`Cli::command()`, exercised by `crates/cli/src/schema.rs` tests) outgrew
+# (`Cli::command()`, exercised by `crates/cli/src/schema/mod.rs` tests) outgrew
 # that default on Windows as the CLI surface expanded, aborting the test
 # binary with STATUS_STACK_OVERFLOW. Pin test threads to the same 16 MiB the
 # main thread and rayon workers use. Applies to every `cargo test`; on POSIX
 # hosts it is a harmless lazy virtual reserve.
 [env]
 RUST_MIN_STACK = "16777216"
+
+# mimalloc (musl binaries only) commits arena memory eagerly by default on
+# Linux. That raised peak RSS by about 150% in a measurement; with eager
+# commit off the RSS cost is about 30% and the speed is the same. cc reads
+# CFLAGS_<target>. An env var that is already set wins over these values.
+CFLAGS_x86_64_unknown_linux_musl = "-DMI_DEFAULT_ARENA_EAGER_COMMIT=0"
+CFLAGS_aarch64_unknown_linux_musl = "-DMI_DEFAULT_ARENA_EAGER_COMMIT=0"

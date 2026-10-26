@@ -34,6 +34,7 @@ pub(super) struct ThresholdOverrideMatch<'a> {
 pub(super) struct ThresholdOverrideResolver {
     entries: Vec<CompiledThresholdOverride>,
     pub(super) global: GlobalHealthThresholds,
+    cyclomatic_policy: fallow_config::CyclomaticPolicy,
 }
 
 impl ThresholdOverrideResolver {
@@ -48,7 +49,7 @@ impl ThresholdOverrideResolver {
             .map(|(index, override_entry)| {
                 let mut builder = globset::GlobSetBuilder::new();
                 for pattern in &override_entry.files {
-                    if let Ok(glob) = globset::Glob::new(pattern) {
+                    if let Ok(glob) = fallow_config::compile_path_glob(pattern) {
                         builder.add(glob);
                     }
                 }
@@ -68,7 +69,36 @@ impl ThresholdOverrideResolver {
                 }
             })
             .collect();
-        Self { entries, global }
+        Self {
+            entries,
+            global,
+            cyclomatic_policy: fallow_config::CyclomaticPolicy::Standard,
+        }
+    }
+
+    /// Set the cyclomatic policy (`health.cyclomaticPolicy`) of the gates.
+    #[must_use]
+    pub(super) const fn with_cyclomatic_policy(
+        mut self,
+        policy: fallow_config::CyclomaticPolicy,
+    ) -> Self {
+        self.cyclomatic_policy = policy;
+        self
+    }
+
+    /// The cyclomatic policy of the gates.
+    #[must_use]
+    pub(super) const fn cyclomatic_policy(&self) -> fallow_config::CyclomaticPolicy {
+        self.cyclomatic_policy
+    }
+
+    /// The cyclomatic value that the gates and CRAP read for `function`.
+    #[must_use]
+    pub(super) fn gate_cyclomatic(
+        &self,
+        function: &fallow_types::extract::FunctionComplexity,
+    ) -> u16 {
+        super::cyclomatic_policy::gate_cyclomatic(function, self.cyclomatic_policy)
     }
 
     #[must_use]
@@ -615,4 +645,34 @@ struct ThresholdOverrideStateInput {
     metrics: Option<fallow_output::ThresholdOverrideMetrics>,
     reason: Option<String>,
     dimension: ThresholdOverrideDimension,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_files_single_star_stays_within_one_segment() {
+        let global = GlobalHealthThresholds {
+            cyclomatic: 20,
+            cognitive: 15,
+            crap: 30.0,
+            unit_size: 60,
+        };
+        let overrides = [fallow_config::HealthThresholdOverride {
+            files: vec!["src/*.ts".to_string()],
+            functions: Vec::new(),
+            max_cyclomatic: Some(40),
+            max_cognitive: None,
+            max_crap: None,
+            max_unit_size: None,
+            reason: None,
+        }];
+        let resolver = ThresholdOverrideResolver::new(&overrides, global);
+
+        let (direct, _) = resolver.resolve(Path::new("src/a.ts"), "run");
+        assert_eq!(direct.effective.max_cyclomatic, 40);
+        let (nested, _) = resolver.resolve(Path::new("src/nested/a.ts"), "run");
+        assert_eq!(nested.effective.max_cyclomatic, 20);
+    }
 }

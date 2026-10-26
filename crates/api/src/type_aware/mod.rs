@@ -7,6 +7,7 @@
 
 mod client;
 mod manifest;
+mod mutant_typecheck;
 mod transport;
 
 use fallow_engine::session::AnalysisSession;
@@ -22,9 +23,12 @@ pub use client::{
     refine_dead_code_results, refine_dead_code_results_in_session, symbol_impact, trace_symbol,
     type_coupling,
 };
+pub use mutant_typecheck::{
+    TypecheckFile, TypecheckMutant, TypecheckOutcome, check_typecheck_companion, typecheck_mutants,
+};
 pub use transport::{
     TypeAwareError, TypeAwareFileChanges, TypeAwareOutcome, TypeAwareSession, TypeAwareStatus,
-    shutdown_type_aware_sidecars, status, terminate_active_type_aware_sidecars,
+    discover_companion, shutdown_type_aware_sidecars, status, terminate_active_type_aware_sidecars,
 };
 
 /// Refine a programmatic dead-code result through the shared semantic client.
@@ -40,7 +44,7 @@ pub fn refine_programmatic_dead_code(
     session: &AnalysisSession,
     results: &mut AnalysisResults,
 ) -> Result<Option<TypeAwareMeta>, ProgrammaticError> {
-    if !options.enabled {
+    if !options.requested() {
         return Ok(None);
     }
 
@@ -117,7 +121,7 @@ pub fn refine_programmatic_dead_code_in_session(
     session: &AnalysisSession,
     results: &mut AnalysisResults,
 ) -> Result<Option<TypeAwareMeta>, ProgrammaticError> {
-    if !options.enabled {
+    if !options.requested() {
         return Ok(None);
     }
     let DeadCodeCapabilityScope {
@@ -196,6 +200,7 @@ pub fn refine_configured_dead_code_results(
         include_private_type_leaks,
         include_type_coupling,
     )?;
+    fallow_engine::dead_code::stamp_missing_finding_ids(results, &config.root);
     fallow_engine::dead_code::filter_configured_ignored_findings(results, config);
     Ok(outcome)
 }
@@ -228,6 +233,7 @@ pub fn refine_configured_dead_code_results_in_session(
         include_private_type_leaks,
         include_type_coupling,
     )?;
+    fallow_engine::dead_code::stamp_missing_finding_ids(results, &config.root);
     fallow_engine::dead_code::filter_configured_ignored_findings(results, config);
     Ok(outcome)
 }

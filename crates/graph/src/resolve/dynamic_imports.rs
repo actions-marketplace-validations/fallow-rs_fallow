@@ -12,8 +12,8 @@
 //!    to a glob pattern and matched against file paths relative to the importing
 //!    directory, producing a list of candidate `FileId`s.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use oxc_span::Span;
 use rustc_hash::FxHashMap;
@@ -24,8 +24,9 @@ use fallow_types::extract::{DynamicImportInfo, DynamicImportPattern, ImportInfo,
 use super::ResolveResult;
 use super::ResolvedImport;
 use super::fallbacks::make_glob_from_pattern;
-use super::specifier::resolve_specifier;
+use super::specifier::resolve_import_specifier;
 use super::types::ResolveContext;
+use fallow_config::extglob::ExtglobMatcher;
 
 /// Resolve dynamic `import()` calls, expanding destructured names into individual imports.
 pub(super) fn resolve_dynamic_imports(
@@ -45,7 +46,7 @@ pub(super) fn resolve_single_dynamic_import(
     file_path: &Path,
     imp: &DynamicImportInfo,
 ) -> Vec<ResolvedImport> {
-    let target = resolve_specifier(ctx, file_path, &imp.source, false);
+    let target = resolve_import_specifier(ctx, file_path, &imp.source, false);
 
     // Speculative candidates (the `__mocks__` sibling and root-level
     // candidates synthesized for factory-less `vi.mock`/`jest.mock` calls)
@@ -79,6 +80,17 @@ pub(super) fn resolve_single_dynamic_import(
             imp,
             ImportedName::Namespace,
             imp.local_name.clone().unwrap_or_default(),
+            target,
+        )];
+    }
+
+    // An escaping namespace without a binding is a whole-module edge: a
+    // `Namespace` import with an empty local name credits every export.
+    if imp.value_escapes {
+        return vec![dynamic_import_with(
+            imp,
+            ImportedName::Namespace,
+            String::new(),
             target,
         )];
     }
@@ -185,28 +197,43 @@ fn dynamic_import_with(
 
 /// Session-local cache of compiled glob matchers keyed by glob string.
 ///
-/// The glob string derives only from the pattern text, not the importing
-/// directory, so one compiled matcher serves every module that contains the
-/// same dynamic import pattern. Failed compilations are cached as `None` so a
-/// malformed pattern is not recompiled per module.
+/// The include glob derives only from the pattern text, so one compiled
+/// matcher serves every module that contains the same dynamic import pattern.
+/// A rebased exclude can hold directory names of the importing file, so such
+/// a pattern compiles one matcher per importing directory. Failed compilations are cached as `None` so a
+/// malformed pattern is not recompiled or reported again per module.
 #[derive(Default)]
 pub(super) struct GlobMatcherCache {
-    map: Mutex<FxHashMap<String, Option<globset::GlobMatcher>>>,
+    map: Mutex<FxHashMap<String, Option<Arc<ExtglobMatcher>>>>,
 }
 
 impl GlobMatcherCache {
-    /// Return the cached matcher for `glob_str`, compiling it on first miss.
-    fn get(&self, glob_str: &str) -> Option<globset::GlobMatcher> {
+    /// Return the cached matcher for `glob_str` with the exclude globs
+    /// `excludes`, compiling it on first miss.
+    fn get(&self, glob_str: &str, excludes: &[&str]) -> Option<Arc<ExtglobMatcher>> {
+        // A NUL byte cannot occur in a path glob, so it separates the globs
+        // of the key without ambiguity.
+        let mut key = glob_str.to_string();
+        for exclude in excludes {
+            key.push('\0');
+            key.push_str(exclude);
+        }
         if let Ok(cache) = self.map.lock()
-            && let Some(value) = cache.get(glob_str)
+            && let Some(value) = cache.get(&key)
         {
             return value.clone();
         }
-        let value = globset::Glob::new(glob_str)
-            .ok()
-            .map(|g| g.compile_matcher());
-        if let Ok(mut cache) = self.map.lock() {
-            cache.insert(glob_str.to_string(), value.clone());
+        let value = ExtglobMatcher::new(glob_str, excludes).map(Arc::new);
+        // Two threads can compile the same pattern at the same time. Only the
+        // thread that inserts the entry first gives the warning.
+        let first_insert = self
+            .map
+            .lock()
+            .map_or(true, |mut cache| cache.insert(key, value.clone()).is_none());
+        if value.is_none() && first_insert {
+            tracing::warn!(
+                "Dynamic import pattern `{glob_str}` is not a valid glob and matches no files"
+            );
         }
         value
     }
@@ -215,8 +242,16 @@ impl GlobMatcherCache {
 /// Resolve dynamic import patterns via glob matching against discovered files.
 /// When canonical paths are available, uses those for matching. Otherwise falls
 /// back to raw file paths from `files` (avoids allocating a separate PathBuf vec).
+/// Every input pattern retains one output row, including empty matches, so the
+/// rows stay positional for resolver-cache restoration.
+///
+/// A pattern is relative to the importing directory `from_dir`, and its leading
+/// `../` steps move the match base up, as Vite and webpack do. A `../` step
+/// that leaves `root` makes the pattern match no files. `root` must have the same form as `from_dir`:
+/// canonical when the candidate paths are canonical.
 pub(super) fn resolve_dynamic_patterns(
     glob_cache: &GlobMatcherCache,
+    root: &Path,
     from_dir: &Path,
     patterns: &[DynamicImportPattern],
     canonical_paths: &[PathBuf],
@@ -224,40 +259,129 @@ pub(super) fn resolve_dynamic_patterns(
 ) -> Vec<(DynamicImportPattern, Vec<FileId>)> {
     patterns
         .iter()
-        .filter_map(|pattern| {
+        .map(|pattern| {
             let glob_str = make_glob_from_pattern(pattern);
-            // Candidates are the paths relative to `from_dir`, which carry no
-            // leading "./". Stripping the prefix from the glob once lets each
-            // candidate be matched as-is instead of allocating a "./"-prefixed
-            // String per file per pattern.
-            let matcher = glob_cache.get(glob_str.strip_prefix("./").unwrap_or(&glob_str))?;
+            let Some(based) = BasedPattern::new(&glob_str, &pattern.excludes, from_dir, root)
+            else {
+                return (pattern.clone(), Vec::new());
+            };
+            let excludes: Vec<&str> = based.excludes.iter().map(String::as_str).collect();
+            let Some(matcher) = glob_cache.get(based.include, &excludes) else {
+                return (pattern.clone(), Vec::new());
+            };
+            let matches = |path: &Path| {
+                path.strip_prefix(based.base)
+                    .is_ok_and(|relative| matcher.is_match(relative))
+            };
             let matched: Vec<FileId> = if canonical_paths.is_empty() {
                 files
                     .iter()
-                    .filter(|f| {
-                        f.path
-                            .strip_prefix(from_dir)
-                            .is_ok_and(|relative| matcher.is_match(relative))
-                    })
+                    .filter(|f| matches(&f.path))
                     .map(|f| f.id)
                     .collect()
             } else {
                 canonical_paths
                     .iter()
                     .enumerate()
-                    .filter(|(_idx, canonical)| {
-                        canonical
-                            .strip_prefix(from_dir)
-                            .is_ok_and(|relative| matcher.is_match(relative))
-                    })
+                    .filter(|(_idx, canonical)| matches(canonical))
                     .map(|(idx, _)| files[idx].id)
                     .collect()
             };
-            if matched.is_empty() {
-                None
-            } else {
-                Some((pattern.clone(), matched))
-            }
+            (pattern.clone(), matched)
         })
         .collect()
+}
+
+/// A dynamic import glob rewritten against the directory that its leading
+/// `./` and `../` steps select. The include and the exclude globs carry no
+/// leading `./` or `../`, so each candidate path relative to `base` is
+/// matched as-is.
+struct BasedPattern<'a> {
+    base: &'a Path,
+    include: &'a str,
+    excludes: Vec<String>,
+}
+
+impl<'a> BasedPattern<'a> {
+    /// Returns `None` when a `../` step leaves the filesystem root or the
+    /// project `root`. A pattern without `../` steps keeps `from_dir` as its
+    /// base and gets no root check.
+    fn new(glob: &'a str, excludes: &[String], from_dir: &'a Path, root: &Path) -> Option<Self> {
+        let (ups, include) = split_parent_steps(glob);
+        let base = from_dir.ancestors().nth(ups)?;
+        if ups > 0 && !base.starts_with(root) {
+            return None;
+        }
+        let excludes = excludes
+            .iter()
+            .filter_map(|exclude| rebase_exclude(exclude, ups, from_dir))
+            .collect();
+        Some(Self {
+            base,
+            include,
+            excludes,
+        })
+    }
+}
+
+/// Rewrite an exclude glob, relative to `from_dir`, to the base that is `ups`
+/// steps above `from_dir`. An exclude with fewer `../` steps gets the glob-escaped
+/// names of the directories between the base and its own start. An exclude
+/// with more `../` steps starts above the base and is dropped, so it removes
+/// no file.
+fn rebase_exclude(exclude: &str, ups: usize, from_dir: &Path) -> Option<String> {
+    let (exclude_ups, rest) = split_parent_steps(exclude);
+    if exclude_ups > ups {
+        return None;
+    }
+    let skipped: Vec<_> = from_dir
+        .components()
+        .rev()
+        .skip(exclude_ups)
+        .take(ups - exclude_ups)
+        .collect();
+    if skipped.len() != ups - exclude_ups {
+        return None;
+    }
+    let mut rebased = String::new();
+    for component in skipped.iter().rev() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        escape_glob_literal(&name.to_string_lossy(), &mut rebased);
+        rebased.push('/');
+    }
+    rebased.push_str(rest);
+    Some(rebased)
+}
+
+/// Split the leading `./` and `../` steps from a relative glob. Returns the
+/// number of `../` steps and the rest of the glob.
+fn split_parent_steps(glob: &str) -> (usize, &str) {
+    let mut ups = 0;
+    let mut rest = glob;
+    loop {
+        if let Some(after) = rest.strip_prefix("./") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("../") {
+            rest = after;
+            ups += 1;
+        } else {
+            return (ups, rest);
+        }
+    }
+}
+
+/// Append `text` to `out` with each glob metacharacter as a one-character
+/// class, the same escape that the extractor applies to literal pattern text.
+fn escape_glob_literal(text: &str, out: &mut String) {
+    for character in text.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '(') {
+            out.push('[');
+            out.push(character);
+            out.push(']');
+        } else {
+            out.push(character);
+        }
+    }
 }

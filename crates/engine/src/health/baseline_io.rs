@@ -5,7 +5,9 @@
     reason = "health baseline save/load preserves existing human stderr notes"
 )]
 
-use crate::baseline::{HealthBaselineData, HealthBaselineMode, filter_new_health_findings};
+use crate::baseline::{
+    BaselineStalenessWarning, HealthBaselineData, HealthBaselineMode, filter_new_health_findings,
+};
 
 use super::HealthError;
 
@@ -18,6 +20,23 @@ pub(super) struct HealthBaselineSaveInput<'a> {
     pub(super) quiet: bool,
     pub(super) mode: HealthBaselineMode,
     pub(super) mode_explicit: bool,
+}
+
+/// Refuse a save aimed at a baseline another command wrote, which this save
+/// would overwrite with a health baseline and destroy.
+///
+/// Checked before [`check_identity_overwrite`], which reads the same file
+/// through `HealthBaselineData` and swallows a parse failure: a foreign file
+/// that happens to parse carries no identity buckets, so that guard would let
+/// this save through.
+fn check_kind_overwrite(save_path: &std::path::Path) -> Result<(), HealthError> {
+    match crate::baseline::refuse_baseline_kind_overwrite(
+        save_path,
+        crate::baseline::BaselineKind::Health,
+    ) {
+        Some(refusal) => Err(HealthError::message(refusal, 2)),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a defaulted count save over a baseline that carries identity
@@ -68,6 +87,7 @@ pub(super) fn save_health_baseline(input: &HealthBaselineSaveInput<'_>) -> Resul
         mode,
         mode_explicit,
     } = *input;
+    check_kind_overwrite(save_path)?;
     check_identity_overwrite(save_path, mode, mode_explicit)?;
     let baseline = HealthBaselineData::from_findings(
         findings,
@@ -81,20 +101,24 @@ pub(super) fn save_health_baseline(input: &HealthBaselineSaveInput<'_>) -> Resul
     };
     match serde_json::to_string_pretty(&baseline) {
         Ok(json) => {
-            if let Some(parent) = save_path.parent()
-                && !parent.as_os_str().is_empty()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                return Err(HealthError::message(
-                    format!("failed to create health baseline directory: {e}"),
-                    2,
-                ));
-            }
-            if let Err(e) = std::fs::write(save_path, json) {
-                return Err(HealthError::message(
-                    format!("failed to save health baseline: {e}"),
-                    2,
-                ));
+            match crate::write_guard::write_file(
+                save_path,
+                json.as_bytes(),
+                crate::write_guard::WriteTarget::Path,
+            ) {
+                Ok(()) => {}
+                Err(e) if e.is_directory() => {
+                    return Err(HealthError::message(
+                        format!("failed to create health baseline directory: {e}"),
+                        2,
+                    ));
+                }
+                Err(e) => {
+                    return Err(HealthError::message(
+                        format!("failed to save health baseline: {e}"),
+                        2,
+                    ));
+                }
             }
             if !quiet {
                 eprintln!("Saved health baseline to {}", save_path.display());
@@ -108,39 +132,42 @@ pub(super) fn save_health_baseline(input: &HealthBaselineSaveInput<'_>) -> Resul
     }
 }
 
-/// Stale fraction (in percent) at which the partial-staleness warning fires.
-///
-/// A little drift is the normal state of a living baseline, so warning on any
-/// stale entry would train people to ignore the note. A quarter of the
-/// baseline matching nothing means the gate protects meaningfully less than
-/// what was saved.
-const STALE_WARN_PERCENT: usize = 25;
-
 pub(super) struct LoadedHealthBaseline {
     pub(super) data: HealthBaselineData,
-    pub(super) staleness: fallow_output::HealthBaselineStaleness,
+    pub(super) staleness: fallow_output::BaselineStaleness,
 }
 
 /// Load and apply a health baseline, filtering findings to show only new ones.
 ///
-/// `change_scoped` marks runs whose findings cover only part of the project
-/// (changed-file, diff, or workspace scoping). Staleness counts are still
-/// reported for such runs, but `stale` stays false and no re-save advice is
-/// printed: a baseline re-saved from a scoped run would carry only the scoped
-/// findings and silently gut the gate.
+/// `scope_reasons` names the channels that narrowed this run below the whole
+/// project (a changed-file set, a diff, or workspace scoping). Staleness counts
+/// are still reported for such runs, but `stale` stays false and no re-save
+/// advice is printed: a baseline re-saved from a scoped run would carry only
+/// the scoped findings and silently gut the gate.
 pub(super) fn load_health_baseline(
     baseline_path: &std::path::Path,
     findings: &mut Vec<fallow_output::ComplexityViolation>,
     root: &std::path::Path,
     quiet: bool,
     mode: HealthBaselineMode,
-    change_scoped: bool,
+    scope_reasons: fallow_output::BaselineScopeReasons,
 ) -> Result<LoadedHealthBaseline, HealthError> {
     let json = std::fs::read_to_string(baseline_path)
         .map_err(|e| HealthError::message(format!("failed to read health baseline: {e}"), 2))?;
     let baseline: HealthBaselineData = serde_json::from_str(&json)
         .map_err(|e| HealthError::message(format!("failed to parse health baseline: {e}"), 2))?;
-    if mode == HealthBaselineMode::Identity && baseline.lacks_identity_data() {
+    // A file this command did not write carries no identity buckets either, so
+    // without this the identity mode would reject another command's baseline
+    // with advice to re-save it in identity mode, instead of saying it is not a
+    // health baseline at all.
+    let unrecognised_format = !matches!(
+        crate::baseline::classify_baseline_file(&json, crate::baseline::BaselineKind::Health),
+        crate::baseline::BaselineFileKind::Own
+    );
+    if !unrecognised_format
+        && mode == HealthBaselineMode::Identity
+        && baseline.lacks_identity_data()
+    {
         return Err(HealthError::message(
             format!(
                 "health baseline {} carries no finding identities, so --baseline-mode identity \
@@ -162,20 +189,28 @@ pub(super) fn load_health_baseline(
             baseline_path.display()
         );
     }
-    let staleness = staleness_from_counts(&StalenessCounts {
+    let counts = StalenessCounts {
         baseline_entries,
         matched_entries: overlap.matched_entries,
         moved_entries: overlap.moved_entries,
         current_findings: before,
-        change_scoped,
-    });
+        unrecognised_format,
+        scope_reasons,
+    };
+    // One finding is one function above a threshold, the unit of
+    // `summary.functions_above_threshold`. A function can match more than one
+    // baseline entry, so the entry counts do not give this number.
+    let staleness = fallow_output::BaselineStaleness {
+        remaining_findings: Some(findings.len()),
+        ..staleness_from_counts(&counts)
+    };
     if !quiet {
-        warn_on_staleness(&staleness, baseline_path);
-        if staleness.moved_entries > 0 {
+        warn_on_staleness(&counts, baseline_path);
+        if counts.moved_entries > 0 {
             eprintln!(
                 "Note: {} baseline entr{} matched through a followed file move.",
-                staleness.moved_entries,
-                if staleness.moved_entries == 1 {
+                counts.moved_entries,
+                if counts.moved_entries == 1 {
                     "y"
                 } else {
                     "ies"
@@ -189,33 +224,38 @@ pub(super) fn load_health_baseline(
     })
 }
 
-/// Warn when the loaded baseline went stale, mirroring the `stale` bool
-/// exactly: a warning prints if and only if `stale` is true.
-fn warn_on_staleness(
-    staleness: &fallow_output::HealthBaselineStaleness,
-    baseline_path: &std::path::Path,
-) {
-    if !staleness.stale {
-        return;
-    }
-    let baseline_entries = staleness.baseline_entries;
-    let stale_entries = staleness.stale_entries;
-    if staleness.matched_entries == 0 {
-        eprintln!(
+/// Warn when the loaded baseline went stale, branching on the shared decision
+/// in [`crate::baseline::BaselineStaleness`] rather than re-deriving it.
+fn warn_on_staleness(counts: &StalenessCounts, baseline_path: &std::path::Path) {
+    let baseline_entries = counts.baseline_entries;
+    let stale_entries = baseline_entries.saturating_sub(counts.matched_entries);
+    match staleness_decision(counts).warning() {
+        BaselineStalenessWarning::None => {}
+        BaselineStalenessWarning::ZeroOverlap => eprintln!(
             "Warning: health baseline has {baseline_entries} entries but matched \
              0 current findings. Your paths may have changed, or the baseline \
              was saved on a different machine. Re-save with: \
              --save-baseline {}",
             baseline_path.display(),
-        );
-    } else {
-        eprintln!(
+        ),
+        BaselineStalenessWarning::Partial => eprintln!(
             "Warning: health baseline is partially stale: {stale_entries} of \
              {baseline_entries} entries matched no current finding, so the \
-             gate protects less than what was saved. Re-save with: \
-             --save-baseline {}",
+             gate protects less than what was saved. Remove only the stale \
+             entries with: {}, or re-save with: --save-baseline {}",
+            crate::baseline::BaselineKind::Health.prune_command(baseline_path),
             baseline_path.display(),
-        );
+        ),
+    }
+}
+
+/// The shared staleness decision for this run's counts.
+const fn staleness_decision(counts: &StalenessCounts) -> crate::baseline::BaselineStaleness {
+    crate::baseline::BaselineStaleness {
+        entries: counts.baseline_entries,
+        matched: counts.matched_entries,
+        current_findings: counts.current_findings,
+        change_scoped: !counts.scope_reasons.is_empty(),
     }
 }
 
@@ -227,26 +267,23 @@ struct StalenessCounts {
     /// found nothing to compare, either because the project is clean or the
     /// scope was empty, so staleness cannot be judged and `stale` stays false.
     current_findings: usize,
-    change_scoped: bool,
+    /// True when the file is another command's baseline rather than an empty
+    /// health one: it names another command, or it names none and carries no key
+    /// the health format writes.
+    unrecognised_format: bool,
+    /// Which channels narrowed this run. `change_scoped` is derived from it, so
+    /// the boolean and the published array cannot disagree.
+    scope_reasons: fallow_output::BaselineScopeReasons,
 }
 
 /// Staleness data for a loaded baseline that matched `matched_entries` of its
 /// `baseline_entries` saved entries on this run.
-fn staleness_from_counts(counts: &StalenessCounts) -> fallow_output::HealthBaselineStaleness {
-    let stale_entries = counts
-        .baseline_entries
-        .saturating_sub(counts.matched_entries);
-    fallow_output::HealthBaselineStaleness {
-        baseline_entries: counts.baseline_entries,
-        matched_entries: counts.matched_entries,
-        stale_entries,
-        moved_entries: counts.moved_entries,
-        change_scoped: counts.change_scoped,
-        stale: !counts.change_scoped
-            && counts.current_findings > 0
-            && stale_entries > 0
-            && stale_entries * 100 >= counts.baseline_entries * STALE_WARN_PERCENT,
-    }
+fn staleness_from_counts(counts: &StalenessCounts) -> fallow_output::BaselineStaleness {
+    staleness_decision(counts).to_envelope(
+        counts.moved_entries,
+        counts.scope_reasons,
+        counts.unrecognised_format,
+    )
 }
 
 #[cfg(test)]
@@ -259,7 +296,8 @@ mod tests {
             matched_entries,
             moved_entries: 0,
             current_findings: baseline_entries.max(1),
-            change_scoped: false,
+            unrecognised_format: false,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty(),
         }
     }
 
@@ -300,12 +338,25 @@ mod tests {
     #[test]
     fn change_scoped_run_is_never_stale() {
         let staleness = staleness_from_counts(&StalenessCounts {
-            change_scoped: true,
+            scope_reasons: fallow_output::BaselineScopeReasons::empty()
+                .with(fallow_output::ScopeReason::ChangedFiles),
             ..counts(8, 2)
         });
         assert_eq!(staleness.stale_entries, 6);
         assert!(staleness.change_scoped);
         assert!(!staleness.stale);
+        assert_eq!(
+            staleness.scope_reasons,
+            fallow_output::BaselineScopeReasons::empty()
+                .with(fallow_output::ScopeReason::ChangedFiles)
+        );
+    }
+
+    #[test]
+    fn an_unscoped_run_reports_no_scope_reasons() {
+        let staleness = staleness_from_counts(&counts(8, 2));
+        assert!(!staleness.change_scoped);
+        assert!(staleness.scope_reasons.is_empty());
     }
 
     #[test]

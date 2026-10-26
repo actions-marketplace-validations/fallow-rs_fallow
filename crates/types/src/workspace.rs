@@ -18,7 +18,51 @@ use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::path_util::display_relative;
 use crate::serde_path;
+
+#[path = "workspace_config_entry.rs"]
+mod config_entry;
+
+/// Why the declared pnpm version ignores the `overrides` section of
+/// `pnpm-workspace.yaml`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum PnpmWorkspaceOverridesIgnoredCause {
+    /// pnpm 10 or earlier, and the root `package.json` declares non-empty
+    /// `pnpm.overrides` or `resolutions`. pnpm uses these entries in place
+    /// of the `pnpm-workspace.yaml` overrides.
+    PackageJsonOverrides,
+    /// pnpm before 10.5.1, which does not read the `overrides` section of
+    /// `pnpm-workspace.yaml`.
+    PnpmVersion,
+}
+
+/// Whether the project had a `node_modules` directory at a point in time.
+///
+/// A dead-code baseline records this when it is saved, so a later run in a
+/// different install state can say that its results can differ.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeModulesState {
+    /// `node_modules` existed, or the project legitimately runs without it.
+    Present,
+    /// `node_modules` did not exist.
+    Missing,
+}
+
+impl NodeModulesState {
+    /// The wire token, as it appears in JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+        }
+    }
+}
 
 /// Why a workspace-discovery candidate was rejected, or why a sibling
 /// directory looked workspace-like but was not declared.
@@ -47,8 +91,48 @@ pub enum WorkspaceDiagnosticKind {
         /// The glob pattern that matched the directory.
         pattern: String,
     },
-    /// `tsconfig.json` exists at the root but failed to parse. Project
-    /// references cannot be discovered.
+    /// A workspace entry is an absolute path or has `..` segments that lead
+    /// above the project root, so it can name directories outside the root. Fallow skips the entry
+    /// before it reads the disk and analyzes no package from it. `path` is
+    /// the file that declares the entry (`package.json`,
+    /// `pnpm-workspace.yaml`, `deno.json` or `deno.jsonc`), or the project
+    /// root for an entry of the fallow config `workspaces.patterns`. The
+    /// diagnostic never names a directory outside the root.
+    ///
+    /// npm, pnpm and yarn accept such an entry, so fallow does not exit with
+    /// an error on it. The project root is the security boundary of a run.
+    WorkspaceGlobOutsideRoot {
+        /// The workspace entry, as written in the file.
+        pattern: String,
+    },
+    /// A positive workspace pattern names a directory that does not exist.
+    /// The check reads the literal part of the pattern before the first
+    /// segment with a glob character (`vite` for `vite/packages/*`). A pattern
+    /// without a literal part (`**/pkg`) never gets this diagnostic, and a
+    /// literal directory that exists but holds no package does not get it
+    /// either. `path` is the file that declares the pattern, or the project
+    /// root for an entry of the fallow config `workspaces.patterns`.
+    ///
+    /// A repository that clones other repositories into the workspace in CI
+    /// declares such patterns. The packages there can consume catalog
+    /// entries, so the run does not report `unused-catalog-entries` while a
+    /// pattern of this kind exists.
+    WorkspacePatternDirMissing {
+        /// The workspace pattern, as written in the file.
+        pattern: String,
+    },
+    /// A directory has its own `package.json` and `pnpm-workspace.yaml`, and
+    /// no workspace pattern of the root manifests declares it. pnpm installs
+    /// it as an independent project. Fallow analyzes it as a workspace, so its
+    /// `package.json` owns its files and dependencies, and its `catalog:`
+    /// references are not checked against the root catalog.
+    ///
+    /// Information only: nothing is lost from the analysis, so
+    /// `degrades_analysis` is false.
+    NestedProjectRoot,
+    /// The root `tsconfig.json`, or a config in its `extends` chain, exists
+    /// but failed to parse. `path` names the file that failed. Fallow ignores
+    /// the project references, path aliases and compiler options of that file.
     MalformedTsconfig {
         /// JSONC parse error text.
         error: String,
@@ -56,12 +140,11 @@ pub enum WorkspaceDiagnosticKind {
     /// `tsconfig.json` lists a `references[].path` that does not point to an
     /// existing directory.
     TsconfigReferenceDirMissing,
-    /// `pnpm-workspace.yaml` exists but failed to parse as YAML. Catalog and
-    /// dependency-override analysis proceeds with no entries (degraded), so
-    /// `catalog:`-referenced dependencies may be misclassified until the
-    /// syntax is fixed.
+    /// `pnpm-workspace.yaml` exists but failed to parse as YAML. The catalog
+    /// checks are skipped and dependency-override analysis proceeds without
+    /// the file's entries (degraded) until the syntax is fixed.
     MalformedPnpmWorkspaceYaml {
-        /// `serde_yaml_ng` parse error text.
+        /// YAML parse error text.
         error: String,
     },
     /// A source file was skipped at discovery because it exceeds the configured
@@ -91,9 +174,14 @@ pub enum WorkspaceDiagnosticKind {
     /// `.changeset`, `.github`) and the directories an active framework plugin
     /// or a `package.json` script reference contributes, so files inside are
     /// never parsed and their imports and exports are invisible to every
-    /// analysis. No config field adds a directory to traversal: run fallow
-    /// with `--root` against the directory to analyze it on its own, or add it
-    /// to `ignorePatterns` to silence this (issue #461).
+    /// analysis. A file, export or dependency that only the directory uses can
+    /// be reported as unused. A `!<dir>/**` entry in `ignorePatterns` adds the
+    /// directory to traversal (issue #2452). Or add the file to `entry`, the
+    /// export to `ignoreExports` or the dependency to `ignoreDependencies` to
+    /// stop that false positive, or add the directory to `ignorePatterns` to
+    /// silence this (issue #461). Running
+    /// fallow with `--root` against the directory analyzes it on its own and
+    /// does not fix the main run (issue #2797).
     ///
     /// "Not excluded" is measured the way the run measures it: a directory
     /// whose contents are gitignored, or excluded by `ignorePatterns`, or (on
@@ -128,6 +216,38 @@ pub enum WorkspaceDiagnosticKind {
         /// Filesystem or UTF-8 decoding error from `read_to_string`.
         error: String,
     },
+    /// A source file was read but parsed with diagnostics, so the module
+    /// extracted from it may be missing imports, exports, or references after
+    /// the first error. Analysis proceeds with the partial module, which is why
+    /// this is reported: an import the parser never saw credits nothing, and its
+    /// target can surface as a confident `unused-file` or `unused-export`
+    /// finding with a `delete-file` or `remove-export` action on it.
+    ///
+    /// Recorded by the parse stage, alongside `source-read-failure`, and never
+    /// used to withhold a finding. oxc reports recoverable errors for valid
+    /// syntax newer than the parser as well as for genuinely broken files, so
+    /// gating findings on this would mute real results project-wide instead of
+    /// just the affected file.
+    ///
+    /// A file that `ignoreFindings` covers is not reported. The user marked it
+    /// as broken on purpose, so its partial parse also adds no caveat to other
+    /// findings and does not count for the parse-error gate.
+    SourceParseDegraded {
+        /// Number of parser diagnostics reported for the file.
+        error_count: u32,
+        /// `true` when the parser abandoned the file instead of recovering, so
+        /// the extracted module is a fragment at best.
+        panicked: bool,
+    },
+    /// A source file nests brackets deeper than the parser cap, or needs more
+    /// stack than fallow reserves, so it was not parsed at all. The file can be
+    /// valid code, so this is not reported as a syntax error, but it degrades
+    /// the run in the same way: its imports credit nothing. It counts for the
+    /// parse-error gate and adds the same caveats as `source-parse-degraded`.
+    SourceNestingTooDeep {
+        /// The bracket nesting cap of the pre-parse scan.
+        limit: u32,
+    },
     /// Dependency-override resolution was skipped because bun's legacy binary
     /// `bun.lockb` sits next to this `package.json`, fallow cannot read the
     /// binary format, and no parseable text lockfile was found to use
@@ -146,10 +266,398 @@ pub enum WorkspaceDiagnosticKind {
     /// `bun.lock` exists but could not be parsed and no readable pnpm or npm
     /// lockfile was available as independent resolution ground truth.
     BunLockOverrideResolutionSkipped,
+    /// Dependency-override resolution was skipped because `pnpm-lock.yaml`
+    /// exists but could not be parsed, for example because it still holds
+    /// unresolved merge-conflict markers, and no other parseable lockfile was
+    /// available as independent resolution ground truth.
+    PnpmLockOverrideResolutionSkipped,
+    /// Dependency-override resolution was skipped because `package-lock.json`
+    /// or `npm-shrinkwrap.json` exists but could not be parsed, for example
+    /// because it still holds unresolved merge-conflict markers, and no other
+    /// parseable lockfile was available as independent resolution ground
+    /// truth.
+    NpmLockOverrideResolutionSkipped,
     /// A bun manifest declares both `overrides` and a non-empty `resolutions`
     /// object. Bun applies `overrides` and ignores `resolutions`, so fallow
     /// reports the shadowed configuration without offering removal advice.
     BunResolutionsShadowedByOverrides,
+    /// The declared pnpm version ignores the `overrides` section of
+    /// `pnpm-workspace.yaml`. pnpm does not print a warning. Fallow reports
+    /// no findings for the ignored entries. `cause` tells why pnpm ignores
+    /// the section.
+    PnpmWorkspaceOverridesIgnored {
+        /// Why pnpm ignores the section. The cause decides the remedy.
+        cause: PnpmWorkspaceOverridesIgnoredCause,
+    },
+    /// The project has no `node_modules` directory and is not a Deno project
+    /// that legitimately runs without one. Analysis proceeds, but three things
+    /// degrade silently: package `exports` and conditional exports cannot be
+    /// read, so imports into a dependency's subpaths resolve less precisely;
+    /// framework plugins that activate on an installed package stay inactive,
+    /// so their entry points and path aliases are missing; and a dependency's
+    /// installed shape cannot be inspected, so type-only dependency
+    /// classification falls back to declaration-based heuristics.
+    ///
+    /// Recorded once per run by the source walk, anchored at the missing
+    /// `node_modules` directory so the reported path is a real location rather
+    /// than the empty string a root-anchored diagnostic would render. This used
+    /// to be a bare `tracing::warn!` duplicated in two pipelines, so it never
+    /// reached JSON output and never reached `fallow doctor`, which reported
+    /// `pass` on a tree that had never been installed.
+    NodeModulesMissing,
+    /// `boundaries` is empty while `boundary-violation` is not `off`, so the
+    /// boundary detector never ran. Its summary counters are therefore
+    /// structurally zero and say nothing about the project.
+    ///
+    /// This is the UNCONFIGURED zero, not the user-chosen one: a project that
+    /// sets `boundary-violation: off` asked for silence and can see that
+    /// choice in `fallow config`. A project that left `boundaries` empty
+    /// cannot distinguish "no violations" from "nothing was measured".
+    BoundariesNotConfigured,
+    /// `rulePacks` is empty while `policy-violation` is not `off`, so the
+    /// policy detector never ran and its summary counters are structurally
+    /// zero. The unconfigured counterpart of
+    /// [`Self::BoundariesNotConfigured`].
+    RulePacksNotConfigured,
+    /// One of fallow's built-in discovery ignore patterns (`**/dist/**`,
+    /// `**/build/**`, `**/coverage/**`, and the four minified-bundle globs)
+    /// removed at least one candidate source file from this walk. The files
+    /// are never read, so their imports and exports are invisible to every
+    /// analysis, and until issue #2638 the drop was completely silent:
+    /// pointing fallow at a directory a built-in pattern matches returned a
+    /// clean report with exit 0 and nothing said why.
+    ///
+    /// `**/node_modules/**` is carved out and never appears in `pattern`:
+    /// installed dependencies are not the first-party source this diagnostic
+    /// is about, and a project that does not gitignore them would get a
+    /// five-figure count with no useful remedy. `**/.git/**` cannot fire,
+    /// because hidden directories are not traversed.
+    ///
+    /// One entry per pattern, never per file or per directory, so the array
+    /// grows by at most the number of built-in patterns on a project of any
+    /// size. `path` anchors at the matched directory holding the most excluded
+    /// files for that pattern, ties broken by the lexicographically first
+    /// path, so two runs on one tree report the same location. On a nested
+    /// match it is the DEEPEST segment the pattern matched
+    /// (`build/tools/build`, not `build`), because that is the directory the
+    /// `--root` remedy names and re-rooting at a shallower one would leave a
+    /// matching segment behind. That directory is the
+    /// largest group and not a majority: a flat monorepo can spread ten
+    /// excluded files over ten sibling `dist/` directories and every one of
+    /// them is then "the largest". `file_count` spans all of them, and
+    /// `directory_count` says how many there were, so a reader can tell a
+    /// single tree from a scattered one without a directory list in the
+    /// payload.
+    ///
+    /// Three properties of the population are load-bearing and easy to
+    /// misread:
+    ///
+    /// - **Gitignored trees count zero.** Source discovery honors
+    ///   `.gitignore`, `.git/info/exclude`, and the global gitignore, and
+    ///   prunes those directories before this check runs. The honest reading
+    ///   is "candidate source files git did not already hide and a built-in
+    ///   pattern then dropped", which is why a repository that gitignores its
+    ///   own `dist/` never sees this diagnostic.
+    /// - **A user `ignorePatterns` entry is not a surprise.** The compiled
+    ///   ignore set is the union of `ignorePatterns` and the built-ins, so a
+    ///   file both matched was an explicit project choice and is attributed to
+    ///   no pattern here. A `!` entry in `ignorePatterns` lifts a built-in for
+    ///   the paths it matches (issue #2940), and a lifted file is discovered,
+    ///   so it is never counted here.
+    /// - **The remedy depends on the pattern's shape.** A directory-shaped
+    ///   built-in (`**/dist/**`) is matched against the path relative to the
+    ///   run root, so re-rooting inside the matched directory removes the
+    ///   matched segment and the files become visible: the message advertises
+    ///   `fallow --root <dir>`. A file-shaped built-in (`**/*.min.js` and the
+    ///   three other bundle globs) matches on the file name and keeps matching
+    ///   at any root, so the message says so and points at renaming instead of
+    ///   handing out a command that provably does nothing.
+    ///
+    /// Deliberately NOT one of the [`Self::source_never_analyzed`] kinds. These
+    /// exclusions are the product's designed behavior on generated output, not
+    /// a degraded run: answering `true` would attach `IncompleteFileAnalysis`
+    /// and `IncompleteImportGraph` caveats to findings on nearly every project
+    /// that keeps a non-gitignored `dist/` or `coverage/`, and make `fallow
+    /// fix` withhold `delete-file` and `remove-export` actions project-wide.
+    ExcludedByDefaultIgnore {
+        /// The built-in glob that matched, verbatim (for example
+        /// `**/build/**`).
+        pattern: String,
+        /// Candidate source files this pattern excluded in this walk, across
+        /// every directory it matched, not just the one `path` anchors at.
+        /// Exact: the walk counts each excluded candidate once.
+        file_count: u32,
+        /// Distinct directories this pattern matched at, `path` included, and
+        /// not the number of directories that held the files. A
+        /// directory-shaped pattern (`**/dist/**`) matches at the directory it
+        /// names, so an excluded subtree counts once however many nested
+        /// directories inside it held source: a `dist/` holding files in three
+        /// sub-directories reports `1`. A file-shaped pattern (`**/*.min.js`)
+        /// has no directory to collapse to and counts each matched file's own
+        /// parent. Exact either way, and anything above `1` says `path` names
+        /// one matched location out of several.
+        directory_count: u32,
+    },
+    /// The walk finished with no source file to analyze at all, so every
+    /// finding count this run reports is zero because nothing was measured
+    /// rather than because the project is clean (issue #2686).
+    ///
+    /// Distinct from [`Self::ExcludedByDefaultIgnore`], which reports one
+    /// pattern's exclusions and is designed behavior on generated output. The
+    /// alarm is not the exclusion, it is having nothing left afterwards, and
+    /// that condition also fires with no exclusion at all: a docs-only
+    /// repository, a workspace member with no TypeScript, or a path filter that
+    /// matched nothing. `excluded_file_count` names the built-in-ignore
+    /// contribution so the common cause is still attributable, and is `0` when
+    /// no built-in pattern took part.
+    ///
+    /// This is the kind a CI consumer reads to tell "measured zero" from
+    /// "measured nothing": the human report has said so since 3.26.0, but only
+    /// in human format and only under the built-in-ignore cause, so `--quiet
+    /// --format json` saw a clean green either way.
+    NoSourceFilesAnalyzed {
+        /// Candidate source files the built-in ignore patterns removed from
+        /// this walk, summed across every pattern. `0` when the walk found no
+        /// candidate to exclude in the first place.
+        excluded_file_count: u32,
+    },
+    /// Per-file health scoring failed, so the score list is empty and the
+    /// scored-file count is `0` because nothing was measured rather than
+    /// because the project has no files worth scoring. Every score-derived
+    /// number (the average maintainability index, the refactoring targets, the
+    /// hotspot complexity half) is then structurally zero (issue #2689).
+    FileScoresUnavailable {
+        /// Scoring error text.
+        error: String,
+    },
+    /// Churn-based hotspot analysis was skipped, so the hotspots, churn and
+    /// ownership sections report nothing at all. The remaining health sections
+    /// are unaffected.
+    HotspotsSkipped {
+        /// Which input stopped it, as a kebab-case token: `not-a-repository`,
+        /// `no-commits`, `invalid-since` or `churn-file-unreadable`. The set is
+        /// open.
+        ///
+        /// The cause decides the remedy, which is why it is on the wire: a run
+        /// outside a repository is fixed by running fallow inside one, a
+        /// branch without a commit by committing, a malformed `--since` by
+        /// respelling the flag, and a churn file that changed under the run by
+        /// rerunning it. A consumer reading only the kind would offer the first
+        /// remedy for all four.
+        cause: String,
+    },
+    /// Change coupling found no pairs because the history cannot show them.
+    /// The `change_coupling` section is present with an empty `pairs` list,
+    /// and this entry tells why the list is empty.
+    ChangeCouplingSkipped {
+        /// Kebab-case token: `shallow-clone` (the fetched history is
+        /// incomplete) or `too-few-commits` (fewer analyzed commits than the
+        /// minimum revisions of one file). The set is open.
+        cause: String,
+    },
+    /// The repository is a shallow clone, so churn is measured over the fetched
+    /// history only and every hotspot figure is incomplete.
+    ShallowClone {
+        /// `true` when the run also asked for ownership attribution, which a
+        /// shallow clone skews further by inflating single-author dominance.
+        ownership_requested: bool,
+    },
+    /// No commit timestamp was available, so churn recency and ownership
+    /// staleness were measured against the wall clock and drift between two
+    /// runs over the same commit.
+    UnpinnedClock,
+    /// Ownership attribution was requested but its inputs did not load, so
+    /// hotspot entries carry degraded or absent owner signals.
+    OwnershipUnavailable {
+        /// Which input failed, as a kebab-case token: `invalid-bot-pattern` or
+        /// `codeowners-parse-failed`. The set is open.
+        cause: String,
+        /// Underlying error text.
+        error: String,
+    },
+    /// A saved health snapshot could not be read or parsed, so the trend is
+    /// computed over fewer snapshots than the project has on disk and a
+    /// direction can flip on the missing point alone.
+    TrendSnapshotUnreadable {
+        /// Filesystem or JSON error text.
+        error: String,
+    },
+    /// A grouped health run asked for a trend, but the baseline snapshot holds
+    /// no group data that matches this run, so the groups carry no trend. The
+    /// project trend is not affected. `path` names the baseline snapshot.
+    TrendGroupBaselineUnavailable {
+        /// Why the groups have no baseline, as a kebab-case token:
+        /// `snapshot-has-no-groups` or `grouped-by-mismatch`. The set is open.
+        cause: String,
+    },
+    /// A framework plugin read a build config and could not read one of its
+    /// keys in full, so part of what the key declares never reached the
+    /// analysis. `path` names the config file.
+    ///
+    /// The reader is syntactic, so a key whose value is computed at build time
+    /// is invisible to it: a Module Federation `exposes: makeExposes()` or a
+    /// `remotes` map spread from an environment module declares entries this
+    /// run does not know about. The consequence is a finding, not a missing
+    /// number: an unread `exposes` target is not registered as an entry point
+    /// and its file can surface as `unused-file`, and an unread `remotes` alias
+    /// is not treated as provided by a remote container and its import can
+    /// surface as an unlisted dependency.
+    ///
+    /// Recorded by the plugin stage, which runs before analysis and is not
+    /// cached, so the entry is present on a warm cache too. It used to be a
+    /// bare `tracing::warn!` from inside the plugin, so it reached no envelope
+    /// and no CI consumer (issue #2736).
+    ///
+    /// A source file that calls the Module Federation runtime API gets the same
+    /// entry: `path` names the source file, `key` names the runtime function
+    /// (`registerRemotes`, `loadRemote`, `init`, `createInstance`) and
+    /// `reason` is `dynamic-argument` when the call receives a value that is
+    /// not a static literal. The analysis records it from the facts of the
+    /// parse, which a warm cache restores (issue #2795). A `.vue` or `.svelte`
+    /// file gets it for a call in its `<script>` blocks (issue #2876).
+    PluginConfigUnreadable {
+        /// The plugin that read the config, as it labels itself:
+        /// `module-federation` for a standalone `module-federation.config.*`,
+        /// or the bundler plugin (`webpack`, `rspack`, `rsbuild`, `vite`) that
+        /// read the same options inline from its own config.
+        plugin: String,
+        /// The config key that was present and not fully readable (`exposes`,
+        /// `remotes`), or the Module Federation runtime function whose
+        /// argument was not readable (`registerRemotes`, `loadRemote`, `init`,
+        /// `createInstance`). The set is open.
+        key: String,
+        /// Why it could not be read, as a kebab-case token:
+        /// `not-object-literal`, `array-form`, `spread`,
+        /// `unreadable-entries`, `unrecognized-call`,
+        /// `import-target-unreadable` or `dynamic-argument`. The set is open.
+        ///
+        /// The reason decides the remedy, which is why it is on the wire: a
+        /// value that is not an object literal is fixed by writing one, while
+        /// unreadable entries are fixed by naming those entries in the config
+        /// option the message points at.
+        reason: String,
+    },
+    /// A framework plugin read a config key it understands, does not model
+    /// that key's effect, and therefore stood a modeled default down. `path`
+    /// names the config file.
+    ///
+    /// A file can also be the `path`: a Nuxt file that reads `#components` or
+    /// `#imports` in a way fallow cannot narrow to names, such as a spread of
+    /// a namespace import, has `key` set to that module and `reason` set to
+    /// `key-effect-not-modeled`. Every name of the module then counts as used.
+    ///
+    /// The Nuxt auto-import gate is the case this exists for. With
+    /// `autoImports` enabled fallow drops the Nuxt convention entry patterns
+    /// so a genuinely unreferenced convention file is reported, and a
+    /// `components:` or `imports:` block whose effect it cannot model keeps
+    /// them, which silently costs the user the findings they opted in for.
+    ///
+    /// Deliberately NOT one of the [`Self::warns_on_stderr`] kinds. Nothing
+    /// was lost that the run could have measured: the patterns stayed, so
+    /// findings are suppressed rather than invented, and a project in this
+    /// state would otherwise warn on every run forever with "write different
+    /// config" as the only remedy, which is the reason
+    /// `boundaries-not-configured` is off stderr as well.
+    PluginEffectNotModeled {
+        /// The plugin that read the config, as it labels itself (`nuxt`).
+        plugin: String,
+        /// The config key whose effect is not modeled (`components`,
+        /// `imports`), or the virtual module a file reads (`#components`,
+        /// `#imports`). The set is open.
+        key: String,
+        /// Why the effect is not modeled, as a kebab-case token:
+        /// `key-effect-not-modeled` when the key's own value is the reason,
+        /// `config-property-unreadable` when a top-level property of the same
+        /// config file could not be read statically, so no surface in it can
+        /// be classified at all. The set is open.
+        reason: String,
+    },
+    /// Test coverage was auto-detected on disk rather than passed with
+    /// `--coverage`, and `path` names the file that fed the CRAP scores.
+    ///
+    /// Deliberately NOT one of the [`Self::warns_on_stderr`] kinds: nothing
+    /// degraded, the run measured exactly what it found. It is provenance, and
+    /// it is on the wire because a score computed against a file the user did
+    /// not name is not reproducible and nothing else says which file it was.
+    CoverageAutoDetected,
+    /// `fallow flags --retirement` asked for flag age, but the repository is
+    /// a shallow clone. Blame and pickaxe see the fetched history only, so
+    /// every age would be too young. The report gives no age.
+    FlagAgeShallowClone,
+    /// `fallow flags --retirement` asked for flag age, but git history is
+    /// not available. The report gives no age.
+    FlagAgeUnavailable {
+        /// Why no history is available, as a kebab-case token:
+        /// `not-a-repository` or `no-commits`. The set is open.
+        cause: String,
+    },
+    /// A glob in `ignoreDependencies` matched no dependency that a
+    /// `package.json` of the project declares, so the entry had no effect in
+    /// this run. The usual cause is a typo in the scope or the name.
+    ///
+    /// The dead-code run records it only when the unused-dependency check ran
+    /// and the run reports dependency findings. A run filtered to other issue
+    /// types (`--unused-files`) or scoped to files (`--file`) does not record
+    /// it. An exact-name entry never produces it. `path` is the project root.
+    ///
+    /// Not a degraded run: the analysis measured what it was asked to, so
+    /// `degrades_analysis` is false and no finding carries a caveat.
+    IgnoreDependenciesGlobUnmatched {
+        /// The `ignoreDependencies` entry, as written in the config.
+        pattern: String,
+    },
+    /// A pattern in `ignoreFindings` matched no finding of the dead-code run,
+    /// so the entry had no effect in this run. The usual cause is a typo in
+    /// the path.
+    ///
+    /// The pattern is compared with every finding the analysis produced,
+    /// before issue-type filters and scope filters, so a filtered run does not
+    /// make a pattern look unused. `path` is the project root.
+    ///
+    /// Not a degraded run, for the same reason as
+    /// [`Self::IgnoreDependenciesGlobUnmatched`].
+    IgnoreFindingsPatternUnmatched {
+        /// The `ignoreFindings` entry, as written in the config.
+        pattern: String,
+    },
+    /// An `entry` pattern matched only files that another source (a
+    /// `package.json` field or script, a plugin, `dynamicallyLoaded`) makes
+    /// runtime entry points (issue #3824). Not for a pattern that matches no
+    /// file, nor a `--production` run. `path` is the root. Not degraded.
+    EntryPatternRedundant {
+        /// The `entry` pattern, as written in the config.
+        pattern: String,
+    },
+    /// An `ignoreDependencies` entry hid no dependency finding (issue #3824).
+    /// A glob that matches no declared dependency is
+    /// [`Self::IgnoreDependenciesGlobUnmatched`] instead. Same conditions as
+    /// that kind, and not a `--production` run. `path` is the root.
+    IgnoreDependenciesEntryRedundant {
+        /// The `ignoreDependencies` entry, as written in the config.
+        pattern: String,
+    },
+    /// An `ignorePatterns` glob excluded no file that the run would otherwise
+    /// analyze (issue #3824). Never a `!` exception, a glob that names a
+    /// hidden directory, or a `--production` run. A glob for build output has
+    /// an effect only after a build. `path` is the root. Not degraded.
+    IgnorePatternsEntryRedundant {
+        /// The `ignorePatterns` glob, as written in the config.
+        pattern: String,
+    },
+    /// The dead-code baseline was saved in a different install state than
+    /// this run: one of the two runs had `node_modules` and the other did not.
+    /// Findings that need installed packages (dependency, unlisted,
+    /// unresolved-import and script-binary findings) can differ, so the run
+    /// can report baseline findings as new. `path` is the baseline file.
+    ///
+    /// Only a baseline that records its install state can report this. A
+    /// legacy baseline has no record, so the state is unknown.
+    BaselineInstallStateMismatch {
+        /// The install state when the baseline was saved.
+        baseline_node_modules: NodeModulesState,
+        /// The install state of this run.
+        run_node_modules: NodeModulesState,
+    },
 }
 
 impl WorkspaceDiagnosticKind {
@@ -160,6 +668,9 @@ impl WorkspaceDiagnosticKind {
             Self::UndeclaredWorkspace => "undeclared-workspace",
             Self::MalformedPackageJson { .. } => "malformed-package-json",
             Self::GlobMatchedNoPackageJson { .. } => "glob-matched-no-package-json",
+            Self::WorkspaceGlobOutsideRoot { .. } => "workspace-glob-outside-root",
+            Self::WorkspacePatternDirMissing { .. } => "workspace-pattern-dir-missing",
+            Self::NestedProjectRoot => "nested-project-root",
             Self::MalformedTsconfig { .. } => "malformed-tsconfig",
             Self::TsconfigReferenceDirMissing => "tsconfig-reference-dir-missing",
             Self::MalformedPnpmWorkspaceYaml { .. } => "malformed-pnpm-workspace-yaml",
@@ -167,9 +678,114 @@ impl WorkspaceDiagnosticKind {
             Self::SkippedMinifiedFile { .. } => "skipped-minified-file",
             Self::SkippedSourceDotdir => "skipped-source-dotdir",
             Self::SourceReadFailure { .. } => "source-read-failure",
+            Self::SourceParseDegraded { .. } => "source-parse-degraded",
+            Self::SourceNestingTooDeep { .. } => "source-nesting-too-deep",
             Self::BunLockbOverrideResolutionSkipped => "bun-lockb-override-resolution-skipped",
             Self::BunLockOverrideResolutionSkipped => "bun-lock-override-resolution-skipped",
+            Self::PnpmLockOverrideResolutionSkipped => "pnpm-lock-override-resolution-skipped",
+            Self::NpmLockOverrideResolutionSkipped => "npm-lock-override-resolution-skipped",
             Self::BunResolutionsShadowedByOverrides => "bun-resolutions-shadowed-by-overrides",
+            Self::PnpmWorkspaceOverridesIgnored { .. } => "pnpm-workspace-overrides-ignored",
+            Self::NodeModulesMissing => "node-modules-missing",
+            Self::BoundariesNotConfigured => "boundaries-not-configured",
+            Self::RulePacksNotConfigured => "rule-packs-not-configured",
+            Self::ExcludedByDefaultIgnore { .. } => "excluded-by-default-ignore",
+            Self::NoSourceFilesAnalyzed { .. } => "no-source-files-analyzed",
+            Self::FileScoresUnavailable { .. } => "file-scores-unavailable",
+            Self::HotspotsSkipped { .. } => "hotspots-skipped",
+            Self::ChangeCouplingSkipped { .. } => "change-coupling-skipped",
+            Self::ShallowClone { .. } => "shallow-clone",
+            Self::UnpinnedClock => "unpinned-clock",
+            Self::OwnershipUnavailable { .. } => "ownership-unavailable",
+            Self::TrendSnapshotUnreadable { .. } => "trend-snapshot-unreadable",
+            Self::TrendGroupBaselineUnavailable { .. } => "trend-group-baseline-unavailable",
+            Self::PluginConfigUnreadable { .. } => "plugin-config-unreadable",
+            Self::PluginEffectNotModeled { .. } => "plugin-effect-not-modeled",
+            Self::CoverageAutoDetected => "coverage-auto-detected",
+            Self::FlagAgeShallowClone => "flag-age-shallow-clone",
+            Self::FlagAgeUnavailable { .. } => "flag-age-unavailable",
+            Self::IgnoreDependenciesGlobUnmatched { .. } => "ignore-dependencies-glob-unmatched",
+            Self::IgnoreFindingsPatternUnmatched { .. } => "ignore-findings-pattern-unmatched",
+            Self::EntryPatternRedundant { .. } => "entry-pattern-redundant",
+            Self::IgnoreDependenciesEntryRedundant { .. } => "ignore-dependencies-entry-redundant",
+            Self::IgnorePatternsEntryRedundant { .. } => "ignore-patterns-entry-redundant",
+            Self::BaselineInstallStateMismatch { .. } => "baseline-install-state-mismatch",
+        }
+    }
+
+    /// Whether this diagnostic is worth a `tracing::warn!` line on stderr, on
+    /// top of its permanent entry in `workspace_diagnostics[]`.
+    ///
+    /// A warning is for a run whose RESULTS are degraded: something the user
+    /// installed, wrote, or expected did not reach the analysis. The two
+    /// unconfigured-check kinds are not that. They fire in the product's
+    /// default state, on every project that never opted into boundaries or
+    /// rule packs, and they will keep firing forever, because the remedy they
+    /// offer is to write configuration in order to silence a warning about not
+    /// having written configuration. They stay in the structured array, where a
+    /// consumer that wants to distinguish "measured zero" from "measured
+    /// nothing" can read them, and off the stderr surface that every other
+    /// command shares.
+    ///
+    /// `coverage-auto-detected` answers false for a third reason: it reports
+    /// the provenance of an input that DID load, so a consumer sentence about a
+    /// degraded run would state something untrue about it. Its own note is
+    /// printed by the health pipeline.
+    ///
+    /// `plugin-effect-not-modeled` answers false for the first reason: the
+    /// config was readable and nothing the run could have measured was lost,
+    /// so it would warn forever on a project whose `nuxt.config` fallow does
+    /// not model. Its sibling `plugin-config-unreadable` answers true, because
+    /// there a declaration the user wrote did not reach the analysis and
+    /// findings can be wrong in either direction.
+    #[must_use]
+    pub const fn warns_on_stderr(&self) -> bool {
+        match self {
+            Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::PluginEffectNotModeled { .. }
+            | Self::CoverageAutoDetected
+            | Self::TrendGroupBaselineUnavailable { .. }
+            | Self::ChangeCouplingSkipped { .. }
+            | Self::IgnoreDependenciesGlobUnmatched { .. }
+            | Self::IgnoreFindingsPatternUnmatched { .. }
+            | Self::EntryPatternRedundant { .. }
+            | Self::IgnoreDependenciesEntryRedundant { .. }
+            | Self::IgnorePatternsEntryRedundant { .. }
+            | Self::NestedProjectRoot => false,
+            Self::UndeclaredWorkspace
+            | Self::MalformedPackageJson { .. }
+            | Self::GlobMatchedNoPackageJson { .. }
+            | Self::WorkspaceGlobOutsideRoot { .. }
+            | Self::WorkspacePatternDirMissing { .. }
+            | Self::MalformedTsconfig { .. }
+            | Self::TsconfigReferenceDirMissing
+            | Self::MalformedPnpmWorkspaceYaml { .. }
+            | Self::SkippedLargeFile { .. }
+            | Self::SkippedMinifiedFile { .. }
+            | Self::SkippedSourceDotdir
+            | Self::SourceReadFailure { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::SourceNestingTooDeep { .. }
+            | Self::BunLockbOverrideResolutionSkipped
+            | Self::BunLockOverrideResolutionSkipped
+            | Self::PnpmLockOverrideResolutionSkipped
+            | Self::NpmLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::PnpmWorkspaceOverridesIgnored { .. }
+            | Self::NodeModulesMissing
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::FlagAgeShallowClone
+            | Self::FlagAgeUnavailable { .. }
+            | Self::BaselineInstallStateMismatch { .. } => true,
         }
     }
 
@@ -189,6 +805,11 @@ impl WorkspaceDiagnosticKind {
                 | Self::SkippedMinifiedFile { .. }
                 | Self::SkippedSourceDotdir
                 | Self::SourceReadFailure { .. }
+                | Self::SourceParseDegraded { .. }
+                | Self::SourceNestingTooDeep { .. }
+                | Self::NodeModulesMissing
+                | Self::ExcludedByDefaultIgnore { .. }
+                | Self::NoSourceFilesAnalyzed { .. }
         )
     }
 
@@ -211,7 +832,101 @@ impl WorkspaceDiagnosticKind {
             Self::SkippedLargeFile { .. }
                 | Self::SkippedMinifiedFile { .. }
                 | Self::SkippedSourceDotdir
+                | Self::NodeModulesMissing
+                | Self::ExcludedByDefaultIgnore { .. }
+                | Self::NoSourceFilesAnalyzed { .. }
         )
+    }
+
+    /// Whether this diagnostic reports a source file whose contents this run
+    /// never analyzed, so every import and export the file holds is invisible
+    /// to the module graph.
+    ///
+    /// This is the class `reachability_caveats[]` exists for. A file the run
+    /// never read credits nothing, so the modules it imports surface as
+    /// confident `unused-file` and `unused-export` findings carrying
+    /// `delete-file` and `remove-export` actions, and `fallow fix` would
+    /// otherwise apply the removal against source that still imports the
+    /// target.
+    ///
+    /// All four discovery-side kinds qualify, for the same reason and with the
+    /// same consequence:
+    ///
+    /// - `skipped-large-file` and `skipped-minified-file`: the file is in the
+    ///   project tree and was never opened, so its import list is unknown.
+    /// - `skipped-source-dotdir`: the directory holds at least one source file
+    ///   the project did not exclude, and none of them were traversed. The
+    ///   diagnostic is capped, so it under-reports rather than over-reports;
+    ///   its presence still proves unseen source exists.
+    /// - `source-read-failure`: the file was discovered and then could not be
+    ///   read, so nothing was extracted from it at all.
+    ///
+    /// `source-parse-degraded` is deliberately NOT one of these, though it
+    /// belongs to the same family. Neither is `excluded-by-default-ignore`,
+    /// for a different reason: that one reports designed behavior on generated
+    /// output rather than a degraded run, and its own doc comment carries the
+    /// argument.
+    ///
+    /// `source-parse-degraded`: that file WAS read, so it has a module and
+    /// a graph node and its reachability is observable, which lets the caveat
+    /// pass narrow it: a degraded module that is itself unreachable cannot
+    /// change a reachability verdict. Every kind above has no node to ask (a
+    /// read failure has one with nothing extracted into it), so no narrowing
+    /// is available and the caveat they raise is run-level.
+    ///
+    /// The match is exhaustive on purpose: a new "the run did not see this
+    /// file" kind has to be classified here, and answering `true` is the only
+    /// wiring its findings need in order to inherit both the caveat and the
+    /// `fallow fix` withholding that follows it.
+    #[must_use]
+    pub const fn source_never_analyzed(&self) -> bool {
+        match self {
+            Self::SkippedLargeFile { .. }
+            | Self::SkippedMinifiedFile { .. }
+            | Self::SkippedSourceDotdir
+            | Self::SourceReadFailure { .. } => true,
+            Self::UndeclaredWorkspace
+            | Self::MalformedPackageJson { .. }
+            | Self::GlobMatchedNoPackageJson { .. }
+            | Self::WorkspaceGlobOutsideRoot { .. }
+            | Self::WorkspacePatternDirMissing { .. }
+            | Self::NestedProjectRoot
+            | Self::MalformedTsconfig { .. }
+            | Self::TsconfigReferenceDirMissing
+            | Self::MalformedPnpmWorkspaceYaml { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::SourceNestingTooDeep { .. }
+            | Self::BunLockbOverrideResolutionSkipped
+            | Self::BunLockOverrideResolutionSkipped
+            | Self::PnpmLockOverrideResolutionSkipped
+            | Self::NpmLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::PnpmWorkspaceOverridesIgnored { .. }
+            | Self::NodeModulesMissing
+            | Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ChangeCouplingSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::TrendGroupBaselineUnavailable { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
+            | Self::CoverageAutoDetected
+            | Self::FlagAgeShallowClone
+            | Self::FlagAgeUnavailable { .. }
+            | Self::IgnoreDependenciesGlobUnmatched { .. }
+            | Self::IgnoreFindingsPatternUnmatched { .. }
+            | Self::EntryPatternRedundant { .. }
+            | Self::IgnoreDependenciesEntryRedundant { .. }
+            | Self::IgnorePatternsEntryRedundant { .. }
+            | Self::BaselineInstallStateMismatch { .. } => false,
+        }
     }
 
     /// Whether this diagnostic is recorded by the ANALYZE stage (the
@@ -234,16 +949,183 @@ impl WorkspaceDiagnosticKind {
             Self::MalformedPnpmWorkspaceYaml { .. }
             | Self::BunLockbOverrideResolutionSkipped
             | Self::BunLockOverrideResolutionSkipped
-            | Self::BunResolutionsShadowedByOverrides => true,
+            | Self::PnpmLockOverrideResolutionSkipped
+            | Self::NpmLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::PnpmWorkspaceOverridesIgnored { .. }
+            | Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured => true,
             Self::UndeclaredWorkspace
             | Self::MalformedPackageJson { .. }
             | Self::GlobMatchedNoPackageJson { .. }
+            | Self::WorkspaceGlobOutsideRoot { .. }
+            | Self::WorkspacePatternDirMissing { .. }
+            | Self::NestedProjectRoot
             | Self::MalformedTsconfig { .. }
             | Self::TsconfigReferenceDirMissing
             | Self::SkippedLargeFile { .. }
             | Self::SkippedMinifiedFile { .. }
             | Self::SkippedSourceDotdir
-            | Self::SourceReadFailure { .. } => false,
+            | Self::SourceReadFailure { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::SourceNestingTooDeep { .. }
+            | Self::NodeModulesMissing
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ChangeCouplingSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::TrendGroupBaselineUnavailable { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
+            | Self::CoverageAutoDetected
+            | Self::FlagAgeShallowClone
+            | Self::FlagAgeUnavailable { .. }
+            | Self::IgnoreDependenciesGlobUnmatched { .. }
+            | Self::IgnoreFindingsPatternUnmatched { .. }
+            | Self::EntryPatternRedundant { .. }
+            | Self::IgnoreDependenciesEntryRedundant { .. }
+            | Self::IgnorePatternsEntryRedundant { .. }
+            | Self::BaselineInstallStateMismatch { .. } => false,
+        }
+    }
+
+    /// Whether this diagnostic is recorded by the HEALTH pipeline (scoring,
+    /// churn, ownership, trend, coverage input resolution) rather than by
+    /// workspace discovery, source discovery or the analyze stage.
+    ///
+    /// Health-stage diagnostics are appended to the registry after config
+    /// load, so `stash_workspace_diagnostics` must preserve them across
+    /// combined mode's per-analysis config re-loads, and the health run clears
+    /// its previous entries before re-recording so a fixed CODEOWNERS drops out
+    /// on the next run (issue #2689).
+    ///
+    /// They are deliberately NOT [`Self::is_analysis_stage`], although they
+    /// share both of those properties. That predicate additionally means "the
+    /// dead-code analyze pass re-records this", and the pass clears every kind
+    /// answering it on entry. Health computes file scores by running that same
+    /// pass, so a health-stage kind classified there would be wiped mid-run by
+    /// the analysis it is reporting on.
+    #[must_use]
+    pub const fn is_health_stage(&self) -> bool {
+        match self {
+            Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ChangeCouplingSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::TrendGroupBaselineUnavailable { .. }
+            | Self::CoverageAutoDetected => true,
+            Self::UndeclaredWorkspace
+            | Self::MalformedPackageJson { .. }
+            | Self::GlobMatchedNoPackageJson { .. }
+            | Self::WorkspaceGlobOutsideRoot { .. }
+            | Self::WorkspacePatternDirMissing { .. }
+            | Self::NestedProjectRoot
+            | Self::MalformedTsconfig { .. }
+            | Self::TsconfigReferenceDirMissing
+            | Self::MalformedPnpmWorkspaceYaml { .. }
+            | Self::SkippedLargeFile { .. }
+            | Self::SkippedMinifiedFile { .. }
+            | Self::SkippedSourceDotdir
+            | Self::SourceReadFailure { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::SourceNestingTooDeep { .. }
+            | Self::BunLockbOverrideResolutionSkipped
+            | Self::BunLockOverrideResolutionSkipped
+            | Self::PnpmLockOverrideResolutionSkipped
+            | Self::NpmLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::PnpmWorkspaceOverridesIgnored { .. }
+            | Self::NodeModulesMissing
+            | Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::PluginConfigUnreadable { .. }
+            | Self::PluginEffectNotModeled { .. }
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FlagAgeShallowClone
+            | Self::FlagAgeUnavailable { .. }
+            | Self::IgnoreDependenciesGlobUnmatched { .. }
+            | Self::IgnoreFindingsPatternUnmatched { .. }
+            | Self::EntryPatternRedundant { .. }
+            | Self::IgnoreDependenciesEntryRedundant { .. }
+            | Self::IgnorePatternsEntryRedundant { .. }
+            | Self::BaselineInstallStateMismatch { .. } => false,
+        }
+    }
+
+    /// Whether this diagnostic is recorded by the PLUGIN stage (framework
+    /// plugins reading their own build configs) rather than by workspace
+    /// discovery, source discovery, the analyze stage or the health pipeline.
+    ///
+    /// Plugin-stage diagnostics are recorded after config load, so
+    /// `stash_workspace_diagnostics` must preserve them across combined mode's
+    /// per-analysis config re-loads, and each plugin run replaces the previous
+    /// run's set so a fixed config drops out on the next run (issue #2736).
+    ///
+    /// They are deliberately NOT [`Self::is_analysis_stage`], although they
+    /// share both of those properties. That predicate additionally means "the
+    /// dead-code analyze pass re-records this", and the pass clears every kind
+    /// answering it on entry. Plugins run in the prelude of that same pass, so
+    /// a plugin-stage kind classified there would be wiped inside the run that
+    /// produced it.
+    ///
+    /// The match is exhaustive on purpose: a new kind must be classified here
+    /// before it compiles.
+    #[must_use]
+    pub const fn is_plugin_stage(&self) -> bool {
+        match self {
+            Self::PluginConfigUnreadable { .. } | Self::PluginEffectNotModeled { .. } => true,
+            Self::UndeclaredWorkspace
+            | Self::MalformedPackageJson { .. }
+            | Self::GlobMatchedNoPackageJson { .. }
+            | Self::WorkspaceGlobOutsideRoot { .. }
+            | Self::WorkspacePatternDirMissing { .. }
+            | Self::NestedProjectRoot
+            | Self::MalformedTsconfig { .. }
+            | Self::TsconfigReferenceDirMissing
+            | Self::MalformedPnpmWorkspaceYaml { .. }
+            | Self::SkippedLargeFile { .. }
+            | Self::SkippedMinifiedFile { .. }
+            | Self::SkippedSourceDotdir
+            | Self::SourceReadFailure { .. }
+            | Self::SourceParseDegraded { .. }
+            | Self::SourceNestingTooDeep { .. }
+            | Self::BunLockbOverrideResolutionSkipped
+            | Self::BunLockOverrideResolutionSkipped
+            | Self::PnpmLockOverrideResolutionSkipped
+            | Self::NpmLockOverrideResolutionSkipped
+            | Self::BunResolutionsShadowedByOverrides
+            | Self::PnpmWorkspaceOverridesIgnored { .. }
+            | Self::NodeModulesMissing
+            | Self::BoundariesNotConfigured
+            | Self::RulePacksNotConfigured
+            | Self::ExcludedByDefaultIgnore { .. }
+            | Self::NoSourceFilesAnalyzed { .. }
+            | Self::FileScoresUnavailable { .. }
+            | Self::HotspotsSkipped { .. }
+            | Self::ChangeCouplingSkipped { .. }
+            | Self::ShallowClone { .. }
+            | Self::UnpinnedClock
+            | Self::OwnershipUnavailable { .. }
+            | Self::TrendSnapshotUnreadable { .. }
+            | Self::TrendGroupBaselineUnavailable { .. }
+            | Self::CoverageAutoDetected
+            | Self::FlagAgeShallowClone
+            | Self::FlagAgeUnavailable { .. }
+            | Self::IgnoreDependenciesGlobUnmatched { .. }
+            | Self::IgnoreFindingsPatternUnmatched { .. }
+            | Self::EntryPatternRedundant { .. }
+            | Self::IgnoreDependenciesEntryRedundant { .. }
+            | Self::IgnorePatternsEntryRedundant { .. }
+            | Self::BaselineInstallStateMismatch { .. } => false,
         }
     }
 }
@@ -278,6 +1160,24 @@ pub struct WorkspaceDiagnostic {
     /// Human-readable rendering derived from `kind` + `path`. Always ends
     /// with a next-step hint.
     pub message: String,
+    /// True when this diagnostic reports a run whose RESULTS are degraded:
+    /// something the user installed, wrote, or expected did not reach the
+    /// analysis. Projected from [`WorkspaceDiagnosticKind::warns_on_stderr`],
+    /// which is the same classification that decides whether the CLI prints a
+    /// stderr line, so a CI log built from this field and a local non-quiet run
+    /// say the same thing.
+    ///
+    /// Omitted when false, which is what keeps every clean run byte-identical.
+    /// The two unconfigured-check kinds answer false on purpose: they fire in
+    /// the product's default state on every project that never opted into
+    /// boundaries or rule packs, so warning on them would warn forever. So does
+    /// `excluded-by-default-ignore`, which is designed behavior on generated
+    /// output; the alarm for that case is `no-source-files-analyzed`.
+    ///
+    /// Read this instead of hardcoding a kind allowlist: a degrading kind added
+    /// in a later release then reaches an unchanged consumer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degrades_analysis: bool,
 }
 
 impl WorkspaceDiagnostic {
@@ -303,10 +1203,12 @@ impl WorkspaceDiagnostic {
         let path = normalise_diagnostic_path(path);
         let kind = normalise_payload_paths(root, kind);
         let message = render_message(root, &path, &kind);
+        let degrades_analysis = kind.warns_on_stderr();
         Self {
             path,
             kind,
             message,
+            degrades_analysis,
         }
     }
 
@@ -322,10 +1224,19 @@ impl WorkspaceDiagnostic {
     ///
     /// Paths outside `root` (canonicalisation crossed a symlink) are left
     /// absolute, matching how [`Self::new`] renders the message.
+    ///
+    /// A diagnostic anchored at the root itself becomes `.`, not the empty
+    /// path: an empty string is not a location, and the analysis envelopes'
+    /// post-serialisation strip only removes a `root + separator` prefix, so a
+    /// root-anchored path that stays absolute here leaks a host path.
     #[must_use]
     pub fn into_root_relative(mut self, root: &Path) -> Self {
         if let Ok(relative) = self.path.strip_prefix(root) {
-            self.path = relative.to_path_buf();
+            self.path = if relative.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                relative.to_path_buf()
+            };
         }
         self
     }
@@ -395,8 +1306,34 @@ fn normalise_payload_paths(root: &Path, kind: WorkspaceDiagnosticKind) -> Worksp
                 error: normalise(error),
             }
         }
+        WorkspaceDiagnosticKind::FileScoresUnavailable { error } => {
+            WorkspaceDiagnosticKind::FileScoresUnavailable {
+                error: normalise(error),
+            }
+        }
+        WorkspaceDiagnosticKind::OwnershipUnavailable { cause, error } => {
+            WorkspaceDiagnosticKind::OwnershipUnavailable {
+                cause,
+                error: normalise(error),
+            }
+        }
+        WorkspaceDiagnosticKind::TrendSnapshotUnreadable { error } => {
+            WorkspaceDiagnosticKind::TrendSnapshotUnreadable {
+                error: normalise(error),
+            }
+        }
         WorkspaceDiagnosticKind::GlobMatchedNoPackageJson { pattern } => {
             WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
+                pattern: canonical_glob_pattern(pattern),
+            }
+        }
+        WorkspaceDiagnosticKind::WorkspaceGlobOutsideRoot { pattern } => {
+            WorkspaceDiagnosticKind::WorkspaceGlobOutsideRoot {
+                pattern: canonical_glob_pattern(pattern),
+            }
+        }
+        WorkspaceDiagnosticKind::WorkspacePatternDirMissing { pattern } => {
+            WorkspaceDiagnosticKind::WorkspacePatternDirMissing {
                 pattern: canonical_glob_pattern(pattern),
             }
         }
@@ -474,14 +1411,132 @@ pub fn dedupe_workspace_diagnostics(
     merge_workspace_diagnostics(diagnostics, Vec::new())
 }
 
-/// Render `path` relative to `root` with forward slashes. The forward-slash
-/// normalisation is load-bearing for cross-platform output stability.
-fn display_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
+/// The first segment of a glob that contains no glob metacharacter, so it
+/// names a real directory rather than a wildcard.
+///
+/// Source discovery uses it to decide which directory a built-in ignore
+/// pattern excluded a file "at"; `render_message` uses it to decide which
+/// remedy is true for that pattern. The two have to agree, so the function
+/// lives here rather than once per crate: a pattern with such a segment
+/// (`**/dist/**`) is lifted by re-rooting inside the matched directory,
+/// because the glob is matched against the path relative to the run root. A
+/// pattern without one (`**/*.min.js`) matches on the file name and keeps
+/// matching at every root.
+#[must_use]
+pub fn glob_first_literal_segment(pattern: &str) -> Option<&str> {
+    pattern.split('/').find(|segment| {
+        !segment.is_empty()
+            && !segment.contains(['*', '?', '[', ']', '{', '}'])
+            && *segment != "."
+            && *segment != ".."
+    })
+}
+
+/// The directory part of a workspace pattern: the segments before the first
+/// segment with a glob character, joined with `/`.
+///
+/// `vite/packages/*` gives `vite/packages`, `vite` gives `vite`, and a
+/// pattern that starts with a glob segment (`**/pkg`, `{a,b}/*`) gives
+/// `None`. A leading `./` and empty or `.` segments are dropped. Workspace
+/// discovery uses it to find a pattern whose directory does not exist, and
+/// the diagnostic message uses it to name that directory, so both read the
+/// same part of the pattern.
+#[must_use]
+pub fn workspace_pattern_literal_dir(pattern: &str) -> Option<String> {
+    let literal: Vec<&str> = pattern
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .take_while(|segment| !segment.contains(['*', '?', '[', ']', '{', '}']))
+        .collect();
+    if literal.is_empty() {
+        None
+    } else {
+        Some(literal.join("/"))
+    }
+}
+
+/// The clause naming why a plugin could not read a config key in full, for one
+/// `plugin-config-unreadable` reason token.
+///
+/// The token set is open, so an unrecognised token renders the general claim
+/// rather than nothing: a diagnostic from a plugin added later still reads as a
+/// sentence.
+fn unreadable_situation(reason: &str) -> &'static str {
+    match reason {
+        "array-form" => "uses the array form, which is not read yet",
+        "spread" => "spreads a value that is not statically readable",
+        "unreadable-entries" => "has entries that hold no statically readable value",
+        "not-object-literal" => "is not a static object literal",
+        "unrecognized-call" => "is passed through a call that is not a known config wrapper",
+        "import-target-unreadable" => "comes from an imported file that is not statically readable",
+        "dynamic-argument" => "receives an argument that is not a static literal",
+        _ => "could not be read statically",
+    }
+}
+
+/// What an unread config key costs, and the configuration option that covers
+/// the gap.
+///
+/// Keyed on the config KEY rather than on the plugin name, because one key is
+/// read by several plugins: Module Federation `exposes` and `remotes` reach a
+/// build from a standalone config file and inline from the webpack, rspack,
+/// rsbuild and vite configs, and both the consequence and the remedy are the
+/// same in all five. A key this build does not know falls back to the general
+/// claim rather than borrowing another key's remedy, so a plugin added later
+/// still renders a sentence that is true.
+///
+/// Two reasons change the remedy. An unrecognized call was read as a lower
+/// bound, so only what the call adds is missing. An unreadable import target
+/// holds config that is shared across files, so the remedy names the option
+/// and does not ask for an object literal.
+fn unreadable_key_consequence(key: &str, reason: &str) -> (&'static str, &'static str) {
+    match (key, reason) {
+        ("exposes", "unrecognized-call") => (
+            "only the targets in the object literal it receives are registered as entry points",
+            "Name any other exposed files in `dynamicallyLoaded`.",
+        ),
+        ("remotes", "unrecognized-call") => (
+            "only the aliases in the object literal it receives are treated as provided by a \
+             remote container",
+            "Name any other aliases in `ignoreDependencies`.",
+        ),
+        ("exposes", "import-target-unreadable") => (
+            "the targets that file declares are not registered as entry points",
+            "Name the exposed files in `dynamicallyLoaded`.",
+        ),
+        ("remotes", "import-target-unreadable") => (
+            "the aliases that file declares are not treated as provided by a remote container",
+            "Name the aliases in `ignoreDependencies`.",
+        ),
+        ("registerRemotes", _) => (
+            "the remotes it registers are not treated as provided by a remote container",
+            "Name the remote aliases in `ignoreDependencies`, or pass the remote names as \
+             string literals.",
+        ),
+        ("init" | "createInstance", _) => (
+            "the remotes its options declare are not treated as provided by a remote container",
+            "Name the remote aliases in `ignoreDependencies`, or pass `remotes` as an array of \
+             objects with literal names.",
+        ),
+        ("loadRemote", _) => (
+            "the remote it loads is not treated as provided by a remote container",
+            "Name the remote alias in `ignoreDependencies`, or pass the request as a string \
+             literal.",
+        ),
+        ("exposes", _) => (
+            "the targets are not registered as entry points",
+            "Name the exposed files in `dynamicallyLoaded`.",
+        ),
+        ("remotes", _) => (
+            "the aliases are not treated as provided by a remote container",
+            "Name the aliases in `ignoreDependencies`, or declare them as the keys of an object \
+             literal, whose values may be computed.",
+        ),
+        _ => (
+            "what it declares is not fully registered",
+            "Declare the value as a static object literal.",
+        ),
+    }
 }
 
 fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> String {
@@ -499,17 +1554,55 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
             "Glob '{pattern}' matched '{display}' but no package.json is present. \
              Add a package.json, narrow the pattern, or add '{display}' to ignorePatterns."
         ),
+        WorkspaceDiagnosticKind::WorkspaceGlobOutsideRoot { pattern } => {
+            let source = if display.is_empty() {
+                "the fallow config `workspaces.patterns`".to_owned()
+            } else {
+                format!("'{display}'")
+            };
+            format!(
+                "Skipped workspace entry '{pattern}' in {source}: it is an absolute path \
+                 or its '..' segments lead above the project root, so it can match directories \
+                 outside the root. \
+                 Fallow analyzes no package from it. Move the package inside the project root, \
+                 or run fallow with --root set to a directory that holds both."
+            )
+        }
+        WorkspaceDiagnosticKind::WorkspacePatternDirMissing { pattern } => {
+            let source = if display.is_empty() {
+                "the fallow config `workspaces.patterns`".to_owned()
+            } else {
+                format!("'{display}'")
+            };
+            let dir = workspace_pattern_literal_dir(pattern).unwrap_or_else(|| pattern.clone());
+            format!(
+                "Workspace pattern '{pattern}' in {source} names directory '{dir}', which does \
+                 not exist. Fallow analyzes no package from it. Unused catalog entries are not \
+                 reported in this run, because packages in that directory can use them. \
+                 Create the directory before the run, or remove the pattern."
+            )
+        }
+        WorkspaceDiagnosticKind::NestedProjectRoot => format!(
+            "Directory '{display}' has its own pnpm-workspace.yaml, so it is an independent \
+             project. Fallow analyzes it as a workspace: its package.json owns its files and \
+             dependencies, and its catalog references are not checked against the root \
+             catalog. Add '{display}' to ignorePatterns to exclude it."
+        ),
         WorkspaceDiagnosticKind::MalformedTsconfig { error } => format!(
-            "tsconfig.json at '{display}' failed to parse ({error}); \
-             project references will be ignored. Fix the JSON syntax."
+            "tsconfig at '{display}' failed to parse ({error}); \
+             its project references, path aliases and compiler options are ignored. \
+             Fix the JSON syntax."
         ),
         WorkspaceDiagnosticKind::TsconfigReferenceDirMissing => format!(
             "tsconfig.json references '{display}' but the directory does not exist. \
              Update or remove the reference, or restore the missing directory."
         ),
         WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml { error } => format!(
-            "'{display}' failed to parse ({error}); catalog and override entries \
-             will be ignored. Fix the YAML syntax."
+            "'{display}' is not valid YAML ({error}). Catalog checks are skipped \
+             and its override entries are ignored until it parses. pnpm install \
+             can accept this file, but `pnpm add` and YAML formatters reject it. \
+             Indent each continuation line of a quoted value or a `[...]` / \
+             `{{...}}` list deeper than its key."
         ),
         WorkspaceDiagnosticKind::SkippedLargeFile { size_bytes } => format!(
             "Skipped '{display}' ({size}): exceeds the max file size limit. \
@@ -528,14 +1621,40 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
         WorkspaceDiagnosticKind::SkippedSourceDotdir => format!(
             "Skipped hidden directory '{display}': it contains source files but hidden \
              directories are not traversed. Its imports and exports are not analyzed. \
-             There is no config field that adds a directory to traversal. If it holds \
-             first-party source, analyze it on its own with fallow --root {display}; if it \
-             is tool or agent scratch state, add '{display}/**' to ignorePatterns to \
-             silence this."
+             A file, export or dependency that only this directory uses can be reported as \
+             unused. To analyze it, add '!{display}/**' to ignorePatterns. To stop \
+             that false positive without that, add the file to entry, the export to \
+             ignoreExports or the dependency to ignoreDependencies. To silence this message, \
+             add '{display}/**' to ignorePatterns. fallow --root {display} analyzes only \
+             that directory on its own and does not fix this run."
         ),
         WorkspaceDiagnosticKind::SourceReadFailure { error } => format!(
             "Could not read source '{display}' ({error}). Restore the file or its read permissions, \
              ensure it contains valid UTF-8 text, or add '{display}' to ignorePatterns."
+        ),
+        WorkspaceDiagnosticKind::SourceParseDegraded {
+            error_count,
+            panicked,
+        } => {
+            let outcome = if *panicked {
+                "the parser stopped there"
+            } else {
+                "the parser recovered and continued"
+            };
+            format!(
+                "Parsed '{display}' with {error_count} error(s); {outcome}. Imports, exports, and \
+                 references it did not reach are missing from this run, so files and symbols it \
+                 uses can be reported as unused. Fix the syntax, or ignore this if the file uses \
+                 syntax newer than fallow's parser."
+            )
+        }
+        WorkspaceDiagnosticKind::SourceNestingTooDeep { limit } => format!(
+            "Did not parse '{display}': it nests brackets deeper than {limit} levels, or it \
+             needs more stack than fallow reserves, so a parse could overflow the stack. Its \
+             imports and exports are missing from this run, so files and symbols it uses can be \
+             reported as unused, and while the file is reachable `fallow fix` holds back its \
+             actions for the whole project. Add '{display}' to ignoreFindings if it is generated \
+             code, or reduce its nesting."
         ),
         WorkspaceDiagnosticKind::BunLockbOverrideResolutionSkipped => format!(
             "Skipped dependency-override resolution for '{display}': bun's legacy binary bun.lockb \
@@ -551,539 +1670,331 @@ fn render_message(root: &Path, path: &Path, kind: &WorkspaceDiagnosticKind) -> S
              findings are not reported. Run bun install to regenerate the text lockfile, then \
              rerun fallow."
         ),
+        WorkspaceDiagnosticKind::PnpmLockOverrideResolutionSkipped => format!(
+            "Skipped dependency-override resolution because '{display}' could not be parsed and \
+             no other parseable lockfile was available, so unused-dependency-overrides findings \
+             are not reported. Resolve any merge-conflict markers in the lockfile, or run pnpm \
+             install to regenerate it, then rerun fallow."
+        ),
+        WorkspaceDiagnosticKind::NpmLockOverrideResolutionSkipped => format!(
+            "Skipped dependency-override resolution because '{display}' could not be parsed and \
+             no other parseable lockfile was available, so unused-dependency-overrides findings \
+             are not reported. Resolve any merge-conflict markers in the lockfile, or run npm \
+             install to regenerate it, then rerun fallow."
+        ),
         WorkspaceDiagnosticKind::BunResolutionsShadowedByOverrides => format!(
             "'{display}' declares both `overrides` and non-empty `resolutions`; bun applies \
              `overrides` and ignores `resolutions`. Move the intended pins into `overrides` or \
              remove the shadowed `resolutions` entries."
         ),
+        WorkspaceDiagnosticKind::PnpmWorkspaceOverridesIgnored {
+            cause: PnpmWorkspaceOverridesIgnoredCause::PackageJsonOverrides,
+        } => format!(
+            "pnpm 10 and earlier ignore the `overrides` in '{display}' because the root package.json \
+             declares `pnpm.overrides` or `resolutions`, so fallow does not check them. Move the \
+             entries into one source."
+        ),
+        WorkspaceDiagnosticKind::PnpmWorkspaceOverridesIgnored {
+            cause: PnpmWorkspaceOverridesIgnoredCause::PnpmVersion,
+        } => format!(
+            "pnpm versions before 10.5.1 do not read the `overrides` in '{display}', so fallow \
+             does not check them. Update `packageManager` to pnpm 10.5.1 or later, or move the \
+             entries into `pnpm.overrides` in the root package.json."
+        ),
+        WorkspaceDiagnosticKind::NodeModulesMissing => format!(
+            "'{display}' does not exist. Package exports and conditional exports cannot be read, \
+             framework plugins that activate on an installed package stay inactive, and \
+             dependency classification degrades, so imports and dependencies can be \
+             misreported. Run npm install / pnpm install / yarn / bun install first."
+        ),
+        WorkspaceDiagnosticKind::BoundariesNotConfigured => {
+            "No architecture boundaries are configured, so the boundary detector did not run and \
+             its violation counts are zero because nothing was measured. Add `boundaries` to the \
+             config, or set `boundary-violation` to off to state that the check is not wanted."
+                .to_string()
+        }
+        WorkspaceDiagnosticKind::RulePacksNotConfigured => {
+            "No rule packs are configured, so the policy detector did not run and its violation \
+             counts are zero because nothing was measured. Add `rulePacks` to the config, or set \
+             `policy-violation` to off to state that the check is not wanted."
+                .to_string()
+        }
+        WorkspaceDiagnosticKind::NoSourceFilesAnalyzed {
+            excluded_file_count,
+        } => {
+            if *excluded_file_count == 0 {
+                "No source files were analyzed, so every finding count this run reports is zero \
+                 because nothing was measured. Check the analysis root, ignorePatterns, and any \
+                 path or workspace filter this run applied."
+                    .to_owned()
+            } else {
+                format!(
+                    "No source files were analyzed. Fallow's built-in ignore patterns excluded \
+                     {excluded_file_count} candidate files, so every finding count this run \
+                     reports is zero because nothing was measured; run with --explain-skipped \
+                     for the breakdown."
+                )
+            }
+        }
+        WorkspaceDiagnosticKind::FileScoresUnavailable { error } => format!(
+            "Could not compute per-file health scores ({error}), so the score list is empty and \
+             the scored-file count is 0 because nothing was measured rather than because the \
+             project has nothing to score. Rerun with --no-cache, or scope the run to a \
+             subdirectory to find the input that fails."
+        ),
+        WorkspaceDiagnosticKind::HotspotsSkipped { cause } => match cause.as_str() {
+            "invalid-since" => "Hotspot analysis was skipped because --since could not be read \
+                 as a time window, so the hotspots, churn and ownership sections report nothing \
+                 rather than zero. Spell it as a duration such as 6m or 90d, or drop it to use \
+                 the default window."
+                .to_owned(),
+            "no-commits" => "Hotspot analysis was skipped because the current branch has no \
+                 commits yet, so the hotspots, churn and ownership sections report nothing \
+                 rather than zero. Commit the project to give churn a history, or pass \
+                 --churn-file with exported change history."
+                .to_owned(),
+            "churn-file-unreadable" => format!(
+                "Hotspot analysis was skipped because the churn file '{display}' could no longer \
+                 be read after it was validated, so the hotspots, churn and ownership sections \
+                 report nothing rather than zero. Make sure nothing rewrites the file while \
+                 fallow runs, and rerun."
+            ),
+            // The original single cause, whose wording predates the token and
+            // is kept byte-identical: a consumer matching on this sentence is
+            // reading the same run it always was.
+            _ => "Hotspot analysis was skipped because no git repository was found at the \
+                  project root, so the hotspots, churn and ownership sections report nothing \
+                  rather than zero. Run fallow inside the repository, or pass --churn-file with \
+                  exported change history."
+                .to_owned(),
+        },
+        WorkspaceDiagnosticKind::ChangeCouplingSkipped { cause } => match cause.as_str() {
+            "shallow-clone" => "Change coupling was not measured because the repository is a \
+                 shallow clone, so no change coupling pairs are reported. Fetch the full \
+                 history with `git fetch --unshallow` to measure it."
+                .to_owned(),
+            _ => "Change coupling found no pairs because the history window has fewer \
+                  analyzed commits than the minimum revisions of one file. Widen the window \
+                  with --since, or lower health.changeCoupling.minRevisions."
+                .to_owned(),
+        },
+        WorkspaceDiagnosticKind::ShallowClone {
+            ownership_requested,
+        } => {
+            let ownership = if *ownership_requested {
+                " Ownership signals are skewed too, because a shallow clone inflates \
+                 single-author dominance."
+            } else {
+                ""
+            };
+            format!(
+                "This is a shallow clone, so churn covers only the fetched history and every \
+                 hotspot figure is incomplete.{ownership} Run git fetch --unshallow for the full \
+                 history."
+            )
+        }
+        WorkspaceDiagnosticKind::UnpinnedClock => {
+            "No commit timestamp was available, so churn recency and ownership staleness were \
+             measured against the wall clock and drift between runs over the same commit. Set \
+             FALLOW_CLOCK_EPOCH to pin the run clock."
+                .to_owned()
+        }
+        WorkspaceDiagnosticKind::OwnershipUnavailable { cause, error } => {
+            if cause == "codeowners-parse-failed" {
+                format!(
+                    "Ownership signals are degraded: CODEOWNERS could not be parsed ({error}), \
+                     so hotspot entries carry no declared owner. Fix the CODEOWNERS syntax, or \
+                     drop --ownership for this run."
+                )
+            } else {
+                format!(
+                    "Ownership signals are degraded: health.ownership.botPatterns contains an \
+                     invalid glob ({error}), so no author is classified as a bot and bot commits \
+                     count towards ownership. Fix the pattern, or remove it from the config."
+                )
+            }
+        }
+        WorkspaceDiagnosticKind::TrendSnapshotUnreadable { error } => format!(
+            "Skipped health snapshot '{display}' ({error}), so the trend is computed over fewer \
+             snapshots than this project has on disk. Delete the unreadable file, or rewrite it \
+             with fallow health --save-snapshot."
+        ),
+        WorkspaceDiagnosticKind::TrendGroupBaselineUnavailable { cause } => {
+            if cause == "grouped-by-mismatch" {
+                format!(
+                    "Health snapshot '{display}' was saved with a different --group-by mode, so \
+                     the groups have no trend. The project trend is not affected. Save a new \
+                     snapshot with the same --group-by mode."
+                )
+            } else {
+                format!(
+                    "Health snapshot '{display}' holds no group data, so the groups have no \
+                     trend. The project trend is not affected. Save a new snapshot with \
+                     --group-by and --save-snapshot."
+                )
+            }
+        }
+        WorkspaceDiagnosticKind::CoverageAutoDetected => format!(
+            "Coverage was auto-detected at '{display}' rather than passed with --coverage, so the \
+             CRAP scores depend on whichever coverage file is on disk at run time. Pass --coverage \
+             '{display}' explicitly for reproducible scores."
+        ),
+        WorkspaceDiagnosticKind::FlagAgeShallowClone => {
+            "This is a shallow clone, so the flag retirement report gives no flag age. Run git \
+             fetch --unshallow for the full history, or pass --flag-age off."
+                .to_owned()
+        }
+        WorkspaceDiagnosticKind::IgnoreDependenciesGlobUnmatched { pattern } => format!(
+            "ignoreDependencies glob '{pattern}' matched no declared dependency in this run, so \
+             it has no effect. A glob matches package names, such as @scope/*. Fix the glob, or \
+             remove it from the config."
+        ),
+        WorkspaceDiagnosticKind::BaselineInstallStateMismatch {
+            baseline_node_modules,
+            ..
+        } => {
+            let (saved, now, remedy) = match baseline_node_modules {
+                NodeModulesState::Present => (
+                    "present",
+                    "has no node_modules",
+                    "Install dependencies before you compare",
+                ),
+                NodeModulesState::Missing => (
+                    "missing",
+                    "has node_modules",
+                    "Compare without installed dependencies",
+                ),
+            };
+            format!(
+                "The baseline '{display}' was saved with node_modules {saved}, and this run \
+                 {now}. Findings that need installed packages (dependency, unlisted, \
+                 unresolved-import and script-binary findings) can differ, so the run can report \
+                 baseline findings as new. {remedy}, or save the baseline again in the same \
+                 install state."
+            )
+        }
+        WorkspaceDiagnosticKind::EntryPatternRedundant { .. }
+        | WorkspaceDiagnosticKind::IgnoreDependenciesEntryRedundant { .. }
+        | WorkspaceDiagnosticKind::IgnorePatternsEntryRedundant { .. } => {
+            config_entry::redundant_entry_message(kind)
+        }
+        WorkspaceDiagnosticKind::IgnoreFindingsPatternUnmatched { pattern } => format!(
+            "ignoreFindings pattern '{pattern}' matched no finding in this run, so it has no \
+             effect. A pattern is a glob relative to the project root. Fix the pattern, or \
+             remove it from the config."
+        ),
+        WorkspaceDiagnosticKind::FlagAgeUnavailable { cause } => {
+            if cause == "no-commits" {
+                "The flag retirement report gives no flag age, because the current branch has no \
+                 commit. Commit the code, or pass --flag-age off."
+                    .to_owned()
+            } else {
+                "The flag retirement report gives no flag age, because no git repository was \
+                 found at the project root. Run fallow inside the repository, or pass --flag-age \
+                 off."
+                    .to_owned()
+            }
+        }
+        WorkspaceDiagnosticKind::PluginConfigUnreadable {
+            plugin,
+            key,
+            reason,
+        } => {
+            let (consequence, advice) = unreadable_key_consequence(key, reason);
+            format!(
+                "Plugin '{plugin}': `{key}` in '{display}' {situation}, so {consequence}. {advice}",
+                situation = unreadable_situation(reason)
+            )
+        }
+        WorkspaceDiagnosticKind::PluginEffectNotModeled {
+            plugin,
+            key,
+            reason,
+        } => {
+            // Two causes, one effect, one remedy. Each cause gets its own
+            // sentence: the cause and the effect on the findings are separate
+            // facts, and one sentence with two `so` clauses states neither fact
+            // clearly.
+            let effect = "`autoImports` kept the convention entry patterns for that surface, and \
+                          fallow reports no unused file there. Write the setting as static \
+                          literals, or remove the key to use the framework defaults.";
+            if key.starts_with('#') {
+                format!(
+                    "Plugin '{plugin}': fallow cannot read which names '{display}' takes from \
+                     `{key}`, so every name of `{key}` counts as used, and fallow reports no \
+                     unused file for these names. Read each name with a member access such as \
+                     `C.Card`, or import it by name."
+                )
+            } else if reason == "config-property-unreadable" {
+                format!(
+                    "Plugin '{plugin}': fallow cannot read a top-level property in '{display}', so \
+                     it cannot classify the `{key}` surface. {effect}"
+                )
+            } else {
+                format!(
+                    "Plugin '{plugin}': fallow does not model the effect of `{key}` in \
+                     '{display}'. {effect}"
+                )
+            }
+        }
+        WorkspaceDiagnosticKind::ExcludedByDefaultIgnore {
+            pattern,
+            file_count,
+            directory_count,
+        } => {
+            // `path` is a location, and an empty string is not one: a built-in
+            // that matched a file sitting directly at the analysis root
+            // anchors at the root itself.
+            let display = if display.is_empty() {
+                ".".to_owned()
+            } else {
+                display
+            };
+            // The payload carries no directory list, so the message names the
+            // one directory `path` anchors at. With several excluded
+            // directories that is the largest group and NOT a majority, so the
+            // sentence says which claim it is making and how many directories
+            // it is leaving unnamed.
+            let location = if *directory_count > 1 {
+                format!(
+                    "Skipped {file_count} source files across {directory_count} directories, \
+                     the largest group under '{display}'"
+                )
+            } else if *file_count == 1 {
+                format!("Skipped 1 source file under '{display}'")
+            } else {
+                format!("Skipped {file_count} source files under '{display}'")
+            };
+            let singular = *file_count == 1 && *directory_count <= 1;
+            let (subject, effect) = if singular {
+                ("it matches", "it imports, exports, or defines")
+            } else {
+                ("they match", "they import, export, or define")
+            };
+            // Only a directory-shaped built-in is lifted by re-rooting. Telling
+            // a user with a `vendor/lib.min.js` to run `fallow --root vendor`
+            // hands them a command that excludes the same file again.
+            let remedy = if glob_first_literal_segment(pattern).is_some() {
+                format!(
+                    "To analyze first-party source there, add '!{display}/**' to \
+                     ignorePatterns, or analyze that directory on its own with \
+                     fallow --root {display}."
+                )
+            } else {
+                "This pattern matches a file name rather than a directory, so re-running under \
+                 a different --root excludes the same files again. Rename first-party source \
+                 that only looks generated, dropping the '.min' or '.bundle' infix, or add a \
+                 '!' entry for the file to ignorePatterns."
+                    .to_owned()
+            };
+            format!(
+                "{location}: {subject} fallow's built-in ignore pattern '{pattern}', so nothing \
+                 {effect} is visible to this run. {remedy}"
+            )
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn skipped_large_file_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("src/vendor/app.bundle.js"),
-            WorkspaceDiagnosticKind::SkippedLargeFile {
-                size_bytes: 6 * 1024 * 1024,
-            },
-        );
-        assert_eq!(diag.kind.id(), "skipped-large-file");
-        assert!(
-            diag.message.contains("src/vendor/app.bundle.js"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("6.0 MB"),
-            "message reports the size: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--max-file-size"),
-            "message names the override flag: {}",
-            diag.message
-        );
-    }
-
-    #[test]
-    fn skipped_minified_file_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("src/assets/index-abc123.js"),
-            WorkspaceDiagnosticKind::SkippedMinifiedFile {
-                size_bytes: 2 * 1024 * 1024,
-            },
-        );
-        assert_eq!(diag.kind.id(), "skipped-minified-file");
-        assert!(
-            diag.message.contains("src/assets/index-abc123.js"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("2.0 MB"),
-            "message reports the size: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--max-file-size 0"),
-            "message names the opt-out: {}",
-            diag.message
-        );
-    }
-
-    #[test]
-    fn skipped_source_dotdir_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join(".claude"),
-            WorkspaceDiagnosticKind::SkippedSourceDotdir,
-        );
-        assert_eq!(diag.kind.id(), "skipped-source-dotdir");
-        assert!(
-            diag.message.contains(".claude"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message
-                .contains("Its imports and exports are not analyzed."),
-            "message states the consequence: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--root"),
-            "message names the real remedy: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("ignorePatterns"),
-            "message names the silencing route: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("no config field"),
-            "the message must say plainly that no config field traverses it: {}",
-            diag.message
-        );
-        assert_eq!(
-            serde_json::to_value(&diag).expect("serializes")["kind"],
-            "skipped-source-dotdir",
-            "id() must byte-match the serde kebab-case tag"
-        );
-    }
-
-    #[cfg(feature = "schema")]
-    #[test]
-    fn workspace_diagnostic_schema_includes_skipped_source_dotdir() {
-        let schema = schemars::schema_for!(WorkspaceDiagnostic);
-        let json = serde_json::to_string(&schema).expect("schema serializes");
-        assert!(json.contains("skipped-source-dotdir"));
-    }
-
-    #[test]
-    fn source_read_failure_serializes_typed_error_payload() {
-        let root = Path::new("/project");
-        let diagnostic = WorkspaceDiagnostic::new(
-            root,
-            root.join("src/removed.ts"),
-            WorkspaceDiagnosticKind::SourceReadFailure {
-                error: "No such file or directory".to_string(),
-            },
-        );
-
-        let json = serde_json::to_value(&diagnostic).expect("diagnostic serializes");
-        assert_eq!(json["kind"], "source-read-failure");
-        assert_eq!(
-            json["path"],
-            root.join("src/removed.ts")
-                .display()
-                .to_string()
-                .replace('\\', "/")
-        );
-        assert_eq!(json["error"], "No such file or directory");
-        assert!(
-            json["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("src/removed.ts"))
-        );
-    }
-
-    #[cfg(feature = "schema")]
-    #[test]
-    fn workspace_diagnostic_schema_includes_source_read_failure() {
-        let schema = schemars::schema_for!(WorkspaceDiagnostic);
-        let json = serde_json::to_string(&schema).expect("schema serializes");
-        assert!(json.contains("source-read-failure"));
-        assert!(json.contains("error"));
-    }
-
-    #[test]
-    fn bun_lockb_override_resolution_skipped_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("package.json"),
-            WorkspaceDiagnosticKind::BunLockbOverrideResolutionSkipped,
-        );
-        assert_eq!(diag.kind.id(), "bun-lockb-override-resolution-skipped");
-        assert!(
-            diag.message.contains("'package.json'"),
-            "message names the project-relative manifest: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("no parseable text lockfile"),
-            "message states the cause: {}",
-            diag.message
-        );
-        assert!(
-            !diag.message.contains("only bun.lockb"),
-            "message must not claim bun.lockb is the only lockfile; yarn.lock or an unparseable \
-             bun.lock may sit beside it: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("bun install --save-text-lockfile")
-                && diag.message.contains("delete the stale bun.lockb"),
-            "message ends with the text-lockfile next step and the stale-lockb alternative: {}",
-            diag.message
-        );
-        let json = serde_json::to_value(&diag).expect("diagnostic serializes");
-        assert_eq!(json["kind"], "bun-lockb-override-resolution-skipped");
-    }
-
-    #[test]
-    fn bun_override_diagnostic_ids_and_messages_are_actionable() {
-        let root = Path::new("/project");
-        let malformed = WorkspaceDiagnostic::new(
-            root,
-            root.join("bun.lock"),
-            WorkspaceDiagnosticKind::BunLockOverrideResolutionSkipped,
-        );
-        assert_eq!(malformed.kind.id(), "bun-lock-override-resolution-skipped");
-        assert!(malformed.message.contains("regenerate"));
-
-        let shadowed = WorkspaceDiagnostic::new(
-            root,
-            root.join("package.json"),
-            WorkspaceDiagnosticKind::BunResolutionsShadowedByOverrides,
-        );
-        assert_eq!(shadowed.kind.id(), "bun-resolutions-shadowed-by-overrides");
-        assert!(shadowed.message.contains("ignores `resolutions`"));
-    }
-
-    #[test]
-    fn into_root_relative_strips_the_root_and_keeps_outside_paths_absolute() {
-        let root = Path::new("/project");
-        let inside = WorkspaceDiagnostic::new(
-            root,
-            root.join("packages/inner"),
-            WorkspaceDiagnosticKind::UndeclaredWorkspace,
-        )
-        .into_root_relative(root);
-        assert_eq!(inside.path, Path::new("packages/inner"));
-
-        let outside = WorkspaceDiagnostic::new(
-            root,
-            PathBuf::from("/elsewhere/packages/inner"),
-            WorkspaceDiagnosticKind::UndeclaredWorkspace,
-        )
-        .into_root_relative(root);
-        assert_eq!(outside.path, Path::new("/elsewhere/packages/inner"));
-    }
-
-    #[test]
-    fn analysis_stage_classification_covers_only_analyze_stage_kinds() {
-        let analysis_stage = [
-            WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml {
-                error: "bad yaml".to_owned(),
-            },
-            WorkspaceDiagnosticKind::BunLockbOverrideResolutionSkipped,
-            WorkspaceDiagnosticKind::BunLockOverrideResolutionSkipped,
-            WorkspaceDiagnosticKind::BunResolutionsShadowedByOverrides,
-        ];
-        for kind in &analysis_stage {
-            assert!(
-                kind.is_analysis_stage() && !kind.is_source_discovery(),
-                "{} is recorded by the analyze stage only",
-                kind.id()
-            );
-        }
-
-        let other = [
-            WorkspaceDiagnosticKind::UndeclaredWorkspace,
-            WorkspaceDiagnosticKind::MalformedPackageJson {
-                error: "trailing comma".to_owned(),
-            },
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "packages/*".to_owned(),
-            },
-            WorkspaceDiagnosticKind::MalformedTsconfig {
-                error: "unexpected token".to_owned(),
-            },
-            WorkspaceDiagnosticKind::TsconfigReferenceDirMissing,
-            WorkspaceDiagnosticKind::SkippedLargeFile { size_bytes: 1 },
-            WorkspaceDiagnosticKind::SkippedMinifiedFile { size_bytes: 1 },
-            WorkspaceDiagnosticKind::SkippedSourceDotdir,
-            WorkspaceDiagnosticKind::SourceReadFailure {
-                error: "permission denied".to_owned(),
-            },
-        ];
-        for kind in &other {
-            assert!(
-                !kind.is_analysis_stage(),
-                "{} is a discovery kind, not an analyze-stage kind",
-                kind.id()
-            );
-        }
-    }
-
-    #[test]
-    fn merge_keeps_two_diagnostics_that_share_a_kind_id_and_path() {
-        let root = Path::new("/project");
-        let first = WorkspaceDiagnostic::new(
-            root,
-            root.join("packages/aaa"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "packages/*".to_owned(),
-            },
-        );
-        let second = WorkspaceDiagnostic::new(
-            root,
-            root.join("packages/aaa"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "packages/a*".to_owned(),
-            },
-        );
-
-        let merged =
-            merge_workspace_diagnostics(vec![first.clone(), second.clone()], vec![first, second]);
-
-        let patterns: Vec<String> = merged
-            .iter()
-            .map(|diagnostic| match &diagnostic.kind {
-                WorkspaceDiagnosticKind::GlobMatchedNoPackageJson { pattern } => pattern.clone(),
-                other => panic!("unexpected kind {}", other.id()),
-            })
-            .collect();
-        assert_eq!(
-            patterns,
-            ["packages/*", "packages/a*"],
-            "two overlapping globs report the same directory twice, with their own pattern; \
-             the same entry seen from two observation points still folds to one"
-        );
-    }
-
-    /// Issue #2366: a repository that declares one glob in two manifests
-    /// (`"./apps/**"` in `package.json`, `apps/**` in `pnpm-workspace.yaml`)
-    /// must not report every package-less directory under it twice now that the
-    /// payload is part of the dedupe key.
-    #[test]
-    fn merge_folds_two_spellings_of_one_glob_into_one_diagnostic() {
-        let root = Path::new("/project");
-        let dotted = WorkspaceDiagnostic::new(
-            root,
-            root.join("apps/site/.next/cache"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "./apps/**".to_owned(),
-            },
-        );
-        let bare = WorkspaceDiagnostic::new(
-            root,
-            root.join("apps/site/.next/cache"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "apps/**".to_owned(),
-            },
-        );
-        assert_eq!(
-            dotted.kind, bare.kind,
-            "the no-op ./ prefix is normalised out of the recorded pattern"
-        );
-        assert!(
-            dotted.message.contains("Glob 'apps/**'"),
-            "the message renders the normalised pattern: {}",
-            dotted.message
-        );
-
-        let merged = merge_workspace_diagnostics(vec![dotted], vec![bare]);
-        assert_eq!(
-            merged.len(),
-            1,
-            "one glob declared twice is one diagnostic: {merged:?}"
-        );
-    }
-
-    /// A glob spelled exactly `"./"` (the project root itself) is the one
-    /// pattern the prefix strip must leave alone: an empty `pattern` field
-    /// names no glob, and the warning would quote nothing.
-    #[test]
-    fn new_keeps_a_root_only_glob_spelling_and_still_strips_a_real_prefix() {
-        let root = Path::new("/project");
-        let recorded = |pattern: &str| {
-            let diagnostic = WorkspaceDiagnostic::new(
-                root,
-                root.join("pkgs"),
-                WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                    pattern: pattern.to_owned(),
-                },
-            );
-            let WorkspaceDiagnosticKind::GlobMatchedNoPackageJson { pattern } = diagnostic.kind
-            else {
-                panic!("constructed a glob-matched-no-package-json diagnostic");
-            };
-            (pattern, diagnostic.message)
-        };
-
-        let (root_pattern, root_message) = recorded("./");
-        assert_eq!(root_pattern, "./", "a root-only glob keeps its spelling");
-        assert!(
-            root_message.contains("Glob './'"),
-            "the warning names the glob the manifest declared: {root_message}"
-        );
-        assert_eq!(recorded(".\\").0, ".\\");
-        assert_eq!(recorded("./pkgs/*").0, "pkgs/*");
-        assert_eq!(recorded(".\\pkgs\\*").0, "pkgs\\*");
-    }
-
-    /// Issue #2366, the path half of the same repository shape: expanding
-    /// `./pkgs/*` joins the no-op `.` into every match, so the two manifests
-    /// hand one directory to the diagnostic under two spellings. Both must
-    /// store, render and serialise as the bare one, otherwise whichever
-    /// manifest was read first decides whether the analysis envelopes print
-    /// `./pkgs/aaa` while the workspace listing envelope prints `pkgs/aaa`.
-    #[test]
-    fn new_stores_one_spelling_for_a_directory_reached_through_a_dotted_glob() {
-        let root = Path::new("/project");
-        let dotted = WorkspaceDiagnostic::new(
-            root,
-            root.join("./pkgs/aaa"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "./pkgs/*".to_owned(),
-            },
-        );
-        let bare = WorkspaceDiagnostic::new(
-            root,
-            root.join("pkgs/aaa"),
-            WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                pattern: "pkgs/*".to_owned(),
-            },
-        );
-
-        let spelling = |diagnostic: &WorkspaceDiagnostic| {
-            diagnostic.path.display().to_string().replace('\\', "/")
-        };
-        assert_eq!(
-            spelling(&dotted),
-            "/project/pkgs/aaa",
-            "the stored path drops the no-op . component, which Path equality \
-             hides but serialization does not"
-        );
-        assert_eq!(spelling(&dotted), spelling(&bare));
-        assert_eq!(
-            spelling(&dotted.clone().into_root_relative(root)),
-            "pkgs/aaa"
-        );
-
-        let merged = merge_workspace_diagnostics(vec![dotted], vec![bare]);
-        assert_eq!(
-            merged.len(),
-            1,
-            "one directory reached through two spellings of one glob: {merged:?}"
-        );
-    }
-
-    /// The single-list fold applied at workspace discovery keeps one entry per
-    /// `(kind, path)` and leaves distinct payloads alone.
-    #[test]
-    fn dedupe_keeps_first_of_each_pair_and_every_distinct_payload() {
-        let root = Path::new("/project");
-        let glob = |pattern: &str, relative: &str| {
-            WorkspaceDiagnostic::new(
-                root,
-                root.join(relative),
-                WorkspaceDiagnosticKind::GlobMatchedNoPackageJson {
-                    pattern: pattern.to_owned(),
-                },
-            )
-        };
-
-        let deduped = dedupe_workspace_diagnostics(vec![
-            glob("pkgs/*", "pkgs/aaa"),
-            glob("pkgs/*", "pkgs/bbb"),
-            glob("./pkgs/*", "./pkgs/aaa"),
-            glob("pkgs/a*", "pkgs/aaa"),
-        ]);
-
-        let reported: Vec<(String, String)> = deduped
-            .iter()
-            .map(|diagnostic| match &diagnostic.kind {
-                WorkspaceDiagnosticKind::GlobMatchedNoPackageJson { pattern } => (
-                    pattern.clone(),
-                    diagnostic.path.display().to_string().replace('\\', "/"),
-                ),
-                other => panic!("unexpected kind {}", other.id()),
-            })
-            .collect();
-
-        assert_eq!(
-            reported,
-            vec![
-                ("pkgs/*".to_owned(), "/project/pkgs/aaa".to_owned()),
-                ("pkgs/*".to_owned(), "/project/pkgs/bbb".to_owned()),
-                ("pkgs/a*".to_owned(), "/project/pkgs/aaa".to_owned()),
-            ],
-            "the duplicate spelling folds away and the overlapping glob stays"
-        );
-    }
-
-    #[test]
-    fn source_walk_recorded_covers_only_the_kinds_a_walk_replaces() {
-        for kind in [
-            WorkspaceDiagnosticKind::SkippedLargeFile { size_bytes: 1 },
-            WorkspaceDiagnosticKind::SkippedMinifiedFile { size_bytes: 1 },
-            WorkspaceDiagnosticKind::SkippedSourceDotdir,
-        ] {
-            assert!(
-                kind.is_source_walk_recorded() && kind.is_source_discovery(),
-                "{} is written by the source walk",
-                kind.id()
-            );
-        }
-
-        let read_failure = WorkspaceDiagnosticKind::SourceReadFailure {
-            error: "permission denied".to_owned(),
-        };
-        assert!(
-            read_failure.is_source_discovery() && !read_failure.is_source_walk_recorded(),
-            "the parse stage records source-read-failure after the walk, so it must keep \
-             reaching sessions through the registry"
-        );
-
-        for kind in [
-            WorkspaceDiagnosticKind::UndeclaredWorkspace,
-            WorkspaceDiagnosticKind::TsconfigReferenceDirMissing,
-            WorkspaceDiagnosticKind::BunLockbOverrideResolutionSkipped,
-            WorkspaceDiagnosticKind::BunLockOverrideResolutionSkipped,
-            WorkspaceDiagnosticKind::BunResolutionsShadowedByOverrides,
-        ] {
-            assert!(
-                !kind.is_source_walk_recorded(),
-                "{} is not written by the source walk",
-                kind.id()
-            );
-        }
-    }
-
-    #[test]
-    fn format_size_mb_one_decimal() {
-        assert_eq!(format_size_mb(0), "0.0 MB");
-        assert_eq!(format_size_mb(5 * 1024 * 1024), "5.0 MB");
-        assert_eq!(format_size_mb(1024 * 1024 + 512 * 1024), "1.5 MB");
-    }
-
-    #[test]
-    fn undeclared_workspace_message_has_next_step() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("packages/legacy"),
-            WorkspaceDiagnosticKind::UndeclaredWorkspace,
-        );
-        assert_eq!(diag.kind.id(), "undeclared-workspace");
-        assert!(diag.message.contains("packages/legacy"), "{}", diag.message);
-        assert!(
-            diag.message.contains("ignorePatterns"),
-            "next-step hint preserved: {}",
-            diag.message
-        );
-    }
-}
+#[path = "workspace_tests.rs"]
+mod tests;

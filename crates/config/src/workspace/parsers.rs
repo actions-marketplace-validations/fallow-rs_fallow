@@ -23,7 +23,11 @@ use super::diagnostics::{
 #[cfg(test)]
 pub(super) fn parse_tsconfig_references(root: &Path) -> Vec<PathBuf> {
     let mut diagnostics = Vec::new();
-    parse_tsconfig_references_with_diagnostics(root, &globset::GlobSet::empty(), &mut diagnostics)
+    parse_tsconfig_references_with_diagnostics(
+        root,
+        &crate::IgnorePatternSet::empty(),
+        &mut diagnostics,
+    )
 }
 
 /// Parse `tsconfig.json` at the project root and extract workspace-candidate
@@ -34,6 +38,10 @@ pub(super) fn parse_tsconfig_references(root: &Path) -> Vec<PathBuf> {
 /// - `tsconfig.json` missing: silent (many JS-only projects have none).
 /// - `tsconfig.json` exists but fails to parse as JSONC: emit
 ///   [`WorkspaceDiagnosticKind::MalformedTsconfig`].
+/// - a config in the `extends` chain of `tsconfig.json` exists but fails to
+///   parse: emit [`WorkspaceDiagnosticKind::MalformedTsconfig`] with the path
+///   of that config. Without it, its path aliases and compiler options are
+///   lost and imports can be misreported.
 /// - `references[].path` points to an existing **file**: silent. The
 ///   TypeScript Project References spec allows `path` to target a config
 ///   file directly; the TypeScript plugin already follows these to extract
@@ -45,7 +53,7 @@ pub(super) fn parse_tsconfig_references(root: &Path) -> Vec<PathBuf> {
 ///   `ignore_patterns` so user-excluded paths stay quiet.
 pub(super) fn parse_tsconfig_references_with_diagnostics(
     root: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
     diagnostics: &mut Vec<WorkspaceDiagnostic>,
 ) -> Vec<PathBuf> {
     let tsconfig_path = root.join("tsconfig.json");
@@ -69,6 +77,14 @@ pub(super) fn parse_tsconfig_references_with_diagnostics(
             return Vec::new();
         }
     };
+
+    for (parent_path, error) in super::tsconfig::malformed_extends_parents(&tsconfig_path, &value) {
+        diagnostics.push(WorkspaceDiagnostic::new(
+            root,
+            parent_path,
+            WorkspaceDiagnosticKind::MalformedTsconfig { error },
+        ));
+    }
 
     let Some(refs) = value.get("references").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -130,58 +146,6 @@ pub fn parse_tsconfig_root_dir(root: &Path) -> Option<String> {
         })
 }
 
-/// Strip trailing commas before `]` and `}` in JSON-like content.
-///
-/// tsconfig.json commonly uses trailing commas which are valid JSONC but not valid JSON.
-/// This strips them so `serde_json` can parse the content.
-#[cfg(test)]
-pub(super) fn strip_trailing_commas(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut result = Vec::with_capacity(len);
-    let mut in_string = false;
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
-
-        if in_string {
-            result.push(b);
-            if b == b'\\' && i + 1 < len {
-                i += 1;
-                result.push(bytes[i]);
-            } else if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' {
-            in_string = true;
-            result.push(b);
-            i += 1;
-            continue;
-        }
-
-        if b == b',' {
-            let mut j = i + 1;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < len && (bytes[j] == b']' || bytes[j] == b'}') {
-                i += 1;
-                continue;
-            }
-        }
-
-        result.push(b);
-        i += 1;
-    }
-
-    String::from_utf8(result).unwrap_or_else(|_| input.to_string())
-}
-
 /// Expand a workspace glob pattern to matching directories.
 ///
 /// Returns `(original_path, canonical_path)` tuples so callers can skip redundant
@@ -206,7 +170,7 @@ pub(super) fn expand_workspace_glob(
         pattern,
         pattern,
         canonical_root,
-        &globset::GlobSet::empty(),
+        &crate::IgnorePatternSet::empty(),
         &mut diagnostics,
     )
 }
@@ -231,7 +195,7 @@ pub(super) fn expand_workspace_glob_with_diagnostics(
     raw_pattern: &str,
     expanded_pattern: &str,
     canonical_root: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
     diagnostics: &mut Vec<WorkspaceDiagnostic>,
 ) -> Vec<(PathBuf, PathBuf)> {
     if expanded_pattern.contains("**") {
@@ -245,9 +209,8 @@ pub(super) fn expand_workspace_glob_with_diagnostics(
         );
     }
 
-    let full_pattern = root.join(expanded_pattern).to_string_lossy().to_string();
-    match glob::glob(&full_pattern) {
-        Ok(paths) => {
+    match crate::glob_validation::expand_disk_glob(root, expanded_pattern) {
+        Some(paths) => {
             let mut results = Vec::new();
             for path in paths.filter_map(Result::ok) {
                 collect_globbed_workspace_dir(
@@ -264,8 +227,8 @@ pub(super) fn expand_workspace_glob_with_diagnostics(
             }
             results
         }
-        Err(e) => {
-            tracing::warn!("invalid workspace glob pattern '{raw_pattern}': {e}");
+        None => {
+            tracing::warn!("invalid workspace glob pattern '{raw_pattern}'");
             Vec::new()
         }
     }
@@ -275,7 +238,7 @@ struct GlobbedWorkspaceContext<'a, 'b> {
     root: &'a Path,
     raw_pattern: &'a str,
     canonical_root: &'a Path,
-    ignore_patterns: &'a globset::GlobSet,
+    ignore_patterns: &'a crate::IgnorePatternSet,
     results: &'b mut Vec<(PathBuf, PathBuf)>,
     diagnostics: &'b mut Vec<WorkspaceDiagnostic>,
 }
@@ -349,7 +312,7 @@ fn collect_globbed_workspace_dir(path: PathBuf, ctx: &mut GlobbedWorkspaceContex
 fn recover_nested_packages(
     path: &Path,
     canonical_root: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
 ) -> Vec<(PathBuf, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(path) else {
         return Vec::new();
@@ -405,7 +368,7 @@ fn maybe_emit_glob_no_pkg_diag(
     root: &Path,
     raw_pattern: &str,
     path: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
     diagnostics: &mut Vec<WorkspaceDiagnostic>,
 ) {
     let leaf = path
@@ -444,7 +407,7 @@ fn expand_recursive_workspace_pattern(
     raw_pattern: &str,
     expanded_pattern: &str,
     canonical_root: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
     diagnostics: &mut Vec<WorkspaceDiagnostic>,
 ) -> Vec<(PathBuf, PathBuf)> {
     let full_pattern = root.join(expanded_pattern).to_string_lossy().to_string();
@@ -484,7 +447,7 @@ struct WorkspaceDirWalkInput<'a> {
     root: &'a Path,
     matcher: &'a glob::Pattern,
     canonical_root: &'a Path,
-    ignore_patterns: &'a globset::GlobSet,
+    ignore_patterns: &'a crate::IgnorePatternSet,
     results: &'a mut Vec<(PathBuf, PathBuf)>,
     diagnostics: &'a mut Vec<WorkspaceDiagnostic>,
 }
@@ -605,50 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_trailing_commas_basic() {
-        assert_eq!(
-            strip_trailing_commas(r#"{"a": 1, "b": 2,}"#),
-            r#"{"a": 1, "b": 2}"#
-        );
-    }
-
-    #[test]
-    fn strip_trailing_commas_array() {
-        assert_eq!(strip_trailing_commas(r"[1, 2, 3,]"), r"[1, 2, 3]");
-    }
-
-    #[test]
-    fn strip_trailing_commas_with_whitespace() {
-        assert_eq!(
-            strip_trailing_commas("{\n  \"a\": 1,\n}"),
-            "{\n  \"a\": 1\n}"
-        );
-    }
-
-    #[test]
-    fn strip_trailing_commas_preserves_strings() {
-        assert_eq!(
-            strip_trailing_commas(r#"{"a": "hello,}"}"#),
-            r#"{"a": "hello,}"}"#
-        );
-    }
-
-    #[test]
-    fn strip_trailing_commas_nested() {
-        let input = r#"{"refs": [{"path": "./a",}, {"path": "./b",},],}"#;
-        let expected = r#"{"refs": [{"path": "./a"}, {"path": "./b"}]}"#;
-        assert_eq!(strip_trailing_commas(input), expected);
-    }
-
-    #[test]
-    fn strip_trailing_commas_escaped_quotes() {
-        assert_eq!(
-            strip_trailing_commas(r#"{"a": "he\"llo,}",}"#),
-            r#"{"a": "he\"llo,}"}"#
-        );
-    }
-
-    #[test]
     fn tsconfig_references_from_dir() {
         let temp_dir = std::env::temp_dir().join("fallow-test-tsconfig-refs");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -762,7 +681,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         let refs = parse_tsconfig_references_with_diagnostics(
             &temp_dir,
-            &globset::GlobSet::empty(),
+            &crate::IgnorePatternSet::empty(),
             &mut diagnostics,
         );
 
@@ -810,7 +729,7 @@ mod tests {
         let mut diagnostics = Vec::new();
         let refs = parse_tsconfig_references_with_diagnostics(
             &temp_dir,
-            &globset::GlobSet::empty(),
+            &crate::IgnorePatternSet::empty(),
             &mut diagnostics,
         );
 
@@ -829,31 +748,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_trailing_commas_no_commas() {
-        let input = r#"{"a": 1, "b": [2, 3]}"#;
-        assert_eq!(strip_trailing_commas(input), input);
-    }
-
-    #[test]
-    fn strip_trailing_commas_empty_input() {
-        assert_eq!(strip_trailing_commas(""), "");
-    }
-
-    #[test]
-    fn strip_trailing_commas_nested_objects() {
-        let input = "{\n  \"a\": {\n    \"b\": 1,\n    \"c\": 2,\n  },\n  \"d\": 3,\n}";
-        let expected = "{\n  \"a\": {\n    \"b\": 1,\n    \"c\": 2\n  },\n  \"d\": 3\n}";
-        assert_eq!(strip_trailing_commas(input), expected);
-    }
-
-    #[test]
-    fn strip_trailing_commas_array_of_objects() {
-        let input = r#"[{"a": 1,}, {"b": 2,},]"#;
-        let expected = r#"[{"a": 1}, {"b": 2}]"#;
-        assert_eq!(strip_trailing_commas(input), expected);
-    }
-
-    #[test]
     fn tsconfig_references_malformed_json() {
         let temp_dir = std::env::temp_dir().join("fallow-test-tsconfig-malformed");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -869,6 +763,101 @@ mod tests {
         assert!(refs.is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn malformed_extends_parent_emits_malformed_tsconfig_diagnostic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": "./base.json" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("base.json"),
+            r#"{ "compilerOptions": { "baseUrl": "." "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        parse_tsconfig_references_with_diagnostics(
+            root,
+            &crate::IgnorePatternSet::empty(),
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diag = &diagnostics[0];
+        assert_eq!(
+            diag.path.file_name(),
+            Some(std::ffi::OsStr::new("base.json"))
+        );
+        assert!(
+            matches!(
+                &diag.kind,
+                WorkspaceDiagnosticKind::MalformedTsconfig { error } if !error.is_empty()
+            ),
+            "{diag:?}"
+        );
+    }
+
+    #[test]
+    fn healthy_extends_chain_emits_no_diagnostic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        std::fs::create_dir_all(root.join("configs")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": ["./configs/base", "./configs/strict.json"], }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("configs/base.json"),
+            "{ // shared\n \"extends\": \"./strict.json\", }",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("configs/strict.json"),
+            r#"{ "extends": "../tsconfig.json" }"#,
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        parse_tsconfig_references_with_diagnostics(
+            root,
+            &crate::IgnorePatternSet::empty(),
+            &mut diagnostics,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn malformed_grandparent_in_array_extends_is_reported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "extends": ["./ok.json", "./mid.json"] }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("ok.json"), "{}").unwrap();
+        std::fs::write(root.join("mid.json"), r#"{ "extends": "./bad" }"#).unwrap();
+        std::fs::write(root.join("bad.json"), "{ compilerOptions: {} }").unwrap();
+
+        let mut diagnostics = Vec::new();
+        parse_tsconfig_references_with_diagnostics(
+            root,
+            &crate::IgnorePatternSet::empty(),
+            &mut diagnostics,
+        );
+
+        let names: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|diag| diag.path.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsStr::new("bad.json")]);
     }
 
     #[test]
@@ -932,6 +921,18 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn expand_workspace_glob_star_under_a_root_with_glob_characters() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("app [1]");
+        std::fs::create_dir_all(root.join("packages/a")).unwrap();
+        std::fs::write(root.join("packages/a/package.json"), r#"{"name": "a"}"#).unwrap();
+
+        let canonical_root = dunce::canonicalize(&root).unwrap();
+        let results = expand_workspace_glob(&root, "packages/*", &canonical_root);
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
@@ -1097,20 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_trailing_commas_string_with_closing_brackets() {
-        let input = r#"{"key": "value with ] and }",}"#;
-        let expected = r#"{"key": "value with ] and }"}"#;
-        assert_eq!(strip_trailing_commas(input), expected);
-    }
-
-    #[test]
-    fn strip_trailing_commas_multiple_levels() {
-        let input = r#"{"a": {"b": [1, 2,], "c": 3,},}"#;
-        let expected = r#"{"a": {"b": [1, 2], "c": 3}}"#;
-        assert_eq!(strip_trailing_commas(input), expected);
-    }
-
-    #[test]
     fn tsconfig_root_dir_with_trailing_commas() {
         let temp_dir = std::env::temp_dir().join("fallow-test-rootdir-trailing-comma");
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1257,7 +1244,7 @@ mod tests {
         let canonical_root = dunce::canonicalize(&temp_dir).unwrap();
         let mut builder = globset::GlobSetBuilder::new();
         builder.add(globset::Glob::new("packages/themes/my-theme").unwrap());
-        let ignore = builder.build().unwrap();
+        let ignore = crate::IgnorePatternSet::from(builder.build().unwrap());
         let mut diagnostics = Vec::new();
         let results = expand_workspace_glob_with_diagnostics(
             &temp_dir,

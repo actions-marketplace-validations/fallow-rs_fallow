@@ -61,9 +61,12 @@ pub fn run_suppressions(opts: &SuppressionsOptions<'_>) -> ExitCode {
     };
 
     let mut active = results.active_suppressions;
-    if let Err(code) = apply_suppression_scopes(&mut active, opts) {
+    if let Err(code) =
+        apply_suppression_scopes(&mut active, opts, &session.config().workspace_patterns)
+    {
         return code;
     }
+    crate::requests::measure_changed_since_scope(session.files());
     crate::telemetry::note_result_count(active.len());
 
     let output = build_suppression_inventory_output(SuppressionInventoryOutputInput {
@@ -72,6 +75,10 @@ pub fn run_suppressions(opts: &SuppressionsOptions<'_>) -> ExitCode {
         // findings are safe to pass unscoped.
         stale: &results.stale_suppressions,
         root: &session.config().root,
+        // The `changed-since` channel only: `init_cli_diff_filter` runs before
+        // dispatch for every command, so the broader reader would publish an
+        // applied `diff-filter` this command never consulted.
+        request_outcomes: crate::requests::changed_since_request_outcomes(),
     });
 
     let elapsed = start.elapsed();
@@ -116,9 +123,13 @@ fn load_suppressions_config(opts: &SuppressionsOptions<'_>) -> Result<ResolvedCo
 fn apply_suppression_scopes(
     active: &mut Vec<ActiveSuppression>,
     opts: &SuppressionsOptions<'_>,
+    workspace_patterns: &[String],
 ) -> Result<(), ExitCode> {
+    // The recording resolver, for the same reason `fallow flags` uses it: an
+    // unresolvable ref widens this inventory to the whole project, and only the
+    // envelope survives `--quiet` (issue #2734).
     if let Some(git_ref) = opts.changed_since
-        && let Some(changed) = crate::check::get_changed_files(opts.root, git_ref)
+        && let Some(changed) = crate::requests::resolve_changed_since(opts.root, git_ref)
     {
         active.retain(|s| changed.contains(&s.path));
     }
@@ -127,6 +138,7 @@ fn apply_suppression_scopes(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
+        workspace_patterns,
         opts.output,
     )?;
     if let Some(ref ws_roots) = ws_scope {
@@ -288,7 +300,6 @@ fn print_suppressions_json(
 ) {
     let value = serialize_suppression_inventory_json_output(
         output,
-        crate::output_runtime::current_root_envelope_mode(),
         crate::output_runtime::telemetry_analysis_run_id().as_deref(),
     )
     .expect("JSON serialization should not fail");
@@ -309,7 +320,10 @@ mod tests {
     const NO_CONFIG: Option<PathBuf> = None;
 
     fn fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/suppression-reasons")
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../tests/fixtures/suppression-reasons")
     }
 
     fn suppressions_opts(root: &Path, output: OutputFormat) -> SuppressionsOptions<'_> {

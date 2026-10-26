@@ -2,7 +2,9 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use super::{MAX_FLAT_ITEMS, format_path, health::format_window, relative_path, thousands};
+use super::{MAX_FLAT_ITEMS, format_path, health::format_window, thousands};
+use crate::health::optimization_target::MIN_COGNITIVE_COST;
+use crate::report::format_display_path;
 
 pub(super) fn render_runtime_coverage(
     lines: &mut Vec<String>,
@@ -82,16 +84,12 @@ fn render_runtime_findings(
 ) {
     let shown_findings = production.findings.len().min(MAX_FLAT_ITEMS);
     for finding in &production.findings[..shown_findings] {
-        let relative = format_path(&relative_path(&finding.path, root).display().to_string());
-        let invocations = finding.invocations.map_or_else(
-            || "untracked".to_owned(),
-            |hits| format!("{hits} invocations"),
-        );
+        let relative = format_path(&format_display_path(&finding.path, root));
         lines.push(format!(
             "  {relative}:{} {} [{}, {}]",
             finding.line,
             finding.function,
-            invocations,
+            invocations_label(finding.invocations),
             finding.verdict.human_label(),
         ));
     }
@@ -103,6 +101,14 @@ fn render_runtime_findings(
     }
 }
 
+fn invocations_label(invocations: Option<u64>) -> String {
+    match invocations {
+        None => "untracked".to_owned(),
+        Some(1) => "1 invocation".to_owned(),
+        Some(hits) => format!("{hits} invocations"),
+    }
+}
+
 fn render_runtime_hot_paths(
     lines: &mut Vec<String>,
     production: &fallow_output::RuntimeCoverageReport,
@@ -111,15 +117,33 @@ fn render_runtime_hot_paths(
     if !production.hot_paths.is_empty() {
         lines.push("  hot paths:".to_owned());
         for entry in production.hot_paths.iter().take(5) {
-            let relative = format_path(&relative_path(&entry.path, root).display().to_string());
+            let relative = format_path(&format_display_path(&entry.path, root));
             lines.push(format!(
-                "    {relative}:{} {} ({} invocations, p{})",
+                "    {relative}:{} {} ({} invocations, p{}{})",
                 entry.line,
                 entry.function,
                 thousands(entry.invocations as usize),
                 entry.percentile,
+                optimization_cost_suffix(entry.optimization_target.as_ref()),
             ));
         }
+    }
+}
+
+fn optimization_cost_suffix(
+    target: Option<&fallow_output::RuntimeCoverageOptimizationTarget>,
+) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+    let score = thousands(usize::try_from(target.cost_score).unwrap_or(usize::MAX));
+    match target.inner_iterations_per_call {
+        Some(ratio) => format!(", cost {score} at {ratio:.2} iterations/call"),
+        None if target.cognitive < MIN_COGNITIVE_COST => format!(
+            ", cost {score} at cognitive {} (counted as {MIN_COGNITIVE_COST})",
+            target.cognitive
+        ),
+        None => format!(", cost {score} at cognitive {}", target.cognitive),
     }
 }
 
@@ -190,4 +214,67 @@ fn render_upgrade_prompt(
     lines.push(
         "  start a trial: `fallow license activate --trial --email you@company.com`".to_owned(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use fallow_output::{RuntimeCoverageCostBasis, RuntimeCoverageOptimizationTarget};
+
+    use super::{invocations_label, optimization_cost_suffix};
+
+    fn target(
+        cost_score: u64,
+        cost_basis: RuntimeCoverageCostBasis,
+        inner_iterations_per_call: Option<f64>,
+    ) -> RuntimeCoverageOptimizationTarget {
+        RuntimeCoverageOptimizationTarget {
+            cost_score,
+            cost_basis,
+            cognitive: 7,
+            cyclomatic: 5,
+            line_count: 15,
+            inner_iterations_per_call,
+        }
+    }
+
+    #[test]
+    fn hot_path_line_shows_measured_cost() {
+        let target = target(3_600, RuntimeCoverageCostBasis::InnerIterations, Some(3.0));
+        assert_eq!(
+            optimization_cost_suffix(Some(&target)),
+            ", cost 3,600 at 3.00 iterations/call"
+        );
+    }
+
+    #[test]
+    fn hot_path_line_shows_static_cost_without_block_counts() {
+        let target = target(1_050, RuntimeCoverageCostBasis::Cognitive, None);
+        assert_eq!(
+            optimization_cost_suffix(Some(&target)),
+            ", cost 1,050 at cognitive 7"
+        );
+    }
+
+    #[test]
+    fn hot_path_line_names_the_minimum_cognitive_cost() {
+        let mut target = target(600, RuntimeCoverageCostBasis::Cognitive, None);
+        target.cognitive = 0;
+        assert_eq!(
+            optimization_cost_suffix(Some(&target)),
+            ", cost 600 at cognitive 0 (counted as 1)"
+        );
+    }
+
+    #[test]
+    fn hot_path_line_is_unchanged_without_a_target() {
+        assert_eq!(optimization_cost_suffix(None), "");
+    }
+
+    #[test]
+    fn invocations_label_matches_the_count() {
+        assert_eq!(invocations_label(None), "untracked");
+        assert_eq!(invocations_label(Some(0)), "0 invocations");
+        assert_eq!(invocations_label(Some(1)), "1 invocation");
+        assert_eq!(invocations_label(Some(2)), "2 invocations");
+    }
 }

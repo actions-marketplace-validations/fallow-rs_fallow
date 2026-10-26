@@ -3,7 +3,7 @@ use std::path::Path;
 use fallow_types::discover::FileId;
 use fallow_types::extract::ModuleInfo;
 
-use crate::parse::parse_source_to_module;
+use crate::parse_source_to_module;
 
 fn parse_sfc(source: &str, filename: &str) -> ModuleInfo {
     parse_source_to_module(FileId(0), Path::new(filename), source, 0, false)
@@ -2362,5 +2362,49 @@ export class UserS {
         }),
         "the typed-property fact should survive the SFC merge, found: {:?}",
         info.semantic_facts
+    );
+}
+
+#[test]
+fn vue_script_setup_top_level_await_import_stays_lazy() {
+    let source = r#"
+<script>
+const { a } = await import("./module-level");
+</script>
+<script setup>
+const { b } = await import("./setup-level");
+</script>
+"#;
+    let info = parse_sfc(source, "Lazy.vue");
+    assert_eq!(
+        crate::tests::eager_dynamic_import_sources(&info),
+        ["./module-level"]
+    );
+    assert!(
+        info.dynamic_imports
+            .iter()
+            .any(|import| import.source == "./setup-level")
+    );
+}
+
+#[test]
+fn svelte_instance_top_level_await_import_stays_lazy() {
+    let source = r#"
+<script module>
+const { a } = await import("./module-level");
+</script>
+<script>
+const { b } = await import("./instance-level");
+</script>
+"#;
+    let info = parse_sfc(source, "Lazy.svelte");
+    assert_eq!(
+        crate::tests::eager_dynamic_import_sources(&info),
+        ["./module-level"]
+    );
+    assert!(
+        info.dynamic_imports
+            .iter()
+            .any(|import| import.source == "./instance-level")
     );
 }

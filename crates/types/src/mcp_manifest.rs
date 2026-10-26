@@ -57,9 +57,17 @@ pub struct McpToolInfo {
     pub license: McpToolLicense,
     /// Free/paid nuance; populated exactly when `license` is `Freemium`.
     pub license_note: Option<&'static str>,
-    /// Whether the tool leaves the project untouched (only `fix_apply`
-    /// mutates files).
+    /// Whether the tool leaves the project untouched. `fix_apply` changes
+    /// source files. `analyze`, `check_changed`, `find_dupes` and
+    /// `check_health` write a baseline, regression baseline or snapshot file
+    /// when the caller asks for one.
     pub read_only: bool,
+    /// camelCase host-API alias when the tool is reachable from Code Mode
+    /// (`code_execute`), `None` when it is not. This field is the single
+    /// source of truth for the Code Mode allowlist: `crates/mcp` builds its
+    /// sandbox bindings from it and drift tests there bind it to the
+    /// `CodeModeTool` enum in both directions.
+    pub code_mode_alias: Option<&'static str>,
 }
 
 impl McpToolInfo {
@@ -76,13 +84,43 @@ impl McpToolInfo {
             "license": self.license.as_str(),
             "license_note": self.license_note,
             "read_only": self.read_only,
+            "code_mode_alias": self.code_mode_alias,
         })
     }
+}
+
+/// Code Mode host-API helpers that have no standalone MCP tool of their own,
+/// as `(camelCase alias, wire tool name)` pairs.
+///
+/// `combined` runs dead-code, complexity, and duplication in one in-process
+/// call and exists only inside the sandbox, so it cannot ride on an
+/// [`McpToolInfo`] row: the tool router never registers it.
+pub const CODE_MODE_ONLY_TOOLS: &[(&str, &str)] = &[("combined", "combined")];
+
+/// Every `(camelCase host alias, wire tool name)` pair the Code Mode sandbox
+/// exposes, in [`MCP_TOOLS`] registration order followed by
+/// [`CODE_MODE_ONLY_TOOLS`].
+///
+/// Similar-code and the mutating fix tools are deliberately absent: Code Mode
+/// caps execution at 30 seconds, which cannot satisfy the similar-code
+/// contract, and the sandbox is read-only.
+#[must_use]
+pub fn code_mode_allowlist() -> Vec<(&'static str, &'static str)> {
+    MCP_TOOLS
+        .iter()
+        .filter_map(|tool| tool.code_mode_alias.map(|alias| (alias, tool.name)))
+        .chain(CODE_MODE_ONLY_TOOLS.iter().copied())
+        .collect()
 }
 
 /// Free/paid nuance attached to runtime-coverage capabilities. Shared with
 /// the `fallow schema` issue-type rows so the wording cannot drift.
 pub const RUNTIME_COVERAGE_LICENSE_NOTE: &str = "A single local runtime-coverage capture is free; continuous or multi-capture runtime monitoring requires an active license (fallow license activate).";
+
+/// Free/paid nuance for the cloud runtime-coverage pull. Distinct from
+/// [`RUNTIME_COVERAGE_LICENSE_NOTE`]: nothing local gates this one, the fallow
+/// cloud account behind the API key does.
+pub const CLOUD_RUNTIME_COVERAGE_LICENSE_NOTE: &str = "Reading runtime coverage from Fallow Cloud needs a FALLOW_API_KEY for an org on the Team tier; the cloud refuses the request otherwise. No local license is involved.";
 
 /// All tools exposed by the fallow MCP server, in registration order.
 pub const MCP_TOOLS: &[McpToolInfo] = &[
@@ -95,11 +133,12 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "analyze",
         kind: "analysis",
-        description: "Full dead-code analysis: unused files, exports, types, dependencies, circular dependencies, and boundary violations",
+        description: "Full dead-code analysis: unused files, exports, types, dependencies, circular dependencies, and boundary violations, each with a stable finding_id",
         cli_command: Some("fallow dead-code --format json --quiet"),
         key_params: &[
             "issue_types",
@@ -111,17 +150,37 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         ],
         license: McpToolLicense::Free,
         license_note: None,
-        read_only: true,
+        read_only: false,
+        code_mode_alias: Some("analyze"),
     },
     McpToolInfo {
         name: "check_changed",
         kind: "analysis",
-        description: "Incremental dead-code analysis scoped to files changed since a git ref (ideal for PR review)",
+        description: "Incremental dead-code analysis scoped to files changed since a git ref (ideal for PR review); findings keep their finding_id",
         cli_command: Some("fallow dead-code --changed-since <ref> --format json --quiet"),
         key_params: &["since", "baseline", "fail_on_regression"],
         license: McpToolLicense::Free,
         license_note: None,
+        read_only: false,
+        code_mode_alias: Some("checkChanged"),
+    },
+    McpToolInfo {
+        name: "check_architecture",
+        kind: "analysis",
+        description: "Architecture check: import cycles, boundary violations, and rule-pack policy violations in the `architecture` envelope, each with a stable finding_id",
+        cli_command: Some("fallow architecture --format json --quiet"),
+        key_params: &[
+            "cycles",
+            "boundaries",
+            "policy",
+            "baseline",
+            "group_by",
+            "file",
+        ],
+        license: McpToolLicense::Free,
+        license_note: None,
         read_only: true,
+        code_mode_alias: Some("checkArchitecture"),
     },
     McpToolInfo {
         name: "security_candidates",
@@ -132,6 +191,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("securityCandidates"),
     },
     McpToolInfo {
         name: "find_similar_code",
@@ -142,6 +202,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "inspect_similar_code",
@@ -154,6 +215,31 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "mutation_plan",
+        kind: "analysis",
+        description: "Static mutation plan for changed code: mutant ids, operators, dispositions, and static test files; runs no tests",
+        cli_command: Some("fallow mutation --plan --format json --quiet"),
+        key_params: &["changed_since", "all", "paths", "max_mutants", "operators"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "mutation_inspect",
+        kind: "trace",
+        description: "Inspect one mutant of a saved mutation report (default: the last run report), with a stale status when its source changed; runs no tests",
+        cli_command: Some(
+            "fallow mutation inspect <mutant-id> [--report <report.json>] --format json --quiet",
+        ),
+        key_params: &["mutant_id", "report"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "inspect_target",
@@ -164,6 +250,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "guard",
@@ -174,6 +261,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "find_dupes",
@@ -190,7 +278,8 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         ],
         license: McpToolLicense::Free,
         license_note: None,
-        read_only: true,
+        read_only: false,
+        code_mode_alias: Some("findDupes"),
     },
     McpToolInfo {
         name: "check_health",
@@ -210,7 +299,8 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         ],
         license: McpToolLicense::Free,
         license_note: None,
-        read_only: true,
+        read_only: false,
+        code_mode_alias: Some("checkHealth"),
     },
     McpToolInfo {
         name: "check_runtime_coverage",
@@ -227,6 +317,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Freemium,
         license_note: Some(RUNTIME_COVERAGE_LICENSE_NOTE),
         read_only: true,
+        code_mode_alias: Some("checkRuntimeCoverage"),
     },
     McpToolInfo {
         name: "get_hot_paths",
@@ -237,6 +328,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Freemium,
         license_note: Some(RUNTIME_COVERAGE_LICENSE_NOTE),
         read_only: true,
+        code_mode_alias: Some("getHotPaths"),
     },
     McpToolInfo {
         name: "get_blast_radius",
@@ -247,6 +339,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Freemium,
         license_note: Some(RUNTIME_COVERAGE_LICENSE_NOTE),
         read_only: true,
+        code_mode_alias: Some("getBlastRadius"),
     },
     McpToolInfo {
         name: "get_importance",
@@ -257,6 +350,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Freemium,
         license_note: Some(RUNTIME_COVERAGE_LICENSE_NOTE),
         read_only: true,
+        code_mode_alias: Some("getImportance"),
     },
     McpToolInfo {
         name: "get_cleanup_candidates",
@@ -267,6 +361,46 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Freemium,
         license_note: Some(RUNTIME_COVERAGE_LICENSE_NOTE),
         read_only: true,
+        code_mode_alias: Some("getCleanupCandidates"),
+    },
+    McpToolInfo {
+        name: "get_cloud_runtime_context",
+        kind: "runtime-coverage",
+        description: "Runtime coverage pulled from Fallow Cloud for a repository, merged into the same runtime_coverage block the local runtime-coverage tools return",
+        cli_command: Some(
+            "fallow coverage analyze --cloud --repo <owner/repo> --format json --quiet",
+        ),
+        key_params: &["repo", "period_days", "environment", "commit_sha", "top"],
+        license: McpToolLicense::Freemium,
+        license_note: Some(CLOUD_RUNTIME_COVERAGE_LICENSE_NOTE),
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "get_cloud_review_packet",
+        kind: "runtime-coverage",
+        description: "Production facts of a few changed files or functions, read from fallow cloud without the full runtime-context pull",
+        cli_command: Some(
+            "fallow coverage review-packet --repo <owner/repo> --file <path> --format json --quiet",
+        ),
+        key_params: &["repo", "files", "functions", "period_days", "project_id"],
+        license: McpToolLicense::Freemium,
+        license_note: Some(CLOUD_RUNTIME_COVERAGE_LICENSE_NOTE),
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "get_cloud_deployment_changes",
+        kind: "runtime-coverage",
+        description: "How production behavior changed between two deployments, read from the fallow cloud change report",
+        cli_command: Some(
+            "fallow coverage deployment-changes --repo <owner/repo> --sha <sha> --format json --quiet",
+        ),
+        key_params: &["repo", "sha", "base", "change"],
+        license: McpToolLicense::Freemium,
+        license_note: Some(CLOUD_RUNTIME_COVERAGE_LICENSE_NOTE),
+        read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "get_token_blast_radius",
@@ -277,15 +411,17 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "audit",
         kind: "analysis",
-        description: "Combined dead-code, complexity, duplication, and styling audit for changed files with a pass/warn/fail verdict",
+        description: "Combined dead-code, complexity, duplication, styling, and diff-risk audit for changed files with a pass/warn/fail verdict. The diff-risk rules are weakened-tests, added-suppression, test-only-branch, diverged-clone-sibling, and added-dependency",
         cli_command: Some("fallow audit --format json --quiet"),
         key_params: &[
             "gate",
             "base",
+            "skip",
             "css_deep",
             "max_crap",
             "coverage",
@@ -294,6 +430,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("audit"),
     },
     McpToolInfo {
         name: "decision_surface",
@@ -304,6 +441,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "fallow_explain",
@@ -314,6 +452,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("explain"),
     },
     McpToolInfo {
         name: "fix_preview",
@@ -324,6 +463,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "fix_apply",
@@ -334,6 +474,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: false,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "project_info",
@@ -344,6 +485,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("projectInfo"),
     },
     McpToolInfo {
         name: "recommend",
@@ -354,6 +496,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "list_boundaries",
@@ -364,6 +507,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("listBoundaries"),
     },
     McpToolInfo {
         name: "feature_flags",
@@ -377,6 +521,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("featureFlags"),
     },
     McpToolInfo {
         name: "list_suppressions",
@@ -387,6 +532,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "impact",
@@ -397,6 +543,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("impact"),
     },
     McpToolInfo {
         name: "impact_all",
@@ -407,6 +554,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "trace_export",
@@ -417,6 +565,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("traceExport"),
     },
     McpToolInfo {
         name: "trace_symbol",
@@ -434,6 +583,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "symbol_impact",
@@ -453,6 +603,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "trace_file",
@@ -463,6 +614,29 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("traceFile"),
+    },
+    McpToolInfo {
+        name: "trace_import_path",
+        kind: "trace",
+        description: "Trace the shortest import path between two modules, hop by hop",
+        cli_command: Some("fallow trace --path <from> <to> --format json --quiet"),
+        key_params: &["from", "to"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "trace_error",
+        kind: "trace",
+        description: "Resolve a runtime stack trace's frames against the project graph",
+        cli_command: Some("fallow trace-error - --format json --quiet"),
+        key_params: &["trace"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
     },
     McpToolInfo {
         name: "impact_closure",
@@ -473,16 +647,18 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("impactClosure"),
     },
     McpToolInfo {
         name: "trace_dependency",
         kind: "trace",
-        description: "Trace where a dependency is imported and whether scripts or CI use it",
+        description: "Trace where a dependency is imported, whether scripts or CI use it, and how the code uses each imported name",
         cli_command: Some("fallow dead-code --trace-dependency <package> --format json --quiet"),
-        key_params: &["package_name"],
+        key_params: &["package_name", "specifiers", "sites", "limit", "cursor"],
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("traceDependency"),
     },
     McpToolInfo {
         name: "trace_clone",
@@ -493,6 +669,7 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         license: McpToolLicense::Free,
         license_note: None,
         read_only: true,
+        code_mode_alias: Some("traceClone"),
     },
 ];
 
@@ -549,6 +726,11 @@ pub const MCP_RESOURCE_SCHEME: &str = "fallow://";
 
 /// RFC 6570 template of the per-issue-type explain resource.
 pub const MCP_EXPLAIN_RESOURCE_TEMPLATE: &str = "fallow://explain/{issue_type}";
+
+/// RFC 6570 template of the per-tool long-form guide. Distinct from the
+/// `fallow://tools` catalogue: that resource stays one terse line per tool,
+/// this template carries the per-flag detail kept out of `tools/list`.
+pub const MCP_TOOL_GUIDE_RESOURCE_TEMPLATE: &str = "fallow://tools/{name}";
 
 /// All resources exposed by the fallow MCP server, in catalogue order.
 /// Concrete resources first, templates last; `resources/list` and
@@ -611,6 +793,22 @@ pub const MCP_RESOURCES: &[McpResourceInfo] = &[
         template: false,
     },
     McpResourceInfo {
+        uri: "fallow://schema/similar-code-snapshot",
+        name: "schema-similar-code-snapshot",
+        title: "Similar-code snapshot JSON Schema",
+        description: "JSON Schema of the inspect_similar_code `snapshot` object: the bounded candidate handoff find_similar_code returns, passed back unchanged",
+        mime_type: "application/json",
+        template: false,
+    },
+    McpResourceInfo {
+        uri: MCP_TOOL_GUIDE_RESOURCE_TEMPLATE,
+        name: "tool-guide",
+        title: "Long-form guide for one tool",
+        description: "Per-flag detail for one MCP tool (payload shapes, unit vocabularies, suppression placements) kept out of its tools/list description; name is the wire tool name. Not every tool has a guide",
+        mime_type: "application/json",
+        template: true,
+    },
+    McpResourceInfo {
         uri: MCP_EXPLAIN_RESOURCE_TEMPLATE,
         name: "explain-issue-type",
         title: "Explain one issue type",
@@ -661,9 +859,9 @@ pub struct CapabilityParityRow {
 /// (api runner / napi export / MCP tool) exposes each fallow capability, and why
 /// a surface is deliberately absent.
 ///
-/// Four capabilities are first-class on all three surfaces (dead-code,
-/// duplication, similar-code, and feature-flags). The napi addon ships a
-/// deliberately narrow set of eight whole-project analysis primitives and has NO
+/// Five capabilities are first-class on all three surfaces (dead-code,
+/// duplication, similar-code, feature-flags, and architecture). The napi addon
+/// ships a deliberately narrow set of nine whole-project analysis primitives and has NO
 /// fix, trace, impact, audit, or introspection surface; the MCP server is the
 /// broad agent surface and folds several api/napi primitives (circular deps,
 /// boundary violations, complexity, health-runner) into `analyze` / `check_health`
@@ -696,6 +894,13 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
         api_runner: Some("run_feature_flags"),
         napi_export: Some("detectFeatureFlags"),
         mcp_tool: Some("feature_flags"),
+        omission_note: None,
+    },
+    CapabilityParityRow {
+        capability: "architecture (cycles, boundaries, policy)",
+        api_runner: Some("run_architecture"),
+        napi_export: Some("detectArchitecture"),
+        mcp_tool: Some("check_architecture"),
         omission_note: None,
     },
     // -- api + napi, folded into a broader MCP tool (no dedicated MCP tool). --
@@ -735,7 +940,7 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
             "Runner-injected health entry point that napi's computeHealth binds. The MCP surface for health is `check_health`, which uses the run_health convenience wrapper; same capability, different entry point.",
         ),
     },
-    // -- MCP tool + api runner, no napi export (addon ships only the eight
+    // -- MCP tool + api runner, no napi export (addon ships only the nine
     //    whole-project primitives). --
     CapabilityParityRow {
         capability: "health / hotspots",
@@ -744,6 +949,15 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
         mcp_tool: Some("check_health"),
         omission_note: Some(
             "napi exposes health through computeHealth, which binds the runner-injected run_health_with_runner variant (its own row); this row is the MCP `check_health` tool plus the run_health convenience wrapper.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "dead-code baseline",
+        api_runner: Some("run_dead_code_with_baseline"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Dead-code analysis that hides the findings of a saved dead-code baseline, read by the same engine function as `fallow dead-code --baseline`. No napi export. The MCP `analyze` tool takes a baseline through its CLI fallback, so it has no dedicated tool.",
         ),
     },
     CapabilityParityRow {
@@ -828,6 +1042,24 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
         ),
     },
     CapabilityParityRow {
+        capability: "shortest import path",
+        api_runner: Some("run_trace_import_path"),
+        napi_export: None,
+        mcp_tool: Some("trace_import_path"),
+        omission_note: Some(
+            "Shortest import path between two modules. No napi export; the trace family is CLI, MCP, and api only.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "stack-trace frame resolution",
+        api_runner: Some("run_trace_error"),
+        napi_export: None,
+        mcp_tool: Some("trace_error"),
+        omission_note: Some(
+            "Runtime stack-trace frame resolution. No napi export; the trace family is CLI, MCP, and api only.",
+        ),
+    },
+    CapabilityParityRow {
         capability: "dependency usage trace",
         api_runner: Some("run_trace_dependency"),
         napi_export: None,
@@ -853,6 +1085,60 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
         mcp_tool: None,
         omission_note: Some(
             "api-only: the bare `fallow` combined report (dead-code + dupes + health). No napi export and no MCP tool; agents compose the three primitives (analyze / find_dupes / check_health) instead.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "project readiness doctor",
+        api_runner: Some("run_doctor"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Read-only project readiness is available through the CLI and Rust api. The initial contract has no napi export or dedicated MCP tool; agents can invoke `fallow doctor --format json --quiet` as a subprocess.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "readiness with explicit cache directory",
+        api_runner: Some("run_doctor_with_cache_dir"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Rust api variant for hosts that supply an explicit cache directory. The value wins over FALLOW_CACHE_DIR and cache.dir, and run_doctor already honors FALLOW_CACHE_DIR. No napi export or dedicated MCP tool.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation testing",
+        api_runner: Some("run_mutation"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Mutation testing runs the project's own tests, so it is available through the CLI (`fallow mutation`) and the Rust api only. A test run is a host permission decision: no napi export, and no MCP run tool in version 1. The read-only plan and inspect halves are the mutation_plan and mutation_inspect MCP tools.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation testing with progress events",
+        api_runner: Some("run_mutation_with_progress"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Rust api variant of run_mutation that sends MutationProgress phase events to a caller sink, for the progress lines of `fallow mutation`. It runs the project's own tests, so it has the same omissions as run_mutation: no napi export and no MCP run tool.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation plan",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("mutation_plan"),
+        omission_note: Some(
+            "Static mutation plan that runs no tests. MCP calls fallow_api::plan_mutation in process; plan_mutation is not a run_* runner, and the napi addon has no mutation surface in version 1.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation inspection",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("mutation_inspect"),
+        omission_note: Some(
+            "One mutant of a saved mutation report, with a stale status when the source changed. MCP shells out to `fallow mutation inspect`; no run_* API runner and no napi export.",
         ),
     },
     // -- MCP-only tools that shell out to the CLI: no api runner, no napi
@@ -909,6 +1195,33 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
         mcp_tool: Some("check_runtime_coverage"),
         omission_note: Some(
             "Runtime-coverage merge into health. MCP shells out to `fallow health --runtime-coverage`; no dedicated run_* runner (run_health covers base health) and no napi export.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "cloud runtime context",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("get_cloud_runtime_context"),
+        omission_note: Some(
+            "Runtime coverage read from Fallow Cloud. MCP shells out to `fallow coverage analyze --cloud`; no dedicated run_* runner and no napi export, and the pull is the CLI's only networked coverage path.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "cloud review packet",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("get_cloud_review_packet"),
+        omission_note: Some(
+            "Production facts of changed code read from fallow cloud. MCP shells out to `fallow coverage review-packet`; no dedicated run_* runner and no napi export, because the read is a network call with no local analysis.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "cloud deployment changes",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("get_cloud_deployment_changes"),
+        omission_note: Some(
+            "The fallow cloud deployment change report. MCP shells out to `fallow coverage deployment-changes`; no dedicated run_* runner and no napi export, because the read is a network call with no local analysis.",
         ),
     },
     CapabilityParityRow {
@@ -1094,9 +1407,16 @@ mod tests {
             MCP_RESOURCES[first_template..].iter().all(|r| r.template),
             "templates must trail the concrete resources so list order stays deterministic"
         );
+        let templates: Vec<&str> = MCP_RESOURCES[first_template..]
+            .iter()
+            .map(|r| r.uri)
+            .collect();
         assert_eq!(
-            MCP_RESOURCES[first_template].uri,
-            MCP_EXPLAIN_RESOURCE_TEMPLATE
+            templates,
+            [
+                MCP_TOOL_GUIDE_RESOURCE_TEMPLATE,
+                MCP_EXPLAIN_RESOURCE_TEMPLATE
+            ]
         );
     }
 
@@ -1115,6 +1435,9 @@ mod tests {
                 "get_blast_radius",
                 "get_importance",
                 "get_cleanup_candidates",
+                "get_cloud_runtime_context",
+                "get_cloud_review_packet",
+                "get_cloud_deployment_changes",
             ],
             "freemium marking must cover exactly the runtime-coverage family"
         );
@@ -1154,15 +1477,108 @@ mod tests {
     }
 
     #[test]
-    fn only_fix_apply_mutates() {
+    fn only_fix_apply_and_the_file_writing_tools_are_not_read_only() {
+        let writers = [
+            "fix_apply",
+            "analyze",
+            "check_changed",
+            "find_dupes",
+            "check_health",
+        ];
         for tool in MCP_TOOLS {
             assert_eq!(
                 tool.read_only,
-                tool.name != "fix_apply",
+                !writers.contains(&tool.name),
                 "read_only flag wrong for {}",
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn code_mode_aliases_are_unique_and_camel_case() {
+        use std::collections::BTreeSet;
+
+        let allowlist = code_mode_allowlist();
+        let aliases: BTreeSet<&str> = allowlist.iter().map(|(alias, _)| *alias).collect();
+        let tools: BTreeSet<&str> = allowlist.iter().map(|(_, tool)| *tool).collect();
+        assert_eq!(
+            aliases.len(),
+            allowlist.len(),
+            "two Code Mode tools claim the same host-API alias"
+        );
+        assert_eq!(
+            tools.len(),
+            allowlist.len(),
+            "a wire tool name appears twice in the Code Mode allowlist"
+        );
+
+        for (alias, tool) in &allowlist {
+            assert!(
+                !alias.is_empty(),
+                "tool {tool} has an empty Code Mode alias"
+            );
+            assert!(
+                !alias.contains('_') && alias.starts_with(|c: char| c.is_ascii_lowercase()),
+                "Code Mode alias {alias} must be camelCase, matching the sandbox host API"
+            );
+        }
+    }
+
+    /// Code Mode's exclusions are routing decisions, not omissions: the
+    /// sandbox is read-only and capped at 30 seconds, so fix tools,
+    /// similar-code and mutation must stay off the allowlist, and the
+    /// meta-tool cannot call itself.
+    #[test]
+    fn code_mode_excludes_fix_similar_code_mutation_and_the_meta_tool() {
+        for name in [
+            "code_execute",
+            "fix_preview",
+            "fix_apply",
+            "find_similar_code",
+            "inspect_similar_code",
+            "mutation_plan",
+            "mutation_inspect",
+        ] {
+            let tool = MCP_TOOLS
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist in MCP_TOOLS"));
+            assert!(
+                tool.code_mode_alias.is_none(),
+                "{name} must stay off the Code Mode allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn code_mode_only_tools_are_not_registered_mcp_tools() {
+        for (alias, tool) in CODE_MODE_ONLY_TOOLS {
+            assert!(
+                !MCP_TOOLS.iter().any(|entry| entry.name == *tool),
+                "{tool} is a registered MCP tool; give it a code_mode_alias instead of listing \
+                 it as a Code Mode-only helper"
+            );
+            assert!(!alias.is_empty(), "{tool} has an empty Code Mode alias");
+        }
+    }
+
+    #[test]
+    fn mutation_inspect_marks_the_report_as_optional() {
+        let tool = MCP_TOOLS
+            .iter()
+            .find(|t| t.name == "mutation_inspect")
+            .expect("mutation_inspect row");
+        let cli_command = tool.cli_command.expect("mutation_inspect CLI analogue");
+        assert!(
+            cli_command.contains("[--report <report.json>]"),
+            "without --report the CLI reads the last run report, so the row must show it as optional: {cli_command}"
+        );
+        assert!(
+            tool.description.contains("last run report"),
+            "the description must name the last run default: {}",
+            tool.description
+        );
     }
 
     #[test]
@@ -1277,7 +1693,8 @@ mod tests {
                 "dead-code analysis",
                 "code duplication",
                 "semantic similar-code discovery",
-                "feature-flag detection"
+                "feature-flag detection",
+                "architecture (cycles, boundaries, policy)"
             ],
             "the set of capabilities exposed on all three surfaces changed; update the parity \
              narrative and confirm the new alignment is intended"

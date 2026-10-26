@@ -5,17 +5,15 @@
 
 use std::fmt;
 
+use fallow_types::cloud::{CloudCommand, cloud_api_key_missing_message};
 use serde::Deserialize;
 
+use super::cloud_transport::{self, CloudAuth, CloudBody, CloudHttpFailure, CloudOutcome};
 use super::upload_common::url_encode_path_segment;
-use crate::api::{
-    NETWORK_EXIT_CODE, api_url, parse_error_envelope, sanitize_network_error,
-    try_api_agent_with_timeout,
-};
+use crate::api::{NETWORK_EXIT_CODE, api_url};
 
-const CLOUD_CONNECT_TIMEOUT_SECS: u64 = 5;
-const CLOUD_TOTAL_TIMEOUT_SECS: u64 = 30;
 const RUNTIME_CONTEXT_FORMAT: &str = "fallow-cloud-runtime-v1";
+const RUNTIME_CONTEXT_OPERATION: &str = "runtime-context";
 
 #[derive(Clone)]
 pub struct CloudRequest {
@@ -26,6 +24,8 @@ pub struct CloudRequest {
     pub period_days: u16,
     pub environment: Option<String>,
     pub commit_sha: Option<String>,
+    /// Allowlisted `x-fallow-agent-source` value, or `None` for no header.
+    pub agent_source: Option<String>,
 }
 
 impl fmt::Debug for CloudRequest {
@@ -38,6 +38,7 @@ impl fmt::Debug for CloudRequest {
             .field("period_days", &self.period_days)
             .field("environment", &self.environment)
             .field("commit_sha", &self.commit_sha)
+            .field("agent_source", &self.agent_source)
             .finish()
     }
 }
@@ -103,6 +104,10 @@ pub struct CloudRuntimeContext {
     pub provenance: Option<CloudRuntimeProvenance>,
     #[serde(default)]
     pub window: CloudRuntimeWindow,
+    /// Real evidence span of the current deployment. `None` for an older
+    /// cloud; `window` stays the nominal requested period.
+    #[serde(default)]
+    pub evidence_window: Option<CloudEvidenceWindow>,
     pub summary: CloudRuntimeSummary,
     #[serde(default)]
     pub functions: Vec<CloudRuntimeFunction>,
@@ -152,6 +157,15 @@ pub struct CloudRuntimeWindow {
     pub period_days: u32,
 }
 
+/// The real evidence span of the current deployment, next to the nominal
+/// `window`. The cloud also sends `first_observed_at`, `last_observed_at` and
+/// `deployments_in_period`; the CLI reads only the field it uses.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CloudEvidenceWindow {
+    #[serde(default)]
+    pub observed_hours: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudRuntimeSummary {
     #[serde(default)]
@@ -185,6 +199,11 @@ pub enum CloudNeverCalledSource {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloudRuntimeFunction {
     pub file_path: String,
+    /// `file_path` with the proven runtime prefix removed: repo-relative,
+    /// forward slashes, no leading slash. `None` for an older cloud that does
+    /// not send it, or when the cloud proved no prefix for an absolute path.
+    #[serde(default)]
+    pub repo_path: Option<String>,
     pub function_name: String,
     /// Cross-surface `FunctionIdentity` join key (`fallow:fn:<hash>`), emitted by
     /// the cloud as snake_case `stable_id` (consistent with every other field on
@@ -209,6 +228,12 @@ pub struct CloudRuntimeFunction {
     pub deployments_observed: u32,
     #[serde(default)]
     pub untracked_reason: Option<String>,
+    /// Tracking state over the whole period, earlier deployments included:
+    /// `called` when the function ran in any deployment of the period.
+    /// `None` for an older cloud. `tracking_state` keeps its meaning for the
+    /// current deployment.
+    #[serde(default)]
+    pub period_tracking_state: Option<CloudTrackingState>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,61 +315,53 @@ pub enum CloudRuntimeWarning {
 pub fn fetch_runtime_context(request: &CloudRequest) -> Result<CloudRuntimeContext, CloudError> {
     validate_request(request)?;
     let url = runtime_context_url(request);
-    let agent = try_api_agent_with_timeout(CLOUD_CONNECT_TIMEOUT_SECS, CLOUD_TOTAL_TIMEOUT_SECS)
-        .map_err(|err| CloudError::Network(network_message(&err.to_string())))?;
-    let mut response = agent
-        .get(&url)
-        .header("Authorization", &format!("Bearer {}", request.api_key))
-        .header("Accept", "application/json")
-        .header("Accept-Encoding", "identity")
-        .call()
-        .map_err(|err| {
-            CloudError::Network(network_message(&sanitize_network_error(&format!("{err}"))))
-        })?;
-
-    let status = response.status().as_u16();
-    if response.status().is_success() {
-        let envelope: CloudRuntimeContextResponse =
-            response.body_mut().read_json().map_err(|err| {
-                CloudError::Server(format!("malformed runtime-context response: {err}"))
-            })?;
-        return Ok(envelope.into_context());
+    let auth = CloudAuth {
+        api_key: request.api_key.clone(),
+        agent_source: request.agent_source.clone(),
+    };
+    match cloud_transport::send(&auth, &url, &CloudBody::None, RUNTIME_CONTEXT_OPERATION)? {
+        CloudOutcome::Success(response) => {
+            serde_json::from_str::<CloudRuntimeContextResponse>(&response.body)
+                .map(CloudRuntimeContextResponse::into_context)
+                .map_err(|err| {
+                    CloudError::Server(format!("malformed runtime-context response: {err}"))
+                })
+        }
+        CloudOutcome::Http(failure) => Err(map_http_failure(
+            &failure,
+            RUNTIME_CONTEXT_OPERATION,
+            &request.repo,
+        )),
     }
+}
 
-    let body = response.body_mut().read_to_string().unwrap_or_default();
-    let envelope = parse_error_envelope(&body);
-    let code = envelope.code();
-    let message = envelope
-        .message()
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| body.trim());
-
-    match (status, code) {
-        (401, _) => Err(CloudError::Auth(
-            "Fallow API key is invalid or revoked.".to_owned(),
-        )),
-        (403, Some("tier_required")) => Err(CloudError::TierRequired(
+/// Map a non-2xx cloud answer to a [`CloudError`]. The 5xx statuses never
+/// reach this function: the transport reports them as an outage.
+pub fn map_http_failure(failure: &CloudHttpFailure, operation: &str, repo: &str) -> CloudError {
+    let message = failure.message.as_str();
+    match (failure.status, failure.code.as_deref()) {
+        (401, _) => CloudError::Auth("Fallow API key is invalid or revoked.".to_owned()),
+        (403, Some("tier_required")) => CloudError::TierRequired(
             "cloud-pull is a Team-tier feature. Start a free trial:\n\n  fallow license activate --trial --email <addr>".to_owned(),
+        ),
+        (404, Some("repo_not_found")) => {
+            CloudError::NotFound(format!("Repo not accessible to your org: {repo}"))
+        }
+        (404, _) => CloudError::NotFound(format!("{operation}: {message}")),
+        (400 | 413, Some("validation_error" | "payload_too_large")) => {
+            CloudError::Validation(format!("Cloud rejected the request: {message}"))
+        }
+        (status, _) => CloudError::Server(format!(
+            "{operation} request failed with HTTP {status}: {message}"
         )),
-        (404, Some("repo_not_found")) => Err(CloudError::NotFound(format!(
-            "Repo not accessible to your org: {}",
-            request.repo
-        ))),
-        (400, Some("validation_error")) => Err(CloudError::Validation(format!(
-            "Cloud rejected the request: {message}"
-        ))),
-        (500..=599, _) => Err(CloudError::Network(network_message(message))),
-        _ => Err(CloudError::Server(format!(
-            "runtime-context request failed with HTTP {status}: {message}"
-        ))),
     }
 }
 
 fn validate_request(request: &CloudRequest) -> Result<(), CloudError> {
     if request.api_key.trim().is_empty() {
-        return Err(CloudError::Auth(
-            "Cloud runtime coverage requires an API key.\n\nSet FALLOW_API_KEY or pass --api-key:\n\n  FALLOW_API_KEY=fallow_live_... fallow coverage analyze --cloud --repo owner/repo".to_owned(),
-        ));
+        return Err(CloudError::Auth(cloud_api_key_missing_message(
+            CloudCommand::Analyze,
+        )));
     }
     if request.repo.trim().is_empty() {
         return Err(CloudError::Validation(
@@ -403,18 +420,7 @@ pub fn runtime_context_url(request: &CloudRequest) -> String {
     )
 }
 
-fn network_message(detail: &str) -> String {
-    let suffix = if detail.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", detail.trim())
-    };
-    format!(
-        "Could not reach fallow.cloud for cloud runtime coverage{suffix}.\n\nCloud mode is explicitly network-backed. Local runtime coverage still works:\n\n  fallow coverage analyze --runtime-coverage ./coverage"
-    )
-}
-
-fn url_encode_query_value(value: &str) -> String {
+pub fn url_encode_query_value(value: &str) -> String {
     url_encode_path_segment(value)
 }
 
@@ -431,6 +437,7 @@ mod tests {
             period_days: 30,
             environment: None,
             commit_sha: None,
+            agent_source: None,
         }
     }
 
@@ -474,6 +481,7 @@ mod tests {
             period_days: 30,
             environment: None,
             commit_sha: None,
+            agent_source: None,
         };
         let formatted = format!("{req:?}");
         assert!(

@@ -8,6 +8,18 @@ import {
 } from "../src/configKeys.js";
 
 describe("config keys", () => {
+  it("restarts binary resolution when auto-download changes", () => {
+    const event = {
+      affectsConfiguration: (key: string): boolean => key === "fallow.autoDownload",
+    };
+    expect(affectsAnyConfiguration(event, RESTART_CONFIG_KEYS)).toBe(true);
+  });
+
+  it("restarts the LSP and re-runs the sidebar when package baselines change", () => {
+    expect(RESTART_CONFIG_KEYS).toContain("fallow.packageBaselines");
+    expect(REANALYSIS_CONFIG_KEYS).toContain("fallow.packageBaselines");
+  });
+
   it("restarts the LSP when duplication settings change", () => {
     expect(RESTART_CONFIG_KEYS).toContain("fallow.duplication");
     expect(REANALYSIS_CONFIG_KEYS).toContain("fallow.duplication");

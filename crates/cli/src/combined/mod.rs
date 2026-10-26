@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use fallow_config::{DuplicatesConfig, OutputFormat};
+use fallow_config::{DuplicatesConfig, OutputFormat, ProductionAnalysis};
+use fallow_engine::project_config::ProductionFlags;
 
-use crate::check::{CheckOptions, CheckResult, IssueFilters, TraceOptions};
-use crate::dupes::{DupesMode, DupesOptions, DupesResult};
+use crate::check::{ArchitectureSelection, CheckOptions, CheckResult, IssueFilters, TraceOptions};
+use crate::dupes::{DupesMode, DupesOptions, DupesOverrides, DupesResult};
 use crate::health::{HealthOptions, HealthResult};
 use crate::regression;
 use crate::report;
@@ -17,7 +18,7 @@ mod output;
 pub use orientation::print_entry_point_summary;
 
 use impact::{record_combined_cache_state, record_combined_impact};
-use output::{handle_regression_and_summary, print_combined_report};
+use output::{handle_regression_and_summary, print_combined_exit_reason, print_combined_report};
 
 pub struct CombinedOptions<'a> {
     pub root: &'a std::path::Path,
@@ -31,12 +32,26 @@ pub struct CombinedOptions<'a> {
     pub fail_on_issues: bool,
     pub sarif_file: Option<&'a std::path::Path>,
     pub changed_since: Option<&'a str>,
+    /// `--no-package-baselines`: ignore `workspaces.changedSince` for this run.
+    pub no_package_baselines: bool,
     /// Import churn from a `fallow-churn/v1` file (`--churn-file`) for the
     /// health hotspots / ownership pass instead of `git log`. Resolved relative
     /// to `root` inside the health pipeline.
     pub churn_file: Option<&'a std::path::Path>,
+    /// The dead-code baseline (`--baseline`).
     pub baseline: Option<&'a std::path::Path>,
     pub save_baseline: Option<&'a std::path::Path>,
+    /// The duplication baseline (`--dupes-baseline`), applied as standalone
+    /// `dupes --baseline` applies it.
+    pub dupes_baseline: Option<&'a std::path::Path>,
+    /// The health baseline (`--health-baseline`), applied as standalone
+    /// `health --baseline` applies it.
+    pub health_baseline: Option<&'a std::path::Path>,
+    pub health_baseline_mode: fallow_engine::baseline::HealthBaselineMode,
+    pub health_baseline_mode_explicit: bool,
+    /// Fail the run when a loaded baseline of any sub-pass has entries that
+    /// match nothing.
+    pub fail_on_stale_baseline: bool,
     pub production: bool,
     pub production_dead_code: Option<bool>,
     pub production_health: Option<bool>,
@@ -54,33 +69,40 @@ pub struct CombinedOptions<'a> {
     pub run_check: bool,
     pub run_dupes: bool,
     pub run_health: bool,
-    pub dupes_mode: Option<DupesMode>,
-    pub dupes_near: bool,
-    pub dupes_threshold: Option<f64>,
-    pub dupes_min_tokens: Option<usize>,
-    pub dupes_min_lines: Option<usize>,
-    pub dupes_min_occurrences: Option<usize>,
-    pub dupes_skip_local: bool,
-    pub dupes_cross_language: bool,
-    /// CLI override for excluding import declarations from duplicate detection.
-    /// `None` defers to config (default `true`); `Some(false)` is the
-    /// `--dupes-no-ignore-imports` opt-out.
-    pub dupes_ignore_imports: Option<bool>,
+    /// Which dead-code findings the run reports (`--only architecture`,
+    /// `--skip architecture`).
+    pub architecture: ArchitectureSelection,
+    /// Global `--dupes-*` overrides of the `duplicates` config.
+    pub dupes: DupesOverrides,
     pub score: bool,
     pub trend: bool,
+    /// `--trend-from`: explicit snapshot file for the trend baseline.
+    pub trend_from: Option<&'a std::path::Path>,
     pub save_snapshot: Option<&'a Option<String>>,
     pub coverage: Option<&'a std::path::Path>,
     pub coverage_root: Option<&'a std::path::Path>,
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
+    /// `--fail-on-parse-error`. The combined run applies the `parse-error`
+    /// gate once over the dead-code and health sections, in every format.
+    pub fail_on_parse_error: bool,
+    /// Positional `[PATH]` scope from bare `fallow [PATH]`: root-joined
+    /// absolute file or directory inside the root, threaded into the
+    /// check/dupes/health sub-pipelines. `None` means whole-project scope.
+    pub scope: Option<std::path::PathBuf>,
     pub regression_opts: regression::RegressionOpts<'a>,
 }
 
 /// Resolve which analyses to run based on --only/--skip flags.
 /// Precondition: only and skip must not both be non-empty (validated in main.rs).
+///
+/// `architecture` reports a part of the dead-code analysis, so `--only
+/// architecture` runs that analysis. See [`resolve_architecture_selection`].
 pub fn resolve_analyses(only: &[AnalysisKind], skip: &[AnalysisKind]) -> (bool, bool, bool) {
     if !only.is_empty() {
         (
-            only.contains(&AnalysisKind::DeadCode),
+            only.contains(&AnalysisKind::DeadCode) || only.contains(&AnalysisKind::Architecture),
             only.contains(&AnalysisKind::Dupes),
             only.contains(&AnalysisKind::Health),
         )
@@ -95,13 +117,47 @@ pub fn resolve_analyses(only: &[AnalysisKind], skip: &[AnalysisKind]) -> (bool, 
     }
 }
 
+/// Resolve which dead-code findings the bare run reports from `--only` and
+/// `--skip`.
+///
+/// `architecture` without `dead-code` narrows the dead-code section:
+/// `--only architecture` keeps only the architecture findings and `--skip
+/// architecture` drops them. With `dead-code` in the same list, the value has
+/// no extra effect.
+pub fn resolve_architecture_selection(
+    only: &[AnalysisKind],
+    skip: &[AnalysisKind],
+) -> ArchitectureSelection {
+    let list = if only.is_empty() { skip } else { only };
+    if !list.contains(&AnalysisKind::Architecture) || list.contains(&AnalysisKind::DeadCode) {
+        return ArchitectureSelection::All;
+    }
+    if only.is_empty() {
+        ArchitectureSelection::Exclude
+    } else {
+        ArchitectureSelection::Only
+    }
+}
+
 pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
+    // Combined saves through its dead-code sub-pass, which is the last step of a
+    // full three-analysis run.
+    if let Some(code) = crate::baseline_gate::refuse_save_before_analysis(
+        opts.save_baseline,
+        fallow_engine::baseline::BaselineKind::DeadCode,
+        opts.output,
+    ) {
+        return code;
+    }
     let start = Instant::now();
     let mut check_result: Option<CheckResult> = None;
     let mut dupes_result: Option<DupesResult> = None;
     let mut health_result: Option<HealthResult> = None;
 
-    let filters = IssueFilters::default();
+    let filters = IssueFilters {
+        architecture_selection: opts.architecture,
+        ..IssueFilters::default()
+    };
     let trace_opts = TraceOptions {
         trace_export: None,
         trace_file: None,
@@ -123,8 +179,20 @@ pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
     record_combined_cache_state(opts, check_result.as_ref());
     print_combined_deferred_performance(opts, &mut check_result, dupes_result.as_ref());
 
-    if let Err(code) = run_combined_health(opts, &mut check_result, &mut health_result) {
+    if let Err(code) = run_combined_health(
+        opts,
+        &mut check_result,
+        &mut dupes_result,
+        &mut health_result,
+    ) {
         return code;
+    }
+    if let Some(result) = health_result.as_mut() {
+        crate::health::note_unrecognised_health_baseline(
+            result,
+            opts.health_baseline,
+            "--health-baseline",
+        );
     }
 
     let total_elapsed = start.elapsed();
@@ -135,6 +203,49 @@ pub fn run_combined(opts: &CombinedOptions<'_>) -> ExitCode {
         health_result.as_ref(),
         total_elapsed,
     )
+}
+
+/// The unrendered results of the analyses a combined run selected.
+pub struct CombinedResults {
+    pub check: Option<CheckResult>,
+    pub dupes: Option<DupesResult>,
+    pub health: Option<HealthResult>,
+}
+
+/// Run the selected analyses as `run_combined` does, but print nothing and
+/// return the results. `fallow baselines prune` reads them.
+pub fn collect_combined_results(opts: &CombinedOptions<'_>) -> Result<CombinedResults, ExitCode> {
+    let filters = IssueFilters {
+        architecture_selection: opts.architecture,
+        ..IssueFilters::default()
+    };
+    let trace_opts = TraceOptions {
+        trace_export: None,
+        trace_file: None,
+        trace_dependency: None,
+        impact_closure: None,
+        symbol_impact: None,
+        performance: false,
+    };
+    let check_opts = build_combined_check_options(opts, &filters, &trace_opts);
+    let mut results = CombinedResults {
+        check: None,
+        dupes: None,
+        health: None,
+    };
+    run_combined_check_and_dupes(
+        opts,
+        check_opts.as_ref(),
+        &mut results.check,
+        &mut results.dupes,
+    )?;
+    run_combined_health(
+        opts,
+        &mut results.check,
+        &mut results.dupes,
+        &mut results.health,
+    )?;
+    Ok(results)
 }
 
 fn build_combined_check_options<'a>(
@@ -154,12 +265,17 @@ fn build_combined_check_options<'a>(
         fail_on_issues: opts.fail_on_issues,
         filters,
         changed_since: opts.changed_since,
+        change_scope_owner: fallow_engine::change_scope::ChangeScopeOwner::Run,
+        no_package_baselines: opts.no_package_baselines,
         diff_index: None,
         use_shared_diff_index: true,
         baseline: opts.baseline,
+        baseline_flag: "--baseline",
+        bare_run: true,
         save_baseline: opts.save_baseline,
+        fail_on_stale_baseline: opts.fail_on_stale_baseline,
         sarif_file: opts.sarif_file,
-        production: opts.production_dead_code.unwrap_or(opts.production),
+        production: combined_production_flags(opts).mode(ProductionAnalysis::DeadCode),
         production_override: opts.production_dead_code,
         workspace: opts.workspace,
         changed_workspaces: opts.changed_workspaces,
@@ -173,12 +289,18 @@ fn build_combined_check_options<'a>(
         explain: opts.explain,
         top: None,
         file: &[],
+        scope: opts.scope.clone(),
+        finding_ids: None,
         include_entry_exports: opts.include_entry_exports,
+        show_cascade: opts.show_cascade,
+        fail_on_parse_error: opts.fail_on_parse_error,
         summary: opts.summary,
         regression_opts: opts.regression_opts,
         retain_modules_for_health: opts.run_health,
         defer_performance: true,
         analysis_snapshot: fallow_config::AnalysisSnapshot::Current,
+        explain_skipped: opts.explain_skipped,
+        surface: crate::check::CheckSurface::DeadCode,
     })
 }
 
@@ -219,7 +341,17 @@ fn print_combined_deferred_performance(
         && let Some(ref mut timings) = check.timings
     {
         timings.duplication_ms = dupes_result.map(|dupes| dupes.elapsed.as_secs_f64() * 1000.0);
-        report::print_performance(timings, opts.output, opts.json_style);
+        // `run_combined_check_and_dupes` joins the two passes only when they
+        // cannot share one file walk.
+        let duplication_concurrent = !can_share_dupes_files_with_check(opts);
+        // Combined mode does not clock its report output, so no process spans.
+        report::print_performance(
+            timings,
+            None,
+            duplication_concurrent,
+            opts.output,
+            opts.json_style,
+        );
     }
 }
 
@@ -241,30 +373,32 @@ fn finish_combined_run(
         Err(code) => return code,
     };
 
-    let require_complete = check_result
-        .map(|result| result.config.type_aware.require)
-        .or_else(|| health_result.map(|result| result.config.type_aware.require))
-        == Some(fallow_config::TypeAwareRequire::Complete);
-    if require_complete
-        && check_result
-            .and_then(|result| result.type_aware_meta.as_ref())
-            .or_else(|| health_result.and_then(|result| result.type_aware_meta.as_ref()))
-            .and_then(|meta| meta.identity.as_ref())
-            .is_some_and(|identity| {
-                identity.completeness != fallow_types::semantic::SemanticCompleteness::Complete
-            })
-    {
-        max_exit = max_exit.max(1);
+    max_exit = max_exit.max(crate::exit_codes::gate_failed_exit_code(
+        fallow_output::GateName::TypeAwareRequire,
+        super::combined::output::combined_type_aware_gate_failed(check_result, health_result),
+    ));
+
+    let parse_error =
+        super::combined::output::combined_parse_error_outcome(check_result, health_result);
+    let parse_error_failed = parse_error
+        .as_ref()
+        .is_some_and(fallow_output::GateOutcome::fails_run);
+    if let Some(outcome) = parse_error.as_ref().filter(|_| parse_error_failed) {
+        crate::gates::print_parse_error_gate_failure(&outcome.files);
     }
+    max_exit = max_exit.max(crate::exit_codes::gate_failed_exit_code(
+        fallow_output::GateName::ParseError,
+        parse_error_failed,
+    ));
 
     handle_regression_and_summary(
         &mut max_exit,
-        opts.quiet,
-        opts.root,
+        opts,
         check_result,
         dupes_result,
         health_result,
     );
+    print_combined_exit_reason(opts, check_result, dupes_result, health_result, max_exit);
 
     let _ = record_combined_impact(opts, check_result, dupes_result, health_result);
 
@@ -274,6 +408,7 @@ fn finish_combined_run(
 fn run_combined_health(
     opts: &CombinedOptions<'_>,
     check_result: &mut Option<CheckResult>,
+    dupes_result: &mut Option<DupesResult>,
     health_result: &mut Option<HealthResult>,
 ) -> Result<(), ExitCode> {
     if !opts.run_health {
@@ -294,18 +429,24 @@ fn run_combined_health(
             &config,
         )
         .map_err(|message| crate::error::emit_error(&message, 2, opts.output))?;
+        let mut degraded_meta = None;
         let semantic = if resolved.enabled {
-            Some(
-                fallow_api::analyze_type_coupling(opts.root, &resolved.projects, &[]).map_err(
-                    |error| {
-                        crate::error::emit_error(
-                            &format!("Type-aware coupling failed: {error}"),
-                            2,
-                            opts.output,
-                        )
-                    },
-                )?,
-            )
+            match fallow_api::analyze_type_coupling(opts.root, &resolved.projects, &[]) {
+                Ok(outcome) => Some(outcome),
+                Err(error) => {
+                    degraded_meta = Some(crate::type_aware_degrade::degrade_or_fail(
+                        &crate::type_aware_degrade::DegradeContext {
+                            root: opts.root,
+                            error: &error.to_string(),
+                            failure_label: "Type-aware coupling failed",
+                            require: resolved.require,
+                            quiet: opts.quiet,
+                            output: opts.output,
+                        },
+                    )?);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -317,7 +458,9 @@ fn run_combined_health(
         }
         let mut result =
             crate::health::execute_health_with_config(&health_opts, config, config_ms)?;
-        result.type_aware_meta = semantic.map(|outcome| outcome.type_aware.meta);
+        result.type_aware_meta = semantic
+            .map(|outcome| outcome.type_aware.meta)
+            .or(degraded_meta);
         *health_result = Some(result);
         return Ok(());
     }
@@ -328,15 +471,23 @@ fn run_combined_health(
     {
         health_opts.analysis_identity = identity;
     }
-    let check_production = opts.production_dead_code.unwrap_or(opts.production);
-    let health_production = opts.production_health.unwrap_or(opts.production);
-    let shared = if check_production == health_production {
+    let shared = if combined_production_flags(opts)
+        .modes()
+        .dead_code_matches_health()
+    {
         check_result.as_mut().and_then(|r| r.shared_parse.take())
     } else {
         None
     };
     let mut result = if let Some(shared_data) = shared {
-        crate::health::execute_health_with_shared_parse(&health_opts, shared_data)?
+        let pre_computed_duplication = dupes_result
+            .as_mut()
+            .and_then(|dupes| dupes.unfiltered_report.take());
+        crate::health::execute_health_with_shared_parse(
+            &health_opts,
+            shared_data,
+            pre_computed_duplication,
+        )?
     } else {
         crate::health::execute_health(&health_opts)?
     };
@@ -398,15 +549,19 @@ fn attach_combined_type_coupling(
         .iter()
         .map(std::path::PathBuf::from)
         .collect::<Vec<_>>();
-    let outcome =
-        fallow_api::analyze_type_coupling(opts.root, &projects, &[]).map_err(|error| {
-            crate::error::emit_error(
-                &format!("Type-aware coupling failed: {error}"),
-                2,
-                opts.output,
-            )
-        })?;
-    let coupling_meta = outcome.type_aware.meta;
+    let coupling_meta = match fallow_api::analyze_type_coupling(opts.root, &projects, &[]) {
+        Ok(outcome) => outcome.type_aware.meta,
+        Err(error) => crate::type_aware_degrade::degrade_or_fail(
+            &crate::type_aware_degrade::DegradeContext {
+                root: opts.root,
+                error: &error.to_string(),
+                failure_label: "Type-aware coupling failed",
+                require: check.config.type_aware.require,
+                quiet: opts.quiet,
+                output: opts.output,
+            },
+        )?,
+    };
     health_result.type_aware_meta = Some(coupling_meta.clone());
     match check.type_aware_meta.as_mut() {
         Some(meta) => fallow_api::merge_type_aware_meta(meta, coupling_meta),
@@ -444,9 +599,8 @@ fn load_combined_dupes_config(opts: &CombinedOptions<'_>) -> Result<DuplicatesCo
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_dupes
-                .or_else(|| opts.production.then_some(true)),
+            production_override: combined_production_flags(opts)
+                .override_for(ProductionAnalysis::Dupes),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
@@ -459,6 +613,7 @@ fn build_combined_dupes_options<'a>(
     opts: &'a CombinedOptions<'a>,
     dupes_cfg: &DuplicatesConfig,
 ) -> DupesOptions<'a> {
+    let overrides = &opts.dupes;
     DupesOptions {
         root: opts.root,
         config_path: opts.config_path,
@@ -468,33 +623,43 @@ fn build_combined_dupes_options<'a>(
         threads: opts.threads,
         quiet: opts.quiet,
         allow_remote_extends: opts.allow_remote_extends,
-        mode: Some(
-            opts.dupes_mode
-                .unwrap_or_else(|| DupesMode::from(dupes_cfg.mode)),
-        ),
-        near: opts.dupes_near || dupes_cfg.near,
-        min_tokens: Some(opts.dupes_min_tokens.unwrap_or(dupes_cfg.min_tokens)),
-        min_lines: Some(opts.dupes_min_lines.unwrap_or(dupes_cfg.min_lines)),
-        min_occurrences: Some(
-            opts.dupes_min_occurrences
-                .unwrap_or(dupes_cfg.min_occurrences),
-        ),
-        threshold: Some(opts.dupes_threshold.unwrap_or(dupes_cfg.threshold)),
-        skip_local: opts.dupes_skip_local || dupes_cfg.skip_local,
-        cross_language: opts.dupes_cross_language || dupes_cfg.cross_language,
-        // `None` defers to config inside `build_dupes_config`; an explicit
-        // `--dupes-no-ignore-imports` (`Some(false)`) overrides config.
-        ignore_imports: opts.dupes_ignore_imports,
+        overrides: DupesOverrides {
+            mode: Some(
+                overrides
+                    .mode
+                    .unwrap_or_else(|| DupesMode::from(dupes_cfg.mode)),
+            ),
+            near: overrides.near || dupes_cfg.near,
+            min_tokens: Some(overrides.min_tokens.unwrap_or(dupes_cfg.min_tokens)),
+            min_lines: Some(overrides.min_lines.unwrap_or(dupes_cfg.min_lines)),
+            min_occurrences: Some(
+                overrides
+                    .min_occurrences
+                    .unwrap_or(dupes_cfg.min_occurrences),
+            ),
+            threshold: Some(overrides.threshold.unwrap_or(dupes_cfg.threshold)),
+            skip_local: overrides.skip_local || dupes_cfg.skip_local,
+            ignore_symlinks: overrides.ignore_symlinks,
+            cross_language: overrides.cross_language || dupes_cfg.cross_language,
+            // `None` defers to config inside `build_dupes_config`; an explicit
+            // `--dupes-no-ignore-imports` (`Some(false)`) overrides config.
+            ignore_imports: overrides.ignore_imports,
+        },
         top: None,
-        baseline_path: None,
+        baseline_path: opts.dupes_baseline,
+        baseline_flag: "--dupes-baseline",
         save_baseline_path: None,
-        production: opts.production_dupes.unwrap_or(opts.production),
+        fail_on_stale_baseline: opts.fail_on_stale_baseline,
+        fail_on_issues: opts.fail_on_issues,
+        production: combined_production_flags(opts).mode(ProductionAnalysis::Dupes),
         production_override: opts.production_dupes,
         trace: None,
         changed_since: opts.changed_since,
         diff_index: None,
         use_shared_diff_index: true,
         changed_files: None,
+        change_scope_owner: fallow_engine::change_scope::ChangeScopeOwner::Run,
+        no_package_baselines: opts.no_package_baselines,
         workspace: opts.workspace,
         changed_workspaces: opts.changed_workspaces,
         explain: opts.explain,
@@ -502,7 +667,31 @@ fn build_combined_dupes_options<'a>(
         summary: opts.summary,
         group_by: opts.group_by,
         performance: false,
+        include_fragments: true,
+        scope: opts.scope.clone(),
+        retain_unfiltered_report: health_can_reuse_dupes_report(opts),
     }
+}
+
+/// Whether health can use the duplication report of the combined run in
+/// place of its own duplicate detection. This mirrors the gate of the
+/// programmatic combined runner (`should_precompute_duplication_for_combined_health`).
+///
+/// The report must cover the same files with the same duplicates config:
+/// - dead code, duplication and health share one file list (all production
+///   modes match, and the dead-code pass runs);
+/// - no `--dupes-*` flag overrides the duplicates config;
+/// - no `--changed-since`, because duplication then runs a focused detection;
+/// - no workspace scope, because health then detects over the scoped files.
+fn health_can_reuse_dupes_report(opts: &CombinedOptions<'_>) -> bool {
+    opts.run_check
+        && opts.run_dupes
+        && opts.run_health
+        && combined_production_flags(opts).modes().all_match()
+        && opts.changed_since.is_none()
+        && opts.workspace.is_none()
+        && opts.changed_workspaces.is_none()
+        && opts.dupes.is_empty()
 }
 
 fn shared_dupes_files(
@@ -516,11 +705,18 @@ fn shared_dupes_files(
     check_result.and_then(|r| r.shared_parse.as_ref().map(|sp| sp.files.clone()))
 }
 
+/// The production flags of the combined run.
+const fn combined_production_flags(opts: &CombinedOptions<'_>) -> ProductionFlags {
+    ProductionFlags::from_cli(
+        opts.production,
+        opts.production_dead_code,
+        opts.production_health,
+        opts.production_dupes,
+    )
+}
+
 fn can_share_dupes_files_with_check(opts: &CombinedOptions<'_>) -> bool {
-    let check_production = opts.production_dead_code.unwrap_or(opts.production);
-    let health_production = opts.production_health.unwrap_or(opts.production);
-    let dupes_production = opts.production_dupes.unwrap_or(opts.production);
-    opts.run_health && check_production == health_production && check_production == dupes_production
+    opts.run_health && combined_production_flags(opts).modes().all_match()
 }
 
 fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
@@ -534,7 +730,7 @@ fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
         thresholds: fallow_engine::health::HealthThresholdOverrides::default(),
         top: None,
         sort: fallow_engine::health::HealthSort::Cyclomatic,
-        production: opts.production_health.unwrap_or(opts.production),
+        production: combined_production_flags(opts).mode(ProductionAnalysis::Health),
         production_override: opts.production_health,
         allow_remote_extends: opts.allow_remote_extends,
         changed_since: opts.changed_since,
@@ -542,14 +738,16 @@ fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
         use_shared_diff_index: true,
         workspace: opts.workspace,
         changed_workspaces: opts.changed_workspaces,
-        baseline: None,
+        baseline: opts.health_baseline,
         save_baseline: None,
-        baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
-        baseline_mode_explicit: false,
+        baseline_mode: opts.health_baseline_mode,
+        baseline_mode_explicit: opts.health_baseline_mode_explicit,
         complexity: true,
         file_scores: true,
         coverage_gaps: false,
-        config_activates_coverage_gaps: false,
+        // Bare `fallow` includes health, so an enabled `coverage-gaps` rule
+        // reports and gates here exactly as it does on `fallow health`.
+        config_activates_coverage_gaps: true,
         hotspots: true,
         ownership: false,
         ownership_emails: None,
@@ -558,10 +756,16 @@ fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
         css_deep: false,
         force_full: false,
         score_only_output: false,
-        enforce_coverage_gap_gate: false,
+        enforce_coverage_gap_gate: true,
         effort: None,
-        score: opts.score || opts.trend,
-        gates: fallow_engine::health::HealthGateOptions::default(),
+        score: opts.score || opts.trend || opts.trend_from.is_some(),
+        // The flag reaches the health config here; the combined run applies
+        // the parse-error gate itself, so the health print never does.
+        gates: fallow_engine::health::HealthGateOptions {
+            fail_on_parse_error: opts.fail_on_parse_error,
+            fail_on_issues: opts.fail_on_issues,
+            ..fallow_engine::health::HealthGateOptions::default()
+        },
         since: None,
         min_commits: None,
         explain: opts.explain,
@@ -581,23 +785,25 @@ fn build_health_opts<'a>(opts: &'a CombinedOptions<'a>) -> HealthOptions<'a> {
         analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
         complexity_breakdown: false,
         group_by: opts.group_by.map(Into::into),
+        group_filter: None,
+        trend_from: opts.trend_from,
+        scope: opts.scope.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::process::ExitCode;
 
     use fallow_config::OutputFormat;
 
     use crate::AnalysisKind;
     use crate::combined::CombinedOptions;
+    use crate::dupes::DupesOverrides;
     use crate::regression::{RegressionOpts, SaveRegressionTarget, Tolerance};
 
     use super::can_share_dupes_files_with_check;
-    use super::orientation::is_test_path;
-    use super::output::exit_code_to_u8;
+    use super::orientation::is_non_production_path;
     use super::resolve_analyses;
 
     static TEST_CONFIG_PATH: Option<PathBuf> = None;
@@ -616,6 +822,43 @@ mod tests {
     }
 
     #[test]
+    fn architecture_value_runs_the_dead_code_analysis() {
+        use super::resolve_architecture_selection;
+        use crate::check::ArchitectureSelection;
+
+        assert_eq!(
+            resolve_analyses(&[AnalysisKind::Architecture], &[]),
+            (true, false, false)
+        );
+        assert_eq!(
+            resolve_analyses(&[], &[AnalysisKind::Architecture]),
+            (true, true, true)
+        );
+        let select = resolve_architecture_selection;
+        assert_eq!(select(&[], &[]), ArchitectureSelection::All);
+        assert_eq!(
+            select(&[AnalysisKind::DeadCode], &[]),
+            ArchitectureSelection::All
+        );
+        assert_eq!(
+            select(&[AnalysisKind::Architecture], &[]),
+            ArchitectureSelection::Only
+        );
+        assert_eq!(
+            select(&[AnalysisKind::Architecture, AnalysisKind::DeadCode], &[]),
+            ArchitectureSelection::All
+        );
+        assert_eq!(
+            select(&[], &[AnalysisKind::Architecture]),
+            ArchitectureSelection::Exclude
+        );
+        assert_eq!(
+            select(&[], &[AnalysisKind::Architecture, AnalysisKind::DeadCode]),
+            ArchitectureSelection::All
+        );
+    }
+
+    #[test]
     fn resolve_analyses_honors_skip_when_only_is_empty() {
         assert_eq!(
             resolve_analyses(&[], &[AnalysisKind::Dupes]),
@@ -625,6 +868,54 @@ mod tests {
             resolve_analyses(&[], &[AnalysisKind::DeadCode, AnalysisKind::Health]),
             (false, true, false)
         );
+    }
+
+    #[test]
+    fn test_path_verdicts_over_shared_corpus() {
+        let corpus = include_str!("../../../engine/tests/fixtures/test-path-corpus.txt");
+        let rendered = corpus
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|path| {
+                let verdict = if is_non_production_path(Path::new(path), Path::new("/project")) {
+                    "test"
+                } else {
+                    "-   "
+                };
+                format!("{verdict} {path}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn non_production_filter_ignores_ascii_case() {
+        for path in [
+            "Tests/button.ts",
+            "src/Button.Test.ts",
+            "Examples/basic-usage.ts",
+            "src/Button.Stories.tsx",
+            "Benchmarks/run-suite.ts",
+        ] {
+            assert!(
+                is_non_production_path(Path::new(path), Path::new("/project")),
+                "{path} should be test-like"
+            );
+        }
+    }
+
+    #[test]
+    fn non_production_filter_ignores_directories_above_the_root() {
+        let root = Path::new("/home/ci/examples/tests/app");
+        assert!(!is_non_production_path(
+            &root.join("src/components/button.ts"),
+            root
+        ));
+        assert!(is_non_production_path(
+            &root.join("src/components/button.test.ts"),
+            root
+        ));
     }
 
     #[test]
@@ -638,7 +929,10 @@ mod tests {
             "src/components/button.fixture.ts",
             "src/a12.ts",
         ] {
-            assert!(is_test_path(Path::new(path)), "{path} should be test-like");
+            assert!(
+                is_non_production_path(Path::new(path), Path::new("/project")),
+                "{path} should be test-like"
+            );
         }
 
         for path in [
@@ -647,17 +941,10 @@ mod tests {
             "src/api/version.ts",
         ] {
             assert!(
-                !is_test_path(Path::new(path)),
+                !is_non_production_path(Path::new(path), Path::new("/project")),
                 "{path} should be production-like"
             );
         }
-    }
-
-    #[test]
-    fn exit_code_to_u8_distinguishes_success_from_failure() {
-        assert_eq!(exit_code_to_u8(ExitCode::SUCCESS), 0);
-        assert_eq!(exit_code_to_u8(ExitCode::from(1)), 1);
-        assert_eq!(exit_code_to_u8(ExitCode::from(2)), 1);
     }
 
     fn test_combined_options() -> CombinedOptions<'static> {
@@ -668,6 +955,7 @@ mod tests {
             json_style: crate::json_style::JsonStyle::Compact,
             no_cache: false,
             threads: 1,
+            no_package_baselines: false,
             quiet: true,
             allow_remote_extends: false,
             fail_on_issues: false,
@@ -676,6 +964,11 @@ mod tests {
             churn_file: None,
             baseline: None,
             save_baseline: None,
+            dupes_baseline: None,
+            health_baseline: None,
+            health_baseline_mode: fallow_engine::baseline::HealthBaselineMode::default(),
+            health_baseline_mode_explicit: false,
+            fail_on_stale_baseline: false,
             production: false,
             production_dead_code: None,
             production_health: None,
@@ -693,21 +986,18 @@ mod tests {
             run_check: true,
             run_dupes: true,
             run_health: true,
-            dupes_mode: None,
-            dupes_near: false,
-            dupes_threshold: None,
-            dupes_min_tokens: None,
-            dupes_min_lines: None,
-            dupes_min_occurrences: None,
-            dupes_skip_local: false,
-            dupes_cross_language: false,
-            dupes_ignore_imports: None,
+            architecture: crate::check::ArchitectureSelection::All,
+            dupes: DupesOverrides::default(),
             score: false,
             trend: false,
+            trend_from: None,
             save_snapshot: None,
             coverage: None,
             coverage_root: None,
             include_entry_exports: false,
+            show_cascade: false,
+            fail_on_parse_error: false,
+            scope: None,
             regression_opts: RegressionOpts {
                 fail_on_regression: false,
                 tolerance: Tolerance::Absolute(0),

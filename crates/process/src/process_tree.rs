@@ -117,7 +117,7 @@ impl Drop for WindowsJobGuard {
 pub struct ProcessTree {
     #[cfg(unix)]
     process_group_id: i32,
-    #[cfg(unix)]
+    #[cfg(all(unix, target_vendor = "apple"))]
     leader_exit_observed: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     job: WindowsHandle,
@@ -180,6 +180,7 @@ impl ProcessTree {
             .map_err(|_| io::Error::other(format!("invalid fallow subprocess PID {pid}")))?;
         Ok(Self {
             process_group_id,
+            #[cfg(target_vendor = "apple")]
             leader_exit_observed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -249,15 +250,31 @@ impl ProcessTree {
         }
         #[cfg(target_vendor = "apple")]
         // macOS returns EPERM when the reserved process group contains only
-        // the observed zombie leader, so there are no live members to signal.
-        if error.raw_os_error() == Some(libc::EPERM)
-            && self
-                .leader_exit_observed
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // the zombie leader, so there are no live members to signal. Ask the
+        // kernel now rather than trusting an earlier poll: a leader that exits
+        // between the last observation and this call would otherwise surface as
+        // a spurious termination error in caller-visible output.
+        if error.raw_os_error() == Some(libc::EPERM) && self.leader_has_exited() {
             return Ok(());
         }
         Err(error)
+    }
+
+    /// Report whether the child leader has already exited, refreshing the
+    /// cached observation. A leader reaped elsewhere reports `ECHILD` and also
+    /// counts as exited, since termination has nothing left to signal.
+    #[cfg(all(unix, target_vendor = "apple"))]
+    fn leader_has_exited(&self) -> bool {
+        if self
+            .leader_exit_observed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        match self.has_exited_without_reaping() {
+            Ok(exited) => exited,
+            Err(error) => error.raw_os_error() == Some(libc::ECHILD),
+        }
     }
 
     /// Wait until the child leader exits without reaping its process-group ID.
@@ -280,12 +297,14 @@ impl ProcessTree {
     )]
     pub fn has_exited_without_reaping(&self) -> io::Result<bool> {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let process_id = libc::id_t::try_from(self.process_group_id)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `info` points to writable storage for a siginfo_t. WNOWAIT
         // observes the dedicated child without releasing its PID or PGID.
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.process_group_id as libc::id_t,
+                process_id,
                 info.as_mut_ptr(),
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
@@ -294,9 +313,13 @@ impl ProcessTree {
             return Err(io::Error::last_os_error());
         }
 
-        // SAFETY: waitid initialized the siginfo_t on success. A zero si_pid
-        // means WNOHANG observed no state change yet.
-        let exited = unsafe { info.assume_init().si_pid() } != 0;
+        // SAFETY: waitid initialized the siginfo_t on success.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: si_pid reads initialized memory: waitid sets it on a state
+        // change, and the zeroed buffer keeps it 0 when WNOHANG finds none.
+        let exited = unsafe { info.si_pid() } != 0;
+        // Only the apple EPERM branch of `terminate` reads this cache.
+        #[cfg(target_vendor = "apple")]
         if exited {
             self.leader_exit_observed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -335,6 +358,13 @@ impl ProcessTree {
         reason = "POSIX process-group liveness checks require libc::kill"
     )]
     pub(crate) fn is_alive(&self) -> bool {
+        // A group that holds only zombies still answers signal 0.
+        #[cfg(target_os = "linux")]
+        if let Some(running) =
+            crate::proc_state::process_group_has_running_member(self.process_group_id)
+        {
+            return running;
+        }
         // SAFETY: Signal 0 checks existence without delivering a signal.
         unsafe { libc::kill(-self.process_group_id, 0) == 0 }
     }

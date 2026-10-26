@@ -1,9 +1,11 @@
 //! Shared trace output contracts for analysis and integration surfaces.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
+use crate::cache_rejection::CacheRejection;
 use crate::duplicates::{CloneInstance, RefactoringSuggestion};
 use crate::semantic::SemanticNamespace;
 use crate::serde_path;
@@ -56,6 +58,12 @@ pub struct ExportTrace {
     pub star_export_ambiguity: Option<StarExportAmbiguity>,
     /// Re-export chains that pass through this export.
     pub re_export_chains: Vec<ReExportChain>,
+    /// The framework plugin rules that mark this export as used. The
+    /// framework calls or reads the export, so no import is necessary. A
+    /// credit sets `is_used` when the file is reachable. Absent when no
+    /// plugin credits the export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_credits: Vec<PluginExportCredit>,
     /// Human-readable reason summary.
     pub reason: String,
     /// Exact checker-backed references when type-aware tracing is enabled.
@@ -98,7 +106,8 @@ pub struct ClassMemberTrace {
     pub owner_file_reachable: bool,
     /// Whether the file is an entry point.
     pub owner_is_entry_point: bool,
-    /// Files that reference the owning export directly.
+    /// Files that reference the owning export directly. The search visibility
+    /// fields on each entry check the owner export name, not the member name.
     pub owner_direct_references: Vec<ExportReference>,
     /// Re-export chains through which the owning export is reachable. Populated
     /// so a machine consumer can tell "used via a barrel" (empty direct refs but
@@ -121,6 +130,85 @@ pub struct ExportReference {
     pub from_file: PathBuf,
     /// Reference kind, such as named import, default import, or re-export.
     pub kind: String,
+    /// 1-based line of the import statement in `from_file`. Absent when the
+    /// graph holds no source position for the reference or the file cannot be
+    /// read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Whether a whole-word text search for the export name finds this
+    /// consumer. Absent when no check applies, for example when the consumer
+    /// source cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_visibility: Option<SearchVisibility>,
+    /// Why a text search does not find the uses in this consumer. With
+    /// `search_visibility` `found`, only `pass-through` occurs: the consumer
+    /// forwards the export and does not use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SearchGapReason>,
+    /// The name to search for in this consumer instead of the export name.
+    /// Absent when the export name finds the uses or no single name does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_as: Option<String>,
+}
+
+impl ExportReference {
+    /// A reference with no source position and no search check.
+    #[must_use]
+    pub const fn new(from_file: PathBuf, kind: String) -> Self {
+        Self {
+            from_file,
+            kind,
+            line: None,
+            search_visibility: None,
+            reason: None,
+            search_as: None,
+        }
+    }
+}
+
+/// Whether a whole-word text search for an export name finds a consumer that
+/// the module graph resolves. The levels sort from best to worst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchVisibility {
+    /// The consumer source contains the export name, and the consumer uses it
+    /// under that name.
+    Found,
+    /// The consumer source contains the export name, but the consumer uses
+    /// the export under another local name.
+    Renamed,
+    /// The consumer source does not contain the export name.
+    Missed,
+}
+
+/// Why a text search for an export name does not find the uses in a consumer,
+/// or why a consumer is not a search target (`pass-through`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SearchGapReason {
+    /// The consumer imports the export under another local name
+    /// (`import { foo as bar }`).
+    ImportAlias,
+    /// The consumer imports a default export under another local name.
+    DefaultImport,
+    /// A barrel re-exports the export under another name, and the consumer
+    /// imports that name.
+    ReExportAlias,
+    /// The consumer imports the whole module namespace and does not name the
+    /// export.
+    NamespaceUse,
+    /// The consumer loads the module with a dynamic `import()` and does not
+    /// name the export.
+    DynamicImport,
+    /// The consumer only forwards the export and does not use it: a barrel
+    /// (`export * from`, `export { foo } from`), or a file that imports the
+    /// export and only exports it again (`import { foo } from`, then a
+    /// top-level `export { foo }`). A change of the export
+    /// needs no edit there, and the files that import through it are checked
+    /// on their own. Occurs with `found`.
+    PassThrough,
 }
 
 /// Direct references that credit one namespace of an export binding.
@@ -169,6 +257,257 @@ pub struct FileTrace {
     pub imported_by: Vec<PathBuf>,
     /// Re-exports declared by this file.
     pub re_exports: Vec<TracedReExport>,
+    /// The configs that make this file an entry point through Module
+    /// Federation `exposes`, one per config. Absent when no Federation config
+    /// exposes the file (issue #2796).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<TraceSource>,
+}
+
+/// Which configs name which files and which dependency names, collected by one
+/// analysis for the trace output.
+///
+/// It holds plain data, so a trace looks a file up without the rules that
+/// produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceProvenance {
+    /// Root-relative file path and the config that names it.
+    files: Vec<(PathBuf, TraceSource)>,
+    /// Dependency name and the config that names it.
+    dependencies: Vec<(String, TraceSource)>,
+    /// Dependency name and why the unused devDependency check credits it as
+    /// tooling.
+    tooling_credits: Vec<(String, ToolingCredit)>,
+    /// Root-relative file path and an export name that a framework plugin
+    /// reads as configuration, such as the Next.js `dynamic` segment option.
+    config_exports: FxHashMap<PathBuf, FxHashSet<String>>,
+    /// Root-relative file path, export name, and the plugin rule that marks
+    /// the export as used.
+    export_credits: FxHashMap<PathBuf, FxHashMap<String, Vec<PluginExportCredit>>>,
+    /// The packages that start the peer-dependency closure in addition to the
+    /// imported packages.
+    peer_seeds: PeerClosureSeeds,
+}
+
+/// The packages that start a peer-dependency closure although no file
+/// imports them: packages that a script runs and packages that a plugin
+/// credits.
+///
+/// The unused-dependency check and the dependency trace read the same seeds,
+/// so the trace names the same hosts that give peer credit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerClosureSeeds {
+    /// Seeds for every closure.
+    shared: FxHashSet<String>,
+    /// Seeds for the closure of one manifest, keyed by the absolute
+    /// `package.json` path.
+    by_manifest: FxHashMap<PathBuf, FxHashSet<String>>,
+}
+
+impl PeerClosureSeeds {
+    /// Seeds that every closure reads.
+    #[must_use]
+    pub fn from_shared(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            shared: names.into_iter().collect(),
+            by_manifest: FxHashMap::default(),
+        }
+    }
+
+    /// Record a seed for the closure of the manifest at `manifest`, an
+    /// absolute `package.json` path.
+    pub fn push_manifest_seed(&mut self, manifest: PathBuf, name: String) {
+        self.by_manifest.entry(manifest).or_default().insert(name);
+    }
+
+    /// The seeds of the closure for the manifest at `manifest`: the shared
+    /// seeds and the seeds of that manifest.
+    pub fn for_manifest<'a>(&'a self, manifest: &Path) -> impl Iterator<Item = &'a str> {
+        self.shared
+            .iter()
+            .chain(self.by_manifest.get(manifest).into_iter().flatten())
+            .map(String::as_str)
+    }
+}
+
+impl TraceProvenance {
+    /// Record that a framework plugin reads the export `name` of the
+    /// root-relative `file` as configuration.
+    pub fn push_config_export(&mut self, file: PathBuf, name: String) {
+        self.config_exports.entry(file).or_default().insert(name);
+    }
+
+    /// Whether a framework plugin reads the export `name` of the
+    /// root-relative `file` as configuration.
+    #[must_use]
+    pub fn is_config_export(&self, file: &Path, name: &str) -> bool {
+        self.config_exports
+            .get(file)
+            .is_some_and(|names| names.contains(name))
+    }
+
+    /// Record the plugin rules that mark exports of the root-relative `file`
+    /// as used, as pairs of an export name and a credit.
+    pub fn push_export_credits(
+        &mut self,
+        file: PathBuf,
+        credits: impl IntoIterator<Item = (String, PluginExportCredit)>,
+    ) {
+        let by_name = self.export_credits.entry(file).or_default();
+        for (name, credit) in credits {
+            let known = by_name.entry(name).or_default();
+            if !known.contains(&credit) {
+                known.push(credit);
+            }
+        }
+    }
+
+    /// The plugin rules that mark the export `name` of the root-relative
+    /// `file` as used.
+    #[must_use]
+    pub fn export_credits(&self, file: &Path, name: &str) -> Vec<PluginExportCredit> {
+        self.export_credits
+            .get(file)
+            .and_then(|by_name| by_name.get(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Record that `source` names the root-relative `file`.
+    pub fn push_file(&mut self, file: PathBuf, source: TraceSource) {
+        if !self
+            .files
+            .iter()
+            .any(|(known, known_source)| *known == file && *known_source == source)
+        {
+            self.files.push((file, source));
+        }
+    }
+
+    /// Record that `source` names the dependency `name`.
+    pub fn push_dependency(&mut self, name: String, source: TraceSource) {
+        if !self
+            .dependencies
+            .iter()
+            .any(|(known, known_source)| *known == name && *known_source == source)
+        {
+            self.dependencies.push((name, source));
+        }
+    }
+
+    /// The configs that name `file`, a root-relative path.
+    #[must_use]
+    pub fn file_sources(&self, file: &std::path::Path) -> Vec<TraceSource> {
+        self.files
+            .iter()
+            .filter(|(known, _)| known == file)
+            .map(|(_, source)| source.clone())
+            .collect()
+    }
+
+    /// The configs that name the dependency `name`.
+    #[must_use]
+    pub fn dependency_sources(&self, name: &str) -> Vec<TraceSource> {
+        self.dependencies
+            .iter()
+            .filter(|(known, _)| known == name)
+            .map(|(_, source)| source.clone())
+            .collect()
+    }
+
+    /// Record why the dependency `name` is credited as tooling. The first
+    /// credit recorded for a name wins.
+    pub fn push_tooling_credit(&mut self, name: String, credit: ToolingCredit) {
+        if !self.tooling_credits.iter().any(|(known, _)| *known == name) {
+            self.tooling_credits.push((name, credit));
+        }
+    }
+
+    /// Why the dependency `name` is credited as tooling, if it is.
+    #[must_use]
+    pub fn tooling_credit(&self, name: &str) -> Option<ToolingCredit> {
+        self.tooling_credits
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, credit)| credit.clone())
+    }
+
+    /// Set the packages that start the peer-dependency closure in addition to
+    /// the imported packages.
+    #[must_use]
+    pub fn with_peer_seeds(mut self, seeds: PeerClosureSeeds) -> Self {
+        self.peer_seeds = seeds;
+        self
+    }
+
+    /// The packages that start the peer-dependency closure in addition to the
+    /// imported packages.
+    #[must_use]
+    pub const fn peer_seeds(&self) -> &PeerClosureSeeds {
+        &self.peer_seeds
+    }
+}
+
+/// Why the unused devDependency check counts a dependency as used tooling
+/// although no source file imports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ToolingCredit {
+    /// The evidence: `plugin-config` when the plugin that declares the
+    /// dependency found its own config file, `plugin-reference` when a
+    /// package.json script, a CI workflow or a git hook runs one of that
+    /// plugin's packages, `ambient-types` for a type package that declares
+    /// globals, `types-target` when the project declares or imports the
+    /// package that a `@types/` package types, `types-config` when a config
+    /// file, such as a tsconfig `types` entry, names the type package,
+    /// `known-tooling` for a library from the tooling catalogue,
+    /// `known-tooling-config` when a command-line tool from the catalogue has
+    /// its own config file, and `own-peer` when the same manifest lists the
+    /// devDependency in `peerDependencies`. The set is open.
+    pub reason: String,
+    /// The plugin that declares the dependency as tooling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    /// The config file found, relative to the project root, for
+    /// `plugin-config` and `known-tooling-config`. A `package.json` path when
+    /// the config is a package.json key. For `own-peer`, the manifest that
+    /// lists the dependency.
+    #[serde(
+        serialize_with = "serde_path::serialize_option",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub config: Option<PathBuf>,
+    /// The package that a script, CI workflow or git hook runs, for
+    /// `plugin-reference`, or the package that a `@types/` package types,
+    /// for `types-target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+}
+
+/// A config that names a traced file or a traced dependency, and the key that
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TraceSource {
+    /// The mechanism that names the file or the dependency:
+    /// `module-federation`. The set is open.
+    pub kind: String,
+    /// The plugin that read the config, as it labels itself:
+    /// `module-federation` for a standalone `module-federation.config.*`,
+    /// or the bundler plugin (`webpack`, `rspack`, `rsbuild`, `vite`,
+    /// `nextjs`) that read the same options inline from its own config.
+    pub plugin: String,
+    /// The file that names the file or the dependency, relative to the
+    /// project root: the config file, or the source file of a Module
+    /// Federation runtime call.
+    #[serde(serialize_with = "serde_path::serialize")]
+    pub config: PathBuf,
+    /// The config key or the runtime function that names the file or the
+    /// dependency: `exposes` for an exposed file, `remotes` for a remote
+    /// alias, and `registerRemotes`, `loadRemote`, `init` or `createInstance`
+    /// for a remote that a runtime call names. The set is open.
+    pub key: String,
 }
 
 /// An export with usage information.
@@ -183,6 +522,57 @@ pub struct TracedExport {
     pub reference_count: usize,
     /// Files that reference this export.
     pub referenced_by: Vec<ExportReference>,
+    /// The framework plugin rules that mark this export as used. Absent when
+    /// no plugin credits the export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_credits: Vec<PluginExportCredit>,
+}
+
+/// A framework plugin rule that marks an export as used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PluginExportCredit {
+    /// The plugin that gives the rule, for example `nextjs`.
+    pub plugin: String,
+    /// The project-relative file pattern of the rule.
+    pub pattern: String,
+}
+
+impl ExportTrace {
+    /// Add the plugin credits that `provenance` records for the traced export.
+    ///
+    /// The analysis does not report a credited export of a reachable file,
+    /// so the trace then marks the export as used. A star re-export
+    /// collision keeps its abstention.
+    pub fn apply_plugin_credits(&mut self, provenance: &TraceProvenance) {
+        let credits = provenance.export_credits(&self.file, &self.export_name);
+        if credits.is_empty() {
+            return;
+        }
+        if self.file_reachable && !self.is_used && self.star_export_ambiguity.is_none() {
+            let mut plugins: Vec<&str> = Vec::new();
+            for credit in &credits {
+                if !plugins.contains(&credit.plugin.as_str()) {
+                    plugins.push(&credit.plugin);
+                }
+            }
+            self.is_used = true;
+            self.reason = format!(
+                "Used by the framework: the {} plugin marks this export as used",
+                plugins.join(", ")
+            );
+        }
+        self.plugin_credits = credits;
+    }
+}
+
+impl FileTrace {
+    /// Add the plugin credits that `provenance` records for each export.
+    pub fn apply_plugin_credits(&mut self, provenance: &TraceProvenance) {
+        for export in &mut self.exports {
+            export.plugin_credits = provenance.export_credits(&self.file, &export.name);
+        }
+    }
 }
 
 /// A re-export with source information.
@@ -204,18 +594,182 @@ pub struct TracedReExport {
 pub struct DependencyTrace {
     /// The dependency name being traced.
     pub package_name: String,
-    /// Files that import this dependency.
+    /// Files that import this dependency, each listed once.
     #[serde(serialize_with = "serde_path::serialize_vec")]
     pub imported_by: Vec<PathBuf>,
-    /// Files that import this dependency with type-only imports.
+    /// Files whose every import of this dependency is type-only, each listed
+    /// once.
     #[serde(serialize_with = "serde_path::serialize_vec")]
     pub type_only_imported_by: Vec<PathBuf>,
-    /// Whether the dependency is invoked from package.json scripts or CI configs.
+    /// Whether the dependency is invoked from package.json scripts, CI configs
+    /// or git hooks.
     pub used_in_scripts: bool,
-    /// Whether the dependency is used at all.
+    /// Whether the dependency is used at all: imported, invoked from scripts,
+    /// or listed as a peer by a used package (`peer_of`).
     pub is_used: bool,
-    /// Total import count.
+    /// Number of files that import this dependency.
     pub import_count: usize,
+    /// Used packages that list this dependency in their installed
+    /// `peerDependencies`, required or optional, sorted by name. The
+    /// unused-dependency check credits such a peer, because the package that
+    /// lists it loads it at runtime. Absent when no used package lists it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_of: Vec<String>,
+    /// The configs that declare this name as a Module Federation remote alias
+    /// under `remotes`, one per config. A remote alias is provided by a
+    /// remote container at runtime, not by an npm package. Absent when no
+    /// Federation config declares the name (issue #2796).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<TraceSource>,
+    /// Why the unused devDependency check credits the dependency as tooling
+    /// when no file imports it and no script, CI workflow or git hook runs it.
+    /// When present, `is_used` is `true`. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooling_credit: Option<ToolingCredit>,
+    /// The manifests that the unused-dependency check flags for this name,
+    /// relative to the project root and sorted. The check reads each
+    /// declaring manifest on its own. An import credits the nearest manifest
+    /// that installs the package, so a name that one workspace uses can still
+    /// be unused in the root manifest or in another workspace. Absent when no
+    /// manifest is flagged.
+    #[serde(
+        default,
+        serialize_with = "serde_path::serialize_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub unused_in: Vec<PathBuf>,
+    /// How the code uses each imported name of the dependency. Present on
+    /// `fallow trace --dependency`, and on the MCP `trace_dependency` tool
+    /// when a usage parameter is set. Absent on
+    /// `fallow dead-code --trace-dependency`. The object has its own
+    /// `schema_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::trace_usage::DependencyUsage>,
+}
+
+impl DependencyTrace {
+    /// Record the manifests that the unused-dependency report flags for this
+    /// name, so the trace names each declaration that the report lists.
+    pub fn apply_unused_declarations(
+        &mut self,
+        results: &crate::results::AnalysisResults,
+        root: &Path,
+    ) {
+        let flagged = results
+            .unused_dependencies
+            .iter()
+            .map(|finding| &finding.dep)
+            .chain(
+                results
+                    .unused_dev_dependencies
+                    .iter()
+                    .map(|finding| &finding.dep),
+            )
+            .chain(
+                results
+                    .unused_optional_dependencies
+                    .iter()
+                    .map(|finding| &finding.dep),
+            )
+            .filter(|dep| dep.package_name == self.package_name)
+            .map(|dep| {
+                dep.path
+                    .strip_prefix(root)
+                    .unwrap_or(&dep.path)
+                    .to_path_buf()
+            });
+        self.unused_in.extend(flagged);
+        self.unused_in.sort();
+        self.unused_in.dedup();
+    }
+
+    /// Attach the tooling credit of an otherwise unused dependency and count
+    /// the dependency as used, so the trace agrees with the unused-dependency
+    /// report. A dependency that an import or a script already uses keeps no
+    /// credit, because the credit does not decide its status.
+    pub fn apply_tooling_credit(&mut self, credit: Option<ToolingCredit>) {
+        if self.is_used {
+            return;
+        }
+        if let Some(credit) = credit {
+            self.is_used = true;
+            self.tooling_credit = Some(credit);
+        }
+    }
+}
+
+/// Sub-phase attribution inside the entry-point discovery stage.
+///
+/// `PipelineTimings::entry_points_ms` is a single opaque number; these are the
+/// consecutive wall-clock spans that make it up, so a slow discovery stage can
+/// be attributed instead of guessed at. The spans cover the discovery sections
+/// only, so they sum to slightly less than `entry_points_ms`: the summary and
+/// count that follow discovery are not attributed to any span.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EntryPointSpans {
+    /// Root-package discovery: manual entry globs, root `package.json` fields,
+    /// and the nested `package.json` scan under the conventional monorepo
+    /// directories.
+    pub root_ms: f64,
+    /// Runtime script seed collection plus per-workspace discovery.
+    pub workspaces_ms: f64,
+    /// Plugin entry-point glob compilation and matching.
+    pub plugins_ms: f64,
+    /// The part of `plugins_ms` spent compiling plugin patterns into a glob
+    /// set. Scales with active pattern count, not with project size.
+    pub plugin_glob_build_ms: f64,
+    /// The part of `plugins_ms` spent matching the compiled set against every
+    /// discovered file. Scales with file count times pattern count.
+    pub plugin_glob_match_ms: f64,
+    /// Infrastructure config-file probing at the project root.
+    pub infrastructure_ms: f64,
+    /// Configured `dynamicallyLoaded` glob expansion. Zero when unconfigured.
+    pub dynamic_ms: f64,
+    /// Sorting and deduplicating the merged entry set.
+    pub dedup_ms: f64,
+}
+
+/// Deterministic work counts for one dead-code pipeline run.
+///
+/// Every count is exact for a given project, commit and cache state. It does
+/// not depend on the thread count, the machine or the load, so a regression
+/// test can compare it with exact equality where a millisecond value is too
+/// noisy. A count is zero when its stage did no work, for example the resolver
+/// counts on a run that reused the persisted module graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PipelineCounters {
+    /// Source files whose bytes the parse stage read from disk. A warm cache
+    /// hit on file metadata reads no bytes. `cache_misses` counts the files
+    /// that were parsed.
+    pub files_read: u64,
+    /// Bytes of source read from disk by the parse stage.
+    pub source_bytes_read: u64,
+    /// Bytes of the persisted parse cache read from disk. Zero when the run
+    /// had no parse cache or used `--no-cache`.
+    pub parse_cache_bytes_read: u64,
+    /// Bytes of stylesheet source that the parse stage passed through the CSS
+    /// comment mask. The parse masks each stylesheet once, so this value is
+    /// the size of the parsed stylesheets. A higher value shows a repeated
+    /// mask. Zero when no stylesheet was parsed.
+    pub css_masked_bytes: u64,
+    /// Specifier resolutions that the import sites asked for: one for each
+    /// static import binding, re-export, `require()`, `import()` and module
+    /// mock. Internal retries inside the resolver are not counted here.
+    pub resolve_specifier_calls: u64,
+    /// Distinct `(specifier, from_style)` pairs for each importing file,
+    /// summed over all files. A ratio of `resolve_specifier_calls` to this
+    /// value above 1.0 shows bindings that share a specifier. The resolver
+    /// runs at most once for each of these pairs. A pair that returns before
+    /// the resolver, such as an external URL, makes no resolver call.
+    pub unique_specifiers: u64,
+    /// Calls into the module resolver, including fallback retries.
+    pub oxc_resolve_calls: u64,
+    /// Path canonicalize calls that import resolution needs: each direct call,
+    /// plus one for each distinct path that goes through the canonicalize
+    /// cache. Resolver setup is not counted.
+    pub canonicalize_calls: u64,
 }
 
 /// Pipeline performance timings.
@@ -238,16 +792,29 @@ pub struct PipelineTimings {
     pub parse_extract_ms: f64,
     /// Summed parser CPU time across workers.
     pub parse_cpu_ms: f64,
+    /// The part of `parse_extract_ms` that reads and decodes the persisted
+    /// parse cache. Zero with `--no-cache`.
+    pub parse_cache_load_ms: f64,
     /// Number of extracted modules.
     pub module_count: usize,
     /// Number of files loaded from the parse cache.
     pub cache_hits: usize,
     /// Number of files parsed without a cache hit.
     pub cache_misses: usize,
+    /// Why the persisted parse cache was not reused, when it was not. `None`
+    /// means the cache was loaded; the hit and miss counts then describe how
+    /// much of it applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_rejection: Option<CacheRejection>,
+    /// Why the persisted module-graph cache was not reused, when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_cache_rejection: Option<CacheRejection>,
     /// Time spent updating the parse cache.
     pub cache_update_ms: f64,
     /// Time spent categorizing entry points.
     pub entry_points_ms: f64,
+    /// Sub-phase attribution for `entry_points_ms`.
+    pub entry_point_spans: EntryPointSpans,
     /// Number of entry points considered.
     pub entry_point_count: usize,
     /// Time spent resolving imports.
@@ -261,6 +828,8 @@ pub struct PipelineTimings {
     pub duplication_ms: Option<f64>,
     /// Total pipeline time.
     pub total_ms: f64,
+    /// Deterministic work counts for this run.
+    pub counters: PipelineCounters,
 }
 
 /// Result of computing the impact closure for a single file as the seed.
@@ -275,6 +844,71 @@ pub struct ImpactClosureTrace {
     pub coordination_gap: Vec<ImpactClosureGap>,
 }
 
+/// Wire-version discriminator for [`ImportPathTrace`]. Independent from the
+/// global `SchemaVersion`: the import-path payload versions on its own cadence,
+/// like the other independently-versioned envelopes. Serializes as a string
+/// `const` so JSON consumers can switch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum ImportPathTraceSchemaVersion {
+    /// First release of the `fallow trace --path` shape.
+    #[serde(rename = "1")]
+    V1,
+}
+
+/// Result of asking how one module reaches another: the shortest import path.
+///
+/// `reachable` is the only field that separates "no route exists" from "the
+/// route is empty because both ends are the same module". Both report
+/// `hops: 0`, so a consumer must read `reachable`, never the hop count.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(title = "fallow trace --path"))]
+pub struct ImportPathTrace {
+    /// Wire-shape version of this payload.
+    pub schema_version: ImportPathTraceSchemaVersion,
+    /// The module the walk started from, root-relative.
+    pub from: String,
+    /// The module the walk was looking for, root-relative.
+    pub to: String,
+    /// Whether `to` is reachable from `from` by following import edges.
+    pub reachable: bool,
+    /// Number of import edges on the reported route. `0` both when the two ends
+    /// are the same module and when there is no route at all.
+    pub hops: usize,
+    /// The route, in import order. Empty whenever `hops` is `0`.
+    pub path: Vec<ImportPathHop>,
+    /// Human-readable summary of the outcome.
+    pub reason: String,
+}
+
+/// One import edge on an [`ImportPathTrace`].
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportPathHop {
+    /// The importing module, root-relative.
+    pub from: String,
+    /// The imported module, root-relative.
+    pub to: String,
+    /// Whether every symbol on this edge is type-only, so the hop is erased at
+    /// build time. Type-only hops are reported, never skipped: an `import type`
+    /// chain is a real compile-time coupling.
+    pub type_only: bool,
+    /// Whether the edge carries a runtime value but no static one: the target
+    /// loads only on demand (`import()`, a lazy glob or template pattern) or
+    /// on another thread (a worker URL, a worker loader request,
+    /// `child_process.fork`). False for a
+    /// static hop and for a type-only hop.
+    pub dynamic: bool,
+    /// 1-based line in `from` of the imported binding that creates this edge:
+    /// the first value-carrying symbol on the import, or the first symbol when
+    /// every symbol is type-only. On a multi-line import that is the binding's
+    /// own line, not the `import` keyword's. Absent when the edge carries no
+    /// span or the source could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_line: Option<u32>,
+}
+
 /// One coordination-gap entry in an [`ImpactClosureTrace`].
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -285,6 +919,24 @@ pub struct ImpactClosureGap {
     pub consumed_symbols: Vec<String>,
     /// Scope note for the syntactic trace.
     pub note: String,
+    /// Whether a whole-word text search for the consumed symbol names finds
+    /// this consumer. When the consumer uses more than one symbol, the worst
+    /// level wins (`missed`, then `renamed`, then `found`). Absent when no
+    /// check applies, for example when the consumer source cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_visibility: Option<SearchVisibility>,
+    /// Why a text search does not find the uses of the worst symbol. With
+    /// `search_visibility` `found`, only `pass-through` occurs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<SearchGapReason>,
+    /// The name to search for in this consumer instead of the symbol name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_as: Option<String>,
+    /// The entry of `consumed_symbols` that `search_visibility`, `reason`
+    /// and `search_as` describe: the worst symbol, `default` for a default
+    /// export. Present when `search_visibility` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_symbol: Option<String>,
 }
 
 /// Result of tracing a clone: all groups containing the code at a source
@@ -327,4 +979,81 @@ pub struct TracedCloneGroup {
     /// Best-effort name for the extracted function. Advisory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unreferenced_trace(file_reachable: bool) -> ExportTrace {
+        ExportTrace {
+            file: PathBuf::from("app/page.tsx"),
+            export_name: "default".to_string(),
+            namespace: SemanticNamespace::Value,
+            file_reachable,
+            is_entry_point: true,
+            is_used: false,
+            direct_references: Vec::new(),
+            direct_references_by_namespace: Vec::new(),
+            star_export_ambiguity: None,
+            re_export_chains: Vec::new(),
+            plugin_credits: Vec::new(),
+            reason: "No references".to_string(),
+            semantic: None,
+        }
+    }
+
+    fn page_provenance() -> TraceProvenance {
+        let mut provenance = TraceProvenance::default();
+        let credit = PluginExportCredit {
+            plugin: "nextjs".to_string(),
+            pattern: "app/**/page.tsx".to_string(),
+        };
+        provenance.push_export_credits(
+            PathBuf::from("app/page.tsx"),
+            [
+                ("default".to_string(), credit.clone()),
+                ("default".to_string(), credit),
+            ],
+        );
+        provenance
+    }
+
+    #[test]
+    fn a_plugin_credit_marks_an_export_of_a_reachable_file_as_used() {
+        let mut trace = unreferenced_trace(true);
+        trace.apply_plugin_credits(&page_provenance());
+        assert!(trace.is_used);
+        assert_eq!(trace.plugin_credits.len(), 1);
+        assert!(trace.reason.contains("nextjs"), "{}", trace.reason);
+    }
+
+    #[test]
+    fn a_plugin_credit_does_not_mark_an_unreachable_file_as_used() {
+        let mut trace = unreferenced_trace(false);
+        trace.apply_plugin_credits(&page_provenance());
+        assert!(!trace.is_used);
+        assert_eq!(trace.plugin_credits.len(), 1);
+        assert_eq!(trace.reason, "No references");
+    }
+
+    #[test]
+    fn a_star_export_collision_keeps_its_abstention() {
+        let mut trace = unreferenced_trace(true);
+        trace.star_export_ambiguity = Some(StarExportAmbiguity {
+            sources: vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")],
+            namespaces: vec![SemanticNamespace::Value],
+        });
+        trace.apply_plugin_credits(&page_provenance());
+        assert!(!trace.is_used);
+    }
+
+    #[test]
+    fn an_export_without_a_credit_keeps_its_trace() {
+        let mut trace = unreferenced_trace(true);
+        trace.export_name = "helper".to_string();
+        trace.apply_plugin_credits(&page_provenance());
+        assert!(!trace.is_used);
+        assert!(trace.plugin_credits.is_empty());
+    }
 }

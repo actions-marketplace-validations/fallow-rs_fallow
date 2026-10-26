@@ -114,12 +114,26 @@ pub struct AuditCacheKeyPayload {
     pub group_by: Option<String>,
     /// Whether entry exports are analyzed.
     pub include_entry_exports: bool,
+    /// Keep the export and member findings of unused files (`--show-cascade`).
+    pub show_cascade: bool,
+    /// Whether the base pass ran for the review brief (`--brief`). Only a
+    /// brief base pass computes the public-export set of the snapshot.
+    pub brief: bool,
     /// CRAP threshold override.
     pub max_crap: Option<f64>,
     /// Coverage input fingerprint.
     pub coverage: Option<AuditCoverageFingerprint>,
     /// Coverage root override.
     pub coverage_root: Option<String>,
+    /// Whether audit ran the dead-code sub-analysis for the base snapshot.
+    pub dead_code: bool,
+    /// Whether audit ran the health sub-analysis for the base snapshot.
+    pub health: bool,
+    /// Whether audit ran the duplication sub-analysis for the base snapshot.
+    pub dupes: bool,
+    /// Which dead-code findings the selection keeps: `all`, `only` (the
+    /// architecture findings) or `exclude` (all but the architecture findings).
+    pub architecture: String,
     /// Whether audit health computed styling keys for the base snapshot.
     pub css: bool,
     /// Whether audit health used deep CSS analysis for the base snapshot.
@@ -130,6 +144,10 @@ pub struct AuditCacheKeyPayload {
     pub health_baseline: Option<String>,
     /// Duplication baseline path.
     pub dupes_baseline: Option<String>,
+    /// Experimental type-aware backend selection. The default backend leaves
+    /// it out, so the key bytes of a default run do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_aware_backend: Option<String>,
 }
 
 /// Builder for audit base-snapshot cache keys.
@@ -165,14 +183,21 @@ impl AuditCacheKeyBuilder {
                 changed_workspaces: None,
                 group_by: None,
                 include_entry_exports: false,
+                show_cascade: false,
+                brief: false,
                 max_crap: None,
                 coverage: None,
                 coverage_root: None,
+                dead_code: true,
+                health: true,
+                dupes: true,
+                architecture: "all".to_string(),
                 css: false,
                 css_deep: false,
                 dead_code_baseline: None,
                 health_baseline: None,
                 dupes_baseline: None,
+                type_aware_backend: None,
             },
         }
     }
@@ -209,6 +234,21 @@ impl AuditCacheKeyBuilder {
         self
     }
 
+    /// Set whether the export and member findings of unused files stay in
+    /// the report.
+    #[must_use]
+    pub const fn show_cascade(mut self, show_cascade: bool) -> Self {
+        self.payload.show_cascade = show_cascade;
+        self
+    }
+
+    /// Set whether the base pass ran for the review brief (`--brief`).
+    #[must_use]
+    pub const fn brief(mut self, brief: bool) -> Self {
+        self.payload.brief = brief;
+        self
+    }
+
     /// Set health and coverage options.
     #[must_use]
     pub fn health(
@@ -220,6 +260,23 @@ impl AuditCacheKeyBuilder {
         self.payload.max_crap = max_crap;
         self.payload.coverage = coverage;
         self.payload.coverage_root = coverage_root;
+        self
+    }
+
+    /// Set which sub-analyses ran for the base snapshot, and which dead-code
+    /// findings the architecture selection kept.
+    #[must_use]
+    pub fn analyses(
+        mut self,
+        dead_code: bool,
+        health: bool,
+        dupes: bool,
+        architecture: impl Into<String>,
+    ) -> Self {
+        self.payload.dead_code = dead_code;
+        self.payload.health = health;
+        self.payload.dupes = dupes;
+        self.payload.architecture = architecture.into();
         self
     }
 
@@ -242,6 +299,13 @@ impl AuditCacheKeyBuilder {
         self.payload.dead_code_baseline = dead_code;
         self.payload.health_baseline = health;
         self.payload.dupes_baseline = dupes;
+        self
+    }
+
+    /// Set the type-aware backend selection.
+    #[must_use]
+    pub fn type_aware_backend(mut self, backend: Option<String>) -> Self {
+        self.payload.type_aware_backend = backend;
         self
     }
 
@@ -350,6 +414,43 @@ mod tests {
         .expect("payload should serialize");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn audit_cache_key_bytes_include_the_analysis_selection() {
+        let build = |dead_code, health, dupes, architecture: &str| {
+            AuditCacheKeyBuilder::new(
+                1,
+                "1.0.0",
+                "base",
+                config(),
+                vec!["src/a.ts".to_string()],
+                context(),
+            )
+            .analyses(dead_code, health, dupes, architecture)
+            .to_json_bytes()
+            .expect("payload should serialize")
+        };
+
+        let all = build(true, true, true, "all");
+        assert_ne!(all, build(false, true, true, "all"));
+        assert_ne!(all, build(true, false, true, "all"));
+        assert_ne!(all, build(true, true, false, "all"));
+        assert_ne!(all, build(true, true, true, "exclude"));
+    }
+
+    #[test]
+    fn audit_cache_key_bytes_include_only_a_selected_type_aware_backend() {
+        let build = |backend: Option<&str>| {
+            AuditCacheKeyBuilder::new(1, "1.0.0", "base", config(), Vec::new(), context())
+                .type_aware_backend(backend.map(str::to_string))
+                .to_json_bytes()
+                .expect("payload should serialize")
+        };
+
+        let default = build(None);
+        assert!(!String::from_utf8_lossy(&default).contains("type_aware_backend"));
+        assert_ne!(default, build(Some("tsrs")));
     }
 
     #[test]

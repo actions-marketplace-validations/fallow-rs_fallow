@@ -198,19 +198,6 @@ fn tokenize_multiple_expression_statements_all_have_semicolons() {
 }
 
 #[test]
-fn tokenize_jsx_self_closing_element() {
-    let tokens = tokenize_tsx("const x = <Input type=\"text\" />;");
-    let has_input = tokens
-        .iter()
-        .any(|t| matches!(&t.kind, TokenKind::Identifier(n) if n == "Input"));
-    let has_type = tokens
-        .iter()
-        .any(|t| matches!(&t.kind, TokenKind::Identifier(n) if n == "type"));
-    assert!(has_input, "Should contain JSX element name 'Input'");
-    assert!(has_type, "Should contain JSX attribute name 'type'");
-}
-
-#[test]
 fn tokenize_logical_expression_order() {
     let tokens = tokenize("const x = a && b;");
     let kinds: Vec<&TokenKind> = tokens.iter().map(|t| &t.kind).collect();
@@ -329,30 +316,6 @@ fn tokenize_deeply_nested_if_else_chain() {
 }
 
 #[test]
-fn tokenize_object_with_nested_member_access() {
-    let tokens = tokenize("const x = { a: obj.b, c: arr[0] };");
-    let has_dot = tokens
-        .iter()
-        .any(|t| matches!(t.kind, TokenKind::Punctuation(PunctuationType::Dot)));
-    let bracket_count = tokens
-        .iter()
-        .filter(|t| {
-            matches!(
-                t.kind,
-                TokenKind::Punctuation(
-                    PunctuationType::OpenBracket | PunctuationType::CloseBracket,
-                )
-            )
-        })
-        .count();
-    assert!(has_dot, "Should have dot for obj.b");
-    assert!(
-        bracket_count >= 2,
-        "Should have brackets for arr[0], got {bracket_count}"
-    );
-}
-
-#[test]
 fn tokenize_same_source_produces_identical_tokens() {
     let code = r"
 function processData(items) {
@@ -446,78 +409,6 @@ fn exact_token_sequence_for_return_statement() {
 }
 
 #[test]
-fn strip_types_non_null_assertion_matches_js() {
-    let stripped = tokenize_cross_language("const x = value!;");
-    let js_tokens = {
-        let path = PathBuf::from("test.js");
-        tokenize_file(&path, "const x = value;", false).tokens
-    };
-    assert_eq!(
-        stripped.len(),
-        js_tokens.len(),
-        "TS non-null assertion stripped should match JS token count: stripped={}, js={}",
-        stripped.len(),
-        js_tokens.len()
-    );
-}
-
-#[test]
-fn strip_types_class_with_generics() {
-    let stripped =
-        tokenize_cross_language("class Container<T> { value: T; constructor(v: T) { } }");
-    let has_class = stripped
-        .iter()
-        .any(|t| matches!(t.kind, TokenKind::Keyword(KeywordType::Class)));
-    assert!(has_class, "Should still have class keyword");
-    let colon_count = stripped
-        .iter()
-        .filter(|t| matches!(t.kind, TokenKind::Punctuation(PunctuationType::Colon)))
-        .count();
-    assert_eq!(
-        colon_count, 0,
-        "Type annotation colons should be stripped, got {colon_count}"
-    );
-}
-
-#[test]
-fn strip_types_arrow_function_matches_js() {
-    let stripped = tokenize_cross_language("const add = (a: number, b: number): number => a + b;");
-    let js_tokens = {
-        let path = PathBuf::from("test.js");
-        tokenize_file(&path, "const add = (a, b) => a + b;", false).tokens
-    };
-    assert_eq!(
-        stripped.len(),
-        js_tokens.len(),
-        "Stripped arrow function should match JS: stripped={}, js={}",
-        stripped.len(),
-        js_tokens.len()
-    );
-    for (i, (ts_tok, js_tok)) in stripped.iter().zip(js_tokens.iter()).enumerate() {
-        assert_eq!(
-            ts_tok.kind, js_tok.kind,
-            "Token {i} mismatch in arrow function: TS={:?}, JS={:?}",
-            ts_tok.kind, js_tok.kind
-        );
-    }
-}
-
-#[test]
-fn strip_types_mixed_import_keeps_only_value_import() {
-    let stripped = tokenize_cross_language(
-        "import type { Type } from './mod';\nimport { value } from './mod';",
-    );
-    let import_count = stripped
-        .iter()
-        .filter(|t| matches!(t.kind, TokenKind::Keyword(KeywordType::Import)))
-        .count();
-    assert_eq!(
-        import_count, 1,
-        "Only value import should remain, got {import_count}"
-    );
-}
-
-#[test]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "test source lengths are trivially small"
@@ -569,4 +460,57 @@ fn token_spans_are_monotonically_non_decreasing() {
             last_keyword_start = token.span.start;
         }
     }
+}
+
+fn token_kinds(source: &str) -> Vec<TokenKind> {
+    tokenize(source).into_iter().map(|t| t.kind).collect()
+}
+
+fn ident(name: &str) -> TokenKind {
+    TokenKind::Identifier(name.to_string())
+}
+
+#[test]
+fn concise_arrow_body_ends_like_an_expression_statement() {
+    let kinds = token_kinds("const f = () => g();");
+    let arrow = kinds
+        .iter()
+        .position(|k| matches!(k, TokenKind::Operator(OperatorType::Arrow)))
+        .unwrap();
+    let body = &kinds[arrow + 1..];
+    assert_eq!(body[0], ident("g"));
+    // The concise body closes with the semicolon of an expression statement,
+    // then the declarator adds its own semicolon.
+    let semicolons = body
+        .iter()
+        .filter(|k| matches!(k, TokenKind::Punctuation(PunctuationType::Semicolon)))
+        .count();
+    assert_eq!(semicolons, 2);
+}
+
+#[test]
+fn meta_properties_give_two_identifiers() {
+    let kinds = token_kinds("const u = import.meta.url;");
+    let import = kinds.iter().position(|k| *k == ident("import")).unwrap();
+    assert_eq!(kinds[import + 1], ident("meta"));
+    assert!(matches!(
+        kinds[import + 2],
+        TokenKind::Punctuation(PunctuationType::Dot)
+    ));
+    assert_eq!(kinds[import + 3], ident("url"));
+
+    let kinds = token_kinds("function F() { return new.target; }");
+    let new = kinds.iter().position(|k| *k == ident("new")).unwrap();
+    assert_eq!(kinds[new + 1], ident("target"));
+}
+
+#[test]
+fn qualified_interface_heritage_keeps_the_dot() {
+    let kinds = token_kinds("interface A extends ns.Base {}");
+    let ns = kinds.iter().position(|k| *k == ident("ns")).unwrap();
+    assert!(matches!(
+        kinds[ns + 1],
+        TokenKind::Punctuation(PunctuationType::Dot)
+    ));
+    assert_eq!(kinds[ns + 2], ident("Base"));
 }

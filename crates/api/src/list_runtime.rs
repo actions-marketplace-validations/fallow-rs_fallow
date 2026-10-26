@@ -3,17 +3,16 @@
 use std::path::{Path, PathBuf};
 
 use fallow_config::{AuthoredRule, LogicalGroup, LogicalGroupStatus, ResolvedBoundaryConfig};
-use fallow_output::{
-    ListEntryPointOutput, RootEnvelopeMode, WorkspaceInfo as WorkspaceOutputInfo, WorkspacesOutput,
-};
+use fallow_output::{ListEntryPointOutput, WorkspaceInfo as WorkspaceOutputInfo, WorkspacesOutput};
 use fallow_types::discover::{DiscoveredFile, EntryPoint};
+use fallow_types::path_util::display_relative;
 use rustc_hash::FxHashMap;
 
 use crate::{
     AnalysisOptions, BoundariesListLogicalGroup, BoundariesListRule, BoundariesListZone,
     BoundariesListing, ListJsonEnvelope, ListJsonOutputInput, ProgrammaticError,
-    analysis_context::changed_files_for_run, resolve_programmatic_analysis_context,
-    serialize_list_json_output,
+    analysis_context::{changed_files_for_run, validate_workspace_selection},
+    resolve_programmatic_analysis_context, serialize_list_json_output,
 };
 
 type ProgrammaticResult<T> = Result<T, ProgrammaticError>;
@@ -53,10 +52,11 @@ pub struct ProjectInfoProgrammaticOutput {
     pub boundaries: Option<BoundariesListing>,
     /// Workspace listing; `None` when the section was not requested.
     pub workspaces: Option<WorkspacesOutput<fallow_config::WorkspaceDiagnostic>>,
+    /// Diagnostics the plugin stage recorded, project-root-relative; empty when
+    /// the stage did not run or recorded none.
+    pub plugin_diagnostics: Vec<fallow_config::WorkspaceDiagnostic>,
     /// Which list envelope shape wraps the serialized body.
     pub envelope: ListJsonEnvelope,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
 }
 
 /// Serialize typed project-info output to the stable JSON contract.
@@ -73,9 +73,10 @@ pub fn serialize_project_info_programmatic_json(
             files: output.files,
             entry_points: output.entry_points,
             boundaries: output.boundaries,
+            entry_weight: None,
             workspaces: output.workspaces,
+            plugin_diagnostics: output.plugin_diagnostics,
         },
-        output.envelope_mode,
         output.envelope,
     )
     .map_err(|err| {
@@ -90,8 +91,6 @@ pub fn serialize_project_info_programmatic_json(
 pub struct ListBoundariesProgrammaticOutput {
     /// Typed boundaries listing produced by the run.
     pub boundaries: BoundariesListing,
-    /// Whether the serialized root envelope carries a `kind` discriminant.
-    pub envelope_mode: RootEnvelopeMode,
 }
 
 /// Serialize typed boundary-list output to the stable JSON contract.
@@ -108,9 +107,10 @@ pub fn serialize_list_boundaries_programmatic_json(
             files: None,
             entry_points: None,
             boundaries: Some(output.boundaries),
+            entry_weight: None,
             workspaces: None,
+            plugin_diagnostics: Vec::new(),
         },
-        output.envelope_mode,
         ListJsonEnvelope::Boundaries,
     )
     .map_err(|err| {
@@ -192,21 +192,26 @@ pub struct LogicalGroupInfo {
 /// # Errors
 ///
 /// Returns a structured programmatic error for invalid options or config-load
-/// failures.
+/// failures, and `FALLOW_CANCELLED` when the caller's cancellation token is
+/// set. This route parses nothing: config load and file discovery are its only
+/// stage, so the token is observed on either side of that and nowhere within
+/// it.
 pub fn run_list_boundaries(
     options: &ListBoundariesOptions,
 ) -> ProgrammaticResult<ListBoundariesProgrammaticOutput> {
     let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
+        resolved.ensure_not_cancelled("config load and file discovery")?;
         let project_config = load_list_project_config(&resolved)?;
         let session = fallow_engine::session::AnalysisSession::from_config(project_config);
+        validate_workspace_selection(&resolved, session.workspaces())?;
+        resolved.ensure_not_cancelled("the boundary listing")?;
         let changed_files = changed_files_for_run(&resolved)?;
         let discovered = scoped_discovered_files(session.files(), changed_files.as_ref());
         let data = compute_boundary_data(session.config(), Some(&discovered));
 
         Ok(ListBoundariesProgrammaticOutput {
             boundaries: boundary_data_to_output(&data),
-            envelope_mode: RootEnvelopeMode::Tagged,
         })
     })
 }
@@ -216,14 +221,20 @@ pub fn run_list_boundaries(
 /// # Errors
 ///
 /// Returns a structured programmatic error for invalid options, config-load
-/// failures, or plugin regex errors.
+/// failures, or plugin regex errors, and `FALLOW_CANCELLED` when the caller's
+/// cancellation token is set. This route parses nothing: config load and file
+/// discovery are its only stage, so the token is observed on either side of
+/// that and nowhere within it.
 pub fn run_project_info(
     options: &ProjectInfoOptions,
 ) -> ProgrammaticResult<ProjectInfoProgrammaticOutput> {
     let resolved = resolve_programmatic_analysis_context(&options.analysis)?;
     resolved.install(|| {
+        resolved.ensure_not_cancelled("config load and file discovery")?;
         let project_config = load_list_project_config(&resolved)?;
         let session = fallow_engine::session::AnalysisSession::from_config(project_config);
+        validate_workspace_selection(&resolved, session.workspaces())?;
+        resolved.ensure_not_cancelled("the project listing")?;
         let config = session.config();
         let workspaces = session.workspaces();
         let show_all = project_info_should_show_all(options);
@@ -232,22 +243,26 @@ pub fn run_project_info(
             project_info_discovered_files(options, show_all, &session, changed_files.as_ref());
         let discovered_ref = discovered.as_deref();
 
-        let plugin_result = collect_plugin_result(
-            resolved.root(),
-            config,
-            options,
-            show_all,
-            discovered_ref,
-            workspaces,
-        )?;
-        let entry_points = collect_entry_points(
-            config,
-            options,
-            show_all,
-            discovered_ref,
-            workspaces,
-            plugin_result.as_ref(),
-        );
+        let inventory = collect_inventory(&session, options, show_all)?;
+        let (plugin_result, entry_points) = match inventory {
+            Some(inventory) => (
+                Some(inventory.plugins),
+                inventory
+                    .entry_points
+                    .map(|entries| scoped_entry_points(entries, changed_files.as_ref())),
+            ),
+            None => (None, None),
+        };
+        let plugin_diagnostics = plugin_result
+            .as_ref()
+            .map(|result| {
+                result
+                    .plugin_diagnostics(&config.root)
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.into_root_relative(&config.root))
+                    .collect()
+            })
+            .unwrap_or_default();
         let boundaries = options
             .boundaries
             .then(|| boundary_data_to_output(&compute_boundary_data(config, discovered_ref)));
@@ -273,8 +288,8 @@ pub fn run_project_info(
                 .map(|entries| entry_points_to_output(&entries, resolved.root())),
             boundaries,
             workspaces,
+            plugin_diagnostics,
             envelope,
-            envelope_mode: RootEnvelopeMode::Tagged,
         })
     })
 }
@@ -353,7 +368,7 @@ fn collect_files(
         discovered.map(|files| {
             files
                 .iter()
-                .map(|file| format_display_path(&file.path, root))
+                .map(|file| display_relative(root, &file.path))
                 .collect()
         })
     } else {
@@ -361,59 +376,49 @@ fn collect_files(
     }
 }
 
-fn collect_plugin_result(
-    root: &Path,
-    config: &fallow_config::ResolvedConfig,
+/// Run the analysis prelude and entry-point discovery when the listing needs
+/// plugins or entry points, over the whole discovery: a changed-file scope
+/// narrows the listing, never which plugins are active.
+fn collect_inventory(
+    session: &fallow_engine::session::AnalysisSession,
     options: &ProjectInfoOptions,
     show_all: bool,
-    discovered: Option<&[DiscoveredFile]>,
-    workspaces: &[fallow_config::WorkspaceInfo],
-) -> ProgrammaticResult<Option<fallow_engine::plugins::AggregatedPluginResult>> {
+) -> ProgrammaticResult<Option<fallow_engine::list_inventory::ListingInventory>> {
     if !(options.plugins || options.entry_points || show_all) {
         return Ok(None);
     }
-    let Some(files) = discovered else {
-        return Ok(None);
-    };
-    fallow_engine::list_inventory::collect_active_plugins(root, config, files, workspaces)
-        .map(Some)
-        .map_err(|err| match err {
-            fallow_engine::list_inventory::ListInventoryError::PluginRegex(errors) => {
-                ProgrammaticError::new(
-                    fallow_engine::plugins::registry::format_plugin_regex_errors(&errors),
-                    2,
-                )
-                .with_code("FALLOW_PLUGIN_REGEX_FAILED")
-                .with_context("project_info.plugins")
-            }
-        })
+    fallow_engine::list_inventory::collect_listing_inventory(
+        session,
+        options.entry_points || show_all,
+    )
+    .map(Some)
+    .map_err(|err| {
+        ProgrammaticError::new(err.message(), 2)
+            .with_code("FALLOW_PLUGIN_REGEX_FAILED")
+            .with_context("project_info.plugins")
+    })
 }
 
-fn collect_entry_points(
-    config: &fallow_config::ResolvedConfig,
-    options: &ProjectInfoOptions,
-    show_all: bool,
-    discovered: Option<&[DiscoveredFile]>,
-    workspaces: &[fallow_config::WorkspaceInfo],
-    plugin_result: Option<&fallow_engine::plugins::AggregatedPluginResult>,
-) -> Option<Vec<EntryPoint>> {
-    if !(options.entry_points || show_all) {
-        return None;
-    }
-    let discovered = discovered?;
-    Some(fallow_engine::list_inventory::collect_entry_points(
-        config,
-        discovered,
-        workspaces,
-        plugin_result,
-    ))
+/// Keep the entry points inside the changed-file scope, the way the listed
+/// files are kept. The analysis found them over the whole project.
+fn scoped_entry_points(
+    entry_points: Vec<EntryPoint>,
+    changed_files: Option<&rustc_hash::FxHashSet<PathBuf>>,
+) -> Vec<EntryPoint> {
+    let Some(changed_files) = changed_files else {
+        return entry_points;
+    };
+    entry_points
+        .into_iter()
+        .filter(|entry| changed_files.contains(&entry.path))
+        .collect()
 }
 
 fn entry_points_to_output(entries: &[EntryPoint], root: &Path) -> Vec<ListEntryPointOutput> {
     entries
         .iter()
         .map(|entry| ListEntryPointOutput {
-            path: format_display_path(&entry.path, root),
+            path: display_relative(root, &entry.path),
             source: entry.source.to_string(),
         })
         .collect()
@@ -448,14 +453,6 @@ fn collect_workspace_output(
     }
 }
 
-fn format_display_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
-}
-
 /// Compute boundary listing data from resolved config and optional discovery.
 #[must_use]
 pub fn compute_boundary_data(
@@ -473,7 +470,7 @@ pub fn compute_boundary_data(
         };
     }
 
-    let zones = build_boundary_zones(config, discovered);
+    let zones = build_boundary_zones(&config.root, boundaries, discovered);
     let rules = build_boundary_rules(boundaries);
     let logical_groups = build_logical_groups(boundaries, &zones);
 
@@ -486,39 +483,44 @@ pub fn compute_boundary_data(
 }
 
 fn build_boundary_zones(
-    config: &fallow_config::ResolvedConfig,
+    root: &Path,
+    boundaries: &ResolvedBoundaryConfig,
     discovered: Option<&[DiscoveredFile]>,
 ) -> Vec<ZoneInfo> {
-    config
-        .boundaries
+    let file_counts = count_boundary_files_by_zone(root, boundaries, discovered);
+
+    boundaries
         .zones
         .iter()
         .map(|zone| ZoneInfo {
             name: zone.name.clone(),
             patterns: zone.matchers.iter().map(|m| m.glob().to_string()).collect(),
-            file_count: count_boundary_zone_files(config, discovered, &zone.name),
+            file_count: file_counts.get(zone.name.as_str()).copied().unwrap_or(0),
         })
         .collect()
 }
 
-fn count_boundary_zone_files(
-    config: &fallow_config::ResolvedConfig,
+fn count_boundary_files_by_zone<'a>(
+    root: &Path,
+    boundaries: &'a ResolvedBoundaryConfig,
     discovered: Option<&[DiscoveredFile]>,
-    zone_name: &str,
-) -> usize {
-    discovered.map_or(0, |files| {
-        files
-            .iter()
-            .filter(|file| {
-                let rel = file
-                    .path
-                    .strip_prefix(&config.root)
-                    .ok()
-                    .map(|path| path.to_string_lossy().replace('\\', "/"));
-                rel.is_some_and(|path| config.boundaries.classify_zone(&path) == Some(zone_name))
-            })
-            .count()
-    })
+) -> FxHashMap<&'a str, usize> {
+    let mut file_counts = FxHashMap::default();
+    let Some(files) = discovered else {
+        return file_counts;
+    };
+
+    for file in files {
+        let Ok(relative_path) = file.path.strip_prefix(root) else {
+            continue;
+        };
+        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+        if let Some(zone_name) = boundaries.classify_zone(&relative_path) {
+            *file_counts.entry(zone_name).or_default() += 1;
+        }
+    }
+
+    file_counts
 }
 
 fn build_boundary_rules(boundaries: &ResolvedBoundaryConfig) -> Vec<RuleInfo> {
@@ -645,6 +647,9 @@ fn logical_group_info_to_output(group: &LogicalGroupInfo) -> BoundariesListLogic
 mod tests {
     use std::process::Command;
 
+    use fallow_config::ResolvedZone;
+    use fallow_types::discover::FileId;
+    use globset::Glob;
     use serde_json::json;
 
     use super::*;
@@ -684,8 +689,39 @@ mod tests {
             .expect("boundary list output should serialize")
     }
 
+    fn resolved_zone(name: &str, patterns: &[&str]) -> ResolvedZone {
+        ResolvedZone {
+            name: name.to_string(),
+            patterns: patterns
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect(),
+            matchers: patterns
+                .iter()
+                .map(|pattern| {
+                    Glob::new(pattern)
+                        .expect("valid test glob")
+                        .compile_matcher()
+                })
+                .collect(),
+            root: None,
+        }
+    }
+
+    fn discovered_files(root: &Path, relative_paths: &[&str]) -> Vec<DiscoveredFile> {
+        relative_paths
+            .iter()
+            .enumerate()
+            .map(|(index, relative_path)| DiscoveredFile {
+                id: FileId(u32::try_from(index).expect("test file count fits in u32")),
+                path: root.join(relative_path),
+                size_bytes: 0,
+            })
+            .collect()
+    }
+
     fn git(project: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = fallow_engine::changed_files::clear_ambient_git_env(&mut Command::new("git"))
             .args(args)
             .current_dir(project)
             .status()
@@ -889,6 +925,7 @@ mod tests {
             .as_array()
             .expect("project info should include workspace_diagnostics")
             .iter()
+            .filter(|diagnostic| diagnostic["kind"] == "glob-matched-no-package-json")
             .map(|diagnostic| {
                 (
                     diagnostic["pattern"].as_str().unwrap_or_default(),
@@ -937,6 +974,106 @@ mod tests {
         .expect("list boundaries should serialize");
         assert_eq!(boundaries["boundaries"]["zones"][0]["file_count"], 1);
         assert_eq!(boundaries["boundaries"]["zones"][1]["file_count"], 0);
+    }
+
+    #[test]
+    fn boundary_zone_counts_preserve_first_match_for_overlapping_zones() {
+        let root = Path::new("project");
+        let boundaries = ResolvedBoundaryConfig {
+            zones: vec![
+                resolved_zone("source", &["src/**"]),
+                resolved_zone("shared", &["src/shared/**"]),
+            ],
+            ..ResolvedBoundaryConfig::default()
+        };
+        let files = discovered_files(root, &["src/app.ts", "src/shared/index.ts"]);
+
+        let zones = build_boundary_zones(root, &boundaries, Some(&files));
+
+        assert_eq!(zones[0].name, "source");
+        assert_eq!(zones[0].file_count, 2);
+        assert_eq!(zones[1].name, "shared");
+        assert_eq!(zones[1].file_count, 0);
+    }
+
+    #[test]
+    fn boundary_zone_counts_ignore_unmatched_and_out_of_root_files() {
+        let root = Path::new("project");
+        let boundaries = ResolvedBoundaryConfig {
+            zones: vec![resolved_zone("matched", &["src/matched/**"])],
+            ..ResolvedBoundaryConfig::default()
+        };
+        let mut files = discovered_files(root, &["src/matched/index.ts", "src/unmatched/index.ts"]);
+        files.push(DiscoveredFile {
+            id: FileId(2),
+            path: PathBuf::from("outside/index.ts"),
+            size_bytes: 0,
+        });
+
+        let zones = build_boundary_zones(root, &boundaries, Some(&files));
+
+        assert_eq!(zones[0].file_count, 1);
+    }
+
+    #[test]
+    fn boundary_zone_counts_preserve_duplicate_name_semantics() {
+        let root = Path::new("project");
+        let boundaries = ResolvedBoundaryConfig {
+            zones: vec![
+                resolved_zone("shared", &["src/first/**"]),
+                resolved_zone("shared", &["src/second/**"]),
+            ],
+            ..ResolvedBoundaryConfig::default()
+        };
+        let files = discovered_files(root, &["src/first/index.ts", "src/second/index.ts"]);
+
+        let zones = build_boundary_zones(root, &boundaries, Some(&files));
+
+        assert_eq!(zones[0].patterns, ["src/first/**"]);
+        assert_eq!(zones[1].patterns, ["src/second/**"]);
+        assert_eq!(zones[0].file_count, 2);
+        assert_eq!(zones[1].file_count, 2);
+    }
+
+    #[test]
+    fn boundary_zone_output_is_deterministic_and_keeps_config_order() {
+        let root = Path::new("project");
+        let boundaries = ResolvedBoundaryConfig {
+            zones: vec![
+                resolved_zone("zeta", &["src/zeta/**"]),
+                resolved_zone("alpha", &["src/alpha/**"]),
+                resolved_zone("middle", &["src/middle/**"]),
+            ],
+            ..ResolvedBoundaryConfig::default()
+        };
+        let files = discovered_files(
+            root,
+            &[
+                "src/middle/two.ts",
+                "src/zeta/one.ts",
+                "src/alpha/one.ts",
+                "src/middle/one.ts",
+            ],
+        );
+
+        let first = build_boundary_zones(root, &boundaries, Some(&files));
+        let second = build_boundary_zones(root, &boundaries, Some(&files));
+        let signature = |zones: &[ZoneInfo]| {
+            zones
+                .iter()
+                .map(|zone| (zone.name.clone(), zone.file_count))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(signature(&first), signature(&second));
+        assert_eq!(
+            signature(&first),
+            vec![
+                ("zeta".to_string(), 1),
+                ("alpha".to_string(), 1),
+                ("middle".to_string(), 2),
+            ]
+        );
     }
 
     #[test]

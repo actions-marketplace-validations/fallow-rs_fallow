@@ -19,8 +19,17 @@ pub struct ListOptions<'a> {
     pub plugins: bool,
     pub boundaries: bool,
     pub workspaces: bool,
+    /// Show the startup import weight of each runtime entry point.
+    pub entry_weight: bool,
+    /// Regression baseline flags for `--entry-weight`; `None` ignores them.
+    pub entry_weight_gate: Option<crate::regression::EntryWeightGate<'a>>,
     pub production: bool,
     pub allow_remote_extends: bool,
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Narrows the file and entry-point inventory to the scope;
+    /// plugins, boundaries metadata, and workspaces stay whole-project.
+    /// `None` means whole-project scope.
+    pub scope: Option<std::path::PathBuf>,
 }
 
 /// Owned listing data assembled by [`collect_list_data`] and borrowed by the
@@ -31,6 +40,7 @@ struct ListData {
     discovered: Option<Vec<fallow_engine::discover::DiscoveredFile>>,
     entry_points: Option<Vec<fallow_engine::discover::EntryPoint>>,
     boundary_data: Option<BoundaryData>,
+    entry_weight: Option<fallow_output::EntryWeightListing>,
     workspace_data: Option<WorkspaceData>,
 }
 
@@ -51,9 +61,26 @@ pub fn run_list(opts: &ListOptions<'_>) -> ExitCode {
         Err(code) => return code,
     };
 
-    let data = match collect_list_data(opts, &config) {
+    let gate = opts
+        .entry_weight_gate
+        .as_ref()
+        .filter(|_| opts.entry_weight);
+    if let Some(gate) = gate
+        && let Err(code) = validate_entry_weight_gate(opts, gate)
+    {
+        return code;
+    }
+
+    let mut data = match collect_list_data(opts, &config) {
         Ok(data) => data,
         Err(code) => return code,
+    };
+    let gate_failed = match (gate, data.entry_weight.as_mut()) {
+        (Some(gate), Some(listing)) => match apply_entry_weight_gate(opts, gate, listing) {
+            Ok(failed) => failed,
+            Err(code) => return code,
+        },
+        _ => false,
     };
 
     match opts.output {
@@ -64,8 +91,10 @@ pub fn run_list(opts: &ListOptions<'_>) -> ExitCode {
             discovered: data.discovered.as_deref(),
             entry_points: data.entry_points.as_deref(),
             boundary_data: data.boundary_data.as_ref(),
+            entry_weight: data.entry_weight.as_ref(),
             workspace_data: data.workspace_data.as_ref(),
-        }),
+        })
+        .map_or_else(|code| code, |()| gate_exit(gate_failed)),
         _ => {
             print_list_human(&ListHumanInput {
                 opts,
@@ -74,9 +103,10 @@ pub fn run_list(opts: &ListOptions<'_>) -> ExitCode {
                 discovered: data.discovered.as_deref(),
                 entry_points: data.entry_points.as_deref(),
                 boundary_data: data.boundary_data.as_ref(),
+                entry_weight: data.entry_weight.as_ref(),
                 workspace_data: data.workspace_data.as_ref(),
             });
-            ExitCode::SUCCESS
+            gate_exit(gate_failed)
         }
     }
 }
@@ -101,8 +131,11 @@ pub fn benchmark_list_json(
         plugins: false,
         boundaries: false,
         workspaces: false,
+        entry_weight: false,
+        entry_weight_gate: None,
         production: false,
         allow_remote_extends: false,
+        scope: None,
     };
     let (data, rendered_bytes) = benchmark_list_data_json(&opts)?;
     let file_count = data.discovered.as_deref().map_or(0, <[_]>::len);
@@ -139,8 +172,11 @@ pub fn benchmark_list_boundaries_json(
         plugins: false,
         boundaries: true,
         workspaces: false,
+        entry_weight: false,
+        entry_weight_gate: None,
         production: false,
         allow_remote_extends: false,
+        scope: None,
     };
     let (data, rendered_bytes) = benchmark_list_data_json(&opts)?;
     let Some(boundary_data) = data.boundary_data else {
@@ -176,6 +212,7 @@ fn benchmark_list_data_json(opts: &ListOptions<'_>) -> Result<(ListData, usize),
         discovered: data.discovered.as_deref(),
         entry_points: data.entry_points.as_deref(),
         boundary_data: data.boundary_data.as_ref(),
+        entry_weight: data.entry_weight.as_ref(),
         workspace_data: data.workspace_data.as_ref(),
     })
     .map_err(|err| {
@@ -196,8 +233,9 @@ fn collect_list_data(
 ) -> Result<ListData, ExitCode> {
     let show_all = should_show_all(opts);
 
-    let need_plugin_result = opts.plugins || opts.entry_points || show_all;
-    let need_files = needs_file_discovery(opts.files, show_all, opts.entry_points, opts.boundaries);
+    let need_plugin_result = opts.plugins || opts.entry_points || opts.entry_weight || show_all;
+    let need_files = needs_file_discovery(opts.files, show_all, opts.entry_points, opts.boundaries)
+        || opts.entry_weight;
     let session = if need_files || need_plugin_result {
         match fallow_engine::session::AnalysisSession::from_resolved_config(config.clone()) {
             Ok(session) => Some(session),
@@ -206,28 +244,38 @@ fn collect_list_data(
     } else {
         None
     };
-    let discovered = session.as_ref().map(|session| session.files().to_vec());
+    let mut discovered = session.as_ref().map(|session| session.files().to_vec());
+    if let Some(scope) = opts.scope.as_deref() {
+        discovered = discovered.map(|files| {
+            files
+                .into_iter()
+                .filter(|file| crate::scope_path::scope_covers(scope, &file.path))
+                .collect()
+        });
+    }
     let session_workspaces = session.as_ref().map(|session| session.workspaces());
     let session_workspace_diagnostics = session
         .as_ref()
         .map(|session| session.workspace_diagnostics().to_vec());
 
-    let plugin_result = collect_plugin_result(
-        opts,
-        config,
-        show_all,
-        discovered.as_deref(),
-        session_workspaces,
-    )?;
-
-    let entry_points = collect_list_entry_points(
-        opts,
-        config,
-        show_all,
-        discovered.as_deref(),
-        plugin_result.as_ref(),
-        session_workspaces,
-    );
+    let inventory = collect_inventory(opts, show_all, session.as_ref())?;
+    let (plugin_result, all_entry_points) = match inventory {
+        Some(inventory) => (Some(inventory.plugins), inventory.entry_points),
+        None => (None, None),
+    };
+    let entry_weight = match (opts.entry_weight, session.as_ref()) {
+        (true, Some(session)) => Some(collect_entry_weight(
+            opts,
+            session,
+            all_entry_points.as_deref().unwrap_or_default(),
+        )?),
+        _ => None,
+    };
+    let entry_points = if opts.entry_points || show_all {
+        all_entry_points.map(|entries| scoped_entry_points(entries, opts.scope.as_deref()))
+    } else {
+        None
+    };
 
     let boundary_data = if opts.boundaries {
         Some(fallow_api::compute_boundary_data(
@@ -252,28 +300,44 @@ fn collect_list_data(
         discovered,
         entry_points,
         boundary_data,
+        entry_weight,
         workspace_data,
     })
 }
 
-fn collect_list_entry_points(
+/// Compute the startup import weight of each runtime entry point. The
+/// positional scope keeps the entries inside it; the graph stays whole.
+fn collect_entry_weight(
     opts: &ListOptions<'_>,
-    config: &fallow_config::ResolvedConfig,
-    show_all: bool,
-    discovered: Option<&[fallow_engine::discover::DiscoveredFile]>,
-    plugin_result: Option<&fallow_engine::plugins::AggregatedPluginResult>,
-    workspaces: Option<&[fallow_config::WorkspaceInfo]>,
-) -> Option<Vec<fallow_engine::discover::EntryPoint>> {
-    if !(opts.entry_points || show_all) {
-        return None;
+    session: &fallow_engine::session::AnalysisSession,
+    entry_points: &[fallow_engine::discover::EntryPoint],
+) -> Result<fallow_output::EntryWeightListing, ExitCode> {
+    let mut listing = fallow_engine::entry_weight::compute_entry_weight(session, entry_points)
+        .map_err(|err| {
+            crate::error::emit_error(&format!("Analysis error: {err}"), 2, opts.output)
+        })?;
+    if let Some(scope) = opts.scope.as_deref() {
+        listing
+            .entries
+            .retain(|entry| crate::scope_path::scope_covers(scope, &opts.root.join(&entry.path)));
+        listing.entry_count = listing.entries.len();
     }
-    let disc = discovered?;
-    Some(fallow_engine::list_inventory::collect_entry_points(
-        config,
-        disc,
-        workspaces.unwrap_or(&[]),
-        plugin_result,
-    ))
+    Ok(listing)
+}
+
+/// Keep the entry points inside the positional scope, the way the listed
+/// files are kept. The analysis found them over the whole project.
+fn scoped_entry_points(
+    entry_points: Vec<fallow_engine::discover::EntryPoint>,
+    scope: Option<&std::path::Path>,
+) -> Vec<fallow_engine::discover::EntryPoint> {
+    let Some(scope) = scope else {
+        return entry_points;
+    };
+    entry_points
+        .into_iter()
+        .filter(|entry| crate::scope_path::scope_covers(scope, &entry.path))
+        .collect()
 }
 
 fn collect_list_workspace_data(
@@ -292,9 +356,10 @@ fn collect_list_workspace_data(
             diagnostics: workspace_diagnostics.unwrap_or(&[]).to_vec(),
         }));
     }
-    match fallow_engine::discover::discover_workspace_packages_with_diagnostics(
+    match fallow_engine::discover::discover_workspace_packages_for_config(
         opts.root,
         &config.ignore_patterns,
+        &config.workspace_patterns,
     ) {
         Ok((workspaces, mut diagnostics)) => {
             append_undeclared_workspace_diagnostics(
@@ -340,7 +405,12 @@ fn append_undeclared_workspace_diagnostics(
 /// When none of the specific flags is set, the command defaults to
 /// showing everything.
 const fn should_show_all(opts: &ListOptions<'_>) -> bool {
-    !opts.entry_points && !opts.files && !opts.plugins && !opts.boundaries && !opts.workspaces
+    !opts.entry_points
+        && !opts.files
+        && !opts.plugins
+        && !opts.boundaries
+        && !opts.workspaces
+        && !opts.entry_weight
 }
 
 /// Determine whether file discovery is needed.
@@ -356,32 +426,27 @@ const fn needs_file_discovery(
     files || show_all || entry_points || boundaries
 }
 
-fn collect_plugin_result(
+/// Run the analysis prelude and entry-point discovery when the listing needs
+/// plugins or entry points. It runs over the session's whole discovery: the
+/// positional scope narrows the listed files and entry points, never which
+/// plugins are active.
+fn collect_inventory(
     opts: &ListOptions<'_>,
-    config: &fallow_config::ResolvedConfig,
     show_all: bool,
-    discovered: Option<&[fallow_engine::discover::DiscoveredFile]>,
-    workspaces: Option<&[fallow_config::WorkspaceInfo]>,
-) -> Result<Option<fallow_engine::plugins::AggregatedPluginResult>, ExitCode> {
-    if !(opts.plugins || opts.entry_points || show_all) {
+    session: Option<&fallow_engine::session::AnalysisSession>,
+) -> Result<Option<fallow_engine::list_inventory::ListingInventory>, ExitCode> {
+    if !(opts.plugins || opts.entry_points || opts.entry_weight || show_all) {
         return Ok(None);
     }
-    let Some(disc) = discovered else {
+    let Some(session) = session else {
         return Ok(None);
     };
-    fallow_engine::list_inventory::collect_active_plugins(
-        opts.root,
-        config,
-        disc,
-        workspaces.unwrap_or(&[]),
+    fallow_engine::list_inventory::collect_listing_inventory(
+        session,
+        opts.entry_points || opts.entry_weight || show_all,
     )
     .map(Some)
-    .map_err(|err| match err {
-        fallow_engine::list_inventory::ListInventoryError::PluginRegex(errors) => {
-            let message = fallow_engine::plugins::registry::format_plugin_regex_errors(&errors);
-            crate::error::emit_error(&message, 2, opts.output)
-        }
-    })
+    .map_err(|err| crate::error::emit_error(err.message(), 2, opts.output))
 }
 
 /// Print list results as JSON and return the appropriate exit code.
@@ -392,20 +457,83 @@ struct ListJsonInput<'a> {
     discovered: Option<&'a [fallow_engine::discover::DiscoveredFile]>,
     entry_points: Option<&'a [fallow_engine::discover::EntryPoint]>,
     boundary_data: Option<&'a BoundaryData>,
+    entry_weight: Option<&'a fallow_output::EntryWeightListing>,
     workspace_data: Option<&'a WorkspaceData>,
 }
 
-fn print_list_json(input: &ListJsonInput<'_>) -> ExitCode {
+fn print_list_json(input: &ListJsonInput<'_>) -> Result<(), ExitCode> {
     match render_list_json(input) {
         Ok(json) => {
-            println!("{json}");
-            ExitCode::SUCCESS
+            crate::report::sink::stdoutln!("{json}");
+            Ok(())
         }
         Err(err) => {
             eprintln!("Error: failed to serialize list output: {err}");
-            ExitCode::from(2)
+            Err(ExitCode::from(2))
         }
     }
+}
+
+/// Exit code 1 when the enforced entry weight gate found an entry that grew
+/// more than the tolerance allows.
+fn gate_exit(gate_failed: bool) -> ExitCode {
+    if gate_failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Refuse gate flags that cannot work before the analysis runs.
+fn validate_entry_weight_gate(
+    opts: &ListOptions<'_>,
+    gate: &crate::regression::EntryWeightGate<'_>,
+) -> Result<(), ExitCode> {
+    gate.validate(opts.output)?;
+    if gate.save_file.is_some() && opts.scope.is_some() {
+        return Err(crate::error::emit_error(
+            "list --entry-weight --save-regression-baseline saves every entry; drop the PATH \
+             scope to save a baseline",
+            2,
+            opts.output,
+        ));
+    }
+    Ok(())
+}
+
+/// Compare the listing with the regression baseline and save a new one.
+/// Returns whether the enforced gate failed.
+fn apply_entry_weight_gate(
+    opts: &ListOptions<'_>,
+    gate: &crate::regression::EntryWeightGate<'_>,
+    listing: &mut fallow_output::EntryWeightListing,
+) -> Result<bool, ExitCode> {
+    let mut failed = false;
+    if let Some(path) = gate.baseline_file {
+        let baseline = crate::regression::load_entry_weight_baseline(path, opts.output)?;
+        let regression = crate::regression::compare_entry_weight(
+            listing,
+            &baseline,
+            gate.tolerance,
+            gate.fail_on_regression,
+            |entry_path| {
+                opts.scope.as_deref().is_none_or(|scope| {
+                    crate::scope_path::scope_covers(scope, &opts.root.join(entry_path))
+                })
+            },
+        );
+        failed = regression.enforced && regression.exceeded;
+        listing.regression = Some(regression);
+    }
+    if let Some(path) = gate.save_file {
+        crate::regression::save_entry_weight_baseline(
+            path,
+            opts.root,
+            crate::regression::EntryWeightCounts::from_listing(listing),
+            opts.output,
+        )?;
+    }
+    Ok(failed)
 }
 
 fn render_list_json(input: &ListJsonInput<'_>) -> Result<String, String> {
@@ -423,12 +551,9 @@ fn render_list_json(input: &ListJsonInput<'_>) -> Result<String, String> {
         ListJsonEnvelope::Plain
     };
 
-    let output = fallow_api::serialize_list_json_output(
-        build_list_json_output_input(input),
-        crate::output_runtime::current_root_envelope_mode(),
-        envelope,
-    )
-    .map_err(|err| err.to_string())?;
+    let output =
+        fallow_api::serialize_list_json_output(build_list_json_output_input(input), envelope)
+            .map_err(|err| err.to_string())?;
 
     input
         .opts
@@ -474,14 +599,30 @@ fn build_list_json_output_input(
             .collect()
     });
 
+    // The plugin stage's diagnostics explain the plugins and entry points
+    // above, so they travel whenever the stage ran, like on the analysis
+    // envelopes (issue #2804).
+    let plugin_diagnostics = input
+        .plugin_result
+        .map(|plugin_result| {
+            plugin_result
+                .plugin_diagnostics(opts.root)
+                .into_iter()
+                .map(|diagnostic| diagnostic.into_root_relative(opts.root))
+                .collect()
+        })
+        .unwrap_or_default();
+
     ListJsonOutputInput {
         plugins,
         files,
         entry_points,
         boundaries: input.boundary_data.map(fallow_api::boundary_data_to_output),
+        entry_weight: input.entry_weight.cloned(),
         workspaces: input
             .workspace_data
             .map(|workspaces| workspace_data_to_output(opts.root, workspaces)),
+        plugin_diagnostics,
     }
 }
 
@@ -523,6 +664,7 @@ struct ListHumanInput<'a> {
     discovered: Option<&'a [fallow_engine::discover::DiscoveredFile]>,
     entry_points: Option<&'a [fallow_engine::discover::EntryPoint]>,
     boundary_data: Option<&'a BoundaryData>,
+    entry_weight: Option<&'a fallow_output::EntryWeightListing>,
     workspace_data: Option<&'a WorkspaceData>,
 }
 
@@ -548,14 +690,14 @@ fn print_list_human(input: &ListHumanInput<'_>) {
     {
         eprintln!("Discovered {} files", disc.len());
         for file in disc {
-            println!("{}", format_display_path(&file.path, opts.root));
+            crate::report::sink::stdoutln!("{}", format_display_path(&file.path, opts.root));
         }
     }
 
     if let Some(entries) = entry_points {
         eprintln!("Found {} entry points", entries.len());
         for ep in entries {
-            println!(
+            crate::report::sink::stdoutln!(
                 "{} ({})",
                 format_display_path(&ep.path, opts.root),
                 ep.source
@@ -567,8 +709,142 @@ fn print_list_human(input: &ListHumanInput<'_>) {
         print_boundary_data_human(bd);
     }
 
+    if let Some(weight) = input.entry_weight {
+        print_entry_weight_human(weight);
+    }
+
     if let Some(ws) = workspace_data {
         print_workspace_data_human(opts.root, ws, opts.workspaces);
+    }
+}
+
+/// Human-mode render for the entry weight section.
+fn print_entry_weight_human(weight: &fallow_output::EntryWeightListing) {
+    eprintln!(
+        "Startup import weight of {} runtime {} (source bytes on disk, not bundle size)",
+        weight.entry_count,
+        if weight.entry_count == 1 {
+            "entry"
+        } else {
+            "entries"
+        }
+    );
+    for entry in &weight.entries {
+        crate::report::sink::stdoutln!("{} ({})", entry.path, entry.source);
+        crate::report::sink::stdoutln!(
+            "  eager          {} {}, {}{}",
+            entry.eager_modules,
+            pluralize("module", entry.eager_modules),
+            format_bytes(entry.eager_bytes),
+            if entry.eager_css_bytes > 0 {
+                format!(" ({} CSS)", format_bytes(entry.eager_css_bytes))
+            } else {
+                String::new()
+            }
+        );
+        crate::report::sink::stdoutln!(
+            "  deferred       {} {}, {}",
+            entry.deferred_modules,
+            pluralize("module", entry.deferred_modules),
+            format_bytes(entry.deferred_bytes)
+        );
+        crate::report::sink::stdoutln!(
+            "  out of thread  {} {}, {}",
+            entry.out_of_thread_modules,
+            pluralize("module", entry.out_of_thread_modules),
+            format_bytes(entry.out_of_thread_bytes)
+        );
+        if !entry.eager_packages.is_empty() {
+            let names: Vec<&str> = entry
+                .eager_packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect();
+            crate::report::sink::stdoutln!(
+                "  eager packages {}: {}",
+                entry.eager_package_count,
+                names.join(", ")
+            );
+        }
+        if !entry.dominating_imports.is_empty() {
+            crate::report::sink::stdoutln!("  imports that keep the most bytes eager:");
+            for import in &entry.dominating_imports {
+                let location = import.line.map_or_else(
+                    || import.importer.clone(),
+                    |line| format!("{}:{line}", import.importer),
+                );
+                crate::report::sink::stdoutln!(
+                    "    {location} -> {}  {}, {} {}",
+                    import.target,
+                    format_bytes(import.exclusive_bytes),
+                    import.exclusive_modules,
+                    pluralize("module", import.exclusive_modules)
+                );
+            }
+        }
+    }
+    if let Some(regression) = &weight.regression {
+        print_entry_weight_regression_human(regression);
+    }
+}
+
+/// Human-mode render for the entry weight regression comparison.
+fn print_entry_weight_regression_human(regression: &fallow_output::EntryWeightRegression) {
+    let verdict = match (regression.exceeded, regression.enforced) {
+        (false, _) => "passed",
+        (true, true) => "failed",
+        (true, false) => "exceeded (report-only; add --fail-on-regression to enforce)",
+    };
+    eprintln!(
+        "Entry weight regression check {verdict} (tolerance {})",
+        regression.tolerance
+    );
+    for delta in &regression.entries {
+        let line = match (delta.baseline_eager_bytes, delta.current_eager_bytes) {
+            (Some(before), Some(now)) if before == now && delta.new_eager_packages.is_empty() => {
+                continue;
+            }
+            (Some(before), Some(now)) => {
+                let change = i128::from(now) - i128::from(before);
+                format!(
+                    "eager {} -> {} ({}{change} B)",
+                    format_bytes(before),
+                    format_bytes(now),
+                    if change >= 0 { "+" } else { "" }
+                )
+            }
+            (None, Some(now)) => format!("new entry, eager {}", format_bytes(now)),
+            (Some(before), None) => format!("gone, was eager {}", format_bytes(before)),
+            (None, None) => continue,
+        };
+        let packages = if delta.new_eager_packages.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", new eager packages: {}",
+                delta.new_eager_packages.join(", ")
+            )
+        };
+        let mark = if delta.exceeded { "  [exceeded]" } else { "" };
+        eprintln!("  {}  {line}{packages}{mark}", delta.path);
+    }
+}
+
+/// Byte count with a binary unit, for human output only.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a display value with one decimal place"
+    )]
+    let value = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MiB", value / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", value / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -600,7 +876,7 @@ fn print_workspace_data_human(root: &std::path::Path, ws: &WorkspaceData, explic
             } else {
                 ""
             };
-            println!("  {} -> {path_str}{suffix}", w.name);
+            crate::report::sink::stdoutln!("  {} -> {path_str}{suffix}", w.name);
         }
     }
     if !ws.diagnostics.is_empty() {
@@ -773,14 +1049,26 @@ mod tests {
             plugins,
             boundaries,
             workspaces: false,
+            entry_weight: false,
+            entry_weight_gate: None,
             production: false,
             allow_remote_extends: false,
+            scope: None,
         }
     }
 
     #[test]
     fn show_all_when_no_flags_set() {
         assert!(should_show_all(&make_opts(false, false, false, false)));
+    }
+
+    #[test]
+    fn not_show_all_when_entry_weight_set() {
+        let opts = ListOptions {
+            entry_weight: true,
+            ..make_opts(false, false, false, false)
+        };
+        assert!(!should_show_all(&opts));
     }
 
     #[test]

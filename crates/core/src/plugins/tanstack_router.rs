@@ -4,17 +4,15 @@
 //! Parses `tsr.config.json` to support custom route directories, generated
 //! route-tree locations, and virtual route config.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{PathRule, Plugin, PluginResult, UsedExportRule, config_parser};
-use oxc_allocator::Allocator;
+use fallow_extract::JsText;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ImportDeclaration, ObjectExpression,
     Program, Statement, VariableDeclaration,
 };
 use oxc_ast_visit::{Visit, walk};
-use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 const ENABLERS: &[&str] = &[
@@ -270,13 +268,13 @@ fn resolve_tsr_config(config_path: &Path, source: &str, root: &Path) -> PluginRe
 
 fn resolve_bundler_config(config_path: &Path, source: &str, root: &Path) -> Option<PluginResult> {
     let source_type = SourceType::from_path(config_path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-    let options = collect_router_plugin_route_options(&parsed.program, config_path, root)
-        .into_iter()
-        .next()?;
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        let options = collect_router_plugin_route_options(&parsed.program, config_path, root)
+            .into_iter()
+            .next()?;
 
-    Some(resolve_route_options(options))
+        Some(resolve_route_options(options))
+    })
 }
 
 #[derive(Debug, Default)]
@@ -432,7 +430,7 @@ fn add_virtual_route_config_file(config: &mut VirtualRouteConfig, root: &Path, c
     push_unique(&mut config.config_files, config_file.to_string());
 
     let file_path = root.join(config_file);
-    let Ok(source) = fs::read_to_string(&file_path) else {
+    let Ok(source) = std::fs::read_to_string(&file_path) else {
         return;
     };
     let base_dir = Path::new(config_file)
@@ -552,11 +550,11 @@ struct VirtualRouteRefs {
 
 fn collect_virtual_route_call_refs(source: &str, path: &Path) -> VirtualRouteRefs {
     let source_type = SourceType::from_path(path).unwrap_or_default();
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-    let mut collector = VirtualRouteCallCollector::default();
-    collector.visit_program(&parsed.program);
-    collector.refs
+    fallow_extract::parse_bounded_or_default(source, source_type, |parsed| {
+        let mut collector = VirtualRouteCallCollector::default();
+        collector.visit_program(&parsed.program);
+        collector.refs
+    })
 }
 
 fn collect_virtual_route_expression_refs(program: &Program, expr: &Expression) -> VirtualRouteRefs {
@@ -638,7 +636,7 @@ struct RouterPluginCallCollector<'a> {
 
 impl<'a> Visit<'a> for RouterPluginCallCollector<'a> {
     fn visit_import_declaration(&mut self, decl: &ImportDeclaration<'a>) {
-        let Some(kind) = import_plugin_kind(decl.source.value.as_str()) else {
+        let Some(kind) = import_plugin_kind(&decl.source.value.text()) else {
             return;
         };
 
@@ -705,7 +703,7 @@ impl<'a> Visit<'a> for RouterPluginCallCollector<'a> {
                         if prop
                             .key
                             .static_name()
-                            .is_some_and(|name| router_plugin_call_name(kind, &name))
+                            .is_some_and(|name| router_plugin_call_name(kind, &name.text()))
                             && let BindingPattern::BindingIdentifier(identifier) = &prop.value
                         {
                             push_unique_kind(
@@ -890,13 +888,13 @@ impl<'a> Visit<'a> for VirtualRouteCallCollector {
                         let Some(helper) = prop.key.static_name() else {
                             continue;
                         };
-                        if is_virtual_route_helper(&helper)
+                        if is_virtual_route_helper(&helper.text())
                             && let BindingPattern::BindingIdentifier(identifier) = &prop.value
                         {
                             push_unique_pair(
                                 &mut self.helper_bindings,
                                 identifier.name.to_string(),
-                                helper.to_string(),
+                                helper.text().into_owned(),
                             );
                         }
                     }
@@ -944,7 +942,7 @@ fn string_arg(call: &CallExpression<'_>, index: usize) -> Option<String> {
     call.arguments
         .get(index)
         .and_then(|argument| match argument {
-            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            Argument::StringLiteral(value) => Some(value.value.text().into_owned()),
             Argument::TemplateLiteral(value) if value.expressions.is_empty() => value
                 .quasis
                 .first()

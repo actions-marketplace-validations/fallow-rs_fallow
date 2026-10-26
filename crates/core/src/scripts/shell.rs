@@ -1,6 +1,96 @@
 //! Shell tokenization: splitting on operators, skipping env wrappers and package managers.
 
 use super::ENV_WRAPPERS;
+use std::borrow::Cow;
+
+/// A literal shell argument with its original position for script forwarding.
+pub(super) struct ShellWord<'a> {
+    pub value: Cow<'a, str>,
+    pub start: usize,
+}
+
+/// Preserve the literal argument prefix without evaluating shell expansions.
+pub(super) fn split_words(source: &str) -> Vec<ShellWord<'_>> {
+    let mut words = Vec::new();
+    let mut rest = source.trim_start();
+    while !rest.is_empty() {
+        let Some(end) = shell_word_end(rest) else {
+            break;
+        };
+        words.push(ShellWord {
+            value: decode_shell_word(&rest[..end]),
+            start: source.len() - rest.len(),
+        });
+        rest = rest[end..].trim_start();
+    }
+    words
+}
+
+fn shell_word_end(source: &str) -> Option<usize> {
+    let mut quote = None;
+    let windows_path = starts_windows_path(source);
+    let mut chars = source.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\\' if quote != Some('\'') && !windows_path => {
+                chars.next()?;
+            }
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ch if Some(ch) == quote => quote = None,
+            // Dynamic command substitutions can produce arbitrary argument boundaries.
+            '`' if quote != Some('\'') => return None,
+            '$' if quote != Some('\'') && chars.peek().is_some_and(|(_, ch)| *ch == '(') => {
+                return None;
+            }
+            ch if quote.is_none() && ch.is_whitespace() => return Some(index),
+            _ => {}
+        }
+    }
+    quote.is_none().then_some(source.len())
+}
+
+fn decode_shell_word(raw: &str) -> Cow<'_, str> {
+    // package.json scripts also run under cmd.exe, where these are path separators.
+    if starts_windows_path(raw) {
+        return Cow::Borrowed(
+            raw.strip_prefix('"')
+                .and_then(|path| path.strip_suffix('"'))
+                .unwrap_or(raw),
+        );
+    }
+    if !raw.contains(['\'', '"', '\\']) {
+        return Cow::Borrowed(raw);
+    }
+    let mut value = String::with_capacity(raw.len());
+    let mut quote = None;
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if quote != Some('\'') => {
+                if let Some(next) = chars.next() {
+                    if quote == Some('"') && !matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        value.push('\\');
+                    }
+                    if next != '\n' {
+                        value.push(next);
+                    }
+                }
+            }
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ch if Some(ch) == quote => quote = None,
+            _ => value.push(ch),
+        }
+    }
+    Cow::Owned(value)
+}
+
+fn starts_windows_path(source: &str) -> bool {
+    let source = source.strip_prefix('"').unwrap_or(source);
+    source.starts_with(".\\")
+        || source.starts_with("..\\")
+        || source.starts_with("\\\\")
+        || matches!(source.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+}
 
 /// Bun runtime boolean flags that may precede an executed file/binary
 /// (`bun --bun <bin>`, `bun --watch <file>`, `bun --hot run dev`). Bun documents
@@ -10,7 +100,8 @@ use super::ENV_WRAPPERS;
 /// leading flag makes the parser treat the command as a script delegation rather
 /// than guess where the binary starts. Source: Bun runtime docs (oven-sh/bun
 /// docs/runtime/index.mdx, watch-mode.mdx).
-const BUN_RUNTIME_FLAGS: &[&str] = &["--bun", "--watch", "--hot", "--smol", "--no-clear-screen"];
+pub(super) const BUN_RUNTIME_FLAGS: &[&str] =
+    &["--bun", "--watch", "--hot", "--smol", "--no-clear-screen"];
 
 /// Split a script string on shell operators (`&&`, `||`, `;`, `|`, `&`).
 /// Respects single and double quotes.
@@ -20,11 +111,17 @@ pub fn split_shell_operators(script: &str) -> Vec<&str> {
     let bytes = script.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut word_start = 0;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
 
     while i < len {
         let b = bytes[i];
+
+        if b == b'\\' && !in_single_quote && !starts_windows_path(&script[word_start..]) {
+            i = (i + 2).min(len);
+            continue;
+        }
 
         if b == b'\'' && !in_double_quote {
             in_single_quote = !in_single_quote;
@@ -46,9 +143,13 @@ pub fn split_shell_operators(script: &str) -> Vec<&str> {
             segments.push(&script[start..i]);
             i += op_len;
             start = i;
+            word_start = i;
             continue;
         }
 
+        if b.is_ascii_whitespace() {
+            word_start = i + 1;
+        }
         i += 1;
     }
 
@@ -57,6 +158,116 @@ pub fn split_shell_operators(script: &str) -> Vec<&str> {
     }
 
     segments
+}
+
+/// Return the bodies of the outermost `$(...)` and backtick command
+/// substitutions in `script`.
+///
+/// The shell runs these bodies as commands, also inside double quotes. Text in
+/// single quotes does not run, so it is skipped. `$((...))` arithmetic and
+/// `${...}` parameter expressions are skipped too. A substitution inside a body
+/// is not returned: parse the body again to get it. An unclosed substitution
+/// gives no body.
+pub fn command_substitutions(script: &str) -> Vec<&str> {
+    let bytes = script.as_bytes();
+    let mut bodies = Vec::new();
+    let mut in_double_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' if !in_double_quote => {
+                let Some(end) = find_byte(bytes, i + 1, b'\'') else {
+                    break;
+                };
+                i = end + 1;
+            }
+            b'"' => {
+                in_double_quote = !in_double_quote;
+                i += 1;
+            }
+            b'`' => {
+                let Some(end) = backtick_end(bytes, i + 1) else {
+                    break;
+                };
+                bodies.push(&script[i + 1..end]);
+                i = end + 1;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                let Some(end) = closing_delimiter(bytes, i + 2, b'{', b'}') else {
+                    break;
+                };
+                i = end + 1;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                let start = i + 2;
+                let Some(end) = closing_delimiter(bytes, start, b'(', b')') else {
+                    break;
+                };
+                if bytes.get(start) != Some(&b'(') {
+                    bodies.push(&script[start..end]);
+                }
+                i = end + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    bodies
+}
+
+fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .iter()
+        .position(|&b| b == needle)
+        .map(|offset| from + offset)
+}
+
+/// Index of the backtick that closes a backtick substitution whose body
+/// starts at `from`. A backslash escapes the next byte.
+fn backtick_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'`' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Index of the `close` byte that matches an `open` byte before `from`.
+///
+/// Quotes in the body start a new quoting context, as in the shell, so a
+/// delimiter inside quotes does not count.
+fn closing_delimiter(bytes: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_double_quote = false;
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            in_double_quote = !in_double_quote;
+        } else if !in_double_quote {
+            if b == b'\'' {
+                i = find_byte(bytes, i + 1, b'\'')?;
+            } else if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Return the byte length of a shell operator at position `i`, or `None`.
@@ -96,9 +307,17 @@ pub fn skip_initial_wrappers(tokens: &[&str], mut idx: usize) -> Option<usize> {
     }
 
     while idx < tokens.len() && ENV_WRAPPERS.contains(&tokens[idx]) {
+        let wrapper = tokens[idx];
         idx += 1;
-        while idx < tokens.len() && super::is_env_assignment(tokens[idx]) {
-            idx += 1;
+        loop {
+            let before = idx;
+            while idx < tokens.len() && super::is_env_assignment(tokens[idx]) {
+                idx += 1;
+            }
+            idx = skip_env_wrapper_flag(wrapper, tokens, idx);
+            if idx == before {
+                break;
+            }
         }
         if idx < tokens.len() && tokens[idx] == "--" {
             idx += 1;
@@ -109,6 +328,48 @@ pub fn skip_initial_wrappers(tokens: &[&str], mut idx: usize) -> Option<usize> {
     }
 
     Some(idx)
+}
+
+/// `dotenv-cli` flags that take a value (`dotenv -e .env.ci -- eslint src`).
+const DOTENV_VALUE_FLAGS: &[&str] = &["-e", "-v", "-p"];
+/// `dotenv-cli` flags without a value.
+const DOTENV_BOOLEAN_FLAGS: &[&str] = &["-o", "--override", "--debug", "--no-expand"];
+/// `env` flags that take a value (`env -u HOME eslint src`).
+const ENV_VALUE_FLAGS: &[&str] = &["-u", "--unset", "-C", "--chdir"];
+/// `env` flags without a value.
+const ENV_BOOLEAN_FLAGS: &[&str] = &["-i", "--ignore-environment", "-0", "--null", "-"];
+
+/// Return the index after one option of an env wrapper at `idx`, or `idx`
+/// when the token there is not an option of that wrapper.
+fn skip_env_wrapper_flag(wrapper: &str, tokens: &[&str], idx: usize) -> usize {
+    let Some(&token) = tokens.get(idx) else {
+        return idx;
+    };
+    let (value_flags, boolean_flags) = match wrapper {
+        "dotenv" => (DOTENV_VALUE_FLAGS, DOTENV_BOOLEAN_FLAGS),
+        "env" => (ENV_VALUE_FLAGS, ENV_BOOLEAN_FLAGS),
+        _ => return idx,
+    };
+    if boolean_flags.contains(&token) {
+        return idx + 1;
+    }
+    if value_flags.contains(&token) {
+        return (idx + 2).min(tokens.len());
+    }
+    if token
+        .split_once('=')
+        .is_some_and(|(flag, _)| value_flags.contains(&flag))
+    {
+        return idx + 1;
+    }
+    // `dotenv -c [environment]`: the environment name is optional.
+    if wrapper == "dotenv" && token == "-c" {
+        let has_value = tokens
+            .get(idx + 1)
+            .is_some_and(|next| *next != "--" && !next.starts_with('-'));
+        return if has_value { idx + 2 } else { idx + 1 };
+    }
+    idx
 }
 
 /// Advance past package manager prefixes (`npx`, `pnpx`, `bunx`, `yarn exec`, `pnpm dlx`, etc.).
@@ -144,8 +405,12 @@ pub fn advance_past_package_manager(tokens: &[&str], mut idx: usize) -> Option<u
     } else if matches!(token, "yarn" | "pnpm" | "npm") {
         if idx + 1 < tokens.len() {
             let subcmd = tokens[idx + 1];
-            if subcmd == "exec" || subcmd == "dlx" {
+            if subcmd == "exec" || subcmd == "dlx" || (token == "npm" && subcmd == "x") {
                 idx += 2;
+                // `npm exec -- eslint` passes everything after `--` to the binary.
+                if tokens.get(idx) == Some(&"--") {
+                    idx += 1;
+                }
             } else {
                 return None;
             }
@@ -163,6 +428,113 @@ pub fn advance_past_package_manager(tokens: &[&str], mut idx: usize) -> Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_words_preserve_quoted_and_escaped_boundaries() {
+        for (source, expected) in [
+            (
+                r#"varlock run -p "./env -- is-ci ignored" -- publint"#,
+                vec![
+                    "varlock",
+                    "run",
+                    "-p",
+                    "./env -- is-ci ignored",
+                    "--",
+                    "publint",
+                ],
+            ),
+            (
+                r"varlock run -p ./env\ --\ is-ci\ ignored -- publint",
+                vec![
+                    "varlock",
+                    "run",
+                    "-p",
+                    "./env -- is-ci ignored",
+                    "--",
+                    "publint",
+                ],
+            ),
+            (
+                r#"va"r"lock run -- 'is-ci'"#,
+                vec!["varlock", "run", "--", "is-ci"],
+            ),
+            (r#"echo "one\q" """#, vec!["echo", r"one\q", ""]),
+            (
+                r#""C:\Program Files\tool.exe" arg"#,
+                vec![r"C:\Program Files\tool.exe", "arg"],
+            ),
+            (
+                r".\tools\runner.exe arg",
+                vec![r".\tools\runner.exe", "arg"],
+            ),
+            (
+                r"\\server\share\runner.exe arg",
+                vec![r"\\server\share\runner.exe", "arg"],
+            ),
+        ] {
+            let words = split_words(source);
+            assert_eq!(
+                words
+                    .iter()
+                    .map(|word| word.value.as_ref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_words_keep_raw_offsets_for_forwarding() {
+        let source = r#" npm --prefix "./path with spaces" run task -- -p "./env -- ignored""#;
+        let words = split_words(source);
+        assert_eq!(&source[words[6].start..], r#"-p "./env -- ignored""#);
+    }
+
+    #[test]
+    fn literal_words_stop_at_opaque_argument_after_known_prefix() {
+        for source in [
+            "vite $(pwd) -- is-ci",
+            "vite `pwd` -- is-ci",
+            "vite 'unclosed",
+            "vite \\",
+        ] {
+            let words = split_words(source);
+            assert_eq!(
+                words
+                    .iter()
+                    .map(|word| word.value.as_ref())
+                    .collect::<Vec<_>>(),
+                vec!["vite"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_operators_remain_inside_the_argument() {
+        assert_eq!(
+            split_shell_operators(r"echo value\;tail && publint"),
+            vec![r"echo value\;tail ", " publint"]
+        );
+    }
+
+    #[test]
+    fn quoted_windows_path_retains_following_shell_command() {
+        let source = r#""C:\Program Files\" && publint"#;
+        assert_eq!(
+            split_shell_operators(source),
+            vec![r#""C:\Program Files\" "#, " publint"]
+        );
+        let commands = super::super::parse_script(source);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.binary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["C:\\Program Files\\", "publint"]
+        );
+    }
 
     #[test]
     fn operator_len_double_ampersand() {
@@ -206,8 +578,63 @@ mod tests {
     }
 
     #[test]
-    fn operator_len_semicolon_at_end() {
-        assert_eq!(shell_operator_len(b";", 0), Some(1));
+    fn substitutions_read_dollar_paren_and_backtick_bodies() {
+        assert_eq!(
+            command_substitutions("a=$(node one.ts) b=`node two.ts`"),
+            vec!["node one.ts", "node two.ts"]
+        );
+    }
+
+    #[test]
+    fn substitutions_read_bodies_inside_double_quotes() {
+        assert_eq!(
+            command_substitutions(r#"x="$(node one.ts arg)""#),
+            vec!["node one.ts arg"]
+        );
+        assert_eq!(
+            command_substitutions(r#"x="`node two.ts`""#),
+            vec!["node two.ts"]
+        );
+    }
+
+    #[test]
+    fn substitutions_return_the_outer_body_of_a_nested_substitution() {
+        let outer = command_substitutions(r#"x="$(echo "$(node inner.ts)" | tr a b)""#);
+        assert_eq!(outer, vec![r#"echo "$(node inner.ts)" | tr a b"#]);
+        assert_eq!(command_substitutions(outer[0]), vec!["node inner.ts"]);
+    }
+
+    #[test]
+    fn substitutions_match_parens_in_quotes_and_subshells() {
+        assert_eq!(
+            command_substitutions("x=$(echo ')' \")\" && (cd a; node b.ts))"),
+            vec!["echo ')' \")\" && (cd a; node b.ts)"]
+        );
+    }
+
+    #[test]
+    fn substitutions_skip_single_quoted_text() {
+        assert!(command_substitutions("echo '$(node none.ts) `node none.ts`'").is_empty());
+        assert_eq!(
+            command_substitutions(r#"echo "it's $(node one.ts)""#),
+            vec!["node one.ts"]
+        );
+    }
+
+    #[test]
+    fn substitutions_skip_arithmetic_and_parameter_expressions() {
+        assert!(command_substitutions("echo $((1 + (2 * 3))) ${HOME} ${x:-)}").is_empty());
+        assert_eq!(
+            command_substitutions("echo $((1 + 2)) $(node one.ts)"),
+            vec!["node one.ts"]
+        );
+    }
+
+    #[test]
+    fn substitutions_skip_escaped_and_unclosed_forms() {
+        assert!(command_substitutions("echo \\$(node none.ts) \\`x`").is_empty());
+        assert!(command_substitutions("x=$(node none.ts").is_empty());
+        assert!(command_substitutions("x=`node none.ts").is_empty());
     }
 
     #[test]

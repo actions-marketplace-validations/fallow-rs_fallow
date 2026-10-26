@@ -60,16 +60,40 @@ pub const TASK_MATRIX: &[TaskRow] = &[
         ],
     },
     TaskRow {
+        task: "find how one module reaches another",
+        command: "fallow trace --path <from> <to>",
+        note: Some(
+            "Reports `reachable: false` instead of failing when no import path exists; type-only hops are reported, not skipped.",
+        ),
+        probe: &["trace", "--path", "src/app.ts", "src/db.ts"],
+    },
+    TaskRow {
         task: "delete an \"unused\" dependency",
         command: "fallow dead-code --trace-dependency <name>",
         note: None,
         probe: &["dead-code", "--trace-dependency", "lodash"],
     },
     TaskRow {
+        task: "migrate a dependency",
+        command: "fallow trace --dependency <name> --sites",
+        note: Some(
+            "Counts each imported name, follows one hop through project wrappers, and counts each use that it cannot resolve.",
+        ),
+        probe: &["trace", "--dependency", "lodash", "--sites"],
+    },
+    TaskRow {
         task: "commit or open a PR",
         command: "fallow audit --base <ref>",
         note: None,
         probe: &["audit", "--base", "main"],
+    },
+    TaskRow {
+        task: "read a diff before approving it",
+        command: "fallow review --base <ref> --brief",
+        note: Some(
+            "orientation, never gates: deterministic and always exit 0, unlike the audit row",
+        ),
+        probe: &["review", "--base", "main", "--brief"],
     },
     TaskRow {
         task: "prioritize refactoring",
@@ -106,6 +130,12 @@ pub const TASK_MATRIX: &[TaskRow] = &[
         command: "fallow guard <files>",
         note: None,
         probe: &["guard", "src/index.ts"],
+    },
+    TaskRow {
+        task: "check import cycles, boundaries and policy rules after changing code",
+        command: "fallow architecture",
+        note: None,
+        probe: &["architecture"],
     },
     TaskRow {
         task: "surface security candidates",
@@ -155,17 +185,16 @@ pub const MUTATING_COMMANDS: &[&str] = &[
     "watch",
 ];
 
-/// The first command token after the `fallow` prefix, or the empty string for
-/// a bare flag-fragment row.
-#[must_use]
-pub fn leading_command_token(row: &TaskRow) -> &'static str {
-    let after_fallow = row.command.strip_prefix("fallow ").unwrap_or(row.command);
-    after_fallow.split_whitespace().next().unwrap_or("")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first command token after the `fallow` prefix, or the empty string
+    /// for a bare flag-fragment row.
+    fn leading_command_token(row: &TaskRow) -> &'static str {
+        let after_fallow = row.command.strip_prefix("fallow ").unwrap_or(row.command);
+        after_fallow.split_whitespace().next().unwrap_or("")
+    }
 
     #[test]
     fn matrix_is_non_empty() {

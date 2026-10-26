@@ -24,16 +24,34 @@ use std::path::Path;
 /// Finding-count and finding-identity baselines for suppressing known issues
 /// across runs.
 pub mod baseline;
+pub mod baseline_growth;
+/// Read-only inspection of the persisted extraction cache, for `fallow doctor`.
+pub mod cache_status;
+pub mod change_coupling;
+pub mod change_scope;
 pub mod changed_files;
 pub mod churn;
+/// Continuous integration detection shared by the API runtime and the CLI.
+pub mod ci_env;
+pub mod clock;
 pub mod codeowners;
 mod core_backend;
 pub mod cross_reference;
 mod css;
 pub mod dead_code;
+pub mod diff_scope;
+pub mod diff_source;
 pub mod discover;
 pub mod duplicates;
+mod effective_severity;
+pub mod entry_weight;
+pub mod error_severity;
 mod feature_flags;
+pub mod flag_age;
+mod flag_registry;
+pub mod flag_report;
+pub mod flag_retirement;
+pub mod flag_vendor;
 pub mod flags;
 pub(crate) mod graph {
     pub use fallow_graph::graph::*;
@@ -42,47 +60,40 @@ pub(crate) mod graph {
 mod git_env;
 pub mod guard;
 pub mod health;
-#[cfg(test)]
-pub(crate) mod extract {
-    pub use fallow_types::extract::*;
-}
-#[cfg(test)]
-pub(crate) mod analyze {
-    pub mod test_support {
-        use fallow_types::discover::FileId;
-        use fallow_types::extract::ModuleInfo;
-
-        pub fn empty_module() -> ModuleInfo {
-            ModuleInfo::empty(FileId(1))
-        }
-    }
-}
 pub mod list_inventory;
 pub mod module_graph;
+/// The static half of mutation testing: mutant selection, test mapping,
+/// pruning and ranking.
+pub mod mutation;
+pub mod package_baselines;
 pub mod plugins;
 pub mod project_analysis;
 pub mod project_config;
 mod public_api;
 pub mod repo_refs;
-#[cfg(test)]
-pub(crate) mod resolve {
-    pub use fallow_graph::resolve::*;
-}
 mod results;
+pub mod search_visibility;
 mod security;
 pub mod session;
+mod session_reuse;
+pub mod shell_quote;
 pub mod similar_code;
 pub mod source;
 mod suppress;
+pub mod test_paths;
 pub mod thread_pool;
 pub mod trace;
 pub mod trace_chain;
+pub mod trace_error;
+pub mod unprovable;
 /// Input validation shared by CLI-facing entry points: git refs, root paths,
 /// and control-character rejection.
 pub mod validate;
 pub mod vital_signs;
 pub mod viz;
+pub mod warm_parse;
 pub mod workspace_scope;
+pub mod write_guard;
 
 /// Result alias for typed engine operations.
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -91,6 +102,7 @@ pub type EngineResult<T> = Result<T, EngineError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineError {
     message: String,
+    cancelled: bool,
 }
 
 impl EngineError {
@@ -99,7 +111,27 @@ impl EngineError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancelled: false,
         }
+    }
+
+    /// Create the error an analysis returns when its caller cancelled it.
+    ///
+    /// `stage` names the pipeline boundary the run stopped at, so a caller can
+    /// tell how far the analysis got before it was stopped.
+    #[must_use]
+    pub fn cancelled(stage: &str) -> Self {
+        Self {
+            message: format!("analysis was cancelled before {stage}"),
+            cancelled: true,
+        }
+    }
+
+    /// Whether this error reports a caller-requested cancellation rather than
+    /// a failed analysis.
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
+        self.cancelled
     }
 
     /// User-facing error message from the backend.
@@ -172,14 +204,18 @@ mod tests {
 
     #[test]
     fn engine_root_does_not_reexport_broad_surface_modules() {
-        let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
-            .expect("read engine lib");
+        let source = fs::read_to_string(
+            std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+            )
+            .join("src/lib.rs"),
+        )
+        .expect("read engine lib");
         let public_surface = source
             .split("#[cfg(test)]")
             .next()
             .expect("engine lib has public surface before tests");
         let forbidden_exports = [
-            "pub use error::",
             "pub use flags::",
             "pub use git_env::",
             "pub use public_api::",
@@ -199,9 +235,13 @@ mod tests {
 
     #[test]
     fn engine_session_owns_dead_code_pipeline_sequence() {
-        let session_source =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session.rs"))
-                .expect("read engine session");
+        let session_source = fs::read_to_string(
+            std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+            )
+            .join("src/session.rs"),
+        )
+        .expect("read engine session");
         assert!(
             !session_source.contains("analyze_with_owned_parse_result_from_discovery"),
             "engine session must not delegate dead-code orchestration to the old core monolith"
@@ -223,9 +263,13 @@ mod tests {
 
     #[test]
     fn engine_session_owns_analysis_discovery() {
-        let session_source =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session.rs"))
-                .expect("read engine session");
+        let session_source = fs::read_to_string(
+            std::path::PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+            )
+            .join("src/session.rs"),
+        )
+        .expect("read engine session");
         assert!(
             session_source.contains("crate::discover::prepare_analysis_discovery"),
             "engine session must build discovery through the engine discovery boundary"
@@ -305,7 +349,8 @@ mod tests {
             config.ignore_patterns = globset::GlobSetBuilder::new()
                 .add(globset::Glob::new("packages/ignored").expect("ignore glob"))
                 .build()
-                .expect("ignore set");
+                .expect("ignore set")
+                .into();
         })
         .expect("session loads");
 
@@ -799,9 +844,11 @@ mod tests {
     }
 
     fn workspace_fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures")
-            .join(name)
+        std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("../../tests/fixtures")
+        .join(name)
     }
 
     fn trace_symbol_chain_fixture(

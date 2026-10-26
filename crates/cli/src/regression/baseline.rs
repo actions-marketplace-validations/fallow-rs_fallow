@@ -5,7 +5,9 @@ use fallow_config::OutputFormat;
 use fallow_engine::changed_files::clear_ambient_git_env;
 use fallow_types::results::AnalysisResults;
 
-use super::counts::{CheckCounts, DupesCounts, REGRESSION_SCHEMA_VERSION, RegressionBaseline};
+use super::counts::{
+    CheckCounts, DupesCounts, FlagsCounts, REGRESSION_SCHEMA_VERSION, RegressionBaseline,
+};
 use super::outcome::RegressionOutcome;
 use super::tolerance::Tolerance;
 
@@ -51,19 +53,12 @@ fn is_likely_gitignored(path: &Path, root: &Path) -> bool {
         .arg(path)
         .current_dir(root);
     clear_ambient_git_env(&mut command);
-    command.output().ok().is_some_and(|o| o.status.success())
+    command.output().is_ok_and(|o| o.status.success())
 }
 
 /// Get the current git SHA, if available.
-fn current_git_sha(root: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
-    command.args(["rev-parse", "HEAD"]).current_dir(root);
-    clear_ambient_git_env(&mut command);
-    command
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+pub(super) fn current_git_sha(root: &Path) -> Option<String> {
+    fallow_engine::repo_refs::head_sha(root).ok().flatten()
 }
 
 #[cfg(test)]
@@ -93,6 +88,12 @@ pub fn save_regression_baseline_with_identity(
     output: OutputFormat,
     analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
 ) -> Result<(), ExitCode> {
+    // `list --entry-weight` and `flags --retirement` write their blocks into
+    // the same file, so a save of the issue counts keeps them.
+    let existing = read_existing_baseline(path);
+    let (entry_weight, flags) = existing
+        .map(|existing| (existing.entry_weight, existing.flags))
+        .unwrap_or_default();
     let baseline = RegressionBaseline {
         schema_version: REGRESSION_SCHEMA_VERSION,
         fallow_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -101,18 +102,69 @@ pub fn save_regression_baseline_with_identity(
         analysis_identity: analysis_identity.clone(),
         check: check_counts.cloned(),
         dupes: dupes_counts.cloned(),
+        entry_weight,
+        flags,
     };
-    let json = serde_json::to_string_pretty(&baseline).map_err(|e| {
+    write_regression_baseline(path, root, &baseline, output)
+}
+
+/// Save the flag counts of `fallow flags --retirement` into a regression
+/// baseline file. The other blocks that the file already holds stay.
+pub fn save_flags_regression_baseline(
+    path: &Path,
+    root: &Path,
+    flags_counts: &FlagsCounts,
+    output: OutputFormat,
+) -> Result<(), ExitCode> {
+    let existing = read_existing_baseline(path);
+    let baseline = RegressionBaseline {
+        schema_version: REGRESSION_SCHEMA_VERSION,
+        fallow_version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: chrono_now(),
+        git_sha: current_git_sha(root),
+        analysis_identity: existing.as_ref().map_or_else(
+            fallow_types::semantic::SemanticAnalysisIdentity::syntactic,
+            |existing| existing.analysis_identity.clone(),
+        ),
+        check: existing
+            .as_ref()
+            .and_then(|existing| existing.check.clone()),
+        dupes: existing
+            .as_ref()
+            .and_then(|existing| existing.dupes.clone()),
+        entry_weight: existing.and_then(|existing| existing.entry_weight),
+        flags: Some(flags_counts.clone()),
+    };
+    write_regression_baseline(path, root, &baseline, output)
+}
+
+/// Read the regression baseline file that a save replaces, when it exists.
+pub(super) fn read_existing_baseline(path: &Path) -> Option<RegressionBaseline> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<RegressionBaseline>(&content).ok())
+}
+
+/// Serialize and write a regression baseline file.
+pub(super) fn write_regression_baseline(
+    path: &Path,
+    root: &Path,
+    baseline: &RegressionBaseline,
+    output: OutputFormat,
+) -> Result<(), ExitCode> {
+    let json = serde_json::to_string_pretty(baseline).map_err(|e| {
         emit_error(
             &format!("failed to serialize regression baseline: {e}"),
             2,
             output,
         )
     })?;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(path, json).map_err(|e| {
+    fallow_engine::write_guard::write_file(
+        path,
+        json.as_bytes(),
+        fallow_engine::write_guard::WriteTarget::Path,
+    )
+    .map_err(|e| {
         emit_error(
             &format!("failed to save regression baseline: {e}"),
             2,
@@ -192,7 +244,12 @@ pub fn save_baseline_to_config_with_identity(
         )
     })?;
 
-    std::fs::write(config_path, updated).map_err(|e| {
+    fallow_engine::write_guard::write_file(
+        config_path,
+        updated.as_bytes(),
+        fallow_engine::write_guard::WriteTarget::DiscoveredConfig,
+    )
+    .map_err(|e| {
         emit_error(
             &format!(
                 "failed to write config file '{}': {e}",
@@ -478,6 +535,7 @@ fn format_schema_mismatch_error(
     expected: u32,
     actual: u32,
     writer_version: &str,
+    command: &str,
 ) -> String {
     let path_display = path.display();
     if actual == 0 {
@@ -485,13 +543,13 @@ fn format_schema_mismatch_error(
             "regression baseline '{path_display}' appears to predate schema versioning \
              (schema_version is 0; this fallow build expects {expected}).\n\
              The baseline was written by fallow {writer_version}.\n\
-             Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+             Regenerate it by running: fallow {command} --save-regression-baseline {path_display}"
         )
     } else {
         format!(
             "regression baseline '{path_display}' has schema_version {actual} but this fallow build expects {expected}.\n\
              The baseline was written by fallow {writer_version}.\n\
-             Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+             Regenerate it by running: fallow {command} --save-regression-baseline {path_display}"
         )
     }
 }
@@ -499,14 +557,14 @@ fn format_schema_mismatch_error(
 /// Build the message for a baseline missing `schema_version` entirely. Pre-versioning
 /// baselines (hand-edited or written by a very old fallow) hit this path; the raw
 /// serde error ("missing field `schema_version`") is unhelpful to a CI user.
-fn format_missing_schema_version_error(path: &Path) -> String {
+fn format_missing_schema_version_error(path: &Path, command: &str) -> String {
     let path_display = path.display();
     let expected = REGRESSION_SCHEMA_VERSION;
     format!(
         "regression baseline '{path_display}' is missing the schema_version field; \
          this fallow build expects schema_version {expected}.\n\
          The baseline likely predates schema versioning or was hand-edited.\n\
-         Regenerate it by running: fallow dead-code --save-regression-baseline {path_display}"
+         Regenerate it by running: fallow {command} --save-regression-baseline {path_display}"
     )
 }
 
@@ -525,6 +583,20 @@ fn format_missing_schema_version_error(path: &Path) -> String {
 pub fn load_regression_baseline(
     path: &Path,
     output: OutputFormat,
+) -> Result<RegressionBaseline, ExitCode> {
+    load_regression_baseline_for(path, output, "dead-code")
+}
+
+/// Load a regression baseline from disk for `command`, the subcommand that
+/// runs. The regenerate hints name that command.
+///
+/// # Errors
+///
+/// The same errors as [`load_regression_baseline`].
+pub fn load_regression_baseline_for(
+    path: &Path,
+    output: OutputFormat,
+    command: &str,
 ) -> Result<RegressionBaseline, ExitCode> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -550,7 +622,7 @@ pub fn load_regression_baseline(
     })?;
     let baseline: RegressionBaseline = serde_json::from_str(&content).map_err(|e| {
         let message = if e.to_string().contains("missing field `schema_version`") {
-            format_missing_schema_version_error(path)
+            format_missing_schema_version_error(path, command)
         } else {
             format!(
                 "failed to parse regression baseline '{}': {e}",
@@ -565,6 +637,7 @@ pub fn load_regression_baseline(
             REGRESSION_SCHEMA_VERSION,
             baseline.schema_version,
             &baseline.fallow_version,
+            command,
         );
         return Err(emit_error(&message, 2, output));
     }
@@ -583,6 +656,7 @@ fn compare_check_regression(
         opts,
         config_baseline,
         &fallow_types::semantic::SemanticAnalysisIdentity::syntactic(),
+        "dead-code",
     )
 }
 
@@ -591,6 +665,7 @@ pub fn compare_check_regression_with_identity(
     opts: &RegressionOpts<'_>,
     config_baseline: Option<&fallow_config::RegressionBaseline>,
     analysis_identity: &fallow_types::semantic::SemanticAnalysisIdentity,
+    command: &str,
 ) -> Result<Option<RegressionOutcome>, ExitCode> {
     if !opts.fail_on_regression {
         return Ok(None);
@@ -606,12 +681,13 @@ pub fn compare_check_regression_with_identity(
     }
 
     let baseline_counts: CheckCounts = if let Some(baseline_path) = opts.regression_baseline_file {
-        let baseline = load_regression_baseline(baseline_path, opts.output)?;
+        let baseline = load_regression_baseline_for(baseline_path, opts.output, command)?;
         ensure_regression_identity(
             &baseline.analysis_identity,
             analysis_identity,
             baseline_path,
             opts.output,
+            command,
         )?;
         let Some(counts) = baseline.check else {
             return Err(emit_error(
@@ -630,6 +706,7 @@ pub fn compare_check_regression_with_identity(
             analysis_identity,
             Path::new("project config"),
             opts.output,
+            command,
         )?;
         CheckCounts::from_config_baseline(config_baseline)
     } else {
@@ -668,6 +745,7 @@ fn ensure_regression_identity(
     current: &fallow_types::semantic::SemanticAnalysisIdentity,
     path: &Path,
     output: OutputFormat,
+    command: &str,
 ) -> Result<(), ExitCode> {
     let incompatible = stored.incompatible_fields(current);
     if incompatible.is_empty() {
@@ -683,7 +761,7 @@ fn ensure_regression_identity(
     };
     Err(emit_error(
         &format!(
-            "regression baseline '{}' has an incompatible analysis identity in: {}. Regenerate it with: fallow dead-code{type_aware_flag} --save-regression-baseline {}",
+            "regression baseline '{}' has an incompatible analysis identity in: {}. Regenerate it with: fallow {command}{type_aware_flag} --save-regression-baseline {}",
             path.display(),
             incompatible.join(", "),
             path.display(),
@@ -694,7 +772,7 @@ fn ensure_regression_identity(
 }
 
 /// ISO 8601 UTC timestamp without external dependencies.
-fn chrono_now() -> String {
+pub(super) fn chrono_now() -> String {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -863,10 +941,14 @@ mod tests {
             unprovided_injects: 0,
             unrendered_components: 0,
             unused_component_props: 0,
+            absent_component_props: 0,
             unused_component_emits: 0,
             unused_component_inputs: 0,
             unused_component_outputs: 0,
             unused_svelte_events: 0,
+            unused_effect_layers: 0,
+            unused_tagged_errors: 0,
+            unproduced_catch_tags: 0,
             unused_server_actions: 0,
             unused_load_data_keys: 0,
             unresolved_imports: 1,
@@ -874,6 +956,7 @@ mod tests {
             duplicate_exports: 1,
             circular_dependencies: 0,
             re_export_cycles: 0,
+            package_cycles: 0,
             type_only_dependencies: 0,
             test_only_dependencies: 0,
             dev_dependencies_in_production: 0,
@@ -928,6 +1011,67 @@ mod tests {
         assert!(loaded.check.is_some());
         assert!(loaded.dupes.is_none());
         assert_eq!(loaded.check.unwrap().unused_files, 5);
+    }
+
+    #[test]
+    fn saving_issue_counts_keeps_the_saved_entry_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regression-baseline.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"fallow_version":"0.0.0","timestamp":"t",
+               "entry_weight":{"entries":[{"path":"src/main.ts","eager_bytes":10,"eager_modules":1}]}}"#,
+        )
+        .unwrap();
+        let counts = CheckCounts {
+            total_issues: 1,
+            unused_files: 1,
+            ..CheckCounts::from_config_baseline(&fallow_config::RegressionBaseline::default())
+        };
+
+        save_regression_baseline(&path, dir.path(), Some(&counts), None, OutputFormat::Human)
+            .unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
+
+        assert_eq!(loaded.check.unwrap().total_issues, 1);
+        let entries = loaded.entry_weight.expect("entry weights kept").entries;
+        assert_eq!(entries[0].path, "src/main.ts");
+    }
+
+    #[test]
+    fn saving_flag_counts_and_issue_counts_keeps_both_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regression-baseline.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"fallow_version":"0.0.0","timestamp":"t",
+               "entry_weight":{"entries":[{"path":"src/main.ts","eager_bytes":10,"eager_modules":1}]}}"#,
+        )
+        .unwrap();
+        let flags = FlagsCounts {
+            total_flags: 3,
+            distinct_flags: 2,
+            by_reason: std::collections::BTreeMap::new(),
+        };
+        let counts = CheckCounts {
+            total_issues: 1,
+            unused_files: 1,
+            ..CheckCounts::from_config_baseline(&fallow_config::RegressionBaseline::default())
+        };
+
+        save_flags_regression_baseline(&path, dir.path(), &flags, OutputFormat::Human).unwrap();
+        save_regression_baseline(&path, dir.path(), Some(&counts), None, OutputFormat::Human)
+            .unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
+
+        assert_eq!(loaded.check.unwrap().total_issues, 1);
+        assert_eq!(loaded.flags.expect("flag counts kept").distinct_flags, 2);
+        assert!(loaded.entry_weight.is_some(), "entry weights kept");
+
+        save_flags_regression_baseline(&path, dir.path(), &flags, OutputFormat::Human).unwrap();
+        let loaded = load_regression_baseline(&path, OutputFormat::Human).unwrap();
+        assert_eq!(loaded.check.expect("issue counts kept").total_issues, 1);
+        assert!(loaded.entry_weight.is_some(), "entry weights kept");
     }
 
     #[test]
@@ -1324,6 +1468,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
 
         let opts = make_opts(true, Tolerance::Absolute(0), false, None);
@@ -1421,8 +1567,13 @@ mod tests {
 
     #[test]
     fn format_schema_mismatch_error_too_high() {
-        let msg =
-            format_schema_mismatch_error(Path::new("/repo/.fallow-baseline.json"), 1, 99, "3.0.0");
+        let msg = format_schema_mismatch_error(
+            Path::new("/repo/.fallow-baseline.json"),
+            1,
+            99,
+            "3.0.0",
+            "dead-code",
+        );
         assert!(msg.contains("schema_version 99"));
         assert!(msg.contains("expects 1"));
         assert!(msg.contains("fallow 3.0.0"));
@@ -1435,8 +1586,13 @@ mod tests {
 
     #[test]
     fn format_schema_mismatch_error_actual_zero_special_case() {
-        let msg =
-            format_schema_mismatch_error(Path::new("/repo/.fallow-baseline.json"), 1, 0, "2.0.0");
+        let msg = format_schema_mismatch_error(
+            Path::new("/repo/.fallow-baseline.json"),
+            1,
+            0,
+            "2.0.0",
+            "dead-code",
+        );
         assert!(msg.contains("predate"));
         assert!(msg.contains("fallow 2.0.0"));
         assert!(
@@ -1446,9 +1602,23 @@ mod tests {
 
     #[test]
     fn format_missing_schema_version_error_includes_regenerate_command() {
-        let msg = format_missing_schema_version_error(Path::new("/repo/baseline.json"));
+        let msg =
+            format_missing_schema_version_error(Path::new("/repo/baseline.json"), "dead-code");
         assert!(msg.contains("missing the schema_version field"));
         assert!(msg.contains("fallow dead-code --save-regression-baseline /repo/baseline.json"));
+    }
+
+    #[test]
+    fn regenerate_hints_name_the_architecture_command() {
+        let path = Path::new("/repo/baseline.json");
+        let expected = "fallow architecture --save-regression-baseline /repo/baseline.json";
+        assert!(format_missing_schema_version_error(path, "architecture").contains(expected));
+        assert!(
+            format_schema_mismatch_error(path, 1, 0, "2.0.0", "architecture").contains(expected)
+        );
+        assert!(
+            format_schema_mismatch_error(path, 1, 99, "3.0.0", "architecture").contains(expected)
+        );
     }
 
     #[test]

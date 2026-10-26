@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
+import {
+  assertArtifactDirectoryInWorkspace,
+  fixtureDependencyEnvironment,
+} from "./type-aware-corpus/dependencies.mjs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -14,7 +26,6 @@ import {
   candidateKey,
   compareCandidateSets,
   evidenceProducerErrors,
-  fixtureDependencyEnvironment,
   independentReviewDigest,
   independentReviewErrors,
   indexLedgerForRefresh,
@@ -36,7 +47,18 @@ import {
   validateSupplementalArtifactData,
   verifyLedgerData,
 } from "./type-aware-corpus.mjs";
-import { renderSummaryMarkdown } from "./type-aware-corpus/summary.mjs";
+import {
+  assertBackendIsolation,
+  minimalEnvironment,
+  selectedBackend,
+} from "./type-aware-corpus/runner.mjs";
+import {
+  blockedProjects,
+  renderSummaryMarkdown,
+  summaryChecks,
+  typeAwareResolutionCounts,
+  typeEvidenceCoverage,
+} from "./type-aware-corpus/summary.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
@@ -244,10 +266,41 @@ test(
       );
       assert.throws(() => invoke(mismatch, "mismatch"), /invalid provenance or envelope/);
 
+      const validResult = {
+        query_id: 0,
+        operation: "symbol-use",
+        status: "complete",
+        evidence: [],
+      };
+      const validResponse = {
+        protocol_version: 7,
+        operation: "semantic-queries",
+        sidecar_version: "x",
+        backend: "typescript-go",
+        backend_version: "x",
+        results: [validResult],
+      };
+      for (const [name, response, expectedError] of [
+        ["null-envelope", null, /invalid provenance or envelope/],
+        ["null-result", { ...validResponse, results: [null] }, /invalid query identity/],
+        [
+          "null-evidence",
+          { ...validResponse, results: [{ ...validResult, evidence: [null] }] },
+          /invalid source evidence/,
+        ],
+      ]) {
+        const sidecar = writeExecutable(
+          root,
+          `${name}.mjs`,
+          `#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => process.stdout.write(${JSON.stringify(JSON.stringify(response))}));\n`,
+        );
+        assert.throws(() => invoke(sidecar, name), expectedError);
+      }
+
       const duplicate = writeExecutable(
         root,
         "duplicate.mjs",
-        '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => { const result={query_id:0,operation:"symbol-use",evidence:[]}; process.stdout.write(JSON.stringify({protocol_version:7,operation:"semantic-queries",sidecar_version:"x",backend:"typescript-go",backend_version:"x",results:[result,result]})); });\n',
+        '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => { const result={query_id:0,operation:"symbol-use",status:"complete",evidence:[]}; process.stdout.write(JSON.stringify({protocol_version:7,operation:"semantic-queries",sidecar_version:"x",backend:"typescript-go",backend_version:"x",results:[result,result]})); });\n',
       );
       assert.throws(() => invoke(duplicate, "duplicate"), /invalid query identity/);
 
@@ -353,8 +406,24 @@ test("manifest contains the complete pinned accuracy and control corpus", () => 
   assert.deepEqual(validateManifest(structuredClone(manifest)), manifest);
 
   const invalid = structuredClone(manifest);
-  invalid.projects.find(({ id }) => id === "vite").candidate_expectation = "nonzero";
-  assert.throws(() => validateManifest(invalid), /vite\.candidate_expectation must be zero/);
+  invalid.projects.find(({ id }) => id === "fastify").candidate_expectation = "nonzero";
+  assert.throws(() => validateManifest(invalid), /fastify\.candidate_expectation must be zero/);
+});
+
+test("manifest reports malformed containers and feature buckets without dereferencing them", () => {
+  assert.throws(() => validateManifest(null), /manifest schema_version must be 1/);
+  assert.throws(
+    () => validateManifest({ ...manifest, projects: null }),
+    /manifest must contain exactly/,
+  );
+  for (const buckets of [null, [null], [42]]) {
+    const invalid = structuredClone(manifest);
+    invalid.projects[0].feature_buckets = buckets;
+    assert.throws(
+      () => validateManifest(invalid),
+      /feature_buckets must be an array of non-empty strings/,
+    );
+  }
 });
 
 test("tracked supplemental smoke is internally reproducible and review-bound", () => {
@@ -397,6 +466,31 @@ test("tracked supplemental smoke is internally reproducible and review-bound", (
       dependencyEnvironment: artifact.project.dependency_environment,
     };
     assert.deepEqual(validateSupplementalArtifactData(artifact, adjudication, context), artifact);
+
+    const missingSourceRuns = structuredClone(artifact);
+    missingSourceRuns.artifacts.source_runs = null;
+    assert.throws(
+      () => validateSupplementalArtifactData(missingSourceRuns, adjudication, context),
+      /requires two baseline and two refined source runs/,
+    );
+
+    assert.throws(
+      () => validateSupplementalArtifactData(null, adjudication, context),
+      /supplemental artifact schema_version must be 6/,
+    );
+    assert.throws(
+      () => validateSupplementalArtifactData(artifact, adjudication, null),
+      /supplemental validation requires runtime hashes and a source root/,
+    );
+    assert.throws(
+      () =>
+        validateSupplementalArtifactData(
+          artifact,
+          { ...adjudication, supplemental_reviews: [] },
+          context,
+        ),
+      /counts, hashes, or review binding/,
+    );
 
     const stale = structuredClone(artifact);
     stale.result.confirmed_candidate_keys.pop();
@@ -553,6 +647,23 @@ test("semantic capability proof cannot be neutered or reassigned to tsc and Oxli
       ),
     };
     assert.deepEqual(validateCapabilitiesArtifactData(artifact, context), artifact);
+    assert.throws(
+      () => validateCapabilitiesArtifactData({ ...artifact, repositories: null }, context),
+      /requires Astro and Vitest in stable order/,
+    );
+    for (const [capability, field, message] of [
+      ["semantic-impact-targeted-tests", "targeted_tests", /no impact or targeted-test proof/],
+      ["public-type-coupling", "top_contributors", /no rich public type-coupling proof/],
+      ["public-type-coupling", "cycles", /no rich public type-coupling proof/],
+    ]) {
+      const invalidArray = structuredClone(artifact);
+      invalidArray.repositories[0].capabilities[capability][field] = null;
+      assert.throws(() => validateCapabilitiesArtifactData(invalidArray, context), message);
+    }
+    assert.throws(
+      () => validateCapabilitiesArtifactData(null, context),
+      /semantic capabilities artifact schema_version must be 3/,
+    );
 
     const missing = structuredClone(artifact);
     delete missing.repositories[0].capabilities["semantic-symbol-trace"];
@@ -612,11 +723,8 @@ test("publication gate rejects a subset missing the zero-control projects", () =
   );
 });
 
-test("publication verifier rejects a focused Fallow binary hash mismatch", () => {
-  const focusedReport = { fallow_sha256: "a".repeat(64) };
-  const discovery = { provenance: { fallow: { sha256: "b".repeat(64) } } };
-  const focusedCases = focusedReport.fallow_sha256 === discovery.provenance.fallow.sha256;
-  const summary = { gate: { go: focusedCases, checks: { focused_cases: focusedCases } } };
+test("publication gate rejects a failed focused check during verification", () => {
+  const summary = { gate: { go: false, checks: { focused_cases: false } } };
 
   assert.throws(() => requirePublicationGo(summary, "verify"), /NO-GO.*focused_cases/);
   assert.doesNotThrow(() => requirePublicationGo(summary, "write"));
@@ -645,6 +753,40 @@ test("corpus harness import does not require sidecar dependencies", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("the child environment forwards only the allowed keys and the backend selection", () => {
+  const environment = minimalEnvironment("/opt/sidecar", {
+    PATH: "/bin",
+    FALLOW_TYPE_AWARE_BACKEND: "tsrs",
+    NODE_OPTIONS: "--inspect",
+  });
+  assert.deepEqual(environment, {
+    PATH: "/bin",
+    FALLOW_FORMAT: "json",
+    FALLOW_QUIET: "1",
+    FALLOW_TYPE_AWARE_BACKEND: "tsrs",
+    FALLOW_TYPE_AWARE_BIN: "/opt/sidecar",
+  });
+});
+
+test("evidence expects the selected backend family in each sidecar response", () => {
+  assert.equal(selectedBackend({}), "typescript-go");
+  assert.equal(selectedBackend({ FALLOW_TYPE_AWARE_BACKEND: " tsrs " }), "tsrs");
+});
+
+test("a non-default backend never writes canonical or tracked artifacts", () => {
+  const canonicalDir = resolve(REPO_ROOT, "target/type-aware-corpus");
+  const tsrs = { FALLOW_TYPE_AWARE_BACKEND: "tsrs" };
+  const isolated = parseArgs(["evidence", "--out-dir", resolve(REPO_ROOT, "target/corpus-tsrs")]);
+  assert.doesNotThrow(() => assertBackendIsolation(isolated, canonicalDir, tsrs));
+  assert.throws(
+    () => assertBackendIsolation(parseArgs(["evidence"]), canonicalDir, tsrs),
+    /non-canonical --out-dir/u,
+  );
+  const tracked = parseArgs(["summarize", "--out-dir", resolve(REPO_ROOT, "target/corpus-tsrs")]);
+  assert.throws(() => assertBackendIsolation(tracked, canonicalDir, tsrs), /runs only/u);
+  assert.doesNotThrow(() => assertBackendIsolation(parseArgs(["summarize"]), canonicalDir, {}));
 });
 
 test("partial runs require an isolated non-canonical output directory", () => {
@@ -739,10 +881,59 @@ test("fixture dependency provenance records approved ancestor node_modules", () 
     });
     assert.throws(
       () => fixtureDependencyEnvironment(fixture, "fixture", resolve(workspace, "other")),
+      /outside the approved dependency root/,
+    );
+    mkdirSync(resolve(workspace, "target/node_modules"));
+    assert.throws(
+      () => fixtureDependencyEnvironment(fixture, "fixture", workspace),
       /resolves dependencies from an unapproved ancestor/,
     );
   } finally {
     rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("fixture dependency provenance rejects a missing fixture or dependency install", () => {
+  const workspace = mkdtempSync(resolve(tmpdir(), "fallow-type-aware-workspace-"));
+  try {
+    const fixture = resolve(workspace, "target/corpus/fixture");
+    assert.throws(
+      () => fixtureDependencyEnvironment(fixture, "fixture", workspace),
+      /fixture is missing: .*run prepare or supplemental first/,
+    );
+    mkdirSync(fixture, { recursive: true });
+    assert.throws(
+      () => fixtureDependencyEnvironment(fixture, "fixture", workspace),
+      /no installed dependencies.*npm ci/,
+    );
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("fixture dependency provenance follows a symlinked artifact directory", () => {
+  const workspace = mkdtempSync(resolve(tmpdir(), "fallow-type-aware-workspace-"));
+  const external = mkdtempSync(resolve(tmpdir(), "fallow-type-aware-external-"));
+  try {
+    mkdirSync(resolve(workspace, "node_modules"), { recursive: true });
+    mkdirSync(resolve(external, "corpus/fixture"), { recursive: true });
+    symlinkSync(external, resolve(workspace, "target"), "junction");
+    const fixture = resolve(workspace, "target/corpus/fixture");
+
+    assert.throws(
+      () => fixtureDependencyEnvironment(fixture, "fixture", workspace),
+      /fixture path .*target.*corpus.*fixture resolves to .*outside the approved dependency root.*symlinked target directory/,
+    );
+    assert.throws(
+      () => assertArtifactDirectoryInWorkspace(resolve(workspace, "target/not-created"), workspace),
+      /artifact directory .*resolves to .*outside the approved dependency root/,
+    );
+    assert.doesNotThrow(() =>
+      assertArtifactDirectoryInWorkspace(resolve(workspace, "real/not-created"), workspace),
+    );
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
   }
 });
 
@@ -831,6 +1022,20 @@ test("measurement validation requires complete paired runs", () => {
     projects: [{ id: "one", runs }],
   };
   assert.doesNotThrow(() => validateMeasurements(discovery, measurements));
+  assert.throws(
+    () => validateMeasurements(discovery, { ...measurements, projects: null }),
+    /measurements must contain every discovery project exactly once/,
+  );
+  const missingRuns = structuredClone(measurements);
+  missingRuns.projects[0].runs = null;
+  assert.throws(() => validateMeasurements(discovery, missingRuns), /incomplete run matrix/);
+  assert.throws(
+    () => validateMeasurements(discovery, null),
+    /measurement artifact schema_version must be 1/,
+  );
+  const nullRun = structuredClone(measurements);
+  nullRun.projects[0].runs[0] = null;
+  assert.throws(() => validateMeasurements(discovery, nullRun), /warmup must be a boolean/);
 
   const invalidMode = structuredClone(measurements);
   invalidMode.projects[0].runs.find(({ mode }) => mode === "refined").mode = "bogus";
@@ -989,16 +1194,142 @@ test("feature bucket gate needs separate correct confirmations for distinct buck
   );
 });
 
+test("checked confirmation yield excludes candidates behind blocking diagnostics", () => {
+  assert.deepEqual(
+    typeEvidenceCoverage(127, 512, {
+      abstainedCount: 134,
+      unresolvedCount: 238,
+      blockingDiagnosticsCount: 237,
+    }),
+    {
+      correct_confirmed_count: 127,
+      confirmation_yield: 0.248047,
+      checked_candidate_count: 275,
+      checked_confirmation_yield: 0.461818,
+      blocking_diagnostics_count: 237,
+      blocking_diagnostics_share: 0.462891,
+      no_type_evidence_count: 372,
+      no_type_evidence_share: 0.726563,
+    },
+  );
+  assert.equal(
+    typeEvidenceCoverage(0, 3, {
+      abstainedCount: 0,
+      unresolvedCount: 3,
+      blockingDiagnosticsCount: 3,
+    }).checked_confirmation_yield,
+    null,
+  );
+});
+
+test("blocked projects list each blocked program config", () => {
+  assert.deepEqual(
+    blockedProjects([
+      {
+        id: "svelte",
+        type_aware: {
+          abstention_reasons: { blocking_diagnostics: 79 },
+          projects: [
+            {
+              config: "packages/svelte/tsconfig.json",
+              reason_code: "blocking-diagnostics",
+              blocking_diagnostic_count: 7,
+            },
+            { config: "tsconfig.json", reason_code: null, blocking_diagnostic_count: 0 },
+          ],
+        },
+      },
+      { id: "astro", type_aware: { abstention_reasons: {}, projects: [] } },
+      { id: "vue-core" },
+    ]),
+    [
+      {
+        project_id: "svelte",
+        blocked_candidate_count: 79,
+        programs: [{ config: "packages/svelte/tsconfig.json", blocking_diagnostic_count: 7 }],
+      },
+    ],
+  );
+});
+
+test("resolution counts sum abstained, unresolved and blocked candidates", () => {
+  assert.deepEqual(
+    typeAwareResolutionCounts([
+      {
+        type_aware: {
+          abstained_count: 1,
+          unresolved_count: 87,
+          abstention_reasons: { blocking_diagnostics: 87 },
+        },
+      },
+      { type_aware: { abstained_count: 26, unresolved_count: 0, abstention_reasons: {} } },
+      {},
+    ]),
+    { abstainedCount: 27, unresolvedCount: 87, blockingDiagnosticsCount: 87 },
+  );
+});
+
+test("type-evidence gates fail on a high blocked share or too few checked candidates", () => {
+  const checks = (coverage) =>
+    summaryChecks({
+      coverage,
+      featureBucketValue: { multiple_feature_buckets: true },
+      isObject: () => true,
+      thresholds: {
+        maximum_blocking_diagnostics_share: 0.5,
+        minimum_checked_candidates: 250,
+        minimum_checked_confirmation_yield: 0.25,
+      },
+    });
+  const passing = {
+    blocking_diagnostics_share: 0.5,
+    checked_candidate_count: 250,
+    checked_confirmation_yield: 0.25,
+  };
+  const passed = checks(passing);
+  assert.equal(passed.blocking_diagnostics_share, true);
+  assert.equal(passed.checked_candidates, true);
+  assert.equal(passed.checked_confirmation_yield, true);
+  assert.equal(
+    checks({ ...passing, blocking_diagnostics_share: 0.51 }).blocking_diagnostics_share,
+    false,
+  );
+  assert.equal(
+    checks({ ...passing, blocking_diagnostics_share: null }).blocking_diagnostics_share,
+    false,
+  );
+  assert.equal(checks({ ...passing, checked_candidate_count: 249 }).checked_candidates, false);
+  assert.equal(
+    checks({ ...passing, checked_confirmation_yield: 0.249 }).checked_confirmation_yield,
+    false,
+  );
+});
+
 test("summary reports bounded evidence without claiming corpus-wide recall", () => {
   const rendered = renderSummaryMarkdown({
     gate: { go: true },
     accuracy: {
       candidate_count: 10,
+      truth_counts: { used: 4 },
+      correct_confirmed_count: 3,
       confirmation_precision: 1,
       confirmation_yield: 0.3,
+      checked_candidate_count: 6,
+      checked_confirmation_yield: 0.5,
+      blocking_diagnostics_count: 4,
+      no_type_evidence_count: 5,
+      no_type_evidence_share: 0.5,
+      blocked_projects: [
+        {
+          project_id: "svelte",
+          blocked_candidate_count: 4,
+          programs: [{ config: "tsconfig.json", blocking_diagnostic_count: 2 }],
+        },
+      ],
       adjudicated_truth_coverage: 0.4,
       correct_unused_retention: 1,
       abstention: 0.2,
+      blocking_diagnostics_share: 0.4,
     },
     performance: {
       marginal_overhead_ms: { median: 10, p95: 20 },
@@ -1009,8 +1340,12 @@ test("summary reports bounded evidence without claiming corpus-wide recall", () 
     },
   });
 
-  assert.match(rendered, /Safe confirmation yield: 0.3/);
+  assert.match(rendered, /Confirmed as used: 3 of 10 candidates \(confirmation yield 0.3\)/);
+  assert.match(rendered, /Checked confirmation yield \(gate\): 0.5 over 6 checked candidates/);
+  assert.match(rendered, /without type evidence \(abstained or unresolved\): 5 \(share 0.5\)/);
+  assert.match(rendered, /- svelte: 4 blocked candidates; `tsconfig.json` \(2 diagnostics\)/);
   assert.match(rendered, /Independently adjudicated truth coverage: 0.4/);
+  assert.match(rendered, /Candidates behind blocking diagnostics: 4 \(share 0.4\)/);
   assert.match(rendered, /No corpus-wide recall is claimed/);
   assert.doesNotMatch(rendered, /Used recall/);
 });

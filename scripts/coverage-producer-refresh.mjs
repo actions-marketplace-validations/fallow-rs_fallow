@@ -41,12 +41,13 @@ import {
   equivalenceClasses,
   sha256,
 } from "./coverage-producer-conformance.mjs";
+import { cargoFallowBin } from "./cargo-target.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CORPUS_ROOT = resolve(REPO_ROOT, "tests/coverage-producer-corpus");
 const MANIFEST = join(CORPUS_ROOT, "manifest.json");
 const PRODUCERS_ROOT = join(CORPUS_ROOT, "producers");
-const DEFAULT_FALLOW_BIN = resolve(REPO_ROOT, "target/debug/fallow");
+const DEFAULT_FALLOW_BIN = cargoFallowBin(REPO_ROOT);
 
 const INSTALL_COMMAND =
   "npm ci --prefix tests/coverage-producer-corpus/producers --no-audit --no-fund --ignore-scripts";
@@ -84,6 +85,10 @@ const assertPinnedProducers = (packages) => {
     });
   }
 };
+
+const installedProducerVersion = (dependency) =>
+  JSON.parse(readFileSync(join(PRODUCERS_ROOT, "node_modules", dependency, "package.json"), "utf8"))
+    .version;
 
 /** Serialized form every recorded map is committed in. */
 export const serializeMap = (map) => `${JSON.stringify(map, null, 2)}\n`;
@@ -149,7 +154,8 @@ const invokeFallow = (binary, root, coveragePath, coverageRoot) => {
   return JSON.parse(result.stdout);
 };
 
-const seedCensusUnit = (unit) =>
+/** Seed a census unit for a new row; an unattributed unit needs a written rationale. */
+export const seedCensusUnit = (unit) =>
   unit.coverage_source === "istanbul"
     ? {
         name: unit.name,
@@ -287,6 +293,11 @@ export const main = async (
   manifest.recorded.producers_lock_sha256 = sha256(
     readFileSync(join(CORPUS_ROOT, manifest.recorded.producers_lock_file)),
   );
+  // The version string is provenance for a reader. It comes from the package
+  // that produced the maps, so a producer bump cannot leave it behind.
+  for (const producer of manifest.producers) {
+    producer.version = installedProducerVersion(producer.package);
+  }
   for (const fixture of manifest.fixtures) {
     fixture.sha256 = sha256(readFileSync(resolve(CORPUS_ROOT, fixture.file)));
   }

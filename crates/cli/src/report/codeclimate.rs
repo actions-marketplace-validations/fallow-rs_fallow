@@ -36,6 +36,9 @@ pub fn rebase_codeclimate_paths(issues: &mut [CodeClimateIssue]) {
     }
     for issue in issues {
         issue.location.path = fallow_output::apply_path_prefix(prefix, &issue.location.path);
+        for location in &mut issue.other_locations {
+            location.path = fallow_output::apply_path_prefix(prefix, &location.path);
+        }
     }
 }
 
@@ -102,6 +105,8 @@ pub fn envelope_codeclimate_issues_with_config(
     match saved_native_codeclimate_issues(kind, envelope, root, config_path, resolver) {
         Ok(issues) => Ok(issues),
         Err(native_error)
+            // `architecture` has no legacy schema: it first shipped with its
+            // own envelope, so a saved architecture file is never legacy.
             if matches!(
                 kind,
                 EnvelopeKind::DeadCode
@@ -167,10 +172,15 @@ fn saved_annotation_codeclimate_issues(
                 fingerprint,
                 location: CodeClimateLocation {
                     path,
-                    lines: CodeClimateLines { begin: line },
+                    lines: CodeClimateLines {
+                        begin: line,
+                        end: None,
+                    },
                 },
+                other_locations: Vec::new(),
                 owner: None,
                 group: None,
+                legacy_fingerprint: None,
             }
         })
         .collect::<Vec<_>>();
@@ -187,7 +197,7 @@ fn saved_native_codeclimate_issues(
 ) -> Result<Vec<CodeClimateIssue>, String> {
     let rules = super::sarif::saved_report_rules(root, config_path);
     match kind {
-        EnvelopeKind::DeadCode => {
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => {
             let mut results =
                 parse_saved_section::<AnalysisResults>(envelope, "dead-code envelope")?;
             if !saved_schema_is_legacy(kind, envelope) {
@@ -228,15 +238,23 @@ fn saved_native_codeclimate_issues(
             annotate_health_groups(&mut issues, resolver);
             Ok(issues)
         }
-        EnvelopeKind::Audit => saved_multi_analysis_codeclimate(
-            envelope,
-            root,
-            &rules,
-            "/dead_code",
-            "/duplication",
-            "/complexity",
-            resolver,
-        ),
+        EnvelopeKind::Audit => {
+            let mut issues = saved_multi_analysis_codeclimate(
+                envelope,
+                root,
+                &rules,
+                "/dead_code",
+                "/duplication",
+                "/complexity",
+                resolver,
+            )?;
+            if let Some(diff_risk) =
+                parse_optional_section::<fallow_output::DiffRiskReport>(envelope, "/diff_risk")?
+            {
+                issues.extend(fallow_api::build_diff_risk_codeclimate(&diff_risk));
+            }
+            Ok(issues)
+        }
         EnvelopeKind::Combined => saved_multi_analysis_codeclimate(
             envelope, root, &rules, "/check", "/dupes", "/health", resolver,
         ),
@@ -368,7 +386,9 @@ fn validate_current_saved_envelope(
     )?;
 
     match kind {
-        EnvelopeKind::DeadCode => validate_current_dead_code_envelope(kind, envelope)?,
+        EnvelopeKind::DeadCode | EnvelopeKind::Architecture => {
+            validate_current_dead_code_envelope(kind, envelope)?;
+        }
         EnvelopeKind::Dupes => validate_current_duplication_payload(envelope)?,
         EnvelopeKind::Health => validate_current_health_payload(envelope)?,
         EnvelopeKind::Audit => {
@@ -443,7 +463,8 @@ fn validate_current_analysis_sections(
             EnvelopeKind::DeadCode => validate_current_dead_code_section(section),
             EnvelopeKind::Dupes => validate_current_duplication_payload(section),
             EnvelopeKind::Health => validate_current_health_payload(section),
-            EnvelopeKind::Audit
+            EnvelopeKind::Architecture
+            | EnvelopeKind::Audit
             | EnvelopeKind::Combined
             | EnvelopeKind::Security
             | EnvelopeKind::Fix => {
@@ -601,6 +622,7 @@ fn saved_schema_is_legacy(kind: EnvelopeKind, envelope: &serde_json::Value) -> b
 fn current_schema_version(kind: EnvelopeKind) -> Option<u32> {
     match kind {
         EnvelopeKind::DeadCode => Some(fallow_output::CHECK_SCHEMA_VERSION),
+        EnvelopeKind::Architecture => Some(fallow_output::ARCHITECTURE_SCHEMA_VERSION),
         EnvelopeKind::Dupes => Some(fallow_output::DUPES_SCHEMA_VERSION),
         EnvelopeKind::Health => Some(fallow_output::HEALTH_SCHEMA_VERSION),
         EnvelopeKind::Audit => Some(fallow_output::AUDIT_SCHEMA_VERSION),
@@ -612,6 +634,7 @@ fn current_schema_version(kind: EnvelopeKind) -> Option<u32> {
 const fn envelope_kind_label(kind: EnvelopeKind) -> &'static str {
     match kind {
         EnvelopeKind::DeadCode => "dead-code",
+        EnvelopeKind::Architecture => "architecture",
         EnvelopeKind::Dupes => "dupes",
         EnvelopeKind::Health => "health",
         EnvelopeKind::Audit => "audit",
@@ -787,6 +810,9 @@ fn envelope_fingerprint(rule_id: &str, path: &str, line: u32, message: &str) -> 
         return codeclimate_fingerprint_hash(&[rule_id, subject]);
     }
     let line = line.to_string();
+    if rule_id.starts_with("fallow/css-") {
+        return codeclimate_fingerprint_hash(&[rule_id, path, &line, message]);
+    }
     if let Some(subject) = first_quoted_subject(message) {
         codeclimate_fingerprint_hash(&[rule_id, path, &line, subject])
     } else {
@@ -800,101 +826,12 @@ fn first_quoted_subject(message: &str) -> Option<&str> {
     (!subject.is_empty()).then_some(subject)
 }
 
-/// Map fallow severity to CodeClimate severity.
-#[cfg(test)]
-fn severity_to_codeclimate(s: Severity) -> CodeClimateSeverity {
-    match s {
-        Severity::Error => CodeClimateSeverity::Major,
-        Severity::Warn => CodeClimateSeverity::Minor,
-        Severity::Off => unreachable!(),
-    }
-}
-
 /// Compute a relative path string with forward-slash normalization.
 ///
 /// Uses `normalize_uri` to ensure forward slashes on all platforms
 /// and percent-encode brackets for Next.js dynamic routes.
 fn cc_path(path: &Path, root: &Path) -> String {
     normalize_uri(&relative_path(path, root).display().to_string())
-}
-
-#[cfg(test)]
-fn fingerprint_hash(parts: &[&str]) -> String {
-    codeclimate_fingerprint_hash(parts)
-}
-
-#[cfg(test)]
-fn coverage_intelligence_check_name(
-    recommendation: fallow_output::CoverageIntelligenceRecommendation,
-) -> &'static str {
-    match recommendation {
-        fallow_output::CoverageIntelligenceRecommendation::AddTestOrSplitBeforeMerge => {
-            "fallow/coverage-intelligence-risky-change"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::DeleteAfterConfirmingOwner => {
-            "fallow/coverage-intelligence-delete"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::ReviewBeforeChanging => {
-            "fallow/coverage-intelligence-review"
-        }
-        fallow_output::CoverageIntelligenceRecommendation::RefactorCarefullyKeepBehavior => {
-            "fallow/coverage-intelligence-refactor"
-        }
-    }
-}
-
-#[cfg(test)]
-const fn health_finding_severity(severity: fallow_output::FindingSeverity) -> CodeClimateSeverity {
-    match severity {
-        fallow_output::FindingSeverity::Critical => CodeClimateSeverity::Critical,
-        fallow_output::FindingSeverity::High => CodeClimateSeverity::Major,
-        fallow_output::FindingSeverity::Moderate => CodeClimateSeverity::Minor,
-    }
-}
-
-#[cfg(test)]
-const fn runtime_coverage_check_name(
-    verdict: fallow_output::RuntimeCoverageVerdict,
-) -> &'static str {
-    match verdict {
-        fallow_output::RuntimeCoverageVerdict::SafeToDelete => "fallow/runtime-safe-to-delete",
-        fallow_output::RuntimeCoverageVerdict::ReviewRequired => "fallow/runtime-review-required",
-        fallow_output::RuntimeCoverageVerdict::LowTraffic => "fallow/runtime-low-traffic",
-        fallow_output::RuntimeCoverageVerdict::CoverageUnavailable => {
-            "fallow/runtime-coverage-unavailable"
-        }
-        fallow_output::RuntimeCoverageVerdict::Active
-        | fallow_output::RuntimeCoverageVerdict::Unknown => "fallow/runtime-coverage",
-    }
-}
-
-#[cfg(test)]
-const fn runtime_coverage_severity(
-    verdict: fallow_output::RuntimeCoverageVerdict,
-) -> CodeClimateSeverity {
-    match verdict {
-        fallow_output::RuntimeCoverageVerdict::SafeToDelete => CodeClimateSeverity::Critical,
-        fallow_output::RuntimeCoverageVerdict::ReviewRequired => CodeClimateSeverity::Major,
-        _ => CodeClimateSeverity::Minor,
-    }
-}
-
-#[cfg(test)]
-const fn coverage_intelligence_severity(
-    verdict: fallow_output::CoverageIntelligenceVerdict,
-) -> Option<CodeClimateSeverity> {
-    match verdict {
-        fallow_output::CoverageIntelligenceVerdict::RiskyChangeDetected
-        | fallow_output::CoverageIntelligenceVerdict::HighConfidenceDelete => {
-            Some(CodeClimateSeverity::Major)
-        }
-        fallow_output::CoverageIntelligenceVerdict::ReviewRequired
-        | fallow_output::CoverageIntelligenceVerdict::RefactorCarefully => {
-            Some(CodeClimateSeverity::Minor)
-        }
-        fallow_output::CoverageIntelligenceVerdict::Clean
-        | fallow_output::CoverageIntelligenceVerdict::Unknown => None,
-    }
 }
 
 /// Fetch CodeClimate issues from the API-owned dead-code output builder.
@@ -1052,32 +989,6 @@ mod tests {
         })
     }
 
-    /// Compute graduated severity for health findings based on threshold ratio.
-    /// Kept for unit test coverage of the original CodeClimate severity model.
-    fn health_severity(value: u16, threshold: u16) -> &'static str {
-        if threshold == 0 {
-            return "minor";
-        }
-        let ratio = f64::from(value) / f64::from(threshold);
-        if ratio > 2.5 {
-            "critical"
-        } else if ratio > 1.5 {
-            "major"
-        } else {
-            "minor"
-        }
-    }
-
-    #[test]
-    fn codeclimate_empty_results_produces_empty_array() {
-        let root = PathBuf::from("/project");
-        let results = AnalysisResults::default();
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let arr = output.as_array().unwrap();
-        assert!(arr.is_empty());
-    }
-
     #[test]
     fn stored_dead_code_envelope_renders_codeclimate_without_analysis() {
         let envelope = serde_json::json!({
@@ -1085,7 +996,10 @@ mod tests {
             "unused_files": [{ "path": "src/dead.ts" }]
         });
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let manifest_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        let root = manifest_dir
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
@@ -1109,7 +1023,10 @@ mod tests {
             "unused_files": [{ "path": "src/dead.ts" }],
             "unused_exports": "invalid"
         });
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let manifest_dir = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+        );
+        let root = manifest_dir
             .parent()
             .and_then(Path::parent)
             .expect("workspace root");
@@ -1400,6 +1317,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let mut direct = api_codeclimate_issues(&results, root.path(), &rules);
@@ -1462,21 +1381,11 @@ mod tests {
     }
 
     #[test]
-    fn codeclimate_produces_array_of_issues() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        assert!(output.is_array());
-        let arr = output.as_array().unwrap();
-        assert!(!arr.is_empty());
-    }
-
-    #[test]
     fn codeclimate_missing_suppression_reason_uses_reason_rule_severity() {
         let root = PathBuf::from("/project");
         let mut results = AnalysisResults::default();
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
@@ -1488,6 +1397,7 @@ mod tests {
             },
             missing_reason: true,
             actions: StaleSuppression::actions_for(true),
+            effective_severity: None,
         });
         let rules = RulesConfig {
             stale_suppressions: Severity::Off,
@@ -1512,20 +1422,24 @@ mod tests {
             kind_known: true,
         };
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
             origin: origin.clone(),
             missing_reason: false,
             actions: StaleSuppression::actions_for(false),
+            effective_severity: None,
         });
         results.stale_suppressions.push(StaleSuppression {
+            finding_id: None,
             path: root.join("src/file.ts"),
             line: 1,
             col: 0,
             origin,
             missing_reason: true,
             actions: StaleSuppression::actions_for(true),
+            effective_severity: None,
         });
         let rules = RulesConfig {
             stale_suppressions: Severity::Warn,
@@ -1538,30 +1452,6 @@ mod tests {
         assert_eq!(output[0]["check_name"], "fallow/stale-suppression");
         assert_eq!(output[1]["check_name"], "fallow/missing-suppression-reason");
         assert_ne!(output[0]["fingerprint"], output[1]["fingerprint"]);
-    }
-
-    #[test]
-    fn codeclimate_issue_has_required_fields() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: root.join("src/dead.ts"),
-            }));
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let issue = &output.as_array().unwrap()[0];
-
-        assert_eq!(issue["type"], "issue");
-        assert_eq!(issue["check_name"], "fallow/unused-file");
-        assert!(issue["description"].is_string());
-        assert!(issue["categories"].is_array());
-        assert!(issue["severity"].is_string());
-        assert!(issue["fingerprint"].is_string());
-        assert!(issue["location"].is_object());
-        assert!(issue["location"]["path"].is_string());
-        assert!(issue["location"]["lines"].is_object());
     }
 
     #[test]
@@ -1600,26 +1490,13 @@ mod tests {
                 col: 4,
                 span_start: 120,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
         let issue = &output[0];
         assert_eq!(issue["location"]["lines"]["begin"], 10);
-    }
-
-    #[test]
-    fn codeclimate_unused_file_line_defaults_to_1() {
-        let root = PathBuf::from("/project");
-        let mut results = AnalysisResults::default();
-        results
-            .unused_files
-            .push(UnusedFileFinding::with_actions(UnusedFile {
-                path: root.join("src/dead.ts"),
-            }));
-        let rules = RulesConfig::default();
-        let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let issue = &output[0];
-        assert_eq!(issue["location"]["lines"]["begin"], 1);
     }
 
     #[test]
@@ -1652,6 +1529,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -1747,29 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn codeclimate_fingerprints_are_deterministic() {
-        let root = PathBuf::from("/project");
-        let results = sample_results(&root);
-        let rules = RulesConfig::default();
-        let output1 = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-        let output2 = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
-
-        let fps1: Vec<&str> = output1
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["fingerprint"].as_str().unwrap())
-            .collect();
-        let fps2: Vec<&str> = output2
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["fingerprint"].as_str().unwrap())
-            .collect();
-        assert_eq!(fps1, fps2);
-    }
-
-    #[test]
     fn codeclimate_fingerprints_are_unique() {
         let root = PathBuf::from("/project");
         let results = sample_results(&root);
@@ -1821,70 +1677,23 @@ mod tests {
                 path: root.join("package.json"),
                 line: 0,
                 used_in_workspaces: Vec::new(),
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
         assert_eq!(output[0]["location"]["lines"]["begin"], 1);
     }
 
-    #[test]
-    fn fingerprint_hash_different_inputs_differ() {
-        let h1 = fingerprint_hash(&["a", "b"]);
-        let h2 = fingerprint_hash(&["a", "c"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_order_matters() {
-        let h1 = fingerprint_hash(&["a", "b"]);
-        let h2 = fingerprint_hash(&["b", "a"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_separator_prevents_collision() {
-        let h1 = fingerprint_hash(&["ab", "c"]);
-        let h2 = fingerprint_hash(&["a", "bc"]);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn fingerprint_hash_is_16_hex_chars() {
-        let h = fingerprint_hash(&["test"]);
-        assert_eq!(h.len(), 16);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn severity_error_maps_to_major() {
-        assert_eq!(
-            severity_to_codeclimate(Severity::Error),
-            CodeClimateSeverity::Major
-        );
-    }
-
-    #[test]
-    fn severity_warn_maps_to_minor() {
-        assert_eq!(
-            severity_to_codeclimate(Severity::Warn),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "internal error: entered unreachable code")]
-    fn severity_off_is_unreachable() {
-        let _ = severity_to_codeclimate(Severity::Off);
-    }
-
     /// Production-mode regression: rules can flip to `Severity::Off` while
     /// the matching findings slice arrives empty (the analyzer's own off-
     /// rule short-circuit clears the vec, but the generic-iterator helpers
-    /// in `codeclimate.rs` previously called `severity_to_codeclimate`
-    /// before checking emptiness and panicked at `Severity::Off`).
+    /// previously called `severity_to_codeclimate` before checking
+    /// emptiness and panicked at `Severity::Off`).
     /// `fallow dead-code --format codeclimate --production` on any project
     /// with a `--production`-suppressed dep / export / member rule used to
-    /// exit 101 with `entered unreachable code` at `ci/severity.rs:28`.
+    /// exit 101 with `entered unreachable code` at the `Severity::Off` arm
+    /// of `severity_to_codeclimate`. Both those helpers and that mapper now
+    /// live in `crates/api/src/dead_code_codeclimate.rs`.
     /// This test exercises all three previously-vulnerable helpers
     /// (`push_dep_cc_issues`, `push_unused_export_issues`,
     /// `push_unused_member_issues`) through `api_codeclimate_issues`.
@@ -1904,36 +1713,6 @@ mod tests {
         };
         let issues = api_codeclimate_issues(&results, &root, &rules);
         assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn health_severity_zero_threshold_returns_minor() {
-        assert_eq!(health_severity(100, 0), "minor");
-    }
-
-    #[test]
-    fn health_severity_at_threshold_returns_minor() {
-        assert_eq!(health_severity(10, 10), "minor");
-    }
-
-    #[test]
-    fn health_severity_1_5x_threshold_returns_minor() {
-        assert_eq!(health_severity(15, 10), "minor");
-    }
-
-    #[test]
-    fn health_severity_above_1_5x_returns_major() {
-        assert_eq!(health_severity(16, 10), "major");
-    }
-
-    #[test]
-    fn health_severity_at_2_5x_returns_major() {
-        assert_eq!(health_severity(25, 10), "major");
-    }
-
-    #[test]
-    fn health_severity_above_2_5x_returns_critical() {
-        assert_eq!(health_severity(26, 10), "critical");
     }
 
     #[test]
@@ -2103,16 +1882,12 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: fallow_output::ExceededThreshold::Crap,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: Some(60.0),
+                    mutation: None,
                     coverage_pct: Some(25.0),
-                    coverage_tier: None,
-                    coverage_source: None,
-                    inherited_from: None,
-                    component_rollup: None,
-                    contributions: Vec::new(),
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -2130,32 +1905,6 @@ mod tests {
         let description = issues[0]["description"].as_str().unwrap();
         assert!(description.contains("CRAP score"), "desc: {description}");
         assert!(description.contains("coverage 25%"), "desc: {description}");
-    }
-
-    // ---------------------------------------------------------------------------
-    // coverage_intelligence_check_name: all four recommendation arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn coverage_intelligence_check_name_review_before_changing() {
-        use fallow_output::CoverageIntelligenceRecommendation;
-        assert_eq!(
-            coverage_intelligence_check_name(
-                CoverageIntelligenceRecommendation::ReviewBeforeChanging
-            ),
-            "fallow/coverage-intelligence-review"
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_check_name_refactor_carefully() {
-        use fallow_output::CoverageIntelligenceRecommendation;
-        assert_eq!(
-            coverage_intelligence_check_name(
-                CoverageIntelligenceRecommendation::RefactorCarefullyKeepBehavior
-            ),
-            "fallow/coverage-intelligence-refactor"
-        );
     }
 
     // ---------------------------------------------------------------------------
@@ -2182,16 +1931,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Both,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -2225,16 +1975,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Cyclomatic,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -2271,16 +2022,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::Cognitive,
+                    effective_severity: None,
                     severity: FindingSeverity::High,
                     crap: None,
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -2314,16 +2066,17 @@ mod tests {
                     react_prop_count: 0,
                     react_hook_profile: None,
                     exceeded: ExceededThreshold::All,
+                    effective_severity: None,
                     severity: FindingSeverity::Critical,
                     crap: Some(110.0),
+                    mutation: None,
                     coverage_pct: None,
                     coverage_tier: None,
                     coverage_source: None,
                     inherited_from: None,
                     component_rollup: None,
                     contributions: vec![],
-                    effective_thresholds: None,
-                    threshold_source: None,
+                    ..Default::default()
                 }
                 .into(),
             ],
@@ -2521,147 +2274,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // health_finding_severity: Critical -> Critical, Moderate -> Minor
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn health_finding_severity_critical_maps_to_critical() {
-        use fallow_output::FindingSeverity;
-        assert_eq!(
-            health_finding_severity(FindingSeverity::Critical),
-            CodeClimateSeverity::Critical
-        );
-    }
-
-    #[test]
-    fn health_finding_severity_moderate_maps_to_minor() {
-        use fallow_output::FindingSeverity;
-        assert_eq!(
-            health_finding_severity(FindingSeverity::Moderate),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // runtime_coverage_check_name: all verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn runtime_coverage_check_name_safe_to_delete() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::SafeToDelete),
-            "fallow/runtime-safe-to-delete"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_low_traffic() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::LowTraffic),
-            "fallow/runtime-low-traffic"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_coverage_unavailable() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::CoverageUnavailable),
-            "fallow/runtime-coverage-unavailable"
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_check_name_active_and_unknown_use_generic() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::Active),
-            "fallow/runtime-coverage"
-        );
-        assert_eq!(
-            runtime_coverage_check_name(RuntimeCoverageVerdict::Unknown),
-            "fallow/runtime-coverage"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // runtime_coverage_severity: verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn runtime_coverage_severity_safe_to_delete_is_critical() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::SafeToDelete),
-            CodeClimateSeverity::Critical
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_severity_review_required_is_major() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::ReviewRequired),
-            CodeClimateSeverity::Major
-        );
-    }
-
-    #[test]
-    fn runtime_coverage_severity_other_verdicts_are_minor() {
-        use fallow_output::RuntimeCoverageVerdict;
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::LowTraffic),
-            CodeClimateSeverity::Minor
-        );
-        assert_eq!(
-            runtime_coverage_severity(RuntimeCoverageVerdict::Active),
-            CodeClimateSeverity::Minor
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // coverage_intelligence_severity: all verdict arms
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn coverage_intelligence_severity_review_required_is_minor() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::ReviewRequired),
-            Some(CodeClimateSeverity::Minor)
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_refactor_carefully_is_minor() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::RefactorCarefully),
-            Some(CodeClimateSeverity::Minor)
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_clean_is_none() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::Clean),
-            None
-        );
-    }
-
-    #[test]
-    fn coverage_intelligence_severity_unknown_is_none() {
-        use fallow_output::CoverageIntelligenceVerdict;
-        assert_eq!(
-            coverage_intelligence_severity(CoverageIntelligenceVerdict::Unknown),
-            None
-        );
-    }
-
-    // ---------------------------------------------------------------------------
     // push_dep_cc_issues: workspace context included in description
     // ---------------------------------------------------------------------------
 
@@ -2677,6 +2289,7 @@ mod tests {
                 path: root.join("package.json"),
                 line: 10,
                 used_in_workspaces: vec![root.join("packages/app")],
+                declared_and_imported_in: Vec::new(),
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -3392,6 +3005,7 @@ mod tests {
                     evidence: RuntimeCoverageEvidence {
                         static_status: "unused".to_string(),
                         test_coverage: "not_covered".to_string(),
+                        test_only_reference: None,
                         v8_tracking: "tracked".to_string(),
                         untracked_reason: None,
                         observation_days: 30,
@@ -3464,6 +3078,7 @@ mod tests {
                     evidence: RuntimeCoverageEvidence {
                         static_status: "used".to_string(),
                         test_coverage: "not_covered".to_string(),
+                        test_only_reference: None,
                         v8_tracking: "untracked".to_string(),
                         untracked_reason: Some("worker_thread".to_string()),
                         observation_days: 7,
@@ -3504,6 +3119,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/a.ts"),
                         start_line: 10,
                         end_line: 20,
@@ -3512,6 +3128,7 @@ mod tests {
                         fragment: "const x = 1;\nconst y = 2;".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/b.ts"),
                         start_line: 30,
                         end_line: 40,
@@ -3537,12 +3154,18 @@ mod tests {
         assert_eq!(issues[0]["location"]["path"].as_str().unwrap(), "src/a.ts");
         assert_eq!(issues[1]["location"]["path"].as_str().unwrap(), "src/b.ts");
         assert_eq!(issues[0]["location"]["lines"]["begin"], 10);
+        assert_eq!(issues[0]["location"]["lines"]["end"], 20);
         assert_eq!(issues[1]["location"]["lines"]["begin"], 30);
+        assert_eq!(issues[1]["location"]["lines"]["end"], 40);
+        assert_eq!(issues[0]["other_locations"][0]["path"], "src/b.ts");
+        assert_eq!(issues[0]["other_locations"][0]["lines"]["begin"], 30);
+        assert_eq!(issues[0]["other_locations"][0]["lines"]["end"], 40);
+        assert_eq!(issues[1]["other_locations"][0]["path"], "src/a.ts");
         assert_eq!(issues[0]["categories"][0], "Duplication");
     }
 
     #[test]
-    fn duplication_codeclimate_description_includes_group_number_and_line_count() {
+    fn duplication_codeclimate_description_uses_stable_clone_handle_not_ordinal() {
         use fallow_types::duplicates::{
             CloneGroup, CloneInstance, DuplicationReport, DuplicationStats,
         };
@@ -3551,6 +3174,7 @@ mod tests {
             clone_groups: vec![
                 CloneGroup {
                     instances: vec![CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/a.ts"),
                         start_line: 1,
                         end_line: 10,
@@ -3564,6 +3188,7 @@ mod tests {
                 },
                 CloneGroup {
                     instances: vec![CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/b.ts"),
                         start_line: 5,
                         end_line: 12,
@@ -3585,13 +3210,47 @@ mod tests {
         let issues = output.as_array().unwrap();
         assert_eq!(issues.len(), 2);
         let desc0 = issues[0]["description"].as_str().unwrap();
-        assert!(desc0.contains("group 1"), "first group: {desc0}");
+        assert!(desc0.starts_with("Code clone dup:"), "first group: {desc0}");
+        assert!(!desc0.contains("group 1"), "ordinal leaked: {desc0}");
         assert!(desc0.contains("8 lines"), "first group line count: {desc0}");
         let desc1 = issues[1]["description"].as_str().unwrap();
-        assert!(desc1.contains("group 2"), "second group: {desc1}");
+        assert!(
+            desc1.starts_with("Code clone dup:"),
+            "second group: {desc1}"
+        );
+        assert!(!desc1.contains("group 2"), "ordinal leaked: {desc1}");
         assert!(
             desc1.contains("6 lines"),
             "second group line count: {desc1}"
+        );
+
+        let mut reordered = report;
+        reordered.clone_groups.reverse();
+        let reordered_output =
+            codeclimate_issues_to_value(&api_duplication_codeclimate_issues(&reordered, &root));
+        let descriptions_by_path = |issues: &serde_json::Value| {
+            issues
+                .as_array()
+                .expect("issues array")
+                .iter()
+                .map(|issue| {
+                    (
+                        issue["location"]["path"]
+                            .as_str()
+                            .expect("location path")
+                            .to_owned(),
+                        issue["description"]
+                            .as_str()
+                            .expect("description")
+                            .to_owned(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            descriptions_by_path(&output),
+            descriptions_by_path(&reordered_output),
+            "clone handles must not depend on report order"
         );
     }
 
@@ -3620,6 +3279,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/x.ts"),
                         start_line: 1,
                         end_line: 5,
@@ -3628,6 +3288,7 @@ mod tests {
                         fragment: "hello".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/y.ts"),
                         start_line: 10,
                         end_line: 14,
@@ -3704,6 +3365,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: true,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         let rules = RulesConfig::default();
         let output = codeclimate_issues_to_value(&api_codeclimate_issues(&results, &root, &rules));
@@ -3722,7 +3385,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            BTreeSet::from(["duplicate-prop-shape", "prop-drilling", "thin-wrapper"]),
+            BTreeSet::from(["duplicate-prop-shape", "thin-wrapper"]),
             missing
         );
 
@@ -3731,5 +3394,6 @@ mod tests {
             .collect();
         assert!(check_names.contains("fallow/stale-suppression"));
         assert!(check_names.contains("fallow/missing-suppression-reason"));
+        assert!(check_names.contains("fallow/prop-drilling"));
     }
 }

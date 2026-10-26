@@ -44,6 +44,10 @@
         "section": "community"
       },
       {
+        "path": "GOVERNANCE.md",
+        "section": "community"
+      },
+      {
         "path": "ROADMAP.md",
         "section": "roadmap"
       },
@@ -94,7 +98,19 @@
         "section": "development"
       },
       {
+        "path": "docs/development/dependency-updates.md",
+        "section": "development"
+      },
+      {
+        "path": "docs/development/drift-contract.md",
+        "section": "development"
+      },
+      {
         "path": "docs/analyzer-authoring.md",
+        "section": "architecture"
+      },
+      {
+        "path": "docs/architecture.md",
         "section": "architecture"
       },
       {
@@ -123,6 +139,10 @@
       },
       {
         "path": "docs/fallow-core-migration.md",
+        "section": "architecture"
+      },
+      {
+        "path": "docs/mutation-testing.md",
         "section": "architecture"
       },
       {
@@ -211,6 +231,11 @@
   },
   "hostRules": [
     {
+      "client": "shared",
+      "root": ".agents/rules",
+      "mode": "scoped-router"
+    },
+    {
       "client": "claude",
       "root": ".claude/rules",
       "mode": "scoped-router"
@@ -251,7 +276,7 @@
       "role": "portable-public-skill-packaging",
       "direction": "canonical-contract-to-public-consumer",
       "revisionSource": "source-lock.json#commit",
-      "allowedRoot": "npm/fallow/skills/fallow",
+      "allowedRoot": "npm/fallow/skills",
       "processor": {
         "kind": "validator",
         "entrypoint": "scripts/check-source-contract.mjs"

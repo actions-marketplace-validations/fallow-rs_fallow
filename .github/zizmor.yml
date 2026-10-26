@@ -17,20 +17,19 @@ rules:
   cache-poisoning:
     ignore:
       - release.yml
-  # benchmark-action/gh-release require tokens in with: block (not env-mappable)
+  # gh-release requires tokens in with: block (not env-mappable)
   secrets-outside-env:
     ignore:
-      - allocs.yml
-      - bench.yml
-      - bloat.yml
-      - conformance.yml
-      - coverage.yml
       - release.yml
   # Dependabot auto-merge uses pull_request_target intentionally — no code checkout,
   # only gh pr merge API call. Actor-gated to dependabot[bot].
   dangerous-triggers:
     ignore:
       - dependabot-auto-merge.yml
+      # Calls the org-wide Dependabot workflow in fallow-rs/.github, pinned
+      # by SHA. That workflow acts only on same-repository dependabot/**
+      # branches and loads its scripts from its own commit.
+      - dependabot.yml
   # github.actor == 'dependabot[bot]' is the standard GitHub-documented pattern;
   # risk is mitigated by --auto (waits for CI) and no code checkout
   bot-conditions:

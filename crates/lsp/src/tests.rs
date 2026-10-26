@@ -2,13 +2,8 @@ use super::*;
 
 use fallow_api::editor_duplicates::{CloneGroup, CloneInstance, DuplicationStats};
 use fallow_api::editor_results::{
-    BoundaryViolation, BoundaryViolationFinding, CircularDependency, CircularDependencyFinding,
-    DevDependencyInProduction, DevDependencyInProductionFinding, ExportUsage, SecuritySeverity,
-    TestOnlyDependency, TestOnlyDependencyFinding, TypeOnlyDependency, UnlistedDependency,
-    UnlistedDependencyFinding, UnusedClassMemberFinding, UnusedDependency, UnusedDependencyFinding,
-    UnusedDevDependencyFinding, UnusedEnumMemberFinding, UnusedExport, UnusedExportFinding,
-    UnusedFile, UnusedFileFinding, UnusedMember, UnusedOptionalDependencyFinding,
-    UnusedStoreMemberFinding, UnusedTypeFinding,
+    BoundaryViolation, BoundaryViolationFinding, SecuritySeverity, UnusedExport,
+    UnusedExportFinding, UnusedFile, UnusedFileFinding,
 };
 use serde_json::json;
 use tower::{Service, ServiceExt};
@@ -28,7 +23,8 @@ fn analyze_project_root_for_test(
     merged_duplication: &mut DuplicationReport,
     merged_inline_complexity: &mut Vec<InlineComplexityFinding>,
     config_messages: &mut Vec<(MessageType, String)>,
-) {
+) -> Vec<config_patterns::UnmatchedConfigPattern> {
+    let mut unmatched_config_patterns = Vec::new();
     let mut merged_analysis = EditorAnalysisOutput::new(
         std::mem::take(merged_results),
         std::mem::take(merged_duplication),
@@ -36,6 +32,7 @@ fn analyze_project_root_for_test(
     let cancellation = Arc::new(AtomicBool::new(false));
     let type_aware_sessions = Arc::new(StdMutex::new(FxHashMap::default()));
     let type_aware_changes = fallow_api::TypeAwareFileChanges::default();
+    let mut package_scopes = Vec::new();
     analyze_project_root(&mut ProjectRootAnalysisInput {
         project_root,
         config_path,
@@ -47,14 +44,22 @@ fn analyze_project_root_for_test(
         type_aware_sessions: &type_aware_sessions,
         type_aware_changes: &type_aware_changes,
         cancellation: &cancellation,
+        run_cancellation: &cancellation,
         changed_files: None,
+        global_changed_since_requested: false,
+        no_package_baselines: false,
+        sessions: &Arc::default(),
+        parse_work: &mut analysis::RunParseWork::default(),
         merged_analysis: &mut merged_analysis,
         merged_inline_complexity,
         config_messages,
+        package_scopes: &mut package_scopes,
+        unmatched_config_patterns: &mut unmatched_config_patterns,
     })
     .expect("project analysis succeeds");
     *merged_results = merged_analysis.results;
     *merged_duplication = merged_analysis.duplication;
+    unmatched_config_patterns
 }
 
 #[test]
@@ -102,6 +107,7 @@ fn analysis_complete_params_collapses_boundary_subresults() {
             import_specifier: "../data".to_string(),
             line: 1,
             col: 0,
+            via_path: None,
         })],
         boundary_coverage_violations: vec![
             fallow_api::editor_results::BoundaryCoverageViolationFinding::with_actions(
@@ -147,8 +153,24 @@ fn analysis_complete_changed_since_scope_is_additive_and_structured() {
         legacy_json.get("changedSinceScope").is_none(),
         "omitted scope status must preserve the legacy payload"
     );
+    assert!(legacy_json.get("packageBaselines").is_none());
     let _: protocol::AnalysisCompleteParams =
         serde_json::from_value(legacy_json).expect("legacy completion remains accepted");
+
+    let packages = vec![fallow_api::PackageBaselineStatus {
+        workspace_root: "packages/web".to_owned(),
+        reference: "main".to_owned(),
+    }];
+    let package_params = protocol::analysis_complete_params(
+        protocol::AnalysisCompleteInput::new(&results, &duplication)
+            .with_package_baselines(&packages),
+    );
+    let package_json = serde_json::to_value(package_params).expect("package status serializes");
+    assert_eq!(
+        package_json["packageBaselines"][0]["workspace_root"],
+        "packages/web"
+    );
+    assert_eq!(package_json["packageBaselines"][0]["reference"], "main");
 
     let applied_status = protocol::ChangedSinceScopeStatus {
         requested_ref: "origin/main".to_string(),
@@ -289,6 +311,7 @@ fn blocking_analysis_surfaces_project_analysis_errors() {
         allow_remote_extends: false,
         duplication_options: None,
         production_override: None,
+        no_package_baselines: false,
         inline_complexity_enabled: false,
         type_aware_options: None,
         type_aware_sessions: Arc::new(StdMutex::new(FxHashMap::default())),
@@ -297,6 +320,8 @@ fn blocking_analysis_surfaces_project_analysis_errors() {
         toplevel: Some(root.clone()),
         changed_since: None,
         cancellation: Arc::new(AtomicBool::new(false)),
+        run_cancellation: Arc::new(AtomicBool::new(false)),
+        sessions: Arc::default(),
     });
 
     let Err(error) = result else {
@@ -624,11 +649,20 @@ fn type_aware_file_classification_covers_source_and_resolution_inputs() {
         "package.json",
         "pnpm-lock.yaml",
         "fallow.toml",
+        ".fallowrc.json",
+        ".fallowrc.jsonc",
+        ".fallow.toml",
         "src/framework.d.ts",
     ] {
         assert!(
             type_aware_resolution_file(Path::new(path)),
             "{path} must force a full semantic invalidation"
+        );
+    }
+    for name in fallow_config::CONFIG_FILE_NAMES {
+        assert!(
+            type_aware_resolution_file(Path::new(name)),
+            "{name} is a config file the loader reads, so it must invalidate the semantic session"
         );
     }
     for path in ["src/index.ts", "src/view.tsx", "src/runtime.js"] {
@@ -687,21 +721,136 @@ fn failed_analysis_restores_semantic_changes_as_full_invalidation() {
 }
 
 #[test]
-fn diagnostic_issue_types_include_all_lsp_codes_in_user_order() {
+fn cancelled_analysis_requeues_unused_semantic_changes_incrementally() {
+    let pending = StdMutex::new(fallow_api::TypeAwareFileChanges {
+        changed: vec![PathBuf::from("src/shared.ts")],
+        created: vec![PathBuf::from("src/newer.ts")],
+        ..fallow_api::TypeAwareFileChanges::default()
+    });
+    let attempted = fallow_api::TypeAwareFileChanges {
+        changed: vec![
+            PathBuf::from("src/shared.ts"),
+            PathBuf::from("src/changed.ts"),
+        ],
+        deleted: vec![PathBuf::from("src/removed.ts")],
+        ..fallow_api::TypeAwareFileChanges::default()
+    };
+
+    requeue_unused_type_aware_changes(&pending, &attempted);
+
+    let pending = pending.lock().expect("pending changes");
+    assert!(!pending.invalidate_all);
+    assert_eq!(
+        pending.changed,
+        [
+            PathBuf::from("src/shared.ts"),
+            PathBuf::from("src/changed.ts")
+        ],
+    );
+    assert_eq!(pending.created, [PathBuf::from("src/newer.ts")]);
+    assert_eq!(pending.deleted, [PathBuf::from("src/removed.ts")]);
+    drop(pending);
+}
+
+#[test]
+fn cancelled_analysis_requeue_fails_closed_past_capacity() {
+    let pending = StdMutex::new(fallow_api::TypeAwareFileChanges {
+        changed: (0..MAX_PENDING_TYPE_AWARE_CHANGES)
+            .map(|index| PathBuf::from(format!("src/file-{index}.ts")))
+            .collect(),
+        ..fallow_api::TypeAwareFileChanges::default()
+    });
+    let attempted = fallow_api::TypeAwareFileChanges {
+        changed: vec![PathBuf::from("src/overflow.ts")],
+        ..fallow_api::TypeAwareFileChanges::default()
+    };
+
+    requeue_unused_type_aware_changes(&pending, &attempted);
+
+    let pending = pending.lock().expect("pending changes");
+    assert!(pending.invalidate_all);
+    assert!(pending.changed.is_empty());
+    drop(pending);
+}
+
+#[test]
+fn only_a_cancel_before_any_root_finished_leaves_semantic_changes_unused() {
+    let root = Path::new("/project");
+    assert!(analysis::ProjectAnalysisError::cancelled(root).type_aware_changes_unused());
+    assert!(
+        !analysis::ProjectAnalysisError::cancelled(root)
+            .after_earlier_roots()
+            .type_aware_changes_unused(),
+        "an earlier root may have run its type-aware pass with the changes",
+    );
+}
+
+#[test]
+fn diagnostic_issue_types_keep_user_order_and_labels() {
     let issue_types = diagnostic_issue_types();
     let codes: Vec<&str> = issue_types
         .iter()
         .map(|issue| issue.code.as_str())
         .collect();
 
-    assert_eq!(codes.first(), Some(&"code-duplication"));
-    assert!(codes.contains(&"unused-file"));
-    assert!(codes.contains(&"private-type-leak"));
-    assert!(codes.contains(&"test-only-dependency"));
-    assert!(codes.contains(&"boundary-violation"));
-    assert!(codes.contains(&"stale-suppression"));
-    assert!(codes.contains(&"security-sink"));
-    assert!(codes.contains(&"security-client-server-leak"));
+    // Editors save code filters by these codes. A change to this list is a
+    // change to the editor contract, so update it on purpose only.
+    assert_eq!(
+        codes,
+        [
+            "code-duplication",
+            "unused-file",
+            "unused-export",
+            "unused-type",
+            "private-type-leak",
+            "unused-dependency",
+            "unused-dev-dependency",
+            "unused-optional-dependency",
+            "unused-enum-member",
+            "unused-class-member",
+            "unused-store-member",
+            "unresolved-import",
+            "unlisted-dependency",
+            "duplicate-export",
+            "type-only-dependency",
+            "test-only-dependency",
+            "dev-dependency-in-production",
+            "circular-dependency",
+            "re-export-cycle",
+            "package-cycle",
+            "boundary-violation",
+            "policy-violation",
+            "invalid-client-export",
+            "mixed-client-server-barrel",
+            "misplaced-directive",
+            "unprovided-inject",
+            "unrendered-component",
+            "unused-component-prop",
+            "absent-component-prop",
+            "unused-component-emit",
+            "unused-component-input",
+            "unused-component-output",
+            "unused-svelte-event",
+            "unused-server-action",
+            "unused-load-data-key",
+            "unused-effect-layer",
+            "unused-tagged-error",
+            "unproduced-catch-tag",
+            "route-collision",
+            "dynamic-segment-name-conflict",
+            "stale-suppression",
+            "unused-catalog-entry",
+            "empty-catalog-group",
+            "unresolved-catalog-reference",
+            "unused-dependency-override",
+            "misconfigured-dependency-override",
+            "security-sink",
+            "security-client-server-leak",
+            "prop-drilling",
+            "thin-wrapper",
+            "duplicate-prop-shape",
+        ]
+    );
     assert_eq!(
         issue_types
             .iter()
@@ -1083,6 +1232,7 @@ fn parse_initialization_options_reads_full_payload() {
         "issueTypes": {
             "unused-exports": false
         },
+        "mutedCategories": ["code-duplication", "unused-file"],
         "changedSince": "origin/main",
         "production": true,
         "duplication": {
@@ -1098,11 +1248,14 @@ fn parse_initialization_options_reads_full_payload() {
             "projects": ["tsconfig.app.json", "tsconfig.test.json"],
             "require": "complete"
         },
+        "prewarm": true,
         "futureClientOnly": true
     });
 
     let parsed = parse_initialization_options(Some(&opts));
 
+    assert!(parsed.prewarm);
+    assert!(!parse_initialization_options(Some(&json!({}))).prewarm);
     assert_eq!(parsed.config_path.as_deref(), Some("config/fallow.json"));
     assert_eq!(
         parsed
@@ -1110,6 +1263,10 @@ fn parse_initialization_options_reads_full_payload() {
             .as_ref()
             .and_then(|issue_types| issue_types.get("unused-exports")),
         Some(&false)
+    );
+    assert_eq!(
+        parsed.muted_categories.as_deref(),
+        Some(["code-duplication".to_string(), "unused-file".to_string()].as_slice())
     );
     assert_eq!(parsed.changed_since.as_deref(), Some("origin/main"));
     assert_eq!(parsed.production, Some(true));
@@ -1150,15 +1307,52 @@ fn parse_initialization_options_is_permissive_for_missing_or_malformed_payload()
         parse_initialization_options(Some(&json!("not an object"))),
         LspInitializationOptions::default()
     );
+    let malformed = parse_initialization_options(Some(&json!({
+        "production": "on",
+        "mutedCategories": "code-duplication",
+        "health": {
+            "inlineComplexity": "yes"
+        }
+    })));
+    assert_eq!(malformed.production, None);
+    assert_eq!(malformed.muted_categories, None);
+
+    let parsed = parse_initialization_options(Some(&json!({
+        "mutedCategories": [
+            "code-duplication",
+            7,
+            null,
+            "unused-export"
+        ]
+    })));
     assert_eq!(
-        parse_initialization_options(Some(&json!({
-            "production": "on",
-            "health": {
-                "inlineComplexity": "yes"
-            }
-        })))
-        .production,
-        None
+        parsed.muted_categories.as_deref(),
+        Some(["code-duplication".to_string(), "unused-export".to_string()].as_slice()),
+        "malformed array entries must not discard valid category codes",
+    );
+}
+
+#[test]
+fn disabled_diagnostic_codes_union_issue_types_and_exact_muted_categories() {
+    let options = LspInitializationOptions {
+        issue_types: Some(std::collections::BTreeMap::from([
+            ("unused-exports".to_string(), false),
+            ("unused-files".to_string(), true),
+        ])),
+        muted_categories: Some(vec![
+            "code-duplication".to_string(),
+            "Code-Duplication".to_string(),
+            "future-diagnostic".to_string(),
+        ]),
+        ..LspInitializationOptions::default()
+    };
+
+    let disabled = disabled_diagnostic_codes(&options);
+
+    assert_eq!(
+        disabled,
+        FxHashSet::from_iter(["code-duplication".to_string(), "unused-export".to_string()]),
+        "muted diagnostic codes and disabled issue-type keys form a validated union",
     );
 }
 
@@ -1174,12 +1368,14 @@ fn initialization_duplication_options_reads_vscode_payload() {
             "minOccurrences": 3,
             "skipLocal": true,
             "crossLanguage": true,
-            "ignoreImports": true
+            "ignoreImports": true,
+            "ignoreSymlinks": true
         }
     });
 
-    let parsed =
-        initialization_duplication_options(&opts).expect("duplication options should parse");
+    let parsed = parse_initialization_options(Some(&opts))
+        .duplication
+        .expect("duplication options should parse");
 
     assert_eq!(parsed.mode, Some(DetectionMode::Semantic));
     assert_eq!(parsed.near, Some(true));
@@ -1190,6 +1386,7 @@ fn initialization_duplication_options_reads_vscode_payload() {
     assert_eq!(parsed.skip_local, Some(true));
     assert_eq!(parsed.cross_language, Some(true));
     assert_eq!(parsed.ignore_imports, Some(true));
+    assert_eq!(parsed.ignore_symlinks, Some(true));
 }
 
 #[test]
@@ -1204,6 +1401,7 @@ fn lsp_duplication_options_override_project_config() {
         skip_local: true,
         cross_language: false,
         ignore_imports: false,
+        ignore_symlinks: false,
         ignore: vec!["generated/**".to_string()],
         ignored_clones: vec!["dup:12345678:2".to_string()],
         ..DuplicatesConfig::default()
@@ -1218,6 +1416,7 @@ fn lsp_duplication_options_override_project_config() {
         skip_local: Some(false),
         cross_language: Some(true),
         ignore_imports: Some(true),
+        ignore_symlinks: Some(true),
     };
 
     let merged = options.merge_with(&project);
@@ -1231,36 +1430,19 @@ fn lsp_duplication_options_override_project_config() {
     assert!(!merged.skip_local);
     assert!(merged.cross_language);
     assert!(merged.ignore_imports);
+    assert!(merged.ignore_symlinks);
     assert_eq!(merged.ignore, vec!["generated/**".to_string()]);
     assert_eq!(merged.ignored_clones, vec!["dup:12345678:2".to_string()]);
 }
 
 #[test]
-fn initialization_inline_complexity_defaults_off() {
-    let opts = serde_json::json!({});
-
-    assert!(!initialization_inline_complexity_enabled(&opts));
-}
-
-#[test]
-fn initialization_inline_complexity_reads_health_option() {
-    let opts = serde_json::json!({
-        "health": {
-            "inlineComplexity": true
-        }
-    });
-
-    assert!(initialization_inline_complexity_enabled(&opts));
-}
-
-#[test]
 fn initialization_production_override_reads_boolean() {
     assert_eq!(
-        initialization_production_override(&serde_json::json!({ "production": true })),
+        parse_initialization_options(Some(&serde_json::json!({ "production": true }))).production,
         Some(true)
     );
     assert_eq!(
-        initialization_production_override(&serde_json::json!({ "production": false })),
+        parse_initialization_options(Some(&serde_json::json!({ "production": false }))).production,
         Some(false)
     );
 }
@@ -1268,11 +1450,11 @@ fn initialization_production_override_reads_boolean() {
 #[test]
 fn initialization_production_override_defers_when_absent_or_non_boolean() {
     assert_eq!(
-        initialization_production_override(&serde_json::json!({})),
+        parse_initialization_options(Some(&serde_json::json!({}))).production,
         None
     );
     assert_eq!(
-        initialization_production_override(&serde_json::json!({ "production": "on" })),
+        parse_initialization_options(Some(&serde_json::json!({ "production": "on" }))).production,
         None
     );
 }
@@ -1383,6 +1565,185 @@ fn analyze_project_root_implicit_config_error_falls_back_to_default_session() {
     );
 }
 
+/// Write a project with one `ignoreDependencies` glob that matches a declared
+/// dependency, one that matches nothing, and one `ignoreFindings` pattern that
+/// matches nothing. `config` names the config file and holds its text.
+fn write_unmatched_pattern_project(root: &Path, config: (&str, &str)) {
+    std::fs::create_dir_all(root.join("src")).expect("create src dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-config-patterns","private":true,"main":"src/index.ts",
+            "dependencies":{"@acme/lib":"1.0.0"}}"#,
+    )
+    .expect("write package");
+    std::fs::write(root.join(config.0), config.1).expect("write config");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import '@acme/lib';\nexport const used = 1;\n",
+    )
+    .expect("write index");
+    // `ignoreFindings` is compared with each finding, so the run needs one.
+    std::fs::write(root.join("src/orphan.ts"), "export const orphan = 2;\n").expect("write orphan");
+}
+
+type LogMessages = Vec<(MessageType, String)>;
+
+/// Analyze `root` and return the log messages and the config pattern
+/// diagnostics of the run.
+fn unmatched_patterns_of(root: &Path) -> (LogMessages, FxHashMap<Uri, Vec<Diagnostic>>) {
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    let patterns = analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+    let mut map = FxHashMap::default();
+    config_patterns::push_diagnostics(&mut map, &patterns);
+    (messages, map)
+}
+
+/// The config text at the range of a diagnostic.
+fn text_at(content: &str, range: Range) -> String {
+    let line = content
+        .lines()
+        .nth(range.start.line as usize)
+        .expect("line");
+    let utf16: Vec<u16> = line.encode_utf16().collect();
+    String::from_utf16(&utf16[range.start.character as usize..range.end.character as usize])
+        .expect("utf16 text")
+}
+
+#[test]
+fn unmatched_config_patterns_are_diagnostics_on_the_config_entry() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let config = "{\n  \"ignoreDependencies\": [\"@acme/*\", \"@acm/*\"],\n  \"ignoreFindings\": [\"src/hiden.ts\"]\n}\n";
+    write_unmatched_pattern_project(root, (".fallowrc.json", config));
+
+    let (messages, map) = unmatched_patterns_of(root);
+
+    let config_path = dunce::canonicalize(root.join(".fallowrc.json")).expect("canonical");
+    let uri = Uri::from_file_path(&config_path).expect("config uri");
+    let diagnostics = map.get(&uri).expect("diagnostics on the config file");
+    let mut located = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                text_at(config, diagnostic.range),
+                diagnostic.code.clone(),
+                diagnostic.severity,
+            )
+        })
+        .collect::<Vec<_>>();
+    located.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        located,
+        vec![
+            (
+                "\"@acm/*\"".to_string(),
+                Some(NumberOrString::String(
+                    "ignore-dependencies-glob-unmatched".to_string()
+                )),
+                Some(DiagnosticSeverity::INFORMATION),
+            ),
+            // `@acme/lib` is imported, so `@acme/*` matched it but hid
+            // nothing (issue #3824).
+            (
+                "\"@acme/*\"".to_string(),
+                Some(NumberOrString::String(
+                    "ignore-dependencies-entry-redundant".to_string()
+                )),
+                Some(DiagnosticSeverity::INFORMATION),
+            ),
+            (
+                "\"src/hiden.ts\"".to_string(),
+                Some(NumberOrString::String(
+                    "ignore-findings-pattern-unmatched".to_string()
+                )),
+                Some(DiagnosticSeverity::INFORMATION),
+            ),
+        ]
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.message.contains("so it has no effect")),
+        "the message is the CLI entry text: {diagnostics:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|(_, message)| message.contains("matched no")),
+        "a located pattern is not logged: {messages:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unlocated_config_patterns_are_logged_once_per_changed_set() {
+    let (service, _) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    let pattern = |text: &str| config_patterns::UnmatchedConfigPattern {
+        code: "ignore-findings-pattern-unmatched",
+        message: text.to_string(),
+        project_root: PathBuf::from("/project"),
+        location: None,
+    };
+    let first = [pattern("ignoreFindings pattern 'a/**' matched no finding")];
+    let second = [pattern("ignoreFindings pattern 'b/**' matched no finding")];
+
+    assert_eq!(backend.new_config_pattern_log_lines(&first).len(), 1);
+    assert!(
+        backend.new_config_pattern_log_lines(&first).is_empty(),
+        "an unchanged set is not logged again"
+    );
+    assert_eq!(backend.new_config_pattern_log_lines(&second).len(), 1);
+    assert!(backend.new_config_pattern_log_lines(&[]).is_empty());
+    assert_eq!(
+        backend.new_config_pattern_log_lines(&second).len(),
+        1,
+        "a set that comes back after a clean run is logged again"
+    );
+}
+
+#[test]
+fn unmatched_config_patterns_in_toml_and_an_extended_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let base = "ignoreFindings = [\n  \"src/hiden.ts\",\n]\n";
+    std::fs::write(root.join("base.toml"), base).expect("write base");
+    write_unmatched_pattern_project(
+        root,
+        (
+            "fallow.toml",
+            "extends = [\"./base.toml\"]\nignoreDependencies = [\"@acm/*\"]\n",
+        ),
+    );
+
+    let (_, map) = unmatched_patterns_of(root);
+
+    let base_uri =
+        Uri::from_file_path(dunce::canonicalize(root.join("base.toml")).expect("canonical"))
+            .expect("base uri");
+    let base_diagnostics = map
+        .get(&base_uri)
+        .expect("the base file declares the pattern");
+    assert_eq!(base_diagnostics.len(), 1);
+    assert_eq!(text_at(base, base_diagnostics[0].range), "\"src/hiden.ts\"");
+    let main_uri =
+        Uri::from_file_path(dunce::canonicalize(root.join("fallow.toml")).expect("canonical"))
+            .expect("main uri");
+    assert_eq!(map.get(&main_uri).map(Vec::len), Some(1));
+}
+
 #[test]
 fn analyze_project_root_applies_lsp_duplication_options() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1450,6 +1811,82 @@ fn analyze_project_root_applies_lsp_duplication_options() {
     );
 
     assert_eq!(filtered_duplication.stats.clone_groups, 0);
+}
+
+#[cfg(unix)]
+fn lsp_symlink_clone_groups(project_ignores: bool, override_value: Option<bool>) -> usize {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).expect("create src dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-dupes-symlinks","private":true,"main":"src/real.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join(".fallowrc.jsonc"),
+        format!(
+            r#"{{"duplicates":{{"minTokens":5,"minLines":1,"ignoreSymlinks":{project_ignores}}}}}"#
+        ),
+    )
+    .expect("write config");
+    std::fs::write(
+        src.join("real.ts"),
+        r"
+            export const calculate = (input: number): number => {
+                const doubled = input * 2;
+                const incremented = doubled + 1;
+                return incremented;
+            };
+        ",
+    )
+    .expect("write real");
+    std::os::unix::fs::symlink("real.ts", src.join("link.ts")).expect("create symlink");
+
+    let options = LspDuplicationOptions {
+        ignore_symlinks: override_value,
+        ..LspDuplicationOptions::default()
+    };
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    analyze_project_root_for_test(
+        root,
+        None,
+        Some(&options),
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+    duplication.stats.clone_groups
+}
+
+#[cfg(unix)]
+#[test]
+fn analyze_project_root_applies_lsp_ignore_symlinks_override() {
+    assert!(
+        lsp_symlink_clone_groups(false, None) > 0,
+        "the symlinked file duplicates the real file by default"
+    );
+    assert_eq!(
+        lsp_symlink_clone_groups(false, Some(true)),
+        0,
+        "ignoreSymlinks: true drops the symlinked instance"
+    );
+    assert_eq!(
+        lsp_symlink_clone_groups(true, None),
+        0,
+        "an unset override keeps the project config"
+    );
+    assert!(
+        lsp_symlink_clone_groups(true, Some(false)) > 0,
+        "ignoreSymlinks: false overrides the project config"
+    );
 }
 
 fn write_inline_complexity_fixture(root: &Path) {
@@ -1544,6 +1981,136 @@ fn analyze_project_root_collects_opt_in_inline_complexity() {
     assert!(finding.cyclomatic > 2);
 }
 
+/// A `health.thresholdOverrides` entry that raises the ceilings for
+/// `src/index.ts` above the complexity of `choose` removes its code lens, as
+/// it removes the health finding.
+#[test]
+fn analyze_project_root_applies_health_threshold_overrides_to_inline_complexity() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_inline_complexity_fixture(root);
+    std::fs::write(
+        root.join(".fallowrc.jsonc"),
+        r#"{"health":{"maxCyclomatic":2,"maxCognitive":2,"thresholdOverrides":[{"files":["src/index.ts"],"maxCyclomatic":50,"maxCognitive":50}]}}"#,
+    )
+    .expect("write config");
+
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        true,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+
+    assert!(
+        messages.iter().all(|(kind, _)| *kind == MessageType::INFO),
+        "the config with thresholdOverrides must load without a warning: {messages:?}"
+    );
+    let names: Vec<&str> = inline_complexity
+        .iter()
+        .map(|finding| finding.name.as_str())
+        .collect();
+    assert!(
+        !names.contains(&"choose"),
+        "the override raises the ceilings for src/index.ts, so `choose` gets no lens: {names:?}"
+    );
+}
+
+/// Collect the inline complexity lenses of `root` with the LSP opt-in on.
+fn inline_complexity_names(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        true,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+    assert!(
+        messages.iter().all(|(kind, _)| *kind == MessageType::INFO),
+        "the config must load without a warning: {messages:?}"
+    );
+    inline_complexity
+        .into_iter()
+        .map(|finding| (finding.name, finding.path))
+        .collect()
+}
+
+/// The `complexity-*` rules decide if a complexity finding is reported, so a
+/// kind set to `off` shows no lens, as the CLI shows no finding.
+#[test]
+fn analyze_project_root_drops_inline_complexity_when_the_rules_are_off() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_inline_complexity_fixture(root);
+    std::fs::write(
+        root.join(".fallowrc.jsonc"),
+        r#"{"health":{"maxCyclomatic":2,"maxCognitive":2},"rules":{"complexity-cyclomatic":"off","complexity-cognitive":"off"}}"#,
+    )
+    .expect("write config");
+
+    let names = inline_complexity_names(root);
+    assert!(
+        names.iter().all(|(name, _)| name != "choose"),
+        "every contributing kind is off, so `choose` gets no lens: {names:?}"
+    );
+}
+
+/// An `overrides[].rules` entry that sets the kinds `off` for one directory
+/// removes the lens there and keeps it elsewhere.
+#[test]
+fn analyze_project_root_applies_rule_overrides_to_inline_complexity() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_inline_complexity_fixture(root);
+    let source = std::fs::read_to_string(root.join("src/index.ts")).expect("read source");
+    std::fs::create_dir_all(root.join("src/legacy")).expect("create legacy dir");
+    std::fs::write(
+        root.join("src/legacy/old.ts"),
+        source.replace("choose", "legacyChoose"),
+    )
+    .expect("write legacy source");
+    std::fs::write(
+        root.join("src/index.ts"),
+        format!("import {{ legacyChoose }} from './legacy/old';\nlegacyChoose(1);\n{source}"),
+    )
+    .expect("write index");
+    std::fs::write(
+        root.join(".fallowrc.jsonc"),
+        r#"{"health":{"maxCyclomatic":2,"maxCognitive":2},"overrides":[{"files":["src/legacy/**"],"rules":{"complexity-cyclomatic":"off","complexity-cognitive":"off"}}]}"#,
+    )
+    .expect("write config");
+
+    let names = inline_complexity_names(root);
+    assert!(
+        names
+            .iter()
+            .any(|(name, path)| name == "choose" && *path == root.join("src/index.ts")),
+        "the override does not cover src/index.ts, so `choose` keeps its lens: {names:?}"
+    );
+    assert!(
+        names.iter().all(|(name, _)| name != "legacyChoose"),
+        "the override sets the kinds off for src/legacy, so `legacyChoose` gets no lens: {names:?}"
+    );
+}
+
 #[test]
 fn find_project_roots_returns_only_workspace_root() {
     // A monorepo with two workspace packages must still yield exactly one
@@ -1585,609 +2152,6 @@ fn find_project_roots_returns_only_workspace_root() {
     assert_eq!(roots.len(), 1, "LSP analyzes exactly one root per run");
     let expected = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     assert_eq!(roots[0], expected, "the single root is the workspace root");
-}
-
-#[test]
-fn merge_results_into_empty_target() {
-    let mut target = AnalysisResults::default();
-    let mut source = AnalysisResults::default();
-    source
-        .unused_files
-        .push(UnusedFileFinding::with_actions(UnusedFile {
-            path: "/a.ts".into(),
-        }));
-    source
-        .unused_exports
-        .push(UnusedExportFinding::with_actions(UnusedExport {
-            path: "/a.ts".into(),
-            export_name: "foo".to_string(),
-            is_type_only: false,
-            line: 1,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        }));
-
-    merge_results(&mut target, source);
-
-    assert_eq!(target.unused_files.len(), 1);
-    assert_eq!(target.unused_exports.len(), 1);
-}
-
-#[test]
-fn merge_results_accumulates_from_multiple_sources() {
-    let mut target = AnalysisResults::default();
-
-    let mut source_a = AnalysisResults::default();
-    source_a
-        .unused_files
-        .push(UnusedFileFinding::with_actions(UnusedFile {
-            path: "/a.ts".into(),
-        }));
-    source_a.unresolved_imports.push(
-        fallow_api::editor_results::UnresolvedImportFinding::with_actions(
-            fallow_api::editor_results::UnresolvedImport {
-                path: "/a.ts".into(),
-                specifier: "./missing".to_string(),
-                line: 1,
-                col: 0,
-                specifier_col: 10,
-            },
-        ),
-    );
-
-    let mut source_b = AnalysisResults::default();
-    source_b
-        .unused_files
-        .push(UnusedFileFinding::with_actions(UnusedFile {
-            path: "/b.ts".into(),
-        }));
-    source_b
-        .unused_exports
-        .push(UnusedExportFinding::with_actions(UnusedExport {
-            path: "/b.ts".into(),
-            export_name: "bar".to_string(),
-            is_type_only: false,
-            line: 5,
-            col: 0,
-            span_start: 0,
-            is_re_export: false,
-        }));
-
-    merge_results(&mut target, source_a);
-    merge_results(&mut target, source_b);
-
-    assert_eq!(target.unused_files.len(), 2);
-    assert_eq!(target.unused_exports.len(), 1);
-    assert_eq!(target.unresolved_imports.len(), 1);
-}
-
-fn merge_test_unused_export(
-    path: &str,
-    export_name: &str,
-    is_type_only: bool,
-    line: u32,
-) -> UnusedExport {
-    UnusedExport {
-        path: path.into(),
-        export_name: export_name.to_string(),
-        is_type_only,
-        line,
-        col: 0,
-        span_start: 0,
-        is_re_export: false,
-    }
-}
-
-fn merge_test_unused_dependency(
-    package_name: &str,
-    location: fallow_api::editor_results::DependencyLocation,
-    line: u32,
-) -> UnusedDependency {
-    UnusedDependency {
-        package_name: package_name.to_string(),
-        location,
-        path: "/pkg.json".into(),
-        line,
-        used_in_workspaces: Vec::new(),
-    }
-}
-
-fn merge_test_unused_member(
-    parent_name: &str,
-    member_name: &str,
-    kind: fallow_api::editor_extract::MemberKind,
-    line: u32,
-) -> UnusedMember {
-    UnusedMember {
-        path: "/f.ts".into(),
-        parent_name: parent_name.to_string(),
-        member_name: member_name.to_string(),
-        kind,
-        line,
-        col: 0,
-    }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "intentionally names every AnalysisResults field (no ..Default::default()) so a new field is a compile error here; see #444"
-)]
-fn merge_test_source_with_all_fields() -> AnalysisResults {
-    AnalysisResults {
-        unused_files: vec![UnusedFileFinding::with_actions(UnusedFile {
-            path: "/f.ts".into(),
-        })],
-        unused_exports: vec![UnusedExportFinding::with_actions(merge_test_unused_export(
-            "/f.ts", "e", false, 1,
-        ))],
-        unused_types: vec![UnusedTypeFinding::with_actions(merge_test_unused_export(
-            "/f.ts", "T", true, 2,
-        ))],
-        unused_dependencies: vec![UnusedDependencyFinding::with_actions(
-            merge_test_unused_dependency(
-                "dep",
-                fallow_api::editor_results::DependencyLocation::Dependencies,
-                3,
-            ),
-        )],
-        unused_dev_dependencies: vec![UnusedDevDependencyFinding::with_actions(
-            merge_test_unused_dependency(
-                "dev-dep",
-                fallow_api::editor_results::DependencyLocation::DevDependencies,
-                4,
-            ),
-        )],
-        unused_optional_dependencies: vec![UnusedOptionalDependencyFinding::with_actions(
-            merge_test_unused_dependency(
-                "opt-dep",
-                fallow_api::editor_results::DependencyLocation::OptionalDependencies,
-                5,
-            ),
-        )],
-        unused_enum_members: vec![UnusedEnumMemberFinding::with_actions(
-            merge_test_unused_member(
-                "E",
-                "A",
-                fallow_api::editor_extract::MemberKind::EnumMember,
-                6,
-            ),
-        )],
-        unused_class_members: vec![UnusedClassMemberFinding::with_actions(
-            merge_test_unused_member(
-                "C",
-                "m",
-                fallow_api::editor_extract::MemberKind::ClassMethod,
-                7,
-            ),
-        )],
-        unused_store_members: vec![UnusedStoreMemberFinding::with_actions(
-            merge_test_unused_member(
-                "S",
-                "a",
-                fallow_api::editor_extract::MemberKind::StoreMember,
-                7,
-            ),
-        )],
-        unresolved_imports: vec![
-            fallow_api::editor_results::UnresolvedImportFinding::with_actions(
-                fallow_api::editor_results::UnresolvedImport {
-                    path: "/f.ts".into(),
-                    specifier: "./gone".to_string(),
-                    line: 8,
-                    col: 0,
-                    specifier_col: 10,
-                },
-            ),
-        ],
-        unlisted_dependencies: vec![UnlistedDependencyFinding::with_actions(
-            UnlistedDependency {
-                package_name: "unlisted".to_string(),
-                imported_from: vec![],
-            },
-        )],
-        duplicate_exports: vec![
-            fallow_api::editor_results::DuplicateExportFinding::with_actions(
-                fallow_api::editor_results::DuplicateExport {
-                    export_name: "dup".to_string(),
-                    locations: vec![],
-                },
-            ),
-        ],
-        type_only_dependencies: vec![
-            fallow_api::editor_results::TypeOnlyDependencyFinding::with_actions(
-                TypeOnlyDependency {
-                    package_name: "type-only".to_string(),
-                    path: "/pkg.json".into(),
-                    line: 9,
-                },
-            ),
-        ],
-        circular_dependencies: vec![CircularDependencyFinding::with_actions(
-            CircularDependency {
-                files: vec!["/a.ts".into(), "/b.ts".into()],
-                length: 2,
-                line: 10,
-                col: 0,
-                edges: Vec::new(),
-                is_cross_package: false,
-            },
-        )],
-        test_only_dependencies: vec![TestOnlyDependencyFinding::with_actions(
-            TestOnlyDependency {
-                package_name: "test-only".to_string(),
-                path: "/pkg.json".into(),
-                line: 11,
-            },
-        )],
-        dev_dependencies_in_production: vec![DevDependencyInProductionFinding::with_actions(
-            DevDependencyInProduction {
-                package_name: "dev-in-prod".to_string(),
-                path: "/pkg.json".into(),
-                line: 12,
-            },
-        )],
-        boundary_violations: vec![BoundaryViolationFinding::with_actions(BoundaryViolation {
-            from_path: "/a.ts".into(),
-            to_path: "/b.ts".into(),
-            from_zone: "ui".to_string(),
-            to_zone: "data".to_string(),
-            import_specifier: "../data/db".to_string(),
-            line: 12,
-            col: 0,
-        })],
-        boundary_coverage_violations: vec![
-            fallow_api::editor_results::BoundaryCoverageViolationFinding::with_actions(
-                fallow_api::editor_results::BoundaryCoverageViolation {
-                    path: "/unzoned.ts".into(),
-                    line: 13,
-                    col: 0,
-                },
-            ),
-        ],
-        boundary_call_violations: vec![
-            fallow_api::editor_results::BoundaryCallViolationFinding::with_actions(
-                fallow_api::editor_results::BoundaryCallViolation {
-                    path: "/zoned.ts".into(),
-                    line: 14,
-                    col: 0,
-                    zone: "domain".to_string(),
-                    callee: "console.log".to_string(),
-                    pattern: "console.*".to_string(),
-                },
-            ),
-        ],
-        policy_violations: vec![
-            fallow_api::editor_results::PolicyViolationFinding::with_actions(
-                fallow_api::editor_results::PolicyViolation {
-                    path: "/zoned.ts".into(),
-                    line: 15,
-                    col: 0,
-                    pack: "team-policy".to_string(),
-                    rule_id: "no-console".to_string(),
-                    kind: fallow_api::editor_results::PolicyRuleKind::BannedCall,
-                    matched: "console.log".to_string(),
-                    severity: fallow_api::editor_results::PolicyViolationSeverity::Warn,
-                    message: None,
-                },
-            ),
-        ],
-        export_usages: vec![ExportUsage {
-            path: "/f.ts".into(),
-            export_name: "used".to_string(),
-            line: 15,
-            col: 0,
-            reference_count: 3,
-            reference_locations: vec![],
-        }],
-        private_type_leaks: vec![
-            fallow_api::editor_results::PrivateTypeLeakFinding::with_actions(
-                fallow_api::editor_results::PrivateTypeLeak {
-                    path: "/f.ts".into(),
-                    export_name: "pub_fn".to_string(),
-                    type_name: "Secret".to_string(),
-                    line: 14,
-                    col: 0,
-                    span_start: 0,
-                    semantic: None,
-                },
-            ),
-        ],
-        re_export_cycles: vec![
-            fallow_api::editor_results::ReExportCycleFinding::with_actions(
-                fallow_api::editor_results::ReExportCycle {
-                    files: vec!["/barrel.ts".into()],
-                    kind: fallow_api::editor_results::ReExportCycleKind::SelfLoop,
-                },
-            ),
-        ],
-        stale_suppressions: vec![fallow_api::editor_results::StaleSuppression {
-            path: "/f.ts".into(),
-            line: 15,
-            col: 0,
-            origin: fallow_api::editor_results::SuppressionOrigin::Comment {
-                issue_kind: None,
-                reason: None,
-                is_file_level: false,
-                kind_known: true,
-            },
-            missing_reason: false,
-            actions: fallow_api::editor_results::StaleSuppression::actions_for(false),
-        }],
-        unused_catalog_entries: vec![
-            fallow_api::editor_results::UnusedCatalogEntryFinding::with_actions(
-                fallow_api::editor_results::UnusedCatalogEntry {
-                    entry_name: "react".to_string(),
-                    catalog_name: "default".to_string(),
-                    path: "/pnpm-workspace.yaml".into(),
-                    line: 16,
-                    hardcoded_consumers: vec![],
-                },
-            ),
-        ],
-        empty_catalog_groups: vec![
-            fallow_api::editor_results::EmptyCatalogGroupFinding::with_actions(
-                fallow_api::editor_results::EmptyCatalogGroup {
-                    catalog_name: "ui".to_string(),
-                    path: "/pnpm-workspace.yaml".into(),
-                    line: 17,
-                },
-            ),
-        ],
-        unresolved_catalog_references: vec![
-            fallow_api::editor_results::UnresolvedCatalogReferenceFinding::with_actions(
-                fallow_api::editor_results::UnresolvedCatalogReference {
-                    entry_name: "vue".to_string(),
-                    catalog_name: "default".to_string(),
-                    path: "/pkg.json".into(),
-                    line: 18,
-                    available_in_catalogs: vec![],
-                },
-            ),
-        ],
-        unused_dependency_overrides: vec![
-            fallow_api::editor_results::UnusedDependencyOverrideFinding::with_actions(
-                fallow_api::editor_results::UnusedDependencyOverride {
-                    raw_key: "react".to_string(),
-                    target_package: "react".to_string(),
-                    parent_package: None,
-                    version_constraint: None,
-                    version_range: "18".to_string(),
-                    source: fallow_api::editor_results::DependencyOverrideSource::PnpmWorkspaceYaml,
-                    path: "/pnpm-workspace.yaml".into(),
-                    line: 19,
-                    hint: None,
-                },
-            ),
-        ],
-        misconfigured_dependency_overrides: vec![
-            fallow_api::editor_results::MisconfiguredDependencyOverrideFinding::with_actions(
-                fallow_api::editor_results::MisconfiguredDependencyOverride {
-                    raw_key: "bad>".to_string(),
-                    target_package: None,
-                    raw_value: String::new(),
-                    reason:
-                        fallow_api::editor_results::DependencyOverrideMisconfigReason::EmptyValue,
-                    source: fallow_api::editor_results::DependencyOverrideSource::PnpmPackageJson,
-                    path: "/pkg.json".into(),
-                    line: 20,
-                },
-            ),
-        ],
-        invalid_client_exports: vec![
-            fallow_api::editor_results::InvalidClientExportFinding::with_actions(
-                fallow_api::editor_results::InvalidClientExport {
-                    path: "/app/page.tsx".into(),
-                    export_name: "metadata".to_string(),
-                    directive: "use client".to_string(),
-                    line: 22,
-                    col: 0,
-                },
-            ),
-        ],
-        mixed_client_server_barrels: vec![
-            fallow_api::editor_results::MixedClientServerBarrelFinding::with_actions(
-                fallow_api::editor_results::MixedClientServerBarrel {
-                    path: "/app/components/index.ts".into(),
-                    client_origin: "./Button".to_string(),
-                    server_origin: "./fetchUser".to_string(),
-                    line: 23,
-                    col: 0,
-                },
-            ),
-        ],
-        misplaced_directives: vec![
-            fallow_api::editor_results::MisplacedDirectiveFinding::with_actions(
-                fallow_api::editor_results::MisplacedDirective {
-                    path: "/app/widget.tsx".into(),
-                    directive: "use client".to_string(),
-                    line: 24,
-                    col: 0,
-                },
-            ),
-        ],
-        unprovided_injects: vec![],
-        unrendered_components: vec![],
-        unused_component_props: vec![],
-        unused_component_emits: vec![],
-        unused_component_inputs: vec![],
-        unused_component_outputs: vec![],
-        unused_svelte_events: vec![],
-        unused_server_actions: vec![],
-        unused_load_data_keys: vec![],
-        unused_load_data_keys_global_abstain: false,
-        prop_drilling_chains: vec![],
-        thin_wrappers: vec![],
-        duplicate_prop_shapes: vec![],
-        route_collisions: vec![
-            fallow_api::editor_results::RouteCollisionFinding::with_actions(
-                fallow_api::editor_results::RouteCollision {
-                    path: "/app/(a)/about/page.tsx".into(),
-                    url: "/about".to_string(),
-                    conflicting_paths: vec!["/app/(b)/about/page.tsx".into()],
-                    line: 1,
-                    col: 0,
-                },
-            ),
-        ],
-        dynamic_segment_name_conflicts: vec![
-            fallow_api::editor_results::DynamicSegmentNameConflictFinding::with_actions(
-                fallow_api::editor_results::DynamicSegmentNameConflict {
-                    path: "/app/shop/[id]/page.tsx".into(),
-                    position: "/shop".to_string(),
-                    conflicting_segments: vec!["[id]".to_string(), "[slug]".to_string()],
-                    conflicting_paths: vec!["/app/shop/[slug]/edit/page.tsx".into()],
-                    line: 1,
-                    col: 0,
-                },
-            ),
-        ],
-        suppression_count: 1,
-        unused_component_props_exempted: 1,
-        active_suppressions: Vec::new(),
-        feature_flags: vec![fallow_api::editor_results::FeatureFlag {
-            path: "/f.ts".into(),
-            flag_name: "ENABLE_X".to_string(),
-            kind: fallow_api::editor_results::FlagKind::EnvironmentVariable,
-            confidence: fallow_api::editor_results::FlagConfidence::High,
-            line: 21,
-            col: 0,
-            guard_span_start: None,
-            guard_span_end: None,
-            sdk_name: None,
-            guard_line_start: None,
-            guard_line_end: None,
-            guarded_dead_exports: vec![],
-        }],
-        entry_point_summary: Some(fallow_api::editor_results::EntryPointSummary {
-            total: 0,
-            by_source: vec![],
-        }),
-        security_findings: vec![fallow_api::editor_results::SecurityFinding {
-            finding_id: String::new(),
-            candidate: fallow_api::editor_results::SecurityCandidate::default(),
-            taint_flow: None,
-            attack_surface: None,
-            kind: fallow_api::editor_results::SecurityFindingKind::ClientServerLeak,
-            category: None,
-            cwe: None,
-            path: "/client.tsx".into(),
-            line: 1,
-            col: 0,
-            evidence: "transitively reaches DATABASE_URL".to_string(),
-            source_backed: false,
-            source_read: None,
-            severity: SecuritySeverity::Low,
-            trace: vec![],
-            actions: vec![],
-            dead_code: None,
-            reachability: None,
-            runtime: None,
-        }],
-        security_unresolved_edge_files: 2,
-        security_unresolved_callee_sites: 0,
-        security_unresolved_callee_diagnostics: vec![
-            fallow_api::editor_results::SecurityUnresolvedCalleeDiagnostic {
-                path: "/client.tsx".into(),
-                line: 2,
-                col: 0,
-                reason: fallow_api::editor_extract::SkippedSecurityCalleeReason::DynamicDispatch,
-                expression_kind:
-                    fallow_api::editor_extract::SkippedSecurityCalleeExpressionKind::Other,
-            },
-        ],
-        render_fan_in: Some(fallow_api::editor_results::RenderFanInMetric {
-            per_component: vec![fallow_api::editor_results::RenderFanInComponent {
-                file: "/Button.tsx".into(),
-                component: "Button".to_string(),
-                render_sites: 6,
-                distinct_parents: 3,
-            }],
-            p95_distinct_parents: Some(3),
-            high_pct: Some(0.0),
-            max_distinct_parents: Some(3),
-        }),
-        react_component_intel: vec![fallow_api::editor_results::ReactComponentIntel {
-            path: "/Button.tsx".into(),
-            component_name: "Button".to_string(),
-            anchor_line: 1,
-            anchor_col: 0,
-            render_sites: 6,
-            distinct_parents: 3,
-            prop_count: 1,
-            hooks: fallow_api::editor_results::ReactHookSummary::default(),
-            props: Vec::new(),
-        }],
-        semantic_framework_contracts: vec![],
-    }
-}
-
-#[test]
-fn merge_results_covers_all_fields() {
-    let mut target = AnalysisResults::default();
-    let source = merge_test_source_with_all_fields();
-
-    merge_results(&mut target, source);
-
-    assert_eq!(target.unused_files.len(), 1);
-    assert_eq!(target.unused_exports.len(), 1);
-    assert_eq!(target.unused_types.len(), 1);
-    assert_eq!(target.private_type_leaks.len(), 1);
-    assert_eq!(target.unused_dependencies.len(), 1);
-    assert_eq!(target.unused_dev_dependencies.len(), 1);
-    assert_eq!(target.unused_optional_dependencies.len(), 1);
-    assert_eq!(target.unused_enum_members.len(), 1);
-    assert_eq!(target.unused_class_members.len(), 1);
-    assert_eq!(target.unused_store_members.len(), 1);
-    assert_eq!(target.unresolved_imports.len(), 1);
-    assert_eq!(target.unlisted_dependencies.len(), 1);
-    assert_eq!(target.duplicate_exports.len(), 1);
-    assert_eq!(target.type_only_dependencies.len(), 1);
-    assert_eq!(target.test_only_dependencies.len(), 1);
-    assert_eq!(target.circular_dependencies.len(), 1);
-    assert_eq!(target.re_export_cycles.len(), 1);
-    assert_eq!(target.boundary_violations.len(), 1);
-    assert_eq!(target.boundary_call_violations.len(), 1);
-    assert_eq!(target.policy_violations.len(), 1);
-    assert_eq!(target.stale_suppressions.len(), 1);
-    assert_eq!(target.unused_catalog_entries.len(), 1);
-    assert_eq!(target.empty_catalog_groups.len(), 1);
-    assert_eq!(target.unresolved_catalog_references.len(), 1);
-    assert_eq!(target.unused_dependency_overrides.len(), 1);
-    assert_eq!(target.misconfigured_dependency_overrides.len(), 1);
-    assert_eq!(target.invalid_client_exports.len(), 1);
-    assert_eq!(target.mixed_client_server_barrels.len(), 1);
-    assert_eq!(target.misplaced_directives.len(), 1);
-    assert_eq!(target.export_usages.len(), 1);
-    assert_eq!(target.feature_flags.len(), 1);
-    assert_eq!(target.security_findings.len(), 1);
-    assert_eq!(target.security_unresolved_edge_files, 2);
-    assert_eq!(target.security_unresolved_callee_diagnostics.len(), 1);
-    assert_eq!(target.suppression_count, 1);
-    assert!(target.entry_point_summary.is_some());
-    assert_eq!(
-        target
-            .render_fan_in
-            .as_ref()
-            .and_then(|m| m.max_distinct_parents),
-        Some(3)
-    );
-    assert_eq!(target.react_component_intel.len(), 1);
-}
-
-#[test]
-fn merge_results_with_empty_source() {
-    let mut target = AnalysisResults::default();
-    target
-        .unused_files
-        .push(UnusedFileFinding::with_actions(UnusedFile {
-            path: "/a.ts".into(),
-        }));
-
-    let source = AnalysisResults::default();
-    merge_results(&mut target, source);
-
-    assert_eq!(target.unused_files.len(), 1);
 }
 
 fn make_diagnostic() -> Diagnostic {
@@ -2254,6 +2218,9 @@ fn git(root: &Path, args: &[&str]) {
     let status = std::process::Command::new("git")
         .args(args)
         .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .status()
         .expect("git command starts");
     assert!(status.success(), "git command failed: {args:?}");
@@ -2288,6 +2255,225 @@ fn changed_since_fixture() -> tempfile::TempDir {
     temp
 }
 
+fn package_baseline_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("temp project");
+    let root = temp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-packages","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .expect("root manifest");
+    for name in ["web", "legacy", "other"] {
+        let package = root.join("packages").join(name);
+        std::fs::create_dir_all(package.join("src")).expect("package directory");
+        std::fs::write(
+            package.join("package.json"),
+            format!(r#"{{"name":"{name}","main":"src/index.ts"}}"#),
+        )
+        .expect("package manifest");
+        std::fs::write(
+            package.join("src/index.ts"),
+            "import { used } from './utils';\nused();\n",
+        )
+        .expect("entry");
+        std::fs::write(
+            package.join("src/utils.ts"),
+            format!("export const used = () => 1;\nexport const unused_{name} = 1;\n"),
+        )
+        .expect("source");
+    }
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test User"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "base"]);
+    std::fs::write(
+        root.join("packages/web/src/utils.ts"),
+        "export const used = () => 2;\nexport const unused_web = 2;\n",
+    )
+    .expect("web change");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "web change"]);
+    std::fs::write(
+        root.join("packages/legacy/src/utils.ts"),
+        "export const used = () => 3;\nexport const unused_legacy = 3;\n",
+    )
+    .expect("legacy change");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"workspaces":{"changedSince":{"packages/web":"HEAD~1","packages/legacy":"HEAD"}}}"#,
+    )
+    .expect("config");
+    temp
+}
+
+/// `initializationOptions.packageBaselines: false` turns the package map off,
+/// as `--no-package-baselines` does on the CLI.
+#[test]
+fn package_baselines_false_keeps_every_package_in_full_scope() {
+    let options = parse_initialization_options(Some(&json!({ "packageBaselines": false })));
+    assert_eq!(options.package_baselines, Some(false));
+    assert_eq!(
+        parse_initialization_options(Some(&json!({}))).package_baselines,
+        None
+    );
+
+    let temp = package_baseline_fixture();
+    let root = temp.path();
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"workspaces":{"changedSince":{"packages/other":"HEAD"}}}"#,
+    )
+    .expect("map the unchanged package");
+    let mapped = run_blocking_analysis(&BlockingAnalysisInput {
+        changed_since: None,
+        ..changed_since_input(root, "HEAD", None)
+    })
+    .expect("package analysis succeeds");
+    let opted_out = run_blocking_analysis(&BlockingAnalysisInput {
+        changed_since: None,
+        no_package_baselines: true,
+        ..changed_since_input(root, "HEAD", None)
+    })
+    .expect("full-scope analysis succeeds");
+    assert!(!mapped.package_scopes.is_empty());
+    assert!(opted_out.package_scopes.is_empty());
+    assert!(
+        opted_out.analysis.results.unused_exports.len()
+            > mapped.analysis.results.unused_exports.len(),
+        "the opt-out reports the findings the map hid"
+    );
+}
+
+#[test]
+fn package_baselines_scope_lsp_results_and_stamp_each_document_ref() {
+    let temp = package_baseline_fixture();
+    let root = temp.path();
+    let input = BlockingAnalysisInput {
+        changed_since: None,
+        ..changed_since_input(root, "HEAD", None)
+    };
+    let output = run_blocking_analysis(&input).expect("package analysis succeeds");
+    assert_eq!(output.package_scopes.len(), 1);
+    let paths = output
+        .analysis
+        .results
+        .unused_exports
+        .iter()
+        .map(|finding| finding.export.path.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>();
+    for name in ["web", "legacy", "other"] {
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with(&format!("packages/{name}/src/utils.ts"))),
+            "missing {name} finding: {paths:?}"
+        );
+    }
+    let statuses = fallow_api::package_baseline_statuses(&output.package_scopes, root);
+    assert_eq!(
+        statuses,
+        vec![
+            fallow_api::PackageBaselineStatus {
+                workspace_root: "packages/legacy".to_owned(),
+                reference: "HEAD".to_owned(),
+            },
+            fallow_api::PackageBaselineStatus {
+                workspace_root: "packages/web".to_owned(),
+                reference: "HEAD~1".to_owned(),
+            },
+        ]
+    );
+
+    let mut diagnostics = FxHashMap::default();
+    for name in ["web", "legacy", "other"] {
+        let uri = Uri::from_file_path(root.join("packages").join(name).join("src/utils.ts"))
+            .expect("source URI");
+        diagnostics.insert(uri, vec![make_diagnostic()]);
+    }
+    diagnostic_filter::attach_package_changed_since_data(&mut diagnostics, &output.package_scopes);
+    for (name, expected) in [
+        ("web", Some("HEAD~1")),
+        ("legacy", Some("HEAD")),
+        ("other", None),
+    ] {
+        let uri = Uri::from_file_path(root.join("packages").join(name).join("src/utils.ts"))
+            .expect("source URI");
+        assert_eq!(
+            diagnostics[&uri][0]
+                .data
+                .as_ref()
+                .and_then(|data| data["changedSince"].as_str()),
+            expected
+        );
+    }
+
+    let dropped = run_blocking_analysis(&changed_since_input(root, "missing-ref", None))
+        .expect("dropped global ref keeps full analysis");
+    assert!(dropped.package_scopes.is_empty());
+}
+
+/// A package map that cannot apply keeps the editor useful: the project shows
+/// its findings in full scope, and a warning says why.
+#[test]
+fn package_map_that_cannot_apply_warns_and_keeps_full_scope() {
+    let temp = package_baseline_fixture();
+    let root = temp.path();
+    let package_input = BlockingAnalysisInput {
+        changed_since: None,
+        ..changed_since_input(root, "HEAD", None)
+    };
+    for (map, cause) in [
+        (
+            r#"{"workspaces":{"changedSince":{"packages/web":"missing-ref"}}}"#,
+            "missing-ref",
+        ),
+        (
+            r#"{"workspaces":{"changedSince":{"packages/wbe":"HEAD"}}}"#,
+            "did you mean 'packages/web'?",
+        ),
+    ] {
+        std::fs::write(root.join(".fallowrc.json"), map).expect("package map");
+        let output = run_blocking_analysis(&package_input)
+            .unwrap_or_else(|error| panic!("{map}: the analysis must continue: {error}"));
+        assert!(output.package_scopes.is_empty(), "{map}");
+        assert!(
+            output.config_messages.iter().any(|(kind, message)| {
+                *kind == MessageType::WARNING
+                    && message.contains("workspaces.changedSince was ignored")
+                    && message.contains(cause)
+            }),
+            "{map}: {:?}",
+            output.config_messages
+        );
+        let legacy_findings = output
+            .analysis
+            .results
+            .unused_exports
+            .iter()
+            .any(|finding| {
+                finding
+                    .export
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .contains("packages/legacy/")
+            });
+        assert!(legacy_findings, "{map}: full scope keeps every package");
+    }
+
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"workspaces":{"changedSince":{"packages/web":"missing-ref"}}}"#,
+    )
+    .expect("invalid config ref");
+    let overridden = run_blocking_analysis(&changed_since_input(root, "HEAD", None))
+        .expect("global ref overrides invalid package ref");
+    assert!(overridden.package_scopes.is_empty());
+    assert_eq!(overridden.applied_changed_since.as_deref(), Some("HEAD"));
+}
+
 fn changed_since_input(
     root: &Path,
     changed_since: &str,
@@ -2299,6 +2485,7 @@ fn changed_since_input(
         allow_remote_extends: false,
         duplication_options,
         production_override: None,
+        no_package_baselines: false,
         inline_complexity_enabled: false,
         type_aware_options: None,
         type_aware_sessions: Arc::new(StdMutex::new(FxHashMap::default())),
@@ -2307,6 +2494,8 @@ fn changed_since_input(
         toplevel: Some(root.to_path_buf()),
         changed_since: Some(changed_since.to_string()),
         cancellation: Arc::new(AtomicBool::new(false)),
+        run_cancellation: Arc::new(AtomicBool::new(false)),
+        sessions: Arc::default(),
     }
 }
 
@@ -2358,6 +2547,90 @@ fn run_blocking_analysis_retains_applied_changed_since_scope() {
                     .any(|instance| instance.file.ends_with("changed.ts"))
             }),
         "changedSince must exclude clone groups that only touch unchanged files"
+    );
+}
+
+/// `dup` is exported by `src/x.ts`, `src/y.ts` and `src/z.ts`, and
+/// `ignoreFindings` matches `src/x.ts` and `src/y.ts`. The full run reports
+/// the duplicate export, because `src/z.ts` is not ignored. After the commit,
+/// only `src/x.ts` and `src/y.ts` change.
+fn ignored_duplicate_export_fixture() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("temp project");
+    let root = temp.path();
+    let src = root.join("src");
+    std::fs::create_dir(&src).expect("src dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-ignored-duplicate-export","type":"module","main":"src/index.ts"}"#,
+    )
+    .expect("package json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"ignoreFindings":["src/x.ts","src/y.ts"]}"#,
+    )
+    .expect("config");
+    std::fs::write(
+        src.join("index.ts"),
+        "export * from \"./x\";\nexport * from \"./y\";\nexport * from \"./z\";\n",
+    )
+    .expect("index source");
+    std::fs::write(src.join("x.ts"), "export const dup = 1;\n").expect("x source");
+    std::fs::write(src.join("y.ts"), "export const dup = 1;\n").expect("y source");
+    std::fs::write(src.join("z.ts"), "export const dup = 1;\n").expect("z source");
+
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test User"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "initial"]);
+
+    std::fs::write(src.join("x.ts"), "export const dup = 2;\n").expect("change x");
+    std::fs::write(src.join("y.ts"), "export const dup = 3;\n").expect("change y");
+    temp
+}
+
+#[test]
+fn run_blocking_analysis_hides_a_duplicate_export_that_only_ignored_owners_hold_after_the_scope() {
+    let temp = ignored_duplicate_export_fixture();
+    let root = temp.path();
+
+    let full = run_blocking_analysis(&BlockingAnalysisInput {
+        changed_since: None,
+        ..changed_since_input(root, "HEAD", None)
+    })
+    .expect("full analysis succeeds");
+    assert_eq!(
+        full.analysis.results.duplicate_exports.len(),
+        1,
+        "the full run reports `dup`, because src/z.ts is not ignored"
+    );
+
+    let scoped = run_blocking_analysis(&changed_since_input(root, "HEAD", None))
+        .expect("changed-since analysis succeeds");
+    assert_eq!(
+        scoped.applied_changed_since.as_deref(),
+        Some("HEAD"),
+        "the changed-since scope must apply"
+    );
+    let owners: Vec<Vec<PathBuf>> = scoped
+        .analysis
+        .results
+        .duplicate_exports
+        .iter()
+        .map(|finding| {
+            finding
+                .export
+                .locations
+                .iter()
+                .map(|location| location.path.clone())
+                .collect()
+        })
+        .collect();
+    assert!(
+        owners.is_empty(),
+        "after the scope only src/x.ts and src/y.ts hold `dup` and `ignoreFindings` \
+         matches both, so the editor hides the finding as the CLI does: {owners:?}"
     );
 }
 
@@ -2519,180 +2792,8 @@ fn attach_changed_since_data_leaves_non_object_data_intact() {
 }
 
 #[test]
-fn merge_duplication_into_empty_target() {
-    let mut target = DuplicationReport::default();
-    let source = DuplicationReport {
-        clone_groups: vec![CloneGroup {
-            instances: vec![CloneInstance {
-                file: "/a.ts".into(),
-                start_line: 1,
-                end_line: 5,
-                start_col: 0,
-                end_col: 10,
-                fragment: "code".to_string(),
-            }],
-            token_count: 20,
-            line_count: 5,
-            similarity: None,
-        }],
-        clone_families: vec![],
-        mirrored_directories: vec![],
-        stats: DuplicationStats {
-            total_files: 10,
-            files_with_clones: 2,
-            total_lines: 100,
-            duplicated_lines: 10,
-            total_tokens: 500,
-            duplicated_tokens: 50,
-            clone_groups: 1,
-            clone_instances: 1,
-            duplication_percentage: 10.0,
-            clone_groups_below_min_occurrences: 0,
-            clone_groups_ignored: 0,
-            near_candidates_skipped: 0,
-        },
-    };
-
-    merge_duplication(&mut target, source);
-
-    assert_eq!(target.clone_groups.len(), 1);
-    assert_eq!(target.stats.total_files, 10);
-    assert_eq!(target.stats.total_lines, 100);
-    assert_eq!(target.stats.duplicated_lines, 10);
-    assert!((target.stats.duplication_percentage - 10.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn merge_duplication_recomputes_percentage() {
-    let mut target = DuplicationReport {
-        clone_groups: vec![],
-        clone_families: vec![],
-        mirrored_directories: vec![],
-        stats: DuplicationStats {
-            total_files: 5,
-            files_with_clones: 1,
-            total_lines: 200,
-            duplicated_lines: 20,
-            total_tokens: 1000,
-            duplicated_tokens: 100,
-            clone_groups: 1,
-            clone_instances: 2,
-            duplication_percentage: 10.0, // 20/200 * 100
-            clone_groups_below_min_occurrences: 0,
-            clone_groups_ignored: 0,
-            near_candidates_skipped: 0,
-        },
-    };
-    let source = DuplicationReport {
-        clone_groups: vec![],
-        clone_families: vec![],
-        mirrored_directories: vec![],
-        stats: DuplicationStats {
-            total_files: 3,
-            files_with_clones: 1,
-            total_lines: 300,
-            duplicated_lines: 60,
-            total_tokens: 1500,
-            duplicated_tokens: 300,
-            clone_groups: 2,
-            clone_instances: 4,
-            duplication_percentage: 20.0, // 60/300 * 100
-            clone_groups_below_min_occurrences: 0,
-            clone_groups_ignored: 0,
-            near_candidates_skipped: 0,
-        },
-    };
-
-    merge_duplication(&mut target, source);
-
-    assert_eq!(target.stats.total_files, 8);
-    assert_eq!(target.stats.files_with_clones, 2);
-    assert_eq!(target.stats.total_lines, 500);
-    assert_eq!(target.stats.duplicated_lines, 80);
-    assert_eq!(target.stats.total_tokens, 2500);
-    assert_eq!(target.stats.duplicated_tokens, 400);
-    assert_eq!(target.stats.clone_groups, 3);
-    assert_eq!(target.stats.clone_instances, 6);
-    assert!((target.stats.duplication_percentage - 16.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn merge_duplication_zero_total_lines_yields_zero_percentage() {
-    let mut target = DuplicationReport::default();
-    let source = DuplicationReport::default();
-
-    merge_duplication(&mut target, source);
-
-    assert_eq!(target.stats.total_lines, 0);
-    assert!((target.stats.duplication_percentage - 0.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn merge_duplication_with_empty_source() {
-    let mut target = DuplicationReport {
-        clone_groups: vec![CloneGroup {
-            instances: vec![],
-            token_count: 10,
-            line_count: 3,
-            similarity: None,
-        }],
-        clone_families: vec![],
-        mirrored_directories: vec![],
-        stats: DuplicationStats {
-            total_files: 5,
-            files_with_clones: 1,
-            total_lines: 100,
-            duplicated_lines: 10,
-            total_tokens: 500,
-            duplicated_tokens: 50,
-            clone_groups: 1,
-            clone_instances: 1,
-            duplication_percentage: 10.0,
-            clone_groups_below_min_occurrences: 0,
-            clone_groups_ignored: 0,
-            near_candidates_skipped: 0,
-        },
-    };
-
-    let source = DuplicationReport::default();
-    merge_duplication(&mut target, source);
-
-    assert_eq!(target.clone_groups.len(), 1);
-    assert_eq!(target.stats.total_files, 5);
-    assert!((target.stats.duplication_percentage - 10.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn issue_type_mapping_has_expected_entries() {
-    let keys: Vec<&str> = diagnostic_issue_type_metas()
-        .filter_map(|issue_type| issue_type.config_key)
-        .collect();
-
-    assert!(keys.contains(&"unused-files"));
-    assert!(keys.contains(&"unused-exports"));
-    assert!(keys.contains(&"unused-types"));
-    assert!(keys.contains(&"private-type-leaks"));
-    assert!(keys.contains(&"unused-dependencies"));
-    assert!(keys.contains(&"unused-dev-dependencies"));
-    assert!(keys.contains(&"unused-optional-dependencies"));
-    assert!(keys.contains(&"unused-enum-members"));
-    assert!(keys.contains(&"unused-class-members"));
-    assert!(keys.contains(&"unused-store-members"));
-    assert!(keys.contains(&"unresolved-imports"));
-    assert!(keys.contains(&"unlisted-dependencies"));
-    assert!(keys.contains(&"duplicate-exports"));
-    assert!(keys.contains(&"type-only-dependencies"));
-    assert!(keys.contains(&"test-only-dependencies"));
-    assert!(keys.contains(&"circular-dependencies"));
-    assert!(keys.contains(&"boundary-violation"));
-    assert!(keys.contains(&"stale-suppressions"));
-    assert!(keys.contains(&"security-sink"));
-    assert!(keys.contains(&"security-client-server-leak"));
-}
-
-#[test]
 fn issue_type_mapping_codes_are_singular() {
-    for issue_type in diagnostic_issue_type_metas() {
+    for issue_type in fallow_types::issue_meta::diagnostic_issue_metas() {
         let Some(config_key) = issue_type.config_key else {
             continue;
         };
@@ -2705,13 +2806,11 @@ fn issue_type_mapping_codes_are_singular() {
 }
 
 async fn install_document(backend: &FallowLspServer, uri: &Uri, version: i32, text: &str) {
-    backend.documents.write().await.insert(
-        uri.clone(),
-        DocumentState {
-            version,
-            text: text.to_string(),
-        },
-    );
+    backend
+        .documents
+        .write()
+        .await
+        .insert(uri.clone(), DocumentState::new(version, text.to_string()));
 }
 
 fn snapshot_for(uri: &Uri, version: i32) -> VersionSnapshot {
@@ -3464,13 +3563,10 @@ async fn text_document_diagnostic_returns_cached_diagnostics_after_open_refresh(
         .cached_diagnostics
         .write()
         .await
-        .insert(uri.clone(), vec![make_diagnostic()]);
+        .insert(uri.clone(), None, vec![make_diagnostic()]);
     backend.documents.write().await.insert(
         uri.clone(),
-        DocumentState {
-            version: 1,
-            text: "export const value = 1;".to_string(),
-        },
+        DocumentState::new(1, "export const value = 1;".to_string()),
     );
 
     let diagnostics = Request::build("textDocument/diagnostic")
@@ -3756,6 +3852,162 @@ async fn publish_inserts_skipped_uri_into_new_uris() {
     );
 }
 
+fn muted_analysis_output(source: &Path) -> BlockingAnalysisOutput {
+    let results = AnalysisResults {
+        unused_files: vec![UnusedFileFinding::with_actions(UnusedFile {
+            path: source.to_path_buf(),
+        })],
+        unused_exports: vec![UnusedExportFinding::with_actions(UnusedExport {
+            path: source.to_path_buf(),
+            export_name: "unused".to_string(),
+            is_type_only: false,
+            line: 1,
+            col: 13,
+            span_start: 13,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        })],
+        ..AnalysisResults::default()
+    };
+    let duplication = DuplicationReport {
+        clone_groups: vec![CloneGroup {
+            instances: vec![CloneInstance {
+                is_symlink: false,
+                file: source.to_path_buf(),
+                start_line: 2,
+                end_line: 2,
+                start_col: 0,
+                end_col: 27,
+                fragment: "export const duplicate = 2;".to_string(),
+            }],
+            token_count: 5,
+            line_count: 1,
+            similarity: None,
+        }],
+        stats: DuplicationStats {
+            clone_groups: 1,
+            clone_instances: 1,
+            ..DuplicationStats::default()
+        },
+        ..DuplicationReport::default()
+    };
+    BlockingAnalysisOutput {
+        analysis: EditorAnalysisOutput::new(results, duplication),
+        inline_complexity: Vec::new(),
+        config_messages: Vec::new(),
+        unmatched_config_patterns: Vec::new(),
+        changed_message: None,
+        applied_changed_since: None,
+        changed_since_scope: None,
+        package_scopes: Vec::new(),
+        parse_work: analysis::RunParseWork::default(),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn initialization_mutes_the_same_diagnostics_for_push_and_pull() {
+    use futures::StreamExt;
+
+    let (mut service, mut socket) = LspService::build(FallowLspServer::new).finish();
+    let initialize = Request::build("initialize")
+        .params(json!({
+            "capabilities": {},
+            "initializationOptions": {
+                "issueTypes": {
+                    "unused-exports": false,
+                    "unused-files": true
+                },
+                "mutedCategories": [
+                    "code-duplication",
+                    "Code-Duplication",
+                    "future-diagnostic",
+                    7
+                ]
+            }
+        }))
+        .id(1)
+        .finish();
+    service
+        .ready()
+        .await
+        .expect("service ready")
+        .call(initialize)
+        .await
+        .expect("initialize call")
+        .expect("initialize response");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = canonicalize_for_lsp(dir.path());
+    let source = root.join("muted.ts");
+    std::fs::write(
+        &source,
+        "export const unused = 1;\nexport const duplicate = 2;\n",
+    )
+    .expect("write source");
+    let uri = Uri::from_file_path(&source).expect("source URI");
+    let backend = service.inner();
+    assert_eq!(
+        *backend.disabled_diagnostic_codes.read().await,
+        FxHashSet::from_iter(["code-duplication".to_string(), "unused-export".to_string()]),
+    );
+
+    let receive_protocol_output = async {
+        let mut pushed = None;
+        loop {
+            let message = tokio::time::timeout(Duration::from_millis(500), socket.next())
+                .await
+                .expect("protocol output must arrive")
+                .expect("client socket must stay open");
+            match message.method() {
+                "textDocument/publishDiagnostics" => pushed = Some(message),
+                "fallow/analysisComplete" => break (pushed, message),
+                _ => {}
+            }
+        }
+    };
+    let output = muted_analysis_output(&source);
+    let version_snapshot = VersionSnapshot::default();
+    let apply = backend.apply_analysis_output(output, &root, &version_snapshot);
+    let ((), (pushed, completion)) = tokio::join!(apply, receive_protocol_output);
+
+    let cached = backend.cached_diagnostics.read().await;
+    assert_eq!(cached[&uri].len(), 1);
+    assert!(matches!(
+        cached[&uri][0].code.as_ref(),
+        Some(NumberOrString::String(code)) if code == "unused-file"
+    ));
+    drop(cached);
+
+    let pushed = pushed.expect("publishDiagnostics must precede analysisComplete");
+    let params = pushed.params().expect("publishDiagnostics params");
+    assert_eq!(params["diagnostics"].as_array().map(Vec::len), Some(1));
+    assert_eq!(params["diagnostics"][0]["code"], "unused-file");
+    let completion = completion.params().expect("analysisComplete params");
+    assert_eq!(completion["unusedFiles"], 1);
+    assert_eq!(completion["unusedExports"], 1);
+    assert_eq!(completion["cloneGroups"], 1);
+
+    let pull = Request::build("textDocument/diagnostic")
+        .params(json!({
+            "textDocument": { "uri": uri.to_string() },
+            "identifier": "fallow"
+        }))
+        .id(2)
+        .finish();
+    let response = service
+        .ready()
+        .await
+        .expect("service ready")
+        .call(pull)
+        .await
+        .expect("diagnostic request")
+        .expect("diagnostic response");
+    let result = response.result().expect("pull result");
+    assert_eq!(result["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(result["items"][0]["code"], "unused-file");
+}
+
 // -------------------------------------------------------------------------
 // config_load_error_detail
 // -------------------------------------------------------------------------
@@ -3869,7 +4121,7 @@ fn filter_disabled_diagnostics_empty_disabled_set_passes_all() {
         make_diagnostic_with_code("unused-file"),
     ];
     let disabled: FxHashSet<String> = FxHashSet::default();
-    let result = filter_disabled_diagnostics(&diags, &disabled);
+    let result = filter_disabled_diagnostics(diags, &disabled);
     assert_eq!(
         result.len(),
         2,
@@ -3884,7 +4136,7 @@ fn filter_disabled_diagnostics_removes_matching_string_code() {
         make_diagnostic_with_code("unused-file"),
     ];
     let disabled: FxHashSet<String> = std::iter::once("unused-export".to_string()).collect();
-    let result = filter_disabled_diagnostics(&diags, &disabled);
+    let result = filter_disabled_diagnostics(diags, &disabled);
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0]
@@ -3904,7 +4156,7 @@ fn filter_disabled_diagnostics_removes_matching_string_code() {
 fn filter_disabled_diagnostics_keeps_numeric_codes_always() {
     let diags = vec![make_diagnostic_with_numeric_code(1001)];
     let disabled: FxHashSet<String> = std::iter::once("1001".to_string()).collect();
-    let result = filter_disabled_diagnostics(&diags, &disabled);
+    let result = filter_disabled_diagnostics(diags, &disabled);
     assert_eq!(
         result.len(),
         1,
@@ -3916,7 +4168,7 @@ fn filter_disabled_diagnostics_keeps_numeric_codes_always() {
 fn filter_disabled_diagnostics_keeps_codeless_diagnostics() {
     let diags = vec![make_diagnostic_no_code()];
     let disabled: FxHashSet<String> = std::iter::once("unused-export".to_string()).collect();
-    let result = filter_disabled_diagnostics(&diags, &disabled);
+    let result = filter_disabled_diagnostics(diags, &disabled);
     assert_eq!(
         result.len(),
         1,
@@ -3938,7 +4190,7 @@ fn filter_disabled_diagnostics_removes_all_disabled() {
     ]
     .into_iter()
     .collect();
-    let result = filter_disabled_diagnostics(&diags, &disabled);
+    let result = filter_disabled_diagnostics(diags, &disabled);
     assert!(
         result.is_empty(),
         "all diagnostics disabled must yield an empty result"
@@ -3950,10 +4202,7 @@ fn filter_disabled_diagnostics_removes_all_disabled() {
 // -------------------------------------------------------------------------
 
 fn make_doc(version: i32, text: &str) -> DocumentState {
-    DocumentState {
-        version,
-        text: text.to_string(),
-    }
+    DocumentState::new(version, text.to_string())
 }
 
 fn clean_snapshot(uri: &Uri, version: i32) -> VersionSnapshot {
@@ -4077,6 +4326,7 @@ fn lsp_duplication_options_all_none_preserves_project_config() {
         skip_local: true,
         cross_language: true,
         ignore_imports: true,
+        ignore_symlinks: true,
         ..DuplicatesConfig::default()
     };
     let options = LspDuplicationOptions::default(); // all None
@@ -4091,6 +4341,21 @@ fn lsp_duplication_options_all_none_preserves_project_config() {
     assert!(merged.skip_local);
     assert!(merged.cross_language);
     assert!(merged.ignore_imports);
+    assert!(merged.ignore_symlinks);
+}
+
+#[test]
+fn lsp_duplication_ignore_symlinks_false_overrides_project_config() {
+    let project = DuplicatesConfig {
+        ignore_symlinks: true,
+        ..DuplicatesConfig::default()
+    };
+    let options = LspDuplicationOptions {
+        ignore_symlinks: Some(false),
+        ..LspDuplicationOptions::default()
+    };
+
+    assert!(!options.merge_with(&project).ignore_symlinks);
 }
 
 // -------------------------------------------------------------------------
@@ -4101,7 +4366,9 @@ fn lsp_duplication_options_all_none_preserves_project_config() {
 fn initialization_duplication_options_returns_none_for_absent_key() {
     let opts = serde_json::json!({});
     assert!(
-        initialization_duplication_options(&opts).is_none(),
+        parse_initialization_options(Some(&opts))
+            .duplication
+            .is_none(),
         "missing 'duplication' key must yield None"
     );
 }
@@ -4109,7 +4376,8 @@ fn initialization_duplication_options_returns_none_for_absent_key() {
 #[test]
 fn initialization_duplication_options_returns_default_for_empty_object() {
     let opts = serde_json::json!({ "duplication": {} });
-    let parsed = initialization_duplication_options(&opts)
+    let parsed = parse_initialization_options(Some(&opts))
+        .duplication
         .expect("empty duplication object must deserialize to default LspDuplicationOptions");
     assert_eq!(parsed, LspDuplicationOptions::default());
 }
@@ -4117,7 +4385,8 @@ fn initialization_duplication_options_returns_default_for_empty_object() {
 #[test]
 fn initialization_duplication_options_partial_fields_are_none_when_absent() {
     let opts = serde_json::json!({ "duplication": { "minTokens": 32 } });
-    let parsed = initialization_duplication_options(&opts)
+    let parsed = parse_initialization_options(Some(&opts))
+        .duplication
         .expect("partial duplication object must deserialize");
     assert_eq!(parsed.min_tokens, Some(32));
     assert!(parsed.mode.is_none(), "unset 'mode' field must remain None");
@@ -4131,29 +4400,1977 @@ fn initialization_duplication_options_partial_fields_are_none_when_absent() {
 // inline_complexity_enabled false path
 // -------------------------------------------------------------------------
 
+#[tokio::test(flavor = "current_thread")]
+async fn initialize_applies_health_options_to_server_state() {
+    for (options, enabled) in [
+        (None, false),
+        (Some(json!({})), false),
+        (
+            Some(json!({ "health": { "inlineComplexity": true } })),
+            true,
+        ),
+        (
+            Some(json!({ "health": { "inlineComplexity": false } })),
+            false,
+        ),
+        (
+            Some(json!({ "health": { "inlineComplexity": "yes" } })),
+            false,
+        ),
+        (Some(json!({ "health": true })), false),
+        (Some(json!({ "otherKey": true })), false),
+    ] {
+        let (mut service, _) = LspService::build(FallowLspServer::new).finish();
+        let request = Request::build("initialize")
+            .params(json!({ "capabilities": {}, "initializationOptions": options }))
+            .id(1)
+            .finish();
+        let response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("initialize handled")
+            .expect("response");
+        assert!(response.is_ok(), "{options:?}");
+        assert_eq!(
+            *service.inner().inline_complexity_enabled.read().await,
+            enabled,
+            "{options:?}"
+        );
+    }
+}
+
+/// Write a project whose `.fallowrc.json` turns `unused-exports` and
+/// `private-type-leaks` off for `src/ui/**` while both rules stay on
+/// everywhere else. Both leaf modules are reachable from the entry point, so
+/// each one carries an unused export plus a private type leak before rule
+/// severities are applied.
+fn write_override_rules_project(root: &Path) {
+    std::fs::create_dir_all(root.join("src/ui")).expect("create ui dir");
+    std::fs::create_dir_all(root.join("src/lib")).expect("create lib dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-override-rules","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{
+  "rules": { "unused-exports": "warn", "private-type-leaks": "warn" },
+  "overrides": [
+    {
+      "files": ["src/ui/**"],
+      "rules": { "unused-exports": "off", "private-type-leaks": "off" }
+    }
+  ]
+}"#,
+    )
+    .expect("write config");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { kitUsed } from './ui/kit';\nimport { libUsed } from './lib/util';\n\nexport const app = `${kitUsed}${libUsed}`;\n",
+    )
+    .expect("write index");
+    std::fs::write(
+        root.join("src/ui/kit.ts"),
+        "type Props = { label: string };\n\nexport const kitUsed = 'kit';\n\nexport const Unused = (props: Props) => props.label;\n",
+    )
+    .expect("write kit");
+    std::fs::write(
+        root.join("src/lib/util.ts"),
+        "type Internal = { id: string };\n\nexport const libUsed = 'lib';\n\nexport const alsoUnused = (value: Internal) => value.id;\n",
+    )
+    .expect("write util");
+}
+
 #[test]
-fn initialization_inline_complexity_false_explicitly() {
-    let opts = serde_json::json!({ "health": { "inlineComplexity": false } });
+fn analyze_project_root_honors_per_path_rule_overrides() {
+    // Inline diagnostics must agree with `fallow dead-code` on per-path rule
+    // severity: a file matching `overrides[].files` with a rule set to "off"
+    // gets no squiggle for that rule, while files outside the override keep
+    // theirs (issue #2621).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    write_override_rules_project(root);
+
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+
+    let diagnostics = crate::diagnostics::build_diagnostics(
+        crate::diagnostics::DiagnosticInput::new(&results, &duplication, root),
+    );
+    let codes_for = |suffix: &str| -> Vec<String> {
+        let mut codes = diagnostics
+            .iter()
+            .filter(|(uri, _)| uri.to_string().ends_with(suffix))
+            .flat_map(|(_, published)| published.iter())
+            .filter_map(|diagnostic| match diagnostic.code.as_ref() {
+                Some(NumberOrString::String(code)) => Some(code.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        codes.sort();
+        codes
+    };
+
+    let overridden = codes_for("/src/ui/kit.ts");
     assert!(
-        !initialization_inline_complexity_enabled(&opts),
-        "explicit false must disable inline complexity"
+        !overridden
+            .iter()
+            .any(|code| code == "unused-export" || code == "private-type-leak"),
+        "an overridden path must not publish rules the project config turns off: {overridden:?}"
+    );
+
+    let unaffected = codes_for("/src/lib/util.ts");
+    assert!(
+        unaffected.iter().any(|code| code == "unused-export"),
+        "paths outside the override keep their unused-export diagnostic: {unaffected:?}"
+    );
+    assert!(
+        unaffected.iter().any(|code| code == "private-type-leak"),
+        "paths outside the override keep their private-type-leak diagnostic: {unaffected:?}"
     );
 }
 
 #[test]
-fn initialization_inline_complexity_non_boolean_health_key() {
-    let opts = serde_json::json!({ "health": { "inlineComplexity": "yes" } });
+fn watched_file_globs_cover_every_config_file_name() {
+    let globs = watched_file_globs();
+
+    for name in fallow_config::CONFIG_FILE_NAMES {
+        let expected = format!("**/{name}");
+        assert!(
+            globs.contains(&expected),
+            "{name} is a config file the loader reads, so the watcher must register {expected}: {globs:?}"
+        );
+    }
+}
+
+#[test]
+fn workspace_manifests_are_watched_session_inputs() {
+    let globs = watched_file_globs();
+
+    for name in ["pnpm-workspace.yaml", "deno.json", "deno.jsonc"] {
+        let expected = format!("**/{name}");
+        assert!(
+            globs.contains(&expected),
+            "workspace discovery reads {name}, so the watcher must register {expected}: {globs:?}"
+        );
+        assert!(
+            session_store::session_input_file(Path::new(name)),
+            "an edit to {name} must load the kept sessions again"
+        );
+    }
+}
+
+/// Drain server-to-client traffic until a `publishDiagnostics` notification for
+/// `uri` carries (or no longer carries) an `unused-export` diagnostic. Returns
+/// `false` when the stream ends or goes quiet first.
+async fn wait_for_unused_export_diagnostic(
+    socket: &mut tower_lsp_server::ClientSocket,
+    uri: &str,
+    expected: bool,
+) -> bool {
+    use futures::StreamExt;
+
+    loop {
+        let Ok(next) = tokio::time::timeout(Duration::from_secs(20), socket.next()).await else {
+            return false;
+        };
+        let Some(message) = next else {
+            return false;
+        };
+        if message.method() != "textDocument/publishDiagnostics" {
+            continue;
+        }
+        let Some(params) = message.params() else {
+            continue;
+        };
+        if params["uri"] != json!(uri) {
+            continue;
+        }
+        let reported = params["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == json!("unused-export"))
+        });
+        if reported == expected {
+            return true;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn config_change_through_watched_files_republishes_diagnostics() {
+    use futures::{SinkExt, StreamExt};
+    use tower_lsp_server::jsonrpc::Response;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = canonicalize_for_lsp(dir.path());
+    std::fs::create_dir_all(root.join("src/ui")).expect("create src dir");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"lsp-config-watch","private":true,"main":"src/index.ts"}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import './ui/kit';\nexport const entry = 1;\nconsole.log(entry);\n",
+    )
+    .expect("write entry");
+    let source = root.join("src/ui/kit.ts");
+    std::fs::write(&source, "export const uiDead = 1;\n").expect("write source");
+    let config = root.join(".fallowrc.json");
+    std::fs::write(&config, r#"{"rules":{"unused-exports":"warn"}}"#).expect("write config");
+
+    let source_uri = Uri::from_file_path(&source).expect("source file URI");
+    let config_uri = Uri::from_file_path(&config).expect("config file URI");
+    let source_uri_text = source_uri.to_string();
+
+    let (mut service, mut socket) = LspService::build(FallowLspServer::new).finish();
+    // Diagnostics only reach the client after the initialize handshake; log
+    // messages do not, so a server set up by hand looks alive while every
+    // publish is dropped. The client declares dynamic watched-file
+    // registration, the capability an editor-agnostic client relies on.
+    let initialize = Request::build("initialize")
+        .params(json!({
+            "capabilities": {
+                "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } }
+            },
+            "rootUri": Uri::from_file_path(&root).expect("root URI").to_string(),
+        }))
+        .id(1)
+        .finish();
+    service
+        .ready()
+        .await
+        .expect("service ready")
+        .call(initialize)
+        .await
+        .expect("initialize call")
+        .expect("initialize response");
+    let backend = service.inner();
+
+    // A client that registers no watcher of its own only reports the files this
+    // registration names, so the patterns are read off the wire instead of from
+    // the helper that builds them.
+    let registered = async {
+        loop {
+            let request = tokio::time::timeout(Duration::from_secs(20), socket.next())
+                .await
+                .expect("the watched-file registration must arrive within timeout")
+                .expect("ClientSocket stream ended before client/registerCapability");
+            if request.method() != "client/registerCapability" {
+                continue;
+            }
+            let id = request
+                .id()
+                .expect("registerCapability is a request")
+                .clone();
+            let params = request.params().cloned().unwrap_or_default();
+            socket
+                .send(Response::from_ok(id, json!(null)))
+                .await
+                .expect("registration response should send");
+            break params;
+        }
+    };
+    let ((), registration_params) =
+        tokio::join!(backend.initialized(InitializedParams {}), registered);
+
+    let registered_globs: Vec<String> = registration_params["registrations"]
+        .as_array()
+        .expect("registration params carry registrations")
+        .iter()
+        .filter(|registration| registration["method"] == json!("workspace/didChangeWatchedFiles"))
+        .filter_map(|registration| registration["registerOptions"]["watchers"].as_array())
+        .flatten()
+        .filter_map(|watcher| watcher["globPattern"].as_str().map(str::to_string))
+        .collect();
+    for name in fallow_config::CONFIG_FILE_NAMES {
+        let expected = format!("**/{name}");
+        assert!(
+            registered_globs.contains(&expected),
+            "{name} is a config file the loader reads, so the client must be asked to watch {expected}: {registered_globs:?}"
+        );
+    }
+
+    backend
+        .did_save(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier::new(source_uri),
+            text: None,
+        })
+        .await;
     assert!(
-        !initialization_inline_complexity_enabled(&opts),
-        "non-boolean inlineComplexity must default to false"
+        wait_for_unused_export_diagnostic(&mut socket, &source_uri_text, true).await,
+        "the first analysis must report the unused export before the override lands",
+    );
+
+    std::fs::write(
+        &config,
+        r#"{"rules":{"unused-exports":"warn"},"overrides":[{"files":["src/ui/**"],"rules":{"unused-exports":"off"}}]}"#,
+    )
+    .expect("rewrite config");
+    backend
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(config_uri, FileChangeType::CHANGED)],
+        })
+        .await;
+
+    assert!(
+        wait_for_unused_export_diagnostic(&mut socket, &source_uri_text, false).await,
+        "a watched config change must re-publish diagnostics without the overridden finding",
+    );
+}
+
+/// Collect the server-to-client messages until the stream is quiet, as
+/// `(method, params)` pairs.
+async fn drain_client_messages(
+    socket: &mut tower_lsp_server::ClientSocket,
+) -> Vec<(String, serde_json::Value)> {
+    use futures::StreamExt;
+
+    let mut messages = Vec::new();
+    while let Ok(Some(message)) =
+        tokio::time::timeout(Duration::from_millis(100), socket.next()).await
+    {
+        messages.push((
+            message.method().to_string(),
+            message.params().cloned().unwrap_or_default(),
+        ));
+    }
+    messages
+}
+
+fn count_method(messages: &[(String, serde_json::Value)], method: &str) -> usize {
+    messages.iter().filter(|(name, _)| name == method).count()
+}
+
+async fn initialized_backend(
+    capabilities: serde_json::Value,
+) -> (LspService<FallowLspServer>, tower_lsp_server::ClientSocket) {
+    let (mut service, socket) = LspService::build(FallowLspServer::new).finish();
+    let initialize = Request::build("initialize")
+        .params(json!({ "capabilities": capabilities }))
+        .id(1)
+        .finish();
+    service
+        .ready()
+        .await
+        .expect("service ready")
+        .call(initialize)
+        .await
+        .expect("initialize call")
+        .expect("initialize response");
+    (service, socket)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unchanged_diagnostics_are_not_published_again() {
+    let (service, mut socket) = initialized_backend(json!({})).await;
+    let backend = service.inner();
+    let uri = "file:///unchanged.ts".parse::<Uri>().unwrap();
+    let run = || {
+        let mut diags_by_file: FxHashMap<Uri, Vec<Diagnostic>> = FxHashMap::default();
+        diags_by_file.insert(uri.clone(), vec![make_diagnostic()]);
+        diags_by_file
+    };
+
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    let first = drain_client_messages(&mut socket).await;
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    let second = drain_client_messages(&mut socket).await;
+
+    assert_eq!(count_method(&first, "textDocument/publishDiagnostics"), 1);
+    assert_eq!(
+        count_method(&second, "textDocument/publishDiagnostics"),
+        0,
+        "a run with the same diagnostics and version must not publish again",
+    );
+    assert!(backend.cached_diagnostics.read().await.contains_key(&uri));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_diagnostics_publish_again_for_a_new_document_version() {
+    let (service, mut socket) = initialized_backend(json!({})).await;
+    let backend = service.inner();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("versioned.ts");
+    std::fs::write(&path, "v1").expect("write source");
+    let uri = Uri::from_file_path(&path).expect("source file URI");
+    let run = || {
+        let mut diags_by_file: FxHashMap<Uri, Vec<Diagnostic>> = FxHashMap::default();
+        diags_by_file.insert(uri.clone(), vec![make_diagnostic()]);
+        diags_by_file
+    };
+
+    install_document(backend, &uri, 1, "v1").await;
+    backend
+        .publish_collected_diagnostics(run(), &snapshot_for(&uri, 1))
+        .await;
+    let first = drain_client_messages(&mut socket).await;
+    install_document(backend, &uri, 2, "v1").await;
+    backend
+        .publish_collected_diagnostics(run(), &snapshot_for(&uri, 2))
+        .await;
+    let second = drain_client_messages(&mut socket).await;
+
+    assert_eq!(count_method(&first, "textDocument/publishDiagnostics"), 1);
+    let versions: Vec<&serde_json::Value> = second
+        .iter()
+        .filter(|(method, _)| method == "textDocument/publishDiagnostics")
+        .map(|(_, params)| &params["version"])
+        .collect();
+    assert_eq!(
+        versions,
+        vec![&json!(2)],
+        "a new document version must publish even when the diagnostics are equal",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pull_refresh_is_skipped_when_no_diagnostics_changed() {
+    let (service, mut socket) = initialized_backend(json!({
+        "workspace": { "diagnostics": { "refreshSupport": true } }
+    }))
+    .await;
+    let backend = service.inner();
+    backend.client_pulls.store(true, Ordering::SeqCst);
+    let uri = "file:///pulled.ts".parse::<Uri>().unwrap();
+    let run = || {
+        let mut diags_by_file: FxHashMap<Uri, Vec<Diagnostic>> = FxHashMap::default();
+        diags_by_file.insert(uri.clone(), vec![make_diagnostic()]);
+        diags_by_file
+    };
+
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    let first = drain_client_messages(&mut socket).await;
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    let second = drain_client_messages(&mut socket).await;
+
+    assert_eq!(count_method(&first, "workspace/diagnostic/refresh"), 1);
+    assert_eq!(
+        count_method(&second, "workspace/diagnostic/refresh"),
+        0,
+        "a run that changed nothing must not ask a pull client to pull again",
+    );
+}
+
+fn pushed_finding_counts(messages: &[(String, serde_json::Value)], uri: &Uri) -> Vec<usize> {
+    messages
+        .iter()
+        .filter(|(method, params)| {
+            method == "textDocument/publishDiagnostics" && params["uri"] == json!(uri.to_string())
+        })
+        .map(|(_, params)| params["diagnostics"].as_array().map_or(0, Vec::len))
+        .collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pull_client_gets_diagnostics_pushed_again_after_open_and_close() {
+    use futures::StreamExt;
+
+    let (service, mut socket) = initialized_backend(json!({
+        "workspace": { "diagnostics": { "refreshSupport": true } }
+    }))
+    .await;
+    let backend = service.inner();
+    backend.client_pulls.store(true, Ordering::SeqCst);
+    backend
+        .startup_analysis_started
+        .store(true, Ordering::SeqCst);
+    // Read the client socket in the background: each server message waits
+    // for the client to take it.
+    let received = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&received);
+    tokio::spawn(async move {
+        while let Some(message) = socket.next().await {
+            sink.lock().unwrap().push((
+                message.method().to_string(),
+                message.params().cloned().unwrap_or_default(),
+            ));
+        }
+    });
+    let uri = "file:///opened-then-closed.ts".parse::<Uri>().unwrap();
+    let run = || {
+        let mut diags_by_file: FxHashMap<Uri, Vec<Diagnostic>> = FxHashMap::default();
+        diags_by_file.insert(uri.clone(), vec![make_diagnostic()]);
+        diags_by_file
+    };
+
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    open_document(backend, &uri, 1, "export const value = 1;").await;
+    backend
+        .did_close(DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier::new(uri.clone()),
+        })
+        .await;
+    backend
+        .publish_collected_diagnostics(run(), &VersionSnapshot::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let messages = received.lock().unwrap().clone();
+
+    assert_eq!(
+        pushed_finding_counts(&messages, &uri),
+        vec![1, 0, 1],
+        "didOpen clears the push namespace, so a closed file must get its findings pushed again",
+    );
+}
+
+fn write_open_document_fixture(root: &Path, name: &str, text: &str) -> Uri {
+    let path = root.join(name);
+    std::fs::write(&path, text).expect("write source");
+    Uri::from_file_path(&path).expect("source file URI")
+}
+
+async fn open_document(backend: &FallowLspServer, uri: &Uri, version: i32, text: &str) {
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem::new(
+                uri.clone(),
+                "typescript".to_string(),
+                version,
+                text.to_string(),
+            ),
+        })
+        .await;
+}
+
+async fn save_document(backend: &FallowLspServer, uri: &Uri) {
+    backend
+        .did_save(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier::new(uri.clone()),
+            text: None,
+        })
+        .await;
+}
+
+async fn pending_disk_reads(backend: &FallowLspServer) -> usize {
+    partition_document_snapshot(&*backend.documents.read().await)
+        .1
+        .len()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn saved_documents_need_no_disk_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, _socket) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    backend
+        .startup_analysis_started
+        .store(true, Ordering::SeqCst);
+    let first = write_open_document_fixture(dir.path(), "first.ts", "export const a = 1;\n");
+    let second = write_open_document_fixture(dir.path(), "second.ts", "export const b = 1;\n");
+    open_document(backend, &first, 1, "export const a = 1;\n").await;
+    open_document(backend, &second, 1, "export const b = 1;\n").await;
+    assert_eq!(
+        pending_disk_reads(backend).await,
+        2,
+        "an opened buffer is not proven clean"
+    );
+
+    for uri in [&first, &second] {
+        save_document(backend, uri).await;
+    }
+
+    assert_eq!(
+        pending_disk_reads(backend).await,
+        0,
+        "a saved buffer equals the file on disk, so a run reads no file for it",
+    );
+    let snapshot = backend.snapshot_document_versions().await;
+    assert!(snapshot.values().all(|state| state.matches_disk));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn edit_or_watched_change_after_save_needs_a_disk_read_again() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, _socket) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    backend
+        .startup_analysis_started
+        .store(true, Ordering::SeqCst);
+    let edited = write_open_document_fixture(dir.path(), "edited.ts", "export const a = 1;\n");
+    let touched = write_open_document_fixture(dir.path(), "touched.ts", "export const b = 1;\n");
+    open_document(backend, &edited, 1, "export const a = 1;\n").await;
+    open_document(backend, &touched, 1, "export const b = 1;\n").await;
+    save_document(backend, &edited).await;
+    save_document(backend, &touched).await;
+
+    backend
+        .did_change(DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(edited.clone(), 2),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "export const a = 2;\n".to_string(),
+            }],
+        })
+        .await;
+    backend
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(touched.clone(), FileChangeType::CHANGED)],
+        })
+        .await;
+
+    assert_eq!(pending_disk_reads(backend).await, 2);
+    let snapshot = backend.snapshot_document_versions().await;
+    assert!(
+        !snapshot[&edited].matches_disk,
+        "the edited buffer differs from disk"
+    );
+    assert!(
+        snapshot[&touched].matches_disk,
+        "the buffer still equals the file after the watched event",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_confirmed_disk_match_is_not_read_again() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, _socket) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    backend
+        .startup_analysis_started
+        .store(true, Ordering::SeqCst);
+    let uri = write_open_document_fixture(dir.path(), "opened.ts", "export const a = 1;\n");
+    open_document(backend, &uri, 1, "export const a = 1;\n").await;
+
+    let first = backend.snapshot_document_versions().await;
+    assert!(first[&uri].matches_disk);
+
+    assert_eq!(
+        pending_disk_reads(backend).await,
+        0,
+        "one read that confirms the match is enough for this document version",
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn watched_change_after_the_disk_reads_keeps_the_buffer_unproven() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (service, _socket) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    backend
+        .startup_analysis_started
+        .store(true, Ordering::SeqCst);
+    let uri = write_open_document_fixture(dir.path(), "watched.ts", "export const a = 1;\n");
+    open_document(backend, &uri, 1, "export const a = 1;\n").await;
+
+    let (mut snapshot, checks, generation) = backend.partition_documents().await;
+    let checked = document_state::check_disk(checks);
+    // The watched-file handler clears the flag before the run takes the
+    // documents lock to record its reads, which are now older than the disk.
+    backend
+        .mark_documents_changed_on_disk(std::iter::once(&uri))
+        .await;
+    backend
+        .remember_disk_matches(checked, generation, &mut snapshot)
+        .await;
+
+    assert!(
+        !backend.documents.read().await[&uri].known_clean,
+        "a read older than a watched-file event must not mark the buffer clean",
+    );
+    assert_eq!(pending_disk_reads(backend).await, 1);
+}
+
+const RUNNER_RELEASE_LIMIT: Duration = Duration::from_secs(5);
+
+/// An analysis runner that each test step starts and releases by hand. It
+/// checks the run token after the release, the way the engine checks it at a
+/// stage boundary.
+struct GatedRunner {
+    started: tokio::sync::mpsc::UnboundedSender<fallow_api::TypeAwareFileChanges>,
+    release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    reached_analyze: std::sync::atomic::AtomicUsize,
+    source: PathBuf,
+}
+
+struct GatedServer {
+    service: LspService<FallowLspServer>,
+    gate: Arc<GatedRunner>,
+    started: tokio::sync::mpsc::UnboundedReceiver<fallow_api::TypeAwareFileChanges>,
+    release: std::sync::mpsc::Sender<()>,
+    publishes: Arc<std::sync::atomic::AtomicUsize>,
+    _dir: tempfile::TempDir,
+    source: PathBuf,
+}
+
+impl GatedServer {
+    async fn new() -> Self {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let source = write_startup_analysis_fixture(&root);
+        let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(GatedRunner {
+            started: started_tx,
+            release: StdMutex::new(release_rx),
+            reached_analyze: std::sync::atomic::AtomicUsize::new(0),
+            source: source.clone(),
+        });
+        let runner_gate = Arc::clone(&gate);
+        let (mut service, mut socket) = LspService::build(move |client| {
+            let mut server = FallowLspServer::new(client);
+            let gate = Arc::clone(&runner_gate);
+            server.analysis_runner = Arc::new(move |input: &BlockingAnalysisInput| {
+                let _ = gate.started.send(input.type_aware_changes.clone());
+                // A real-time limit: a test that never releases this run
+                // fails on its assertions instead of hanging, because the
+                // paused clock does not advance while this blocking call runs.
+                let _ = gate
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(RUNNER_RELEASE_LIMIT);
+                if input.run_cancellation.load(Ordering::SeqCst) {
+                    return Err(analysis::ProjectAnalysisError::cancelled(&input.root));
+                }
+                gate.reached_analyze.fetch_add(1, Ordering::SeqCst);
+                Ok(muted_analysis_output(&gate.source))
+            });
+            server
+        })
+        .finish();
+        // The client drops server messages until the server is initialized.
+        let initialize = Request::build("initialize")
+            .params(json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        service
+            .ready()
+            .await
+            .expect("service ready")
+            .call(initialize)
+            .await
+            .expect("initialize call")
+            .expect("initialize response");
+        *service.inner().root.write().await = Some(root);
+        let publishes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&publishes);
+        tokio::spawn(async move {
+            while let Some(message) = socket.next().await {
+                if message.method() == "textDocument/publishDiagnostics" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        Self {
+            service,
+            gate,
+            started,
+            release,
+            publishes,
+            _dir: dir,
+            source,
+        }
+    }
+
+    fn backend(&self) -> &FallowLspServer {
+        self.service.inner()
+    }
+
+    async fn save(&self) {
+        self.backend()
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(
+                    Uri::from_file_path(&self.source).expect("source file URI"),
+                ),
+                text: None,
+            })
+            .await;
+    }
+
+    /// Wait for the next run to reach the runner. Returns its type-aware
+    /// changes.
+    async fn next_run(&mut self) -> fallow_api::TypeAwareFileChanges {
+        tokio::time::timeout(Duration::from_secs(30), self.started.recv())
+            .await
+            .expect("a run must start")
+            .expect("runner channel open")
+    }
+
+    fn release_run(&self) {
+        self.release.send(()).expect("runner waits for release");
+    }
+
+    async fn wait_for_completed_epoch(&self, epoch: u64) {
+        for _ in 0..600 {
+            if self.backend().last_completed_epoch.load(Ordering::SeqCst) == epoch {
+                // Let the socket drain task count the messages of the run.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("epoch {epoch} never completed");
+    }
+}
+
+// Unix only: other platforms expose no inode change time, so a kept
+// session parses again on every save and the parse counts differ.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn back_to_back_saves_during_a_run_reach_analyze_once() {
+    let mut server = GatedServer::new().await;
+
+    server.save().await;
+    server.next_run().await;
+    for _ in 0..3 {
+        server.save().await;
+    }
+    server.release_run();
+    let restored_changes = server.next_run().await;
+    server.release_run();
+    server.wait_for_completed_epoch(4).await;
+
+    assert_eq!(
+        server.gate.reached_analyze.load(Ordering::SeqCst),
+        1,
+        "the superseded run must stop before analyze, so only the last run reaches it",
+    );
+    assert!(
+        !restored_changes.invalidate_all,
+        "a run cancelled before the type-aware pass keeps the changes incremental",
+    );
+    assert_eq!(
+        restored_changes.changed,
+        [server.source.clone()],
+        "a cancelled run returns its type-aware changes to the pending set",
+    );
+    assert!(server.publishes.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn run_after_a_cancelled_run_finishes_and_publishes() {
+    let mut server = GatedServer::new().await;
+
+    server.save().await;
+    server.next_run().await;
+    server.save().await;
+    server.release_run();
+
+    server.next_run().await;
+    server.save().await;
+    server.release_run();
+    server.wait_for_completed_epoch(2).await;
+    let published_by_superseded_run = server.publishes.load(Ordering::SeqCst);
+
+    server.next_run().await;
+    server.release_run();
+    server.wait_for_completed_epoch(3).await;
+
+    assert!(
+        published_by_superseded_run >= 1,
+        "a finished run publishes even when a newer save arrived during it",
+    );
+    assert_eq!(server.gate.reached_analyze.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn saves_within_the_debounce_start_one_run() {
+    let mut server = GatedServer::new().await;
+
+    for _ in 0..5 {
+        server.save().await;
+        tokio::time::sleep(schedule::DEBOUNCE / 4).await;
+    }
+    server.next_run().await;
+    server.release_run();
+    server.wait_for_completed_epoch(5).await;
+
+    assert!(
+        server.started.try_recv().is_err(),
+        "the burst must start exactly one run",
+    );
+    assert_eq!(server.gate.reached_analyze.load(Ordering::SeqCst), 1);
+}
+
+/// A server with the real analysis that reports the parse work of each run.
+struct ParseWorkServer {
+    service: LspService<FallowLspServer>,
+    runs: tokio::sync::mpsc::UnboundedReceiver<analysis::RunParseWork>,
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    source: PathBuf,
+}
+
+impl ParseWorkServer {
+    async fn new(capabilities: serde_json::Value) -> Self {
+        Self::with_options(capabilities, json!({}), true).await
+    }
+
+    async fn with_options(
+        capabilities: serde_json::Value,
+        initialization_options: serde_json::Value,
+        with_manifest: bool,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let source = write_startup_analysis_fixture(&root);
+        if !with_manifest {
+            std::fs::remove_file(root.join("package.json")).expect("remove the manifest");
+        }
+        let (runs_tx, runs) = tokio::sync::mpsc::unbounded_channel();
+        let (mut service, mut socket) = LspService::build(move |client| {
+            let mut server = FallowLspServer::new(client);
+            server.analysis_runner = Arc::new(move |input: &BlockingAnalysisInput| {
+                let output = run_blocking_analysis(input);
+                if let Ok(output) = &output {
+                    let _ = runs_tx.send(output.parse_work);
+                }
+                output
+            });
+            server
+        })
+        .finish();
+        let initialize = Request::build("initialize")
+            .params(json!({
+                "capabilities": capabilities,
+                "rootUri": Uri::from_file_path(&root).expect("root URI").to_string(),
+                "initializationOptions": initialization_options,
+            }))
+            .id(1)
+            .finish();
+        service
+            .ready()
+            .await
+            .expect("service ready")
+            .call(initialize)
+            .await
+            .expect("initialize call")
+            .expect("initialize response");
+        // The server waits on its client channel, so the test reads it and
+        // answers each request, such as the watched-file registration.
+        tokio::spawn(async move {
+            use futures::{SinkExt, StreamExt};
+            while let Some(message) = socket.next().await {
+                if let Some(id) = message.id() {
+                    let response =
+                        tower_lsp_server::jsonrpc::Response::from_ok(id.clone(), json!(null));
+                    let _ = socket.send(response).await;
+                }
+            }
+        });
+        Self {
+            service,
+            runs,
+            _dir: dir,
+            root,
+            source,
+        }
+    }
+
+    fn backend(&self) -> &FallowLspServer {
+        self.service.inner()
+    }
+
+    async fn save(&mut self, path: &Path) -> analysis::RunParseWork {
+        self.backend()
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(
+                    Uri::from_file_path(path).expect("file URI"),
+                ),
+                text: None,
+            })
+            .await;
+        self.next_run().await
+    }
+
+    async fn next_run(&mut self) -> analysis::RunParseWork {
+        tokio::time::timeout(Duration::from_secs(30), self.runs.recv())
+            .await
+            .expect("a run must finish")
+            .expect("runner channel open")
+    }
+}
+
+fn reporting_client() -> serde_json::Value {
+    json!({ "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } } })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_reports_file_changes_keeps_the_project_session() {
+    let mut server = ParseWorkServer::new(reporting_client()).await;
+    let source = server.source.clone();
+
+    let first = server.save(&source).await;
+    std::fs::write(&source, "export const ready = 2;\nexport const more = 1;\n")
+        .expect("edit the source");
+    let second = server.save(&source).await;
+
+    assert_eq!(first.sessions_loaded, 1);
+    assert_eq!(
+        (
+            second.sessions_loaded,
+            second.parse.modules_parsed,
+            second.parse.disk_cache_hits
+        ),
+        (0, 1, 0),
+        "the second save reuses the session and parses only the saved file"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_changed_config_input_loads_the_project_session_again() {
+    let mut server = ParseWorkServer::new(reporting_client()).await;
+    let source = server.source.clone();
+    let manifest = server.root.join("package.json");
+    server.save(&source).await;
+
+    std::fs::write(
+        &manifest,
+        r#"{"name":"lsp-startup","private":true,"main":"src/index.ts","dependencies":{}}"#,
+    )
+    .expect("edit the manifest");
+    server
+        .backend()
+        .did_change_watched_files(DidChangeWatchedFilesParams {
+            changes: vec![FileEvent::new(
+                Uri::from_file_path(&manifest).expect("manifest URI"),
+                FileChangeType::CHANGED,
+            )],
+        })
+        .await;
+    let after_manifest = server.next_run().await;
+    let after_source = server.save(&source).await;
+    server
+        .backend()
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::Value::Null,
+        })
+        .await;
+    let after_settings = server.next_run().await;
+
+    assert_eq!(
+        after_manifest.sessions_loaded, 1,
+        "a manifest change reloads the config"
+    );
+    assert_eq!(
+        after_source.sessions_loaded, 0,
+        "a source save keeps the reloaded session"
+    );
+    assert_eq!(
+        after_settings.sessions_loaded, 1,
+        "a settings change reloads the config"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edit_to_an_extended_config_loads_the_project_session_again() {
+    let mut server = ParseWorkServer::new(reporting_client()).await;
+    let source = server.source.clone();
+    let base = server.root.join("base.json");
+    std::fs::write(
+        server.root.join(".fallowrc.json"),
+        r#"{"extends":"./base.json"}"#,
+    )
+    .expect("write the config");
+    std::fs::write(&base, r#"{"rules":{"unused-exports":"warn"}}"#).expect("write the base");
+    server.save(&source).await;
+
+    std::fs::write(&base, r#"{"rules":{"unused-exports":"off"}}"#).expect("edit the base");
+    let after_base = server.save(&base).await;
+    let after_source = server.save(&source).await;
+
+    assert_eq!(
+        after_base.sessions_loaded, 1,
+        "an edit to an extends target reloads the config"
+    );
+    assert_eq!(
+        after_source.sessions_loaded, 0,
+        "a source save keeps the reloaded session"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edit_to_the_config_path_file_loads_the_project_session_again() {
+    let mut server = ParseWorkServer::new(reporting_client()).await;
+    let source = server.source.clone();
+    let custom = server.root.join("cfg/custom.json");
+    std::fs::create_dir_all(custom.parent().expect("config dir")).expect("create config dir");
+    std::fs::write(&custom, r#"{"rules":{"unused-exports":"warn"}}"#).expect("write the config");
+    *server.backend().config_path.write().await = Some(custom.clone());
+    server.save(&source).await;
+
+    std::fs::write(&custom, r#"{"rules":{"unused-exports":"off"}}"#).expect("edit the config");
+    let after_config = server.save(&source).await;
+
+    assert_eq!(
+        after_config.sessions_loaded, 1,
+        "an edit to the configPath file reloads the config, also without an event for it"
+    );
+}
+
+/// Save the source once, run `edit`, and save the source again. Returns
+/// whether the second run loaded the project session again.
+async fn source_save_after(edit: impl FnOnce(&Path), setup: impl FnOnce(&Path)) -> bool {
+    let mut server = ParseWorkServer::new(reporting_client()).await;
+    let source = server.source.clone();
+    setup(&server.root);
+    server.save(&source).await;
+
+    edit(&server.root);
+    let after_edit = server.save(&source).await;
+    let after_source = server.save(&source).await;
+    assert_eq!(
+        after_source.sessions_loaded, 0,
+        "a source save keeps the reloaded session"
+    );
+    after_edit.sessions_loaded == 1
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edit_to_a_plugin_file_loads_the_project_session_again() {
+    let plugin = Path::new(".fallow/plugins/entries.json");
+    let reloaded = source_save_after(
+        |root| {
+            std::fs::write(root.join(plugin), r#"{"name":"entries","entryPoints":[]}"#)
+                .expect("edit the plugin");
+        },
+        |root| {
+            std::fs::create_dir_all(root.join(".fallow/plugins")).expect("plugin dir");
+            std::fs::write(
+                root.join(plugin),
+                r#"{"name":"entries","entryPoints":["src/entry.ts"]}"#,
+            )
+            .expect("write the plugin");
+        },
+    )
+    .await;
+
+    assert!(reloaded, "an edit to a plugin file reloads the config");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_root_plugin_file_loads_the_project_session_again() {
+    let reloaded = source_save_after(
+        |root| {
+            std::fs::write(
+                root.join("fallow-plugin-entries.json"),
+                r#"{"name":"entries","entryPoints":["src/entry.ts"]}"#,
+            )
+            .expect("create the plugin");
+        },
+        |_| {},
+    )
+    .await;
+
+    assert!(reloaded, "a new root plugin file reloads the config");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_edit_to_a_rule_pack_loads_the_project_session_again() {
+    let pack = |message: &str| {
+        format!(
+            r#"{{"version":1,"name":"team","rules":[{{"id":"no-moment","kind":"banned-import","specifiers":["moment"],"message":"{message}"}}]}}"#
+        )
+    };
+    let reloaded = source_save_after(
+        |root| {
+            std::fs::write(root.join("policy/team.json"), pack("Use date-fns now."))
+                .expect("edit the pack");
+        },
+        |root| {
+            std::fs::create_dir_all(root.join("policy")).expect("pack dir");
+            std::fs::write(root.join("policy/team.json"), pack("Use date-fns."))
+                .expect("write the pack");
+            std::fs::write(
+                root.join(".fallowrc.json"),
+                r#"{"rulePacks":["policy/team.json"]}"#,
+            )
+            .expect("write the config");
+        },
+    )
+    .await;
+
+    assert!(reloaded, "an edit to a rule pack reloads the config");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_auto_discovered_zone_loads_the_project_session_again() {
+    let reloaded = source_save_after(
+        |root| {
+            std::fs::create_dir_all(root.join("src/features/billing")).expect("new zone");
+        },
+        |root| {
+            std::fs::create_dir_all(root.join("src/features/auth")).expect("zone");
+            std::fs::write(
+                root.join(".fallowrc.json"),
+                r#"{"boundaries":{"zones":[{"name":"features","patterns":[],"autoDiscover":["src/features"]}],"rules":[]}}"#,
+            )
+            .expect("write the config");
+        },
+    )
+    .await;
+
+    assert!(
+        reloaded,
+        "a new auto-discovered zone folder reloads the config"
     );
 }
 
 #[test]
-fn initialization_inline_complexity_missing_health_object() {
-    let opts = serde_json::json!({ "otherKey": true });
+fn plugin_files_are_watched_session_inputs() {
+    let globs = watched_file_globs();
+
+    for (path, glob) in [
+        (
+            "fallow-plugin-entries.toml",
+            "**/fallow-plugin-*.{toml,json,jsonc}",
+        ),
+        (
+            ".fallow/plugins/entries.jsonc",
+            "**/.fallow/plugins/*.{toml,json,jsonc}",
+        ),
+    ] {
+        assert!(globs.contains(&glob.to_string()), "{glob}: {globs:?}");
+        assert!(
+            session_store::session_input_file(Path::new(path)),
+            "an edit to {path} must load the kept sessions again"
+        );
+    }
+    assert!(!session_store::session_input_file(Path::new(
+        ".fallow/cache.bin"
+    )));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_without_file_change_reports_loads_a_session_per_run() {
+    let mut server = ParseWorkServer::new(json!({})).await;
+    let source = server.source.clone();
+
+    server.save(&source).await;
+    let second = server.save(&source).await;
+
+    assert_eq!(
+        second.sessions_loaded, 1,
+        "without watched-file events a kept session would miss config changes"
+    );
+}
+
+fn prewarm_options() -> serde_json::Value {
+    json!({ "prewarm": true })
+}
+
+#[cfg(unix)]
+async fn open_source(server: &ParseWorkServer) {
+    server
+        .backend()
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem::new(
+                Uri::from_file_path(&server.source).expect("source file URI"),
+                "typescript".to_string(),
+                1,
+                "export const ready = 1;\n".to_string(),
+            ),
+        })
+        .await;
+}
+
+async fn wait_for_prewarm(server: &ParseWorkServer) {
+    let _run_slot = tokio::time::timeout(
+        Duration::from_secs(30),
+        server.backend().analysis_guard.lock(),
+    )
+    .await
+    .expect("the prewarm must finish");
+}
+
+// Unix only: other platforms expose no inode change time, so a kept
+// session parses again on every save and the parse counts differ.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn prewarm_parses_the_project_before_the_first_open() {
+    let mut server =
+        ParseWorkServer::with_options(reporting_client(), prewarm_options(), true).await;
+    server.backend().initialized(InitializedParams {}).await;
+
+    open_source(&server).await;
+    let first = server.next_run().await;
+
+    assert_eq!(
+        (
+            first.sessions_loaded,
+            first.parse.modules_parsed,
+            first.parse.disk_cache_hits
+        ),
+        (0, 0, 0),
+        "the first run starts from the prewarmed session"
+    );
+    assert!(first.parse.modules_reused > 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prewarm_publishes_nothing_and_keeps_the_startup_gate() {
+    let server = ParseWorkServer::with_options(reporting_client(), prewarm_options(), true).await;
+    server.backend().initialized(InitializedParams {}).await;
+    wait_for_prewarm(&server).await;
+
+    assert_eq!(server.backend().lock_sessions().kept_session_count(), 1);
+    assert!(server.backend().analysis.read().await.is_none());
     assert!(
-        !initialization_inline_complexity_enabled(&opts),
-        "absent health object must default inline complexity to false"
+        !server
+            .backend()
+            .startup_analysis_started
+            .load(Ordering::SeqCst),
+        "the first open still starts the startup run"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn prewarm_is_off_by_default_and_needs_a_manifest() {
+    let off = ParseWorkServer::new(reporting_client()).await;
+    off.backend().initialized(InitializedParams {}).await;
+    wait_for_prewarm(&off).await;
+    let without_manifest =
+        ParseWorkServer::with_options(reporting_client(), prewarm_options(), false).await;
+    without_manifest
+        .backend()
+        .initialized(InitializedParams {})
+        .await;
+    wait_for_prewarm(&without_manifest).await;
+
+    assert_eq!(off.backend().lock_sessions().kept_session_count(), 0);
+    assert_eq!(
+        without_manifest
+            .backend()
+            .lock_sessions()
+            .kept_session_count(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_shutdown_during_the_prewarm_keeps_no_session() {
+    let server = ParseWorkServer::with_options(reporting_client(), prewarm_options(), true).await;
+    server.backend().cancellation.store(true, Ordering::SeqCst);
+    server.backend().initialized(InitializedParams {}).await;
+    wait_for_prewarm(&server).await;
+
+    assert_eq!(server.backend().lock_sessions().kept_session_count(), 0);
+}
+
+#[test]
+fn analyzed_dead_code_diagnostics_carry_the_stamped_finding_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"finding-id-lsp","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "import { used } from './utils';\nconsole.log(used);\n",
+    )
+    .expect("write index");
+    std::fs::write(
+        root.join("src/utils.ts"),
+        "export const used = 1;\nexport const unusedHelper = 2;\n",
+    )
+    .expect("write utils");
+
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+
+    let finding = results
+        .unused_exports
+        .iter()
+        .find(|f| f.export.export_name == "unusedHelper")
+        .expect("unusedHelper is reported");
+    let stamped = finding
+        .finding_id
+        .as_deref()
+        .expect("the engine stamps a finding_id");
+    assert!(stamped.starts_with("dc1:unused-export:"), "{stamped}");
+
+    let diagnostics = crate::diagnostics::build_diagnostics(
+        crate::diagnostics::DiagnosticInput::new(&results, &duplication, root),
+    );
+    let published = diagnostics
+        .values()
+        .flatten()
+        .find(|d| d.message == "Export 'unusedHelper' is unused")
+        .expect("unusedHelper diagnostic is published");
+    assert_eq!(
+        published
+            .data
+            .as_ref()
+            .and_then(|data| data["findingId"].as_str()),
+        Some(stamped),
+    );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create fixture dir");
+    for entry in std::fs::read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("fixture entry type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy fixture file");
+        }
+    }
+}
+
+type FindingIds = fn(&AnalysisResults) -> Vec<Option<String>>;
+
+/// The component health hints carry the `finding_id` of the JSON finding, so
+/// the editor and `--format json` name one finding with one id.
+#[test]
+fn component_health_hints_carry_the_json_finding_id() {
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("../../tests/fixtures");
+    let cases: [(&str, FindingIds); 3] = [
+        ("prop-drilling", |r| {
+            r.prop_drilling_chains
+                .iter()
+                .map(|f| f.finding_id.clone())
+                .collect()
+        }),
+        ("thin-wrapper", |r| {
+            r.thin_wrappers
+                .iter()
+                .map(|f| f.finding_id.clone())
+                .collect()
+        }),
+        ("duplicate-prop-shape", |r| {
+            r.duplicate_prop_shapes
+                .iter()
+                .map(|f| f.finding_id.clone())
+                .collect()
+        }),
+    ];
+
+    for (code, ids_of) in cases {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        copy_dir(&fixtures.join(code), root);
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            format!(r#"{{"rules":{{"{code}":"warn"}}}}"#),
+        )
+        .expect("write config");
+
+        let mut results = AnalysisResults::default();
+        let mut duplication = DuplicationReport::default();
+        let mut inline_complexity = Vec::new();
+        let mut messages = Vec::new();
+        analyze_project_root_for_test(
+            root,
+            None,
+            None,
+            None,
+            false,
+            &mut results,
+            &mut duplication,
+            &mut inline_complexity,
+            &mut messages,
+        );
+
+        let mut stamped: Vec<String> = ids_of(&results)
+            .into_iter()
+            .map(|id| id.unwrap_or_else(|| panic!("`{code}` finding has no finding_id")))
+            .collect();
+        assert!(
+            !stamped.is_empty(),
+            "the fixture reports no `{code}` finding"
+        );
+        let json_text = serde_json::to_value(&results)
+            .expect("serialize results")
+            .to_string();
+        for id in &stamped {
+            assert!(
+                id.starts_with(&format!("dc1:{code}:")),
+                "unexpected `{code}` id {id}"
+            );
+            assert!(json_text.contains(id.as_str()), "JSON output lacks {id}");
+        }
+
+        let diagnostics = crate::diagnostics::build_diagnostics(
+            crate::diagnostics::DiagnosticInput::new(&results, &duplication, root),
+        );
+        let mut published: Vec<String> = diagnostics
+            .values()
+            .flatten()
+            .filter(|d| matches!(&d.code, Some(NumberOrString::String(c)) if c == code))
+            .map(|d| {
+                d.data
+                    .as_ref()
+                    .and_then(|data| data["findingId"].as_str())
+                    .unwrap_or_else(|| panic!("`{code}` diagnostic has no data.findingId"))
+                    .to_string()
+            })
+            .collect();
+        stamped.sort();
+        published.sort();
+        assert_eq!(published, stamped, "`{code}` hints and JSON ids diverge");
+    }
+}
+
+/// The security id that `fallow security --format json` reports for the
+/// `eval` candidate below: the FNV-1a 64 digest of
+/// `security/code-injection:src/index.ts:2:9`.
+const CLI_SECURITY_FINDING_ID: &str = "0cf02d65349bc7dc";
+
+#[test]
+fn analyzed_security_diagnostics_carry_the_cli_finding_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("create src");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"finding-id-security-lsp","main":"src/index.ts"}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"security-sink":"warn"}}"#,
+    )
+    .expect("write config");
+    std::fs::write(
+        root.join("src/index.ts"),
+        "export function evaluate(userInput: string): unknown {\n  return eval(userInput);\n}\n",
+    )
+    .expect("write index");
+
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    let mut inline_complexity = Vec::new();
+    let mut messages = Vec::new();
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut inline_complexity,
+        &mut messages,
+    );
+
+    let finding = results
+        .security_findings
+        .iter()
+        .find(|f| f.category.as_deref() == Some("code-injection"))
+        .expect("the eval candidate is reported");
+    assert_eq!(finding.finding_id, CLI_SECURITY_FINDING_ID);
+
+    let diagnostics = crate::diagnostics::build_diagnostics(
+        crate::diagnostics::DiagnosticInput::new(&results, &duplication, root),
+    );
+    let published = diagnostics
+        .values()
+        .flatten()
+        .find(|d| {
+            d.code
+                == Some(ls_types::NumberOrString::String(
+                    "security-sink".to_string(),
+                ))
+        })
+        .expect("the security diagnostic is published");
+    let data = published
+        .data
+        .as_ref()
+        .expect("security diagnostic has data");
+    assert_eq!(data["findingId"].as_str(), Some(CLI_SECURITY_FINDING_ID));
+    assert_eq!(
+        data["security"]["category"].as_str(),
+        Some("code-injection"),
+        "findingId merges into the existing data object",
+    );
+}
+
+#[test]
+fn absent_component_prop_editor_analysis_severity_and_live_suppression() {
+    let project = tempfile::tempdir().expect("project");
+    let root = project.path();
+    let card = root.join("Card.tsx");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"fixture","private":true,"dependencies":{"react":"19.0.0"}}"#,
+    )
+    .expect("package");
+    std::fs::write(
+        root.join("App.tsx"),
+        "import {Card} from './Card'; export const App = () => <Card />;\n",
+    )
+    .expect("caller");
+    std::fs::write(&card, "export const Card = ({highlight}: {highlight?: boolean}) => <div>{highlight && <b>Featured</b>}</div>;\n").expect("component");
+    let analyze = || {
+        let mut results = AnalysisResults::default();
+        let mut duplication = DuplicationReport::default();
+        let mut complexity = Vec::new();
+        let mut messages = Vec::new();
+        analyze_project_root_for_test(
+            root,
+            None,
+            None,
+            None,
+            false,
+            &mut results,
+            &mut duplication,
+            &mut complexity,
+            &mut messages,
+        );
+        (results, duplication)
+    };
+    std::fs::write(root.join(".fallowrc.json"), r#"{"entry":["App.tsx"]}"#).expect("config");
+    assert!(analyze().0.absent_component_props.is_empty());
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"entry":["App.tsx"],"rules":{"absent-component-props":"error"}}"#,
+    )
+    .expect("config");
+    let (results, duplication) = analyze();
+    assert_eq!(results.absent_component_props.len(), 1);
+    let map = crate::diagnostics::build_diagnostics(crate::diagnostics::DiagnosticInput::new(
+        &results,
+        &duplication,
+        root,
+    ));
+    let uri = Uri::from_file_path(&card).expect("uri");
+    let diagnostic = map
+        .get(&uri)
+        .expect("candidate declaration diagnostics")
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == Some(NumberOrString::String("absent-component-prop".to_string()))
+        })
+        .expect("candidate diagnostic");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert!(diagnostic.tags.is_none());
+    assert_eq!(
+        diagnostic
+            .related_information
+            .as_ref()
+            .expect("callers")
+            .len(),
+        1
+    );
+    let text = std::fs::read_to_string(&card).expect("live source");
+    let lines: Vec<_> = text.lines().collect();
+    let actions = crate::code_actions::build_code_action_response(
+        crate::code_actions::CodeActionInput::new(
+            &results,
+            Some(root),
+            &card,
+            &uri,
+            &diagnostic.range,
+            &lines,
+        )
+        .with_current_absent_prop_source(&text),
+    )
+    .expect("actions");
+    assert_eq!(actions.len(), 1, "candidate has suppression only");
+    let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+        panic!("expected suppression action");
+    };
+    assert!(action.title.starts_with("Dismiss optional prop review"));
+    let edits = &action
+        .edit
+        .as_ref()
+        .expect("edit")
+        .changes
+        .as_ref()
+        .expect("changes")[&uri];
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].range.start, edits[0].range.end);
+    std::fs::write(&card, format!("{}{text}", edits[0].new_text))
+        .expect("apply additive suppression");
+    assert!(
+        analyze().0.absent_component_props.is_empty(),
+        "suppression must be honored by shared analysis"
+    );
+}
+
+const ABSENT_PROP_FRAMEWORK_CASES: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "react",
+        "tsx",
+        "import {Card} from './Card'; export const App=()=> <Card />;",
+        "export function Card({flag=false}: {\nflag?:boolean\n}) {return <p>{flag ? 'yes' : 'no'}</p>}",
+        "Card",
+    ),
+    (
+        "vue",
+        "vue",
+        "<script setup lang='ts'>import Card from './Card.vue';</script><template><Card /></template>",
+        "<script setup lang='ts'>\nconst {flag=false}=defineProps<{\nflag?:boolean\n}>();\n</script><template><p>{{flag ? 'yes' : 'no'}}</p></template>",
+        "Card",
+    ),
+    (
+        "svelte",
+        "svelte",
+        "<script lang='ts'>import Card from './Card.svelte';</script><Card />",
+        "<script lang='ts'>\nlet {flag=false}:{\nflag?:boolean\n}=$props();\n</script><p>{flag ? 'yes' : 'no'}</p>",
+        "Card",
+    ),
+    (
+        "astro",
+        "astro",
+        "---\nimport Card from './Card.astro';\n---\n<Card />",
+        "---\ninterface Props {\nflag?:boolean\n}\nconst {flag=false}=Astro.props;\n---\n<p>{flag ? 'yes' : 'no'}</p>",
+        "Card",
+    ),
+    (
+        "@angular/core",
+        "ts",
+        "import {Component} from '@angular/core'; import {Card} from './Card'; @Component({selector:'app-root',imports:[Card],template:`<app-card />`}) export class App {}",
+        "import {Component,Input} from '@angular/core';\n@Component({selector:'app-card',template:`{{flag}}`}) export class Card {\n@Input() flag?:boolean;\n}",
+        "Card",
+    ),
+    (
+        "lit",
+        "ts",
+        "import {html} from 'lit'; import './Card'; export const view=html`<x-card></x-card>`;",
+        "import {LitElement,html} from 'lit'; import {customElement,property} from 'lit/decorators.js';\n@customElement('x-card') export class Card extends LitElement {\n@property({type:Boolean}) flag?:boolean;\nrender(){return html`<p>${this.flag}</p>`;}\n}",
+        "Card",
+    ),
+    (
+        "@glimmer/component",
+        "gts",
+        "import Card from './Card'; <template><Card /></template>",
+        "import Component from '@glimmer/component';\ninterface Signature {Args:{\nflag?:boolean\n}}\nexport default class Card extends Component<Signature> { <template><p>{{@flag}}</p></template> }",
+        "Card",
+    ),
+];
+
+#[test]
+fn absent_prop_framework_code_comments_roundtrip_through_shared_analysis() {
+    for &(dependency, extension, caller, source, name) in ABSENT_PROP_FRAMEWORK_CASES {
+        let project = tempfile::tempdir().expect("project");
+        let root = project.path();
+        let entry = format!("App.{extension}");
+        let card = root.join(format!("{name}.{extension}"));
+        std::fs::write(
+            root.join("package.json"),
+            json!({"name":"fixture","private":true,"dependencies":{dependency:"*"}}).to_string(),
+        )
+        .expect("package");
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            json!({"entry":[entry],"rules":{"absent-component-props":"warn"}}).to_string(),
+        )
+        .expect("config");
+        std::fs::write(root.join(&entry), caller).expect("caller");
+        std::fs::write(&card, source).expect("component");
+        let analyze = || {
+            let mut results = AnalysisResults::default();
+            analyze_project_root_for_test(
+                root,
+                None,
+                None,
+                None,
+                false,
+                &mut results,
+                &mut DuplicationReport::default(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            results
+        };
+        let results = analyze();
+        let finding = results
+            .absent_component_props
+            .iter()
+            .find(|finding| finding.prop.prop_name == "flag")
+            .unwrap_or_else(|| {
+                panic!(
+                    "positive control for {dependency}: {:?}",
+                    results.absent_component_props
+                )
+            });
+        let mut mapper = crate::position::PositionMapper::default();
+        let diagnostic =
+            crate::diagnostics::absent_props::absent_prop_diagnostic(finding, &mut mapper)
+                .expect("candidate");
+        let uri = Uri::from_file_path(&card).expect("uri");
+        let actions = crate::code_actions::build_suppress_absent_prop_actions(
+            &results,
+            &card,
+            &uri,
+            &diagnostic.range,
+            source,
+        );
+        assert_eq!(actions.len(), 1, "{dependency}");
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("action")
+        };
+        let edits = &action
+            .edit
+            .as_ref()
+            .expect("edit")
+            .changes
+            .as_ref()
+            .expect("changes")[&uri];
+        let anchor = edits[0].range.start.line as usize;
+        let offset: usize = source
+            .split_inclusive('\n')
+            .take(anchor)
+            .map(str::len)
+            .sum();
+        let suppressed = format!(
+            "{}{}{}",
+            &source[..offset],
+            edits[0].new_text,
+            &source[offset..]
+        );
+        std::fs::write(&card, suppressed).expect("apply framework comment");
+        assert!(
+            analyze().absent_component_props.is_empty(),
+            "{dependency} suppression must affect shared detector"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn absent_prop_actions_require_the_saved_analysed_document_version() {
+    let project = tempfile::tempdir().expect("project");
+    let root = project.path();
+    let card = root.join("Card.tsx");
+    let source = "export function Card({highlight=false}: {\n  /*😀*/highlight?:boolean\n}) {return <p>{highlight ? 'yes' : 'no'}</p>}\n";
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"fixture","private":true,"dependencies":{"react":"*"}}"#,
+    )
+    .expect("package");
+    std::fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"entry":["App.tsx"],"rules":{"absent-component-props":"warn"}}"#,
+    )
+    .expect("config");
+    std::fs::write(
+        root.join("App.tsx"),
+        "import {Card} from './Card'; export const App=()=> <Card />;",
+    )
+    .expect("caller");
+    std::fs::write(&card, source).expect("saved valid component");
+    let mut results = AnalysisResults::default();
+    let mut duplication = DuplicationReport::default();
+    analyze_project_root_for_test(
+        root,
+        None,
+        None,
+        None,
+        false,
+        &mut results,
+        &mut duplication,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    let finding = results
+        .absent_component_props
+        .first()
+        .expect("positive shared analysis");
+    let diagnostic = crate::diagnostics::absent_props::absent_prop_diagnostic(
+        finding,
+        &mut crate::position::PositionMapper::default(),
+    )
+    .expect("candidate");
+    let uri = Uri::from_file_path(&card).expect("uri");
+    let (service, _) = LspService::build(FallowLspServer::new).finish();
+    let backend = service.inner();
+    *backend.root.write().await = Some(root.to_path_buf());
+    *backend.analysis.write().await = Some(
+        analysis::LspAnalysisSnapshot::new(results, duplication, vec![])
+            .with_document_versions(snapshot_for(&uri, 7)),
+    );
+    install_document(backend, &uri, 7, source).await;
+    let request = || {
+        serde_json::from_value::<CodeActionParams>(json!({"textDocument":{"uri":uri.to_string()},"range":diagnostic.range,"context":{"diagnostics":[]}})).expect("request")
+    };
+    let actions = backend
+        .code_action(request())
+        .await
+        .expect("response")
+        .expect("candidate action");
+    assert_eq!(actions.len(), 1);
+    let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+        panic!("action")
+    };
+    assert_eq!(
+        action.diagnostics.as_ref().expect("linked diagnostic")[0]
+            .range
+            .start
+            .character,
+        8
+    );
+    for live in [
+        "const description = `\n  /*😀*/highlight\n`;\n",
+        "/*\n  😀    highlight\n*/\n",
+    ] {
+        install_document(backend, &uri, 8, live).await;
+        assert!(
+            backend
+                .code_action(request())
+                .await
+                .expect("unsaved response")
+                .is_none()
+        );
+        std::fs::write(&card, live).expect("save changed same-name source");
+        assert!(
+            backend
+                .code_action(request())
+                .await
+                .expect("saved stale response")
+                .is_none()
+        );
+    }
+    std::fs::write(&card, source).expect("restore saved declaration");
+    install_document(backend, &uri, 8, source).await;
+    assert!(
+        backend
+            .code_action(request())
+            .await
+            .expect("newer version")
+            .is_none()
     );
 }

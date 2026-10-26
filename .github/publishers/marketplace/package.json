@@ -1,0 +1,14 @@
+{
+  "name": "fallow-marketplace-publisher",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@vscode/vsce": "4.0.0"
+  },
+  "overrides": {
+    "@azure/msal-node": "7.1.1"
+  }
+}

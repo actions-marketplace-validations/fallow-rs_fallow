@@ -37,24 +37,25 @@ use crate::output::{
     SuppressLineKind, SuppressLineScope,
 };
 use crate::results::{
-    BoundaryCallViolation, BoundaryCoverageViolation, BoundaryViolation, CircularDependency,
-    DependencyOverrideSource, DevDependencyInProduction, DuplicateExport, DuplicatePropShape,
-    DynamicSegmentNameConflict, EmptyCatalogGroup, InvalidClientExport,
-    MisconfiguredDependencyOverride, MisplacedDirective, MixedClientServerBarrel, PolicyViolation,
-    PrivateTypeLeak, PropDrillingChain, ReExportCycle, ReExportCycleKind, RouteCollision,
-    TestOnlyDependency, ThinWrapper, TypeOnlyDependency, UnlistedDependency, UnprovidedInject,
+    AbsentComponentProp, BoundaryCallViolation, BoundaryCoverageViolation, BoundaryViolation,
+    CircularDependency, DependencyOverrideSource, DeprecatedExportInUse, DevDependencyInProduction,
+    DuplicateExport, DuplicatePropShape, DynamicSegmentNameConflict, EmptyCatalogGroup,
+    InvalidClientExport, MisconfiguredDependencyOverride, MisplacedDirective,
+    MixedClientServerBarrel, PackageCycle, PolicyViolation, PrivateTypeLeak, PropDrillingChain,
+    ReExportCycle, ReExportCycleKind, RouteCollision, TestOnlyDependency, ThinWrapper,
+    TypeOnlyDependency, UnlistedDependency, UnproducedCatchTag, UnprovidedInject,
     UnrenderedComponent, UnresolvedCatalogReference, UnresolvedImport, UnusedCatalogEntry,
     UnusedComponentEmit, UnusedComponentInput, UnusedComponentOutput, UnusedComponentProp,
-    UnusedDependency, UnusedDependencyOverride, UnusedExport, UnusedFile, UnusedLoadDataKey,
-    UnusedMember, UnusedServerAction, UnusedSvelteEvent,
+    UnusedDependency, UnusedDependencyOverride, UnusedEffectLayer, UnusedExport, UnusedFile,
+    UnusedLoadDataKey, UnusedMember, UnusedServerAction, UnusedSvelteEvent, UnusedTaggedError,
 };
 use crate::semantic::{
     SemanticCandidateDecision, SemanticCandidateDecisionKind, SemanticCompleteness,
 };
 
-/// Shared note for the `duplicate-exports` fix action. Mirrors the const used
-/// by the human report (see `crates/cli/src/report/shared.rs`); kept here so
-/// the wire-format builder reads from the same source of truth.
+/// Shared note for the `duplicate-exports` fix action. This const is the
+/// single source of truth: `crates/cli/src/report/shared.rs` aliases it for
+/// the human report.
 pub const NAMESPACE_BARREL_HINT: &str = "If every location is the sole `index.*` of its directory, this is likely an intentional namespace-barrel API. Prefer adding these files to `ignoreExports` over removing exports.";
 
 /// JSON Schema fragment URL for the `add-to-config` `ignoreExports` action's
@@ -95,6 +96,307 @@ fn suppress_line(comment: &str) -> IssueAction {
     })
 }
 
+/// A per-finding caveat on a dead-code verdict that a file this run never
+/// fully analyzed can distort.
+///
+/// Advisory provenance, in the same spirit as the fix path's
+/// `low_confidence_off_graph` / `low_confidence_unresolved_imports` skip
+/// reasons: a caveat NEVER withholds, reorders, downgrades, or re-severities
+/// the finding, and never changes an exit code. It records that the verdict
+/// was computed over an import graph fallow already knows is incomplete, so a
+/// reader who sees the finding also sees the caveat instead of having to
+/// notice a diagnostic at the other end of the envelope.
+///
+/// Deliberately NOT named `confidence`: `health --targets` already emits a
+/// `confidence` key holding an enum string, and a shared consumer helper that
+/// met both would see the same key change type. Emitted on every finding type
+/// that registers it: the reachability arrays (`unused_files[]`,
+/// `unused_exports[]`, `unused_types[]`), the member arrays
+/// (`unused_enum_members[]`, `unused_class_members[]`, `unused_store_members[]`),
+/// and the three dependency arrays. Sorted and deduplicated, absent from the
+/// wire when empty. The set is open in the same sense
+/// `workspace_diagnostics[].kind` is: treat an unrecognised value as "some
+/// caveat" rather than as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ReachabilityCaveat {
+    /// This finding's own file is one the run did not fully analyze, so the
+    /// export and import lists extracted from it may stop short of the real
+    /// ones. That reaches an `unused-file` verdict directly, because the
+    /// "is any export of this file referenced from a reachable module" test
+    /// reads exactly that truncated export list.
+    ///
+    /// Three workspace diagnostics put a file in this state: a partial parse
+    /// (`source-parse-degraded`), no parse (`source-nesting-too-deep`), or no
+    /// read (`source-read-failure`). The token names the consequence rather than
+    /// either cause, so a future kind that leaves a discovered file partially
+    /// extracted carries the same value.
+    ///
+    /// Dependency findings never carry this value: the file they name is a
+    /// `package.json`, not a parsed source module.
+    IncompleteFileAnalysis,
+    /// A module whose import list feeds this verdict was not analyzed, so the
+    /// import that would have credited this finding may never have been seen.
+    ///
+    /// The cause is any workspace diagnostic that leaves a source file's
+    /// imports unseen: a partial parse (`source-parse-degraded`), no parse
+    /// (`source-nesting-too-deep`), no read (`source-read-failure`), or a skip
+    /// by discovery before the read (`skipped-large-file`,
+    /// `skipped-minified-file`, `skipped-source-dotdir`). The token names the
+    /// class rather than any one cause.
+    ///
+    /// Which modules feed the verdict differs by array, and the caveat is
+    /// emitted only when a degraded module is actually one of them:
+    ///
+    /// - `unused_files[]`, `unused_exports[]`, and `unused_types[]` rest on
+    ///   reachability, so only a degraded module that is itself observed
+    ///   reachable can change the verdict. When every degraded module is
+    ///   unreachable the caveat is absent, and soundly: the FIRST missing edge
+    ///   on any entry-point path leaves from a module whose every predecessor
+    ///   edge was observed, so that module is observed reachable. A file the
+    ///   run never read has no module and no graph node, so its reachability
+    ///   is not observable at all and that narrowing cannot be applied: any
+    ///   skipped or unreadable source caveats every reachability verdict in
+    ///   the run.
+    /// - the member arrays (`unused_enum_members[]`, `unused_class_members[]`,
+    ///   `unused_store_members[]`) do not rest on reachability at all: member
+    ///   usage is collected by walking every module the run resolved,
+    ///   reachable or not, so this narrowing does not apply to them either.
+    ///   Same unnarrowed condition as the dependency arrays below, plus the
+    ///   per-finding value above when the member's own file is the one that
+    ///   was incompletely analyzed.
+    /// - the dependency arrays rest on whether ANY module in the project
+    ///   imports the package specifier, reachable or not, so any degraded
+    ///   parse anywhere can hide the import that would have credited the
+    ///   package. Reachability does not narrow that one.
+    ///
+    /// The limit, stated because an approximation presented as exact is worse
+    /// than nothing: this is a RUN-level condition, not proof that a degraded
+    /// module imports this path or package. An import the parser never saw
+    /// cannot be attributed to a target, so the link cannot be narrowed
+    /// further without re-reading the source. Read `workspace_diagnostics[]`
+    /// for which files degraded.
+    IncompleteImportGraph,
+}
+
+impl ReachabilityCaveat {
+    /// The wire token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::IncompleteFileAnalysis => "incomplete-file-analysis",
+            Self::IncompleteImportGraph => "incomplete-import-graph",
+        }
+    }
+
+    /// A one-line explanation for human and agent-facing renderers.
+    ///
+    /// Neither sentence names a single cause. A degraded parse is only one of
+    /// the ways a file goes unread: it may also have been unreadable, or
+    /// skipped before it was ever opened (oversized, minified, in a dotdir).
+    /// Naming the parse case alone sent a reader whose run was degraded by the
+    /// size guard hunting for parse errors that do not exist, so both messages
+    /// point at `workspace_diagnostics[]`, which names the actual files.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::IncompleteFileAnalysis => {
+                "low: this file was not fully analyzed, so its extracted exports and imports may be incomplete; see workspace_diagnostics[]"
+            }
+            Self::IncompleteImportGraph => {
+                "low: a module this run did not fully read may hold an import that would credit this; see workspace_diagnostics[]"
+            }
+        }
+    }
+
+    /// A compact label for a one-line human renderer, where the full
+    /// [`Self::message`] would not fit next to the finding.
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::IncompleteFileAnalysis => "incomplete file analysis",
+            Self::IncompleteImportGraph => "incomplete import graph",
+        }
+    }
+}
+
+/// The compact labels of `caveats`, joined for a one-line renderer, or `None`
+/// when there is nothing to say.
+#[must_use]
+pub fn caveat_labels(caveats: &[ReachabilityCaveat]) -> Option<String> {
+    if caveats.is_empty() {
+        return None;
+    }
+    let labels: Vec<&str> = caveats
+        .iter()
+        .map(|caveat| ReachabilityCaveat::short_label(*caveat))
+        .collect();
+    Some(labels.join(", "))
+}
+
+/// The compact parenthetical a one-line human renderer appends to a finding
+/// carrying `caveats`, or `None` when there is nothing to say. Shared by every
+/// dead-code section so the suffix reads the same everywhere.
+#[must_use]
+pub fn caveat_suffix(caveats: &[ReachabilityCaveat]) -> Option<String> {
+    caveat_labels(caveats).map(|labels| format!("{CAVEAT_SUFFIX_MARKER}{labels})"))
+}
+
+/// The opening of the parenthetical [`caveat_suffix`] renders. Public because
+/// one consumer can only see the rendered description: the CI review formats
+/// build their comments from CodeClimate issues, whose `description` is the
+/// only place the caveat survives (the CodeClimate wire is a published
+/// contract with no field for it). Recognising the marker is what lets those
+/// formats withhold a one-click mutation.
+pub const CAVEAT_SUFFIX_MARKER: &str = " (caveat: ";
+
+/// Whether a rendered finding description already carries a caveat
+/// parenthetical, for a surface holding the string rather than the typed
+/// finding.
+///
+/// Lives here, next to the renderer, so the producer and the recogniser cannot
+/// drift; `a_rendered_suffix_is_recognised_by_the_marker` pins the pair.
+#[must_use]
+pub fn description_carries_caveat(description: &str) -> bool {
+    description.contains(CAVEAT_SUFFIX_MARKER)
+}
+
+/// The compact label for one wire token, for a renderer that reads
+/// `reachability_caveats[]` back off a serialized envelope instead of holding
+/// the typed findings.
+///
+/// The value set is OPEN, exactly as the wire documentation says: a token this
+/// build does not recognise is still a caveat, so it is rendered as itself with
+/// its separators relaxed into spaces rather than dropped. Dropping it would
+/// turn a finding whose evidence is incomplete back into a confident one,
+/// which is the failure this whole mechanism exists to prevent.
+#[must_use]
+pub fn caveat_label_for_token(token: &str) -> String {
+    match token {
+        "incomplete-file-analysis" => {
+            ReachabilityCaveat::short_label(ReachabilityCaveat::IncompleteFileAnalysis).to_owned()
+        }
+        "incomplete-import-graph" => {
+            ReachabilityCaveat::short_label(ReachabilityCaveat::IncompleteImportGraph).to_owned()
+        }
+        other => other.replace('-', " "),
+    }
+}
+
+/// The joined compact labels for wire tokens, or `None` when there are none.
+/// The token-side twin of [`caveat_labels`], for renderers driven by a
+/// serialized envelope rather than by typed findings.
+#[must_use]
+pub fn caveat_labels_for_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let labels: Vec<String> = tokens.into_iter().map(caveat_label_for_token).collect();
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels.join(", "))
+}
+
+/// The token-side twin of [`caveat_suffix`], so an envelope-driven renderer
+/// appends the same parenthetical as a findings-driven one.
+#[must_use]
+pub fn caveat_suffix_for_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    caveat_labels_for_tokens(tokens).map(|labels| format!("{CAVEAT_SUFFIX_MARKER}{labels})"))
+}
+
+/// The note every mutating action carries once [`MutationEvidence`] withholds
+/// it. One string, so the CLI action array, the LSP diagnostic, and the MCP
+/// tool contract all say the same thing about the same finding.
+pub const INCOMPLETE_EVIDENCE_NOTE: &str = "Evidence is incomplete: a file this run did not fully analyze may hold the reference that \
+     credits this finding, so this mutation is not applied automatically. Resolve the files named \
+     in workspace_diagnostics[] and re-run, or confirm and remove it by hand.";
+
+/// The one question every mutation surface asks before it offers, plans, or
+/// performs a dead-code finding's removal.
+///
+/// A finding whose reachability verdict rests on a file the run never fully
+/// read is still REPORTED, always: a caveat withholds no finding, changes no
+/// severity, and moves no exit code. What it withholds is the automation. The
+/// predicate lives here, next to the findings, rather than in any one consumer,
+/// because it was re-derived per surface three times and a fourth door opened
+/// every time: `fallow fix`, the LSP quick fix, and the `auto_fixable` flag an
+/// agent plans against each answered it differently. Every one of those now
+/// calls [`Self::may_auto_apply_mutation`], so a sixth finding type or a fourth
+/// mutation surface cannot silently opt out.
+///
+/// Implemented only by the findings that can carry a caveat. A finding type
+/// that exposes an auto-fixable mutation and does NOT implement this trait is
+/// the bug this trait exists to make visible; `every_auto_fixable_dead_code_
+/// mutation_is_gated` in this module's tests pins that.
+pub trait MutationEvidence {
+    /// The advisory caveats recorded on the reachability verdict behind this
+    /// finding. Empty when the run analyzed every file it discovered.
+    fn reachability_caveats(&self) -> &[ReachabilityCaveat];
+
+    /// Whether this finding's mutation may be applied without a human first
+    /// being told the evidence is incomplete. THE gate: never re-derive it,
+    /// never widen it per surface.
+    fn may_auto_apply_mutation(&self) -> bool {
+        self.reachability_caveats().is_empty()
+    }
+}
+
+/// Record a run's caveats on a finding, enforcing [`MutationEvidence`] on its
+/// typed `actions` in the same step.
+///
+/// Separate from [`MutationEvidence`] so a read-only consumer (the fixer, the
+/// LSP, a renderer) depends only on the question and never on the answer's
+/// setter. `annotate` in the analysis layer is the single writer.
+pub trait CaveatedFinding: MutationEvidence {
+    /// Store `caveats` and downgrade every mutating action the gate now
+    /// withholds. The field itself stays `pub` (a renderer test builds an
+    /// already-caveated fixture directly, without running the annotation
+    /// pass); every non-test writer goes through this setter instead of the
+    /// field so the downgrade travels with the write.
+    fn set_reachability_caveats(&mut self, caveats: Vec<ReachabilityCaveat>);
+}
+
+/// Downgrade every `Fix` action in `actions` when `caveats` is non-empty, so
+/// the `auto_fixable` flag an agent plans against matches what `fallow fix`
+/// will actually do. Only ever downgrades: a surface that has already decided
+/// a mutation is unsafe for its own reasons keeps that decision.
+fn withhold_caveated_mutations(actions: &mut [IssueAction], caveats: &[ReachabilityCaveat]) {
+    if caveats.is_empty() {
+        return;
+    }
+    for action in actions {
+        let IssueAction::Fix(fix) = action else {
+            continue;
+        };
+        fix.auto_fixable = false;
+        fix.note = Some(match fix.note.take() {
+            Some(existing) => format!("{existing}. {INCOMPLETE_EVIDENCE_NOTE}"),
+            None => INCOMPLETE_EVIDENCE_NOTE.to_string(),
+        });
+    }
+}
+
+/// Implement the gate for a finding wrapper carrying a `reachability_caveats`
+/// field alongside a typed `actions` array. A new caveated finding type adds
+/// one line here rather than a new per-surface branch.
+macro_rules! impl_caveated_finding {
+    ($($finding:ty),+ $(,)?) => {
+        $(
+            impl MutationEvidence for $finding {
+                fn reachability_caveats(&self) -> &[ReachabilityCaveat] {
+                    &self.reachability_caveats
+                }
+            }
+
+            impl CaveatedFinding for $finding {
+                fn set_reachability_caveats(&mut self, caveats: Vec<ReachabilityCaveat>) {
+                    withhold_caveated_mutations(&mut self.actions, &caveats);
+                    self.reachability_caveats = caveats;
+                }
+            }
+        )+
+    };
+}
+
 /// Wire-shape envelope for an [`UnusedFile`] finding. The bare finding
 /// flattens in via `#[serde(flatten)]`, with a typed `actions` array
 /// populated at construction time and the audit-pass `introduced` flag
@@ -105,6 +407,13 @@ pub struct UnusedFileFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub file: UnusedFile,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps: a `delete-file` primary and a `suppress-file`
     /// secondary. Always emitted (possibly empty for forward-compat).
     pub actions: Vec<IssueAction>,
@@ -112,6 +421,23 @@ pub struct UnusedFileFinding {
     /// the merge-base. `None` when serialized directly from Rust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the reachability verdict behind this finding.
+    /// Sorted, deduplicated, and omitted from the wire when empty, so a run
+    /// that analyzed every discovered file is byte-identical. Never gates the
+    /// finding or the `delete-file` action, though `fallow fix` does withhold
+    /// the removal of a caveated finding as low confidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedFileFinding {
@@ -141,9 +467,12 @@ impl UnusedFileFinding {
             }),
         ];
         Self {
+            finding_id: None,
             file,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -157,6 +486,13 @@ pub struct PrivateTypeLeakFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub leak: PrivateTypeLeak,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -164,6 +500,16 @@ pub struct PrivateTypeLeakFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl PrivateTypeLeakFinding {
@@ -190,9 +536,84 @@ impl PrivateTypeLeakFinding {
             }),
         ];
         Self {
+            finding_id: None,
             leak,
             actions,
             introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for a [`DeprecatedExportInUse`] finding. Carries a
+/// manual `migrate-deprecated-export` primary action plus a `suppress-line`
+/// secondary. Never auto-fixable: fallow does not rewrite consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DeprecatedExportInUseFinding {
+    /// The underlying dead-code entry.
+    #[serde(flatten)]
+    pub export: DeprecatedExportInUse,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl DeprecatedExportInUseFinding {
+    /// Build the wrapper from a raw [`DeprecatedExportInUse`].
+    #[must_use]
+    pub fn with_actions(export: DeprecatedExportInUse) -> Self {
+        let trace_hint = format!(
+            "For the full consumer list, run `fallow dead-code --trace <path>:{}` with the `path` of this finding.",
+            export.export_name
+        );
+        let note = if export.public_api {
+            format!(
+                "This export is public API. External consumers are not visible, so do not remove it on this evidence alone. {trace_hint}"
+            )
+        } else {
+            format!(
+                "Move each consumer to the replacement that the deprecation message names, then remove the export. {trace_hint}"
+            )
+        };
+        let actions = vec![
+            IssueAction::Fix(FixAction {
+                kind: FixActionType::MigrateDeprecatedExport,
+                auto_fixable: false,
+                description: "Move the consumers off the deprecated export".to_string(),
+                note: Some(note),
+                available_in_catalogs: None,
+                suggested_target: None,
+            }),
+            suppress_line("// fallow-ignore-next-line deprecated-export-in-use"),
+        ];
+        Self {
+            finding_id: None,
+            export,
+            actions,
+            introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -207,6 +628,13 @@ pub struct UnresolvedImportFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub import: UnresolvedImport,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -214,6 +642,16 @@ pub struct UnresolvedImportFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnresolvedImportFinding {
@@ -254,9 +692,11 @@ impl UnresolvedImportFinding {
             }),
         ];
         Self {
+            finding_id: None,
             import,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -271,6 +711,13 @@ pub struct CircularDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub cycle: CircularDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -278,6 +725,16 @@ pub struct CircularDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl CircularDependencyFinding {
@@ -306,9 +763,11 @@ impl CircularDependencyFinding {
             }),
         ];
         Self {
+            finding_id: None,
             cycle,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -326,6 +785,13 @@ pub struct ReExportCycleFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub cycle: ReExportCycle,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -333,6 +799,16 @@ pub struct ReExportCycleFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl ReExportCycleFinding {
@@ -386,9 +862,85 @@ impl ReExportCycleFinding {
             }),
         ];
         Self {
+            finding_id: None,
             cycle,
             actions,
             introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for a [`PackageCycle`] finding. Mirrors
+/// [`CircularDependencyFinding`]: flattens the bare finding and carries a
+/// typed `actions` array (`refactor-cycle` primary plus `suppress-line`
+/// secondary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PackageCycleFinding {
+    /// The underlying dead-code entry.
+    #[serde(flatten)]
+    pub cycle: PackageCycle,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl PackageCycleFinding {
+    /// Build the wrapper from a raw [`PackageCycle`].
+    #[must_use]
+    pub fn with_actions(cycle: PackageCycle) -> Self {
+        let actions = vec![
+            IssueAction::Fix(FixAction {
+                kind: FixActionType::RefactorCycle,
+                auto_fixable: false,
+                description: "Remove the imports on one hop of the cycle, for example by \
+                              moving the shared code to a package that both packages import"
+                    .to_string(),
+                note: Some(
+                    "Packages that import each other cannot be built in dependency order"
+                        .to_string(),
+                ),
+                available_in_catalogs: None,
+                suggested_target: None,
+            }),
+            IssueAction::SuppressLine(SuppressLineAction {
+                kind: SuppressLineKind::SuppressLine,
+                auto_fixable: false,
+                description: "Suppress with an inline comment above the import. The cycle \
+                              is gone when every import on one hop is suppressed"
+                    .to_string(),
+                comment: "// fallow-ignore-next-line package-cycle".to_string(),
+                scope: None,
+            }),
+        ];
+        Self {
+            cycle,
+            finding_id: None,
+            actions,
+            introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -403,6 +955,13 @@ pub struct BoundaryViolationFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub violation: BoundaryViolation,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -410,6 +969,16 @@ pub struct BoundaryViolationFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl BoundaryViolationFinding {
@@ -438,9 +1007,11 @@ impl BoundaryViolationFinding {
             }),
         ];
         Self {
+            finding_id: None,
             violation,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -454,12 +1025,29 @@ pub struct BoundaryCoverageViolationFinding {
     /// The underlying coverage entry.
     #[serde(flatten)]
     pub violation: BoundaryCoverageViolation,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl BoundaryCoverageViolationFinding {
@@ -502,9 +1090,11 @@ impl BoundaryCoverageViolationFinding {
             }),
         ];
         Self {
+            finding_id: None,
             violation,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -518,12 +1108,29 @@ pub struct BoundaryCallViolationFinding {
     /// The underlying forbidden-call entry.
     #[serde(flatten)]
     pub violation: BoundaryCallViolation,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl BoundaryCallViolationFinding {
@@ -561,9 +1168,11 @@ impl BoundaryCallViolationFinding {
             }),
         ];
         Self {
+            finding_id: None,
             violation,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -577,6 +1186,13 @@ pub struct PolicyViolationFinding {
     /// The underlying rule-pack policy entry.
     #[serde(flatten)]
     pub violation: PolicyViolation,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
@@ -594,21 +1210,27 @@ impl PolicyViolationFinding {
             crate::results::PolicyRuleKind::BannedImport => "import",
             crate::results::PolicyRuleKind::BannedEffect => "effect",
             crate::results::PolicyRuleKind::BannedExport => "export",
+            crate::results::PolicyRuleKind::GdpProofProducer => "proof producer",
         };
         let description = match &violation.message {
             Some(message) => format!("Replace the `{}` {what}: {message}", violation.matched),
             None => format!("Replace the `{}` {what}", violation.matched),
         };
         let suppress_token = format!("policy-violation:{}/{}", violation.pack, violation.rule_id);
+        let note = if violation.kind == crate::results::PolicyRuleKind::GdpProofProducer {
+            "This check resolves the gdp-ts factory through static imports and unambiguous re-exports. Move proof creation to an allowed module. It does not verify authorization logic or follow arbitrary wrappers.".to_owned()
+        } else {
+            format!(
+                "Rule `{}/{}` from the configured rule packs bans this {what}. The check is syntactic: it does not follow aliased or re-bound callees, and import matching uses the raw specifier",
+                violation.pack, violation.rule_id,
+            )
+        };
         let actions = vec![
             IssueAction::Fix(FixAction {
                 kind: FixActionType::ResolvePolicyViolation,
                 auto_fixable: false,
                 description,
-                note: Some(format!(
-                    "Rule `{}/{}` from the configured rule packs bans this {what}. The check is syntactic: it does not follow aliased or re-bound callees, and import matching uses the raw specifier",
-                    violation.pack, violation.rule_id,
-                )),
+                note: Some(note),
                 available_in_catalogs: None,
                 suggested_target: None,
             }),
@@ -630,6 +1252,7 @@ impl PolicyViolationFinding {
             }),
         ];
         Self {
+            finding_id: None,
             violation,
             actions,
             introduced: None,
@@ -647,6 +1270,13 @@ pub struct UnusedExportFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub export: UnusedExport,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -657,6 +1287,22 @@ pub struct UnusedExportFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the reachability verdict behind this finding.
+    /// Sorted, deduplicated, and omitted from the wire when empty. Never gates
+    /// the finding or the `remove-export` action, though `fallow fix` does
+    /// withhold the removal of a caveated export as low confidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedExportFinding {
@@ -691,17 +1337,20 @@ impl UnusedExportFinding {
             }),
         ];
         Self {
+            finding_id: None,
             export,
             actions,
             semantic: None,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 
     /// Attach type-aware evidence and disable the syntactic fix when semantic
     /// analysis could not establish complete negative evidence.
     pub fn set_semantic_decision(&mut self, decision: SemanticCandidateDecision) {
-        set_export_semantic_action(&mut self.actions, &decision);
+        set_export_semantic_action(&mut self.actions, &decision, &self.reachability_caveats);
         self.semantic = Some(decision);
     }
 }
@@ -716,6 +1365,13 @@ pub struct UnusedTypeFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub export: UnusedExport,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -726,6 +1382,23 @@ pub struct UnusedTypeFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the reachability verdict behind this finding.
+    /// A type export rests on exactly the reachability test an
+    /// `unused_exports[]` entry does, and the LSP offers the same
+    /// remove-the-`export`-keyword quick fix for both, so the two must render
+    /// with the same confidence. Sorted, deduplicated, omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedTypeFinding {
@@ -761,34 +1434,48 @@ impl UnusedTypeFinding {
             }),
         ];
         Self {
+            finding_id: None,
             export,
             actions,
             semantic: None,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 
     /// Attach type-aware evidence and disable the syntactic fix when semantic
     /// analysis could not establish complete negative evidence.
     pub fn set_semantic_decision(&mut self, decision: SemanticCandidateDecision) {
-        set_export_semantic_action(&mut self.actions, &decision);
+        set_export_semantic_action(&mut self.actions, &decision, &self.reachability_caveats);
         self.semantic = Some(decision);
     }
 }
 
-fn set_export_semantic_action(actions: &mut [IssueAction], decision: &SemanticCandidateDecision) {
+/// The semantic pass runs in the API layer, AFTER the analysis layer stamped
+/// this run's caveats, and it is the one code path that RAISES `auto_fixable`.
+/// It therefore has to ask the gate too, or a `Complete` semantic verdict would
+/// silently re-open a mutation the incomplete run had already withheld.
+fn set_export_semantic_action(
+    actions: &mut [IssueAction],
+    decision: &SemanticCandidateDecision,
+    caveats: &[ReachabilityCaveat],
+) {
     let complete_negative = decision.decision
         == SemanticCandidateDecisionKind::ConfirmedNoStaticReferences
         && decision.status == SemanticCompleteness::Complete;
     let Some(IssueAction::Fix(action)) = actions.first_mut() else {
         return;
     };
-    action.auto_fixable = complete_negative;
+    action.auto_fixable = complete_negative && caveats.is_empty();
     if !complete_negative {
         action.note = Some(
             "Type-aware analysis retained this candidate because complete negative evidence was not available"
                 .to_string(),
         );
+    }
+    if !caveats.is_empty() {
+        action.note = Some(INCOMPLETE_EVIDENCE_NOTE.to_string());
     }
 }
 
@@ -803,6 +1490,13 @@ pub struct InvalidClientExportFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub export: InvalidClientExport,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -810,6 +1504,16 @@ pub struct InvalidClientExportFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl InvalidClientExportFinding {
@@ -841,9 +1545,11 @@ impl InvalidClientExportFinding {
             }),
         ];
         Self {
+            finding_id: None,
             export,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -859,6 +1565,13 @@ pub struct MixedClientServerBarrelFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub barrel: MixedClientServerBarrel,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -866,6 +1579,16 @@ pub struct MixedClientServerBarrelFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl MixedClientServerBarrelFinding {
@@ -897,9 +1620,11 @@ impl MixedClientServerBarrelFinding {
             }),
         ];
         Self {
+            finding_id: None,
             barrel,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -915,6 +1640,13 @@ pub struct MisplacedDirectiveFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub directive_site: MisplacedDirective,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -922,6 +1654,16 @@ pub struct MisplacedDirectiveFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl MisplacedDirectiveFinding {
@@ -953,9 +1695,11 @@ impl MisplacedDirectiveFinding {
             }),
         ];
         Self {
+            finding_id: None,
             directive_site,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -970,6 +1714,13 @@ pub struct UnprovidedInjectFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub inject: UnprovidedInject,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -977,6 +1728,16 @@ pub struct UnprovidedInjectFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnprovidedInjectFinding {
@@ -993,9 +1754,11 @@ impl UnprovidedInjectFinding {
             suppress_line("// fallow-ignore-next-line unprovided-inject"),
         ];
         Self {
+            finding_id: None,
             inject,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1010,6 +1773,13 @@ pub struct UnusedServerActionFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub action: UnusedServerAction,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1017,6 +1787,16 @@ pub struct UnusedServerActionFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedServerActionFinding {
@@ -1033,9 +1813,11 @@ impl UnusedServerActionFinding {
             suppress_line("// fallow-ignore-next-line unused-server-action"),
         ];
         Self {
+            finding_id: None,
             action,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1050,6 +1832,13 @@ pub struct UnusedLoadDataKeyFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub key: UnusedLoadDataKey,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1057,6 +1846,16 @@ pub struct UnusedLoadDataKeyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedLoadDataKeyFinding {
@@ -1073,9 +1872,11 @@ impl UnusedLoadDataKeyFinding {
             suppress_line("// fallow-ignore-next-line unused-load-data-key"),
         ];
         Self {
+            finding_id: None,
             key,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1090,6 +1891,13 @@ pub struct UnrenderedComponentFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub component: UnrenderedComponent,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1097,6 +1905,16 @@ pub struct UnrenderedComponentFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnrenderedComponentFinding {
@@ -1113,9 +1931,11 @@ impl UnrenderedComponentFinding {
             suppress_line("// fallow-ignore-next-line unrendered-component"),
         ];
         Self {
+            finding_id: None,
             component,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1130,6 +1950,13 @@ pub struct UnusedComponentPropFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub prop: UnusedComponentProp,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1137,6 +1964,16 @@ pub struct UnusedComponentPropFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedComponentPropFinding {
@@ -1153,9 +1990,70 @@ impl UnusedComponentPropFinding {
             suppress_line("// fallow-ignore-next-line unused-component-prop"),
         ];
         Self {
+            finding_id: None,
             prop,
             actions,
             introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for an [`AbsentComponentProp`] finding. There is no safe
+/// auto-fix: removing a declared prop is judgement-bearing (the prop may be part
+/// of a deliberately-stable public component API). Actions are manual
+/// remediation guidance plus a line-level suppress at the prop declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AbsentComponentPropFinding {
+    /// The underlying finding.
+    #[serde(flatten)]
+    pub prop: AbsentComponentProp,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl AbsentComponentPropFinding {
+    /// Build the wrapper from a raw [`AbsentComponentProp`]. Emits a manual
+    /// fix action plus a line-level suppress.
+    #[must_use]
+    pub fn with_actions(prop: AbsentComponentProp) -> Self {
+        let actions = vec![
+            manual_framework_fix(
+                FixActionType::ReviewComponentProp,
+                "Review inspected callers, defaults and API intent",
+                "Retain or suppress intentional stable props, or update the component manually; static analysis does not prove runtime unreachability.",
+            ),
+            suppress_line("// fallow-ignore-next-line absent-component-prop"),
+        ];
+        Self {
+            finding_id: None,
+            prop,
+            actions,
+            introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1170,6 +2068,13 @@ pub struct UnusedComponentEmitFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub emit: UnusedComponentEmit,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1177,6 +2082,16 @@ pub struct UnusedComponentEmitFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedComponentEmitFinding {
@@ -1193,9 +2108,11 @@ impl UnusedComponentEmitFinding {
             suppress_line("// fallow-ignore-next-line unused-component-emit"),
         ];
         Self {
+            finding_id: None,
             emit,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1211,6 +2128,13 @@ pub struct UnusedSvelteEventFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub event: UnusedSvelteEvent,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1218,6 +2142,16 @@ pub struct UnusedSvelteEventFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedSvelteEventFinding {
@@ -1234,9 +2168,182 @@ impl UnusedSvelteEventFinding {
             suppress_line("// fallow-ignore-next-line unused-svelte-event"),
         ];
         Self {
+            finding_id: None,
             event,
             actions,
             introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for an [`UnusedEffectLayer`] finding. There is no safe auto-fix: a test or a script outside the project graph can still use the layer. Actions are manual
+/// remediation guidance plus a line-level suppress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnusedEffectLayerFinding {
+    /// The underlying finding.
+    #[serde(flatten)]
+    pub layer: UnusedEffectLayer,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl UnusedEffectLayerFinding {
+    /// Build the wrapper from a raw [`UnusedEffectLayer`]. Emits a manual fix action plus
+    /// a line-level suppress.
+    #[must_use]
+    pub fn with_actions(layer: UnusedEffectLayer) -> Self {
+        let actions = vec![
+            manual_framework_fix(
+                FixActionType::ComposeEffectLayer,
+                "Compose the layer into a layer that reaches a runtime, or remove it with its unused consumers",
+                "Manual review required: remove the unused consumer layers first, then this layer. Code outside the analyzed project can still compose it.",
+            ),
+            suppress_line("// fallow-ignore-next-line unused-effect-layer"),
+        ];
+        Self {
+            finding_id: None,
+            layer,
+            actions,
+            introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for an [`UnusedTaggedError`] finding. There is no safe auto-fix: the error can be part of a public API contract. Actions are manual
+/// remediation guidance plus a line-level suppress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnusedTaggedErrorFinding {
+    /// The underlying finding.
+    #[serde(flatten)]
+    pub error: UnusedTaggedError,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl UnusedTaggedErrorFinding {
+    /// Build the wrapper from a raw [`UnusedTaggedError`]. Emits a manual fix action plus
+    /// a line-level suppress.
+    #[must_use]
+    pub fn with_actions(error: UnusedTaggedError) -> Self {
+        let actions = vec![
+            manual_framework_fix(
+                FixActionType::FailTaggedError,
+                "Fail with this error where the condition occurs, or remove the class and its catchTag handlers",
+                "Manual review required: consumers outside the analyzed project can construct or decode the error.",
+            ),
+            suppress_line("// fallow-ignore-next-line unused-tagged-error"),
+        ];
+        Self {
+            finding_id: None,
+            error,
+            actions,
+            introduced: None,
+            effective_severity: None,
+        }
+    }
+}
+
+/// Wire-shape envelope for an [`UnproducedCatchTag`] finding. There is no safe auto-fix: the handler can guard against a future producer. Actions are manual
+/// remediation guidance plus a line-level suppress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct UnproducedCatchTagFinding {
+    /// The underlying finding.
+    #[serde(flatten)]
+    pub catch_tag: UnproducedCatchTag,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    /// Suggested next steps. Always emitted (possibly empty for
+    /// forward-compat).
+    pub actions: Vec<IssueAction>,
+    /// Set by the audit pass when this finding is introduced relative to
+    /// the merge-base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+}
+
+impl UnproducedCatchTagFinding {
+    /// Build the wrapper from a raw [`UnproducedCatchTag`]. Emits a manual fix action plus
+    /// a line-level suppress.
+    #[must_use]
+    pub fn with_actions(catch_tag: UnproducedCatchTag) -> Self {
+        let actions = vec![
+            manual_framework_fix(
+                FixActionType::RemoveCatchTagHandler,
+                "Remove the handler for this tag, or fail with the error where the condition occurs",
+                "Manual review required: a package or code outside the analyzed project can produce the tag.",
+            ),
+            suppress_line("// fallow-ignore-next-line unproduced-catch-tag"),
+        ];
+        Self {
+            finding_id: None,
+            catch_tag,
+            actions,
+            introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1252,6 +2359,13 @@ pub struct PropDrillingChainFinding {
     /// The underlying located chain.
     #[serde(flatten)]
     pub chain: PropDrillingChain,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1259,6 +2373,16 @@ pub struct PropDrillingChainFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Rule severity after resolving overrides for the source hop. An explicit
+    /// `error` enforces the chain; `warn` stays advisory under strict flags.
+    /// Saved reports use this value for CI levels. Absent in older output.
+    /// Not part of finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl PropDrillingChainFinding {
@@ -1277,9 +2401,11 @@ impl PropDrillingChainFinding {
             scope: None,
         })];
         Self {
+            finding_id: None,
             chain,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1295,6 +2421,13 @@ pub struct ThinWrapperFinding {
     /// The underlying located thin wrapper.
     #[serde(flatten)]
     pub wrapper: ThinWrapper,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1302,6 +2435,17 @@ pub struct ThinWrapperFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Rule severity of this finding. This type never gates the run, so the
+    /// value does not change the exit code. `fallow report --from` reads it
+    /// for the SARIF level, so the level does not depend on the config at
+    /// render time. Absent in output from older versions. Not part of the
+    /// finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl ThinWrapperFinding {
@@ -1319,9 +2463,11 @@ impl ThinWrapperFinding {
             scope: None,
         })];
         Self {
+            finding_id: None,
             wrapper,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1339,6 +2485,13 @@ pub struct DuplicatePropShapeFinding {
     /// The underlying duplicate-prop-shape entry.
     #[serde(flatten)]
     pub shape: DuplicatePropShape,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1346,6 +2499,17 @@ pub struct DuplicatePropShapeFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Rule severity of this finding. This type never gates the run, so the
+    /// value does not change the exit code. `fallow report --from` reads it
+    /// for the SARIF level, so the level does not depend on the config at
+    /// render time. Absent in output from older versions. Not part of the
+    /// finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl DuplicatePropShapeFinding {
@@ -1381,9 +2545,11 @@ impl DuplicatePropShapeFinding {
             }),
         ];
         Self {
+            finding_id: None,
             shape,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1398,6 +2564,13 @@ pub struct UnusedComponentInputFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub input: UnusedComponentInput,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1405,6 +2578,16 @@ pub struct UnusedComponentInputFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedComponentInputFinding {
@@ -1421,9 +2604,11 @@ impl UnusedComponentInputFinding {
             scope: None,
         })];
         Self {
+            finding_id: None,
             input,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1438,6 +2623,13 @@ pub struct UnusedComponentOutputFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub output: UnusedComponentOutput,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1445,6 +2637,16 @@ pub struct UnusedComponentOutputFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedComponentOutputFinding {
@@ -1461,9 +2663,11 @@ impl UnusedComponentOutputFinding {
             scope: None,
         })];
         Self {
+            finding_id: None,
             output,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1479,6 +2683,13 @@ pub struct RouteCollisionFinding {
     /// The underlying route-collision entry.
     #[serde(flatten)]
     pub collision: RouteCollision,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1486,6 +2697,16 @@ pub struct RouteCollisionFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl RouteCollisionFinding {
@@ -1521,9 +2742,11 @@ impl RouteCollisionFinding {
             }),
         ];
         Self {
+            finding_id: None,
             collision,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1538,6 +2761,13 @@ pub struct DynamicSegmentNameConflictFinding {
     /// The underlying dynamic-segment-name-conflict entry.
     #[serde(flatten)]
     pub conflict: DynamicSegmentNameConflict,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1545,6 +2775,16 @@ pub struct DynamicSegmentNameConflictFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl DynamicSegmentNameConflictFinding {
@@ -1580,9 +2820,11 @@ impl DynamicSegmentNameConflictFinding {
             }),
         ];
         Self {
+            finding_id: None,
             conflict,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1595,6 +2837,13 @@ pub struct UnusedEnumMemberFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub member: UnusedMember,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1602,6 +2851,24 @@ pub struct UnusedEnumMemberFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A member's usage
+    /// is collected by walking the member accesses of every module the run
+    /// parsed, so a member whose only reference lives in a file the run never
+    /// read reads as unused exactly like an export does. Sorted,
+    /// deduplicated, and omitted from the wire when empty. Never gates the
+    /// finding; it does withhold the `remove-enum-member` mutation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedEnumMemberFinding {
@@ -1626,9 +2893,12 @@ impl UnusedEnumMemberFinding {
             }),
         ];
         Self {
+            finding_id: None,
             member,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -1643,6 +2913,13 @@ pub struct UnusedClassMemberFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub member: UnusedMember,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1659,6 +2936,25 @@ pub struct UnusedClassMemberFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A class member's
+    /// usage is collected by the same reachability-free member-access walk an
+    /// enum member's is, so it takes the enum-member rule unchanged: any module
+    /// this run analyzed incompletely can hold the access that credits it.
+    /// Sorted, deduplicated, and omitted from the wire when empty. Never gates
+    /// the finding; it does withhold the `remove-class-member` mutation that
+    /// the type-aware pass would otherwise open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedClassMemberFinding {
@@ -1688,11 +2984,14 @@ impl UnusedClassMemberFinding {
             }),
         ];
         Self {
+            finding_id: None,
             member,
             actions,
             semantic: None,
             semantic_only_candidate: false,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 
@@ -1705,11 +3004,26 @@ impl UnusedClassMemberFinding {
     }
 
     /// Attach the canonical semantic decision and expose the class-member fix
-    /// only when the API policy granted closed-world eligibility.
+    /// only when the API policy granted closed-world eligibility AND this run
+    /// holds the evidence for the mutation.
+    ///
+    /// This is the one code path that RAISES `auto_fixable` on a class member,
+    /// and it runs in the API layer AFTER the analysis layer stamped the run's
+    /// caveats, so it asks the gate for the same reason
+    /// `set_export_semantic_action` does: a closed-world verdict computed
+    /// over a program the run never fully read must not re-open a removal the
+    /// incomplete run already withheld. The withheld note names the evidence
+    /// gap rather than the semantic explanation, which stays readable on the
+    /// finding's own `semantic` object.
     pub fn set_semantic_decision(&mut self, decision: SemanticCandidateDecision) {
+        let evidence_complete = self.reachability_caveats.is_empty();
         if let Some(IssueAction::Fix(action)) = self.actions.first_mut() {
-            action.auto_fixable = decision.closed_world_eligible;
-            action.note = Some(decision.explanation.clone());
+            action.auto_fixable = decision.closed_world_eligible && evidence_complete;
+            action.note = Some(if evidence_complete {
+                decision.explanation.clone()
+            } else {
+                INCOMPLETE_EVIDENCE_NOTE.to_string()
+            });
         }
         self.semantic = Some(decision);
     }
@@ -1729,6 +3043,13 @@ pub struct UnusedStoreMemberFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub member: UnusedMember,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1736,6 +3057,26 @@ pub struct UnusedStoreMemberFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A store member's
+    /// usage is collected by the same reachability-free member-access walk a
+    /// class member's is, so it takes the member rule unchanged: any module
+    /// this run analyzed incompletely can hold the access that credits it.
+    /// Sorted, deduplicated, and omitted from the wire when empty. There is no
+    /// mutation here to withhold, because a store member offers none on any
+    /// surface; this is disclosure only, so a reader deciding by hand is told
+    /// what the run did not see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedStoreMemberFinding {
@@ -1752,9 +3093,12 @@ impl UnusedStoreMemberFinding {
             scope: None,
         })];
         Self {
+            finding_id: None,
             member,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -1841,6 +3185,13 @@ pub struct UnusedDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: UnusedDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1848,6 +3199,24 @@ pub struct UnusedDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A dependency is
+    /// reported unused when NO module in the project imports its specifier,
+    /// so a module that parsed with errors can hide the import that would
+    /// have credited the package. Sorted, deduplicated, and omitted from the
+    /// wire when empty. Never gates the finding, though `fallow fix`
+    /// withholds the `remove-dependency` write while a caveat stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedDependencyFinding {
@@ -1857,9 +3226,12 @@ impl UnusedDependencyFinding {
     pub fn with_actions(dep: UnusedDependency) -> Self {
         let actions = build_unused_dependency_actions(&dep, "dependencies", "unused-dependency");
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -1875,6 +3247,13 @@ pub struct UnusedDevDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: UnusedDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1882,6 +3261,24 @@ pub struct UnusedDevDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A dependency is
+    /// reported unused when NO module in the project imports its specifier,
+    /// so a module that parsed with errors can hide the import that would
+    /// have credited the package. Sorted, deduplicated, and omitted from the
+    /// wire when empty. Never gates the finding, though `fallow fix`
+    /// withholds the `remove-dependency` write while a caveat stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedDevDependencyFinding {
@@ -1891,9 +3288,12 @@ impl UnusedDevDependencyFinding {
         let actions =
             build_unused_dependency_actions(&dep, "devDependencies", "unused-dev-dependency");
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -1909,6 +3309,13 @@ pub struct UnusedOptionalDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: UnusedDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1916,6 +3323,24 @@ pub struct UnusedOptionalDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
+    /// Advisory caveats on the verdict behind this finding. A dependency is
+    /// reported unused when NO module in the project imports its specifier,
+    /// so a module that parsed with errors can hide the import that would
+    /// have credited the package. Sorted, deduplicated, and omitted from the
+    /// wire when empty. Never gates the finding, though `fallow fix`
+    /// withholds the `remove-dependency` write while a caveat stands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability_caveats: Vec<ReachabilityCaveat>,
 }
 
 impl UnusedOptionalDependencyFinding {
@@ -1925,9 +3350,12 @@ impl UnusedOptionalDependencyFinding {
         let actions =
             build_unused_dependency_actions(&dep, "optionalDependencies", "unused-dependency");
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
+            reachability_caveats: Vec::new(),
         }
     }
 }
@@ -1941,6 +3369,13 @@ pub struct UnlistedDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: UnlistedDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1948,6 +3383,16 @@ pub struct UnlistedDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnlistedDependencyFinding {
@@ -1968,9 +3413,11 @@ impl UnlistedDependencyFinding {
             build_ignore_dependencies_suppress_action(&dep.package_name, "unlisted-dependency"),
         ];
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -1984,6 +3431,13 @@ pub struct TypeOnlyDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: TypeOnlyDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -1991,6 +3445,16 @@ pub struct TypeOnlyDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl TypeOnlyDependencyFinding {
@@ -2012,9 +3476,11 @@ impl TypeOnlyDependencyFinding {
             build_ignore_dependencies_suppress_action(&dep.package_name, "type-only-dependency"),
         ];
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2028,6 +3494,13 @@ pub struct TestOnlyDependencyFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: TestOnlyDependency,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -2035,6 +3508,16 @@ pub struct TestOnlyDependencyFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl TestOnlyDependencyFinding {
@@ -2056,9 +3539,11 @@ impl TestOnlyDependencyFinding {
             build_ignore_dependencies_suppress_action(&dep.package_name, "test-only-dependency"),
         ];
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2073,6 +3558,13 @@ pub struct DevDependencyInProductionFinding {
     /// The underlying dead-code entry.
     #[serde(flatten)]
     pub dep: DevDependencyInProduction,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -2080,6 +3572,16 @@ pub struct DevDependencyInProductionFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl DevDependencyInProductionFinding {
@@ -2106,9 +3608,11 @@ impl DevDependencyInProductionFinding {
             ),
         ];
         Self {
+            finding_id: None,
             dep,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2139,6 +3643,13 @@ pub struct DuplicateExportFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub export: DuplicateExport,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted (possibly empty for
     /// forward-compat).
     pub actions: Vec<IssueAction>,
@@ -2146,6 +3657,16 @@ pub struct DuplicateExportFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl DuplicateExportFinding {
@@ -2190,9 +3711,11 @@ impl DuplicateExportFinding {
         }));
 
         Self {
+            finding_id: None,
             export,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 
@@ -2251,12 +3774,29 @@ pub struct UnusedCatalogEntryFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub entry: UnusedCatalogEntry,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedCatalogEntryFinding {
@@ -2301,9 +3841,11 @@ impl UnusedCatalogEntryFinding {
             }));
         }
         Self {
+            finding_id: None,
             entry,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2317,12 +3859,29 @@ pub struct EmptyCatalogGroupFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub group: EmptyCatalogGroup,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl EmptyCatalogGroupFinding {
@@ -2359,9 +3918,11 @@ impl EmptyCatalogGroupFinding {
             }));
         }
         Self {
+            finding_id: None,
             group,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2383,6 +3944,13 @@ pub struct UnresolvedCatalogReferenceFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub reference: UnresolvedCatalogReference,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted; position 0 is the discriminated
     /// primary (see struct docs).
     pub actions: Vec<IssueAction>,
@@ -2390,6 +3958,16 @@ pub struct UnresolvedCatalogReferenceFinding {
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnresolvedCatalogReferenceFinding {
@@ -2408,9 +3986,11 @@ impl UnresolvedCatalogReferenceFinding {
         let suppress = suppress_catalog_reference_action(&reference, consumer_path);
 
         Self {
+            finding_id: None,
             reference,
             actions: vec![primary, fallback, suppress],
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2452,7 +4032,7 @@ fn remove_catalog_reference_action() -> IssueAction {
     IssueAction::Fix(FixAction {
         kind: FixActionType::RemoveCatalogReference,
         auto_fixable: false,
-        description: "Remove the catalog reference and pin a hardcoded version in package.json"
+        description: "Remove the catalog reference and pin a hardcoded version in its place"
             .to_string(),
         note: Some(
             "Use only when neither another catalog declares the package nor the named catalog should grow to include it"
@@ -2500,12 +4080,29 @@ pub struct UnusedDependencyOverrideFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub entry: UnusedDependencyOverride,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl UnusedDependencyOverrideFinding {
@@ -2535,9 +4132,11 @@ impl UnusedDependencyOverrideFinding {
         }
 
         Self {
+            finding_id: None,
             entry,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2553,12 +4152,29 @@ pub struct MisconfiguredDependencyOverrideFinding {
     /// The underlying finding.
     #[serde(flatten)]
     pub entry: MisconfiguredDependencyOverride,
+    /// Stable id of this finding: `dc1:<rule>:<16 hex digits>`, with a
+    /// `~<k>` suffix when several findings of one type share an identity.
+    /// Line and column are not inputs, so the id survives line shifts,
+    /// reformats and reorders. A rename of the file or the symbol gives a
+    /// new id. Absent in output from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
     /// Suggested next steps. Always emitted.
     pub actions: Vec<IssueAction>,
     /// Set by the audit pass when this finding is introduced relative to
     /// the merge-base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced: Option<AuditIntroduced>,
+    /// Gate severity of this finding after `rules` and `overrides[].rules`
+    /// resolve for its path. CI formats read it for the annotation, SARIF
+    /// and CodeClimate level. Absent in output from older versions. Not
+    /// part of the finding identity, baseline keys or fingerprints.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_effective_severity"
+    )]
+    pub effective_severity: Option<EffectiveSeverity>,
 }
 
 impl MisconfiguredDependencyOverrideFinding {
@@ -2592,9 +4208,11 @@ impl MisconfiguredDependencyOverrideFinding {
         }
 
         Self {
+            finding_id: None,
             entry,
             actions,
             introduced: None,
+            effective_severity: None,
         }
     }
 }
@@ -2628,6 +4246,162 @@ fn build_ignore_dependency_overrides_suppress(
     }))
 }
 
+// ── The mutation gate, registered once ──────────────────────────
+//
+// Every finding whose reachability verdict a lost import edge can distort.
+// The analysis layer stamps caveats through `set_reachability_caveats`, which
+// enforces the gate on the finding's actions in the same call; every mutation
+// surface reads the answer back through `may_auto_apply_mutation`.
+impl_caveated_finding!(
+    UnusedFileFinding,
+    UnusedExportFinding,
+    UnusedTypeFinding,
+    UnusedEnumMemberFinding,
+    UnusedClassMemberFinding,
+    UnusedStoreMemberFinding,
+    UnusedDependencyFinding,
+    UnusedDevDependencyFinding,
+    UnusedOptionalDependencyFinding,
+);
+
+/// Gate severity of one finding after rule resolution.
+///
+/// It is the severity that `rules` and the matching `overrides[].rules` give
+/// the finding for its path. `--fail-on-issues` raises `warn` to `error`. A
+/// finding whose rule is `off` is not reported, so there is no `off` value.
+/// The type is separate from the health `severity` band, which ranks a
+/// finding and does not gate it.
+///
+/// The `fallow dead-code` findings gate fails when a finding is `error`.
+/// Other gates (regression, stale baseline) decide on their own inputs. Two
+/// commands differ: the `fallow audit` `new-only` gate fails only on introduced
+/// findings, so an inherited `error` finding does not fail the audit, and the
+/// combined command (`fallow` without a subcommand) exits 0 for machine
+/// formats unless `--fail-on-issues` or `--ci` is set.
+///
+/// Complexity findings carry the same type. The `complexity-cyclomatic`,
+/// `complexity-cognitive` and `complexity-crap` rules set it, and the
+/// `fallow health` findings gate and the audit verdict read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum EffectiveSeverity {
+    /// The finding fails the run.
+    Error,
+    /// The finding is reported and does not fail the run.
+    Warn,
+}
+
+/// Read an optional [`EffectiveSeverity`] and treat an unknown value as absent.
+///
+/// A saved report from a newer version can carry a value this version does not
+/// know. The renderers then use the rule-based level, as for a report without
+/// the field, and the envelope still loads.
+///
+/// # Errors
+///
+/// Returns an error only when the input is not valid JSON-like data.
+pub fn deserialize_effective_severity<'de, D>(
+    deserializer: D,
+) -> Result<Option<EffectiveSeverity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Tolerant {
+        Known(EffectiveSeverity),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Tolerant>::deserialize(deserializer)? {
+        Some(Tolerant::Known(severity)) => Some(severity),
+        Some(Tolerant::Unknown(_)) | None => None,
+    })
+}
+
+/// A finding wrapper that carries an [`EffectiveSeverity`].
+///
+/// The analysis layer writes the value one time after rule resolution. CI
+/// renderers read it and fall back to the rule-level severity when it is
+/// absent, for example in a saved report from an older version.
+pub trait GatedFinding {
+    /// The gate severity, or `None` when no value was written.
+    fn effective_severity(&self) -> Option<EffectiveSeverity>;
+
+    /// Write the gate severity.
+    fn set_effective_severity(&mut self, severity: Option<EffectiveSeverity>);
+}
+
+/// Implement [`GatedFinding`] for wrappers with an `effective_severity` field.
+macro_rules! impl_gated_finding {
+    ($($finding:ty),+ $(,)?) => {
+        $(
+            impl GatedFinding for $finding {
+                fn effective_severity(&self) -> Option<EffectiveSeverity> {
+                    self.effective_severity
+                }
+
+                fn set_effective_severity(&mut self, severity: Option<EffectiveSeverity>) {
+                    self.effective_severity = severity;
+                }
+            }
+        )+
+    };
+}
+
+impl_gated_finding!(
+    UnusedFileFinding,
+    PrivateTypeLeakFinding,
+    DeprecatedExportInUseFinding,
+    UnresolvedImportFinding,
+    CircularDependencyFinding,
+    ReExportCycleFinding,
+    PackageCycleFinding,
+    BoundaryViolationFinding,
+    BoundaryCoverageViolationFinding,
+    BoundaryCallViolationFinding,
+    UnusedExportFinding,
+    UnusedTypeFinding,
+    InvalidClientExportFinding,
+    MixedClientServerBarrelFinding,
+    MisplacedDirectiveFinding,
+    UnprovidedInjectFinding,
+    UnusedServerActionFinding,
+    UnusedLoadDataKeyFinding,
+    UnrenderedComponentFinding,
+    UnusedComponentPropFinding,
+    AbsentComponentPropFinding,
+    UnusedComponentEmitFinding,
+    UnusedSvelteEventFinding,
+    UnusedEffectLayerFinding,
+    UnusedTaggedErrorFinding,
+    UnproducedCatchTagFinding,
+    UnusedComponentInputFinding,
+    UnusedComponentOutputFinding,
+    RouteCollisionFinding,
+    DynamicSegmentNameConflictFinding,
+    UnusedEnumMemberFinding,
+    UnusedClassMemberFinding,
+    UnusedStoreMemberFinding,
+    UnusedDependencyFinding,
+    UnusedDevDependencyFinding,
+    UnusedOptionalDependencyFinding,
+    UnlistedDependencyFinding,
+    TypeOnlyDependencyFinding,
+    TestOnlyDependencyFinding,
+    DevDependencyInProductionFinding,
+    DuplicateExportFinding,
+    UnusedCatalogEntryFinding,
+    EmptyCatalogGroupFinding,
+    UnresolvedCatalogReferenceFinding,
+    UnusedDependencyOverrideFinding,
+    MisconfiguredDependencyOverrideFinding,
+    PropDrillingChainFinding,
+    ThinWrapperFinding,
+    DuplicatePropShapeFinding,
+    crate::results::StaleSuppression,
+);
+
 // ── Position-0 invariant golden tests ───────────────────────────
 //
 // These tests document the load-bearing position-0 semantics that flow
@@ -2637,6 +4411,530 @@ fn build_ignore_dependency_overrides_suppress(
 // document WHY position 0 has a specific value, so a future refactor that
 // re-orders actions tells you what broke instead of just "the snapshot
 // changed".
+#[cfg(test)]
+mod caveat_tokens {
+    use super::*;
+
+    /// The token-side helpers must render the same words as the typed ones, so
+    /// one finding reads identically whether a surface holds the findings or
+    /// re-reads them off a serialized envelope.
+    #[test]
+    fn token_labels_match_the_typed_labels() {
+        let typed = [
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ];
+        let tokens: Vec<&str> = typed.iter().map(|c| c.token()).collect();
+
+        assert_eq!(
+            caveat_labels_for_tokens(tokens.iter().copied()),
+            caveat_labels(&typed)
+        );
+        assert_eq!(
+            caveat_suffix_for_tokens(tokens.iter().copied()),
+            caveat_suffix(&typed)
+        );
+    }
+
+    #[test]
+    fn no_tokens_means_nothing_to_say() {
+        assert_eq!(caveat_labels_for_tokens(std::iter::empty()), None);
+        assert_eq!(caveat_suffix_for_tokens(std::iter::empty()), None);
+    }
+
+    /// The CI review formats can only see the rendered description, so the
+    /// recogniser and the renderer have to stay one pair. A description with
+    /// no caveat must not match, or the review formats would withhold the
+    /// suggestion block on every finding in a clean run.
+    #[test]
+    fn a_rendered_suffix_is_recognised_by_the_marker() {
+        for caveats in [
+            &[ReachabilityCaveat::IncompleteImportGraph][..],
+            &[
+                ReachabilityCaveat::IncompleteFileAnalysis,
+                ReachabilityCaveat::IncompleteImportGraph,
+            ][..],
+        ] {
+            let suffix = caveat_suffix(caveats).expect("a caveat renders a suffix");
+            assert!(
+                description_carries_caveat(&format!("Something is never referenced{suffix}")),
+                "the marker must match what caveat_suffix writes: {suffix}"
+            );
+        }
+        assert!(
+            description_carries_caveat(&format!(
+                "Something is never referenced{}",
+                caveat_suffix_for_tokens(["some-future-cause"]).expect("token suffix")
+            )),
+            "the token-side renderer writes the same marker"
+        );
+        assert!(
+            !description_carries_caveat("Class member 'Widget.helper' is never referenced"),
+            "a clean description must not read as caveated"
+        );
+    }
+
+    /// A caveat is a RUN-level condition covering several ways a file goes
+    /// unread: a degraded parse, an unreadable file, and three kinds of file
+    /// discovery skipped before opening. A message naming only the parse case
+    /// told a reader whose run was degraded by the size guard to go fix parse
+    /// errors that do not exist, which is the same overclaiming the caveat
+    /// itself exists to prevent.
+    #[test]
+    fn no_caveat_message_names_a_single_cause() {
+        for caveat in [
+            ReachabilityCaveat::IncompleteFileAnalysis,
+            ReachabilityCaveat::IncompleteImportGraph,
+        ] {
+            let message = caveat.message();
+            assert!(
+                !message.contains("parse cleanly") && !message.contains("parse error"),
+                "{} names the parse cause alone, but a size-skipped or unreadable \
+                 file reaches the same caveat: {message}",
+                caveat.token()
+            );
+            assert!(
+                message.contains("workspace_diagnostics"),
+                "{} must point at the list that names the actual files: {message}",
+                caveat.token()
+            );
+        }
+    }
+
+    /// The value set is open. A token a consumer build does not recognise still
+    /// means the evidence is incomplete, so it must survive into the rendered
+    /// hedge rather than being dropped back into a confident-looking finding.
+    #[test]
+    fn an_unrecognised_token_still_renders_as_a_caveat() {
+        let suffix = caveat_suffix_for_tokens(["some-future-cause"])
+            .expect("an unknown token is still a caveat");
+
+        assert_eq!(suffix, " (caveat: some future cause)");
+    }
+}
+
+/// The gate, pinned as one property across every finding type rather than as
+/// one test per mutation surface.
+///
+/// Three separate reviewers found three separate mutation paths that had never
+/// learned about the caveat, because each earlier round fixed the door it
+/// found. These tests assert the invariant itself: for every dead-code finding
+/// that can carry a caveat, a caveated finding exposes NO auto-fixable action,
+/// and an uncaveated one is untouched. Adding a caveated finding type without
+/// registering it in `impl_caveated_finding!` fails to compile at the
+/// `set_reachability_caveats` call the annotation pass makes; adding one that
+/// exposes an auto-fixable mutation and never gets annotated is what
+/// `every_auto_fixable_dead_code_mutation_is_gated` catches.
+#[cfg(test)]
+mod mutation_gate {
+    use super::*;
+    use crate::extract::MemberKind;
+    use crate::results::DependencyLocation;
+    use std::path::PathBuf;
+
+    const BOTH: [ReachabilityCaveat; 2] = [
+        ReachabilityCaveat::IncompleteFileAnalysis,
+        ReachabilityCaveat::IncompleteImportGraph,
+    ];
+
+    fn export(name: &str) -> UnusedExport {
+        UnusedExport {
+            path: PathBuf::from("/p/src/mod.ts"),
+            export_name: name.to_string(),
+            is_type_only: false,
+            line: 1,
+            col: 0,
+            span_start: 0,
+            is_re_export: false,
+            deprecated: false,
+            deprecated_reason: None,
+        }
+    }
+
+    fn member(name: &str) -> UnusedMember {
+        UnusedMember {
+            path: PathBuf::from("/p/src/mod.ts"),
+            parent_name: "Color".to_string(),
+            member_name: name.to_string(),
+            kind: MemberKind::EnumMember,
+            line: 2,
+            col: 2,
+        }
+    }
+
+    fn class_member(name: &str) -> UnusedMember {
+        UnusedMember {
+            parent_name: "Widget".to_string(),
+            kind: MemberKind::ClassMethod,
+            ..member(name)
+        }
+    }
+
+    fn store_member(name: &str) -> UnusedMember {
+        UnusedMember {
+            parent_name: "useCounterStore".to_string(),
+            kind: MemberKind::StoreMember,
+            ..member(name)
+        }
+    }
+
+    fn dependency(name: &str) -> UnusedDependency {
+        UnusedDependency {
+            package_name: name.to_string(),
+            location: DependencyLocation::Dependencies,
+            path: PathBuf::from("/p/package.json"),
+            line: 5,
+            used_in_workspaces: Vec::new(),
+            declared_and_imported_in: Vec::new(),
+        }
+    }
+
+    /// One finding type: its name, the uncaveated finding, and the same
+    /// finding after the annotation pass stamped a caveat on it.
+    type GatedPair = (&'static str, Box<dyn Gated>, Box<dyn Gated>);
+
+    /// Every caveated finding type, boxed behind the one question the mutation
+    /// surfaces ask.
+    fn every_finding_type() -> Vec<GatedPair> {
+        fn pair<T: Gated + Clone + 'static>(name: &'static str, clean: T) -> GatedPair {
+            let mut caveated = clean.clone();
+            caveated.stamp(BOTH.to_vec());
+            (name, Box::new(clean), Box::new(caveated))
+        }
+        vec![
+            pair(
+                "unused_files",
+                UnusedFileFinding::with_actions(UnusedFile {
+                    path: PathBuf::from("/p/src/orphan.ts"),
+                }),
+            ),
+            pair(
+                "unused_exports",
+                UnusedExportFinding::with_actions(export("helper")),
+            ),
+            pair(
+                "unused_types",
+                UnusedTypeFinding::with_actions(export("Shape")),
+            ),
+            pair(
+                "unused_enum_members",
+                UnusedEnumMemberFinding::with_actions(member("Blue")),
+            ),
+            pair(
+                "unused_class_members",
+                UnusedClassMemberFinding::with_actions(class_member("legacyMethod")),
+            ),
+            pair(
+                "unused_store_members",
+                UnusedStoreMemberFinding::with_actions(store_member("onlyUsedInBigFile")),
+            ),
+            pair(
+                "unused_dependencies",
+                UnusedDependencyFinding::with_actions(dependency("lodash")),
+            ),
+            pair(
+                "unused_dev_dependencies",
+                UnusedDevDependencyFinding::with_actions(dependency("vitest")),
+            ),
+            pair(
+                "unused_optional_dependencies",
+                UnusedOptionalDependencyFinding::with_actions(dependency("fsevents")),
+            ),
+        ]
+    }
+
+    /// Erases the finding type down to what a mutation surface needs: the gate,
+    /// the actions it gates, and the annotation-pass write.
+    trait Gated {
+        fn actions(&self) -> &[IssueAction];
+        fn gate_allows_mutation(&self) -> bool;
+        fn stamp(&mut self, caveats: Vec<ReachabilityCaveat>);
+    }
+
+    impl<T: MutationEvidence + CaveatedFinding + HasActions> Gated for T {
+        fn actions(&self) -> &[IssueAction] {
+            HasActions::actions(self)
+        }
+        fn gate_allows_mutation(&self) -> bool {
+            self.may_auto_apply_mutation()
+        }
+        fn stamp(&mut self, caveats: Vec<ReachabilityCaveat>) {
+            self.set_reachability_caveats(caveats);
+        }
+    }
+
+    trait HasActions {
+        fn actions(&self) -> &[IssueAction];
+    }
+
+    macro_rules! has_actions {
+        ($($ty:ty),+ $(,)?) => { $( impl HasActions for $ty {
+            fn actions(&self) -> &[IssueAction] { &self.actions }
+        } )+ };
+    }
+    has_actions!(
+        UnusedFileFinding,
+        UnusedExportFinding,
+        UnusedTypeFinding,
+        UnusedEnumMemberFinding,
+        UnusedClassMemberFinding,
+        UnusedStoreMemberFinding,
+        UnusedDependencyFinding,
+        UnusedDevDependencyFinding,
+        UnusedOptionalDependencyFinding,
+    );
+
+    /// THE property. Not "the CLI withholds it" or "the LSP hides it": no
+    /// finding whose evidence the run itself flagged may advertise an
+    /// automatically applicable mutation, whichever surface is reading.
+    #[test]
+    fn every_auto_fixable_dead_code_mutation_is_gated() {
+        for (name, _clean, caveated) in every_finding_type() {
+            assert!(
+                !caveated.gate_allows_mutation(),
+                "{name}: a stamped finding must fail the gate"
+            );
+            for action in caveated.actions() {
+                assert!(
+                    !action.is_auto_fixable(),
+                    "{name}: a caveated finding still advertises an auto-fixable action, so an \
+                     agent following the documented actions contract would plan a removal \
+                     `fallow fix` refuses"
+                );
+            }
+        }
+    }
+
+    /// The other half, and the one a blunt fix breaks: the gate must not turn
+    /// every finding into a manual one. A run that read every file it
+    /// discovered keeps exactly the behavior it had.
+    #[test]
+    fn an_uncaveated_finding_keeps_its_auto_fix() {
+        let auto_fixable_types = [
+            "unused_exports",
+            "unused_types",
+            "unused_enum_members",
+            "unused_dependencies",
+            "unused_dev_dependencies",
+            "unused_optional_dependencies",
+        ];
+        for (name, clean, _caveated) in every_finding_type() {
+            assert!(
+                clean.gate_allows_mutation(),
+                "{name}: a finding with no caveat must pass the gate"
+            );
+            if auto_fixable_types.contains(&name) {
+                assert!(
+                    clean.actions().iter().any(IssueAction::is_auto_fixable),
+                    "{name}: the gate must not withhold a mutation the run has the evidence for"
+                );
+            }
+        }
+    }
+
+    /// The caveat is advisory about the FINDING and decisive only about the
+    /// MUTATION: the actions array keeps its shape so a consumer reading
+    /// `actions[0].type` is unaffected, and the suppress alternative stays.
+    #[test]
+    fn the_gate_downgrades_a_mutation_without_removing_it() {
+        let clean = UnusedExportFinding::with_actions(export("helper"));
+        let mut caveated = clean.clone();
+        caveated.set_reachability_caveats(BOTH.to_vec());
+
+        assert_eq!(caveated.actions.len(), clean.actions.len());
+        let IssueAction::Fix(fix) = &caveated.actions[0] else {
+            panic!("position 0 stays the fix action");
+        };
+        assert!(!fix.auto_fixable);
+        assert_eq!(
+            fix.note.as_deref(),
+            Some(INCOMPLETE_EVIDENCE_NOTE),
+            "the withheld action says why in its own note, not only in a sibling array"
+        );
+    }
+
+    /// A pre-existing note is context the user still needs (the re-export
+    /// warning names a public-API risk the caveat says nothing about), so the
+    /// gate appends rather than overwrites.
+    #[test]
+    fn a_gated_mutation_keeps_the_note_it_already_had() {
+        let mut re_export = export("helper");
+        re_export.is_re_export = true;
+        let mut finding = UnusedExportFinding::with_actions(re_export);
+        finding.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+
+        let IssueAction::Fix(fix) = &finding.actions[0] else {
+            panic!("position 0 stays the fix action");
+        };
+        let note = fix.note.as_deref().expect("note present");
+        assert!(note.contains("public API"), "the original note survives");
+        assert!(
+            note.contains("Evidence is incomplete"),
+            "the caveat is added"
+        );
+    }
+
+    /// The gate is complete only if every finding type that can ever expose an
+    /// auto-fixable mutation is in it. The one member type deliberately left
+    /// out is safe for a different reason, and this pins that reason rather
+    /// than trusting a comment: a store member exposes no fix action at all,
+    /// because reflective access via a Pinia plugin or `$onAction` is
+    /// invisible to syntactic analysis, so no evidence this run could gather
+    /// would open the removal. If it ever ships one, it needs
+    /// `reachability_caveats` and a row in `impl_caveated_finding!` first.
+    ///
+    /// A class member used to sit here on the weaker argument that its removal
+    /// STARTS withheld. That argument covered only the syntactic finding: the
+    /// type-aware sidecar reopens the removal through
+    /// [`UnusedClassMemberFinding::set_semantic_decision`], and the review
+    /// formats rendered a one-click commit for it regardless of
+    /// `auto_fixable`. It is inside the gate now, so the assertion here is
+    /// only that the SYNTACTIC finding still ships no auto-fix; the reopening
+    /// path is pinned by `a_complete_semantic_verdict_cannot_reopen_a_
+    /// caveated_class_member`.
+    #[test]
+    fn a_store_member_exposes_no_mutation_at_all() {
+        let store = UnusedStoreMemberFinding::with_actions(member("total"));
+        assert!(
+            !store.actions.iter().any(IssueAction::is_auto_fixable),
+            "a store member must expose no automatically applicable mutation"
+        );
+        assert!(
+            !store
+                .actions
+                .iter()
+                .any(|action| matches!(action, IssueAction::Fix(_))),
+            "and no fix action at all"
+        );
+
+        let class = UnusedClassMemberFinding::with_actions(class_member("helper"));
+        assert!(
+            !class.actions.iter().any(IssueAction::is_auto_fixable),
+            "a class member's syntactic removal stays withheld until semantic evidence opens it"
+        );
+    }
+
+    /// The semantic pass runs after the annotation pass and is the only code
+    /// path that RAISES `auto_fixable`. A `Complete` verdict must not re-open a
+    /// mutation the incomplete run already withheld.
+    #[test]
+    fn a_complete_semantic_verdict_cannot_reopen_a_caveated_mutation() {
+        use crate::semantic::{
+            SemanticCandidateDecision, SemanticCandidateDecisionKind, SemanticCompleteness,
+            SemanticNamespace, SemanticSymbol,
+        };
+
+        let complete_negative = || SemanticCandidateDecision {
+            query_id: 0,
+            subject: SemanticSymbol {
+                path: PathBuf::from("/p/src/mod.ts"),
+                namespace: SemanticNamespace::Value,
+                declaration_kind: "function".to_string(),
+                exported_name: "helper".to_string(),
+                local_name: "helper".to_string(),
+                owner: None,
+                line: 1,
+                col: 0,
+            },
+            decision: SemanticCandidateDecisionKind::ConfirmedNoStaticReferences,
+            status: SemanticCompleteness::Complete,
+            owning_projects: Vec::new(),
+            evidence: Vec::new(),
+            contract: None,
+            framework_contract: None,
+            closed_world_eligible: false,
+            edit_guard: None,
+            reason_code: None,
+            explanation: String::new(),
+            actions: Vec::new(),
+            total_evidence_count: 0,
+            truncated: false,
+            omissions: Vec::new(),
+        };
+
+        let mut clean = UnusedExportFinding::with_actions(export("helper"));
+        clean.set_semantic_decision(complete_negative());
+        assert!(
+            clean.actions.iter().any(IssueAction::is_auto_fixable),
+            "a complete negative verdict on a clean run still enables the fix"
+        );
+
+        let mut caveated = UnusedExportFinding::with_actions(export("helper"));
+        caveated.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        caveated.set_semantic_decision(complete_negative());
+        assert!(
+            !caveated.actions.iter().any(IssueAction::is_auto_fixable),
+            "the semantic pass must ask the gate too"
+        );
+    }
+
+    /// The class-member twin, on its own eligibility flag. `closed_world_
+    /// eligible` is proved over the program the sidecar could see, which is
+    /// the program this run parsed; a member whose only call site sits in a
+    /// file the run never opened is absent from that world for the same reason
+    /// it is absent from the syntactic verdict, so a `true` here is not
+    /// evidence the run lacks.
+    #[test]
+    fn a_complete_semantic_verdict_cannot_reopen_a_caveated_class_member() {
+        use crate::semantic::{
+            SemanticCandidateDecision, SemanticCandidateDecisionKind, SemanticCompleteness,
+            SemanticNamespace, SemanticSymbol,
+        };
+
+        let eligible = || SemanticCandidateDecision {
+            query_id: 0,
+            subject: SemanticSymbol {
+                path: PathBuf::from("/p/src/mod.ts"),
+                namespace: SemanticNamespace::Value,
+                declaration_kind: "method".to_string(),
+                exported_name: "Widget".to_string(),
+                local_name: "legacyMethod".to_string(),
+                owner: Some("Widget".to_string()),
+                line: 2,
+                col: 2,
+            },
+            decision: SemanticCandidateDecisionKind::ConfirmedNoStaticReferences,
+            status: SemanticCompleteness::Complete,
+            owning_projects: Vec::new(),
+            evidence: Vec::new(),
+            contract: None,
+            framework_contract: None,
+            closed_world_eligible: true,
+            edit_guard: None,
+            reason_code: None,
+            explanation: "closed world proved".to_string(),
+            actions: Vec::new(),
+            total_evidence_count: 0,
+            truncated: false,
+            omissions: Vec::new(),
+        };
+
+        let mut clean = UnusedClassMemberFinding::with_actions(class_member("legacyMethod"));
+        clean.set_semantic_decision(eligible());
+        assert!(
+            clean.actions.iter().any(IssueAction::is_auto_fixable),
+            "a closed-world verdict on a run that read every file still opens the removal"
+        );
+
+        let mut caveated = UnusedClassMemberFinding::with_actions(class_member("legacyMethod"));
+        caveated.set_reachability_caveats(vec![ReachabilityCaveat::IncompleteImportGraph]);
+        caveated.set_semantic_decision(eligible());
+        assert!(
+            !caveated.actions.iter().any(IssueAction::is_auto_fixable),
+            "the class-member semantic pass must ask the gate too"
+        );
+        let IssueAction::Fix(fix) = &caveated.actions[0] else {
+            panic!("position 0 stays the fix action");
+        };
+        assert_eq!(
+            fix.note.as_deref(),
+            Some(INCOMPLETE_EVIDENCE_NOTE),
+            "the withheld action says why, rather than repeating a closed-world explanation \
+             computed over a program the run did not fully read"
+        );
+    }
+}
+
 #[cfg(test)]
 mod position_0_invariants {
     use super::*;
@@ -2666,6 +4964,7 @@ mod position_0_invariants {
                 FixActionType::RefactorReExportCycle => "refactor-re-export-cycle",
                 FixActionType::RefactorBoundary => "refactor-boundary",
                 FixActionType::ExportType => "export-type",
+                FixActionType::MigrateDeprecatedExport => "migrate-deprecated-export",
                 FixActionType::RemoveCatalogEntry => "remove-catalog-entry",
                 FixActionType::RemoveEmptyCatalogGroup => "remove-empty-catalog-group",
                 FixActionType::UpdateCatalogReference => "update-catalog-reference",
@@ -2682,8 +4981,12 @@ mod position_0_invariants {
                 FixActionType::UseLoadData => "use-load-data",
                 FixActionType::RenderComponent => "render-component",
                 FixActionType::UseComponentProp => "use-component-prop",
+                FixActionType::ReviewComponentProp => "review-component-prop",
                 FixActionType::EmitComponentEvent => "emit-component-event",
                 FixActionType::WireSvelteEvent => "wire-svelte-event",
+                FixActionType::ComposeEffectLayer => "compose-effect-layer",
+                FixActionType::FailTaggedError => "fail-tagged-error",
+                FixActionType::RemoveCatchTagHandler => "remove-catch-tag-handler",
                 FixActionType::ResolveRouteCollision => "resolve-route-collision",
                 FixActionType::ResolveDynamicSegmentNameConflict => {
                     "resolve-dynamic-segment-name-conflict"
@@ -2921,9 +5224,8 @@ mod position_0_invariants {
     /// of `unresolved_catalog_references[].actions` is `add-catalog-entry`,
     /// directing the agent to grow the targeted catalog.
     ///
-    /// Downstream consumers (MCP `actions[0].type` dispatch, jq scripts in
-    /// `action/jq/review-comments-check.jq` and `ci/jq/review-check.jq`)
-    /// pattern-match on this string. A future refactor that puts the
+    /// Downstream consumers (MCP `actions[0].type` dispatch and JSON
+    /// consumers that read the first action) pattern-match on this string. A future refactor that puts the
     /// generic `remove-catalog-reference` fallback at position 0 would
     /// flip every CI annotation from "add this entry" to "remove this
     /// reference", reversing the recommended action.

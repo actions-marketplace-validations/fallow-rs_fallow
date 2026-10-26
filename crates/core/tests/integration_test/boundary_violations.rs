@@ -29,6 +29,7 @@ fn create_boundary_config_with_entry(
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -37,8 +38,10 @@ fn create_boundary_config_with_entry(
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -60,7 +63,9 @@ fn create_boundary_config_with_entry(
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None)
@@ -362,6 +367,7 @@ fn no_violations_when_rule_is_off() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -370,8 +376,10 @@ fn no_violations_when_rule_is_off() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Off,
@@ -393,7 +401,9 @@ fn no_violations_when_rule_is_off() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -426,6 +436,7 @@ fn preset_detects_boundary_violation() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -434,8 +445,10 @@ fn preset_detects_boundary_violation() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -457,7 +470,9 @@ fn preset_detects_boundary_violation() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -530,6 +545,7 @@ fn root_field_classifies_per_subtree() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -538,8 +554,10 @@ fn root_field_classifies_per_subtree() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -561,7 +579,9 @@ fn root_field_classifies_per_subtree() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -638,6 +658,7 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -646,8 +667,10 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -669,7 +692,9 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root.clone(), OutputFormat::Human, 4, true, true, None);
@@ -714,6 +739,7 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -722,8 +748,10 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -745,7 +773,9 @@ fn root_field_genuinely_disambiguates_flat_patterns() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -858,6 +888,7 @@ fn bulletproof_preset_detects_violation() {
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -866,8 +897,10 @@ fn bulletproof_preset_detects_violation() {
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -889,7 +922,9 @@ fn bulletproof_preset_detects_violation() {
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -967,6 +1002,7 @@ fn bulletproof_top_level_features_file_is_strict_without_barrel_false_positive()
         framework: vec![],
         workspaces: None,
         ignore_dependencies: vec![],
+        ignore_command_entries: vec![],
         ignore_unresolved_imports: vec![],
         ignore_exports: vec![],
         ignore_catalog_references: vec![],
@@ -975,8 +1011,10 @@ fn bulletproof_top_level_features_file_is_strict_without_barrel_false_positive()
         used_class_members: vec![],
         ignore_decorators: vec![],
         unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+        circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
         duplicates: DuplicatesConfig::default(),
         similar_code: fallow_config::SimilarCodeConfig::default(),
+        mutation: fallow_config::MutationConfig::default(),
         health: HealthConfig::default(),
         rules: RulesConfig {
             boundary_violation: Severity::Error,
@@ -998,7 +1036,9 @@ fn bulletproof_top_level_features_file_is_strict_without_barrel_false_positive()
         resolve: ResolveConfig::default(),
         sealed: false,
         include_entry_exports: false,
+        show_cascade: false,
         auto_imports: false,
+        fail_on_parse_error: false,
         cache: fallow_config::CacheConfig::default(),
     }
     .resolve(root, OutputFormat::Human, 4, true, true, None);
@@ -1249,5 +1289,282 @@ fn allow_type_only_admits_type_only_re_exports() {
     assert!(
         !from_paths.contains("src/ui/type_reexport.ts"),
         "type-only re-export must not fire under allowTypeOnly=[db]; got: {from_paths:?}"
+    );
+}
+
+fn zone(name: &str, patterns: &[&str]) -> BoundaryZone {
+    BoundaryZone {
+        name: name.to_string(),
+        patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+        auto_discover: vec![],
+        root: None,
+    }
+}
+
+fn deny_all(from: &str) -> BoundaryRule {
+    BoundaryRule {
+        from: from.to_string(),
+        allow: vec![],
+        allow_type_only: vec![],
+    }
+}
+
+/// Boundaries for the `boundary-unreachable` fixture: `tools/orphan-task.ts`
+/// is in the `tools` zone, but no entry point reaches it (issue #2937).
+fn unreachable_fixture_boundaries() -> BoundaryConfig {
+    BoundaryConfig {
+        zones: vec![
+            zone("app", &["src/app/**", "src/index.ts"]),
+            zone("secret", &["src/secret/**"]),
+            zone("tools", &["tools/**"]),
+        ],
+        rules: vec![deny_all("app"), deny_all("tools"), deny_all("secret")],
+        calls: BoundaryCallsConfig {
+            forbidden: vec![
+                forbid_call("app", "child_process.*"),
+                forbid_call("tools", "child_process.*"),
+            ],
+        },
+        coverage: BoundaryCoverageConfig {
+            require_all_files: true,
+            allow_unmatched: vec![],
+        },
+        ..BoundaryConfig::default()
+    }
+}
+
+fn normalized(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn boundary_checks_cover_files_that_no_entry_point_reaches() {
+    let root = fixture_path("boundary-unreachable");
+    let config =
+        create_boundary_config_with_entry(root, unreachable_fixture_boundaries(), "src/index.ts");
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+
+    let unused: Vec<String> = results
+        .unused_files
+        .iter()
+        .map(|f| normalized(&f.file.path))
+        .collect();
+    assert!(
+        unused.iter().any(|p| p.ends_with("tools/orphan-task.ts")),
+        "the orphan task must stay an unused file, got {unused:?}"
+    );
+
+    let imports: Vec<(String, String)> = results
+        .boundary_violations
+        .iter()
+        .map(|v| {
+            (
+                normalized(&v.violation.from_path),
+                normalized(&v.violation.to_path),
+            )
+        })
+        .collect();
+    assert!(
+        imports
+            .iter()
+            .any(|(from, to)| from.ends_with("tools/orphan-task.ts")
+                && to.ends_with("src/secret/store.ts")),
+        "the unreachable orphan task imports the secret zone, got {imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|(from, _)| from.ends_with("src/app/main.ts")),
+        "the reachable app file must still be reported, got {imports:?}"
+    );
+
+    let calls: Vec<String> = results
+        .boundary_call_violations
+        .iter()
+        .map(|v| normalized(&v.violation.path))
+        .collect();
+    assert!(
+        calls.iter().any(|p| p.ends_with("tools/orphan-task.ts")),
+        "the unreachable orphan task calls child_process, got {calls:?}"
+    );
+
+    let coverage: Vec<String> = results
+        .boundary_coverage_violations
+        .iter()
+        .map(|v| normalized(&v.violation.path))
+        .collect();
+    assert!(
+        coverage
+            .iter()
+            .any(|p| p.ends_with("misc/unzoned-orphan.ts")),
+        "requireAllFiles must report the unreachable unzoned file, got {coverage:?}"
+    );
+    assert!(
+        coverage
+            .iter()
+            .any(|p| p.ends_with("misc/unzoned-reach.ts")),
+        "requireAllFiles must still report the reachable unzoned file, got {coverage:?}"
+    );
+}
+
+/// Boundaries for the `boundary-reexport-chain` fixture (issue #2939). The
+/// `ui` zone may import `shared` and `kit`, `kit` may import only `shared`,
+/// and `shared` has no rule, so its barrels can forward `core` symbols.
+fn reexport_chain_boundaries(ui_allow_type_only: Vec<String>) -> BoundaryConfig {
+    BoundaryConfig {
+        zones: vec![
+            zone("ui", &["src/ui/**"]),
+            zone("shared", &["src/shared/**"]),
+            zone("kit", &["src/kit/**"]),
+            zone("core", &["src/core/**"]),
+        ],
+        rules: vec![
+            BoundaryRule {
+                from: "ui".to_string(),
+                allow: vec!["shared".to_string(), "kit".to_string()],
+                allow_type_only: ui_allow_type_only,
+            },
+            BoundaryRule {
+                from: "kit".to_string(),
+                allow: vec!["shared".to_string()],
+                allow_type_only: vec![],
+            },
+            deny_all("core"),
+        ],
+        ..BoundaryConfig::default()
+    }
+}
+
+fn relative_to(path: &std::path::Path, root: &std::path::Path) -> String {
+    normalized(path.strip_prefix(root).unwrap_or(path))
+}
+
+/// `(from_path, to_path)` pairs relative to the fixture root.
+fn reexport_chain_pairs(
+    ui_allow_type_only: Vec<String>,
+) -> std::collections::BTreeSet<(String, String)> {
+    let root = fixture_path("boundary-reexport-chain");
+    let config = create_boundary_config_with_entry(
+        root.clone(),
+        reexport_chain_boundaries(ui_allow_type_only),
+        "src/ui/App.ts",
+    );
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    results
+        .boundary_violations
+        .iter()
+        .map(|v| {
+            (
+                relative_to(&v.violation.from_path, &root),
+                relative_to(&v.violation.to_path, &root),
+            )
+        })
+        .collect()
+}
+
+fn pair_set(pairs: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String)> {
+    pairs
+        .iter()
+        .map(|(from, to)| ((*from).to_string(), (*to).to_string()))
+        .collect()
+}
+
+#[test]
+fn boundary_checks_follow_re_export_chains_to_the_origin_module() {
+    let pairs = reexport_chain_pairs(vec![]);
+
+    let expected = pair_set(&[
+        ("src/ui/control-direct.ts", "src/core/direct.ts"),
+        ("src/ui/via-named.ts", "src/core/named.ts"),
+        ("src/ui/via-alias.ts", "src/core/aliased.ts"),
+        ("src/ui/via-star.ts", "src/core/star.ts"),
+        ("src/ui/via-deep.ts", "src/core/deep.ts"),
+        ("src/ui/via-type.ts", "src/core/types.ts"),
+        ("src/ui/via-type-hop.ts", "src/core/types.ts"),
+        ("src/ui/via-namespace-reexport.ts", "src/core/ns.ts"),
+        ("src/ui/multi.ts", "src/core/aliased.ts"),
+        ("src/ui/multi.ts", "src/core/named.ts"),
+        ("src/ui/direct-and-barrel.ts", "src/core/named.ts"),
+        // The barrel hop itself is the violation, so its consumer
+        // `src/ui/via-kit.ts` is not reported a second time.
+        ("src/kit/index.ts", "src/core/kit-core.ts"),
+    ]);
+
+    assert_eq!(pairs, expected);
+}
+
+#[test]
+fn re_export_chains_keep_allow_type_only_semantics() {
+    let pairs = reexport_chain_pairs(vec!["core".to_string()]);
+
+    assert!(
+        !pairs.iter().any(|(from, _)| from == "src/ui/via-type.ts"),
+        "a type-only import through a barrel must use allowTypeOnly, got {pairs:?}"
+    );
+    assert!(
+        !pairs
+            .iter()
+            .any(|(from, _)| from == "src/ui/via-type-hop.ts"),
+        "a type-only re-export hop must use allowTypeOnly, got {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&(
+            "src/ui/via-named.ts".to_string(),
+            "src/core/named.ts".to_string()
+        )),
+        "a value import through a barrel must still fire, got {pairs:?}"
+    );
+}
+
+#[test]
+fn re_export_chain_violations_name_the_barrel_in_via_path() {
+    let root = fixture_path("boundary-reexport-chain");
+    let config = create_boundary_config_with_entry(
+        root.clone(),
+        reexport_chain_boundaries(vec![]),
+        "src/ui/App.ts",
+    );
+    let results = fallow_core::analyze(&config).expect("analysis should succeed");
+    let via_of = |from: &str, to: &str| -> Option<Option<String>> {
+        results
+            .boundary_violations
+            .iter()
+            .find(|v| {
+                relative_to(&v.violation.from_path, &root) == from
+                    && relative_to(&v.violation.to_path, &root) == to
+            })
+            .map(|v| {
+                v.violation
+                    .via_path
+                    .as_deref()
+                    .map(|via| relative_to(via, &root))
+            })
+    };
+
+    assert_eq!(
+        via_of("src/ui/via-deep.ts", "src/core/deep.ts"),
+        Some(Some("src/shared/index.ts".to_string())),
+        "via_path names the barrel that the importer imports directly"
+    );
+    assert_eq!(
+        via_of("src/ui/control-direct.ts", "src/core/direct.ts"),
+        Some(None),
+        "a direct import has no via_path"
+    );
+    assert_eq!(
+        via_of("src/ui/direct-and-barrel.ts", "src/core/named.ts"),
+        Some(None),
+        "a direct import of the origin wins over the barrel import"
+    );
+
+    let via_named = results
+        .boundary_violations
+        .iter()
+        .find(|v| relative_to(&v.violation.from_path, &root) == "src/ui/via-named.ts")
+        .expect("via-named.ts must produce a violation");
+    assert_eq!(via_named.violation.to_zone, "core");
+    assert_eq!(
+        via_named.violation.line, 1,
+        "the finding anchors on the import line"
     );
 }

@@ -2,8 +2,9 @@ use std::path::Path;
 
 use fallow_api::{
     EditorAnalysisResults as AnalysisResults, EditorDuplicationReport as DuplicationReport,
+    PackageBaselineStatus,
 };
-use fallow_types::issue_meta::{IssueKindMeta, diagnostic_issue_metas};
+use fallow_types::issue_meta::diagnostic_issue_metas;
 use ls_types::notification;
 use serde::{Deserialize, Serialize};
 
@@ -57,10 +58,15 @@ pub struct AnalysisCompleteParams {
     pub unprovided_injects: usize,
     pub unrendered_components: usize,
     pub unused_component_props: usize,
+    #[serde(default)]
+    pub absent_component_props: usize,
     pub unused_component_emits: usize,
     pub unused_component_inputs: usize,
     pub unused_component_outputs: usize,
     pub unused_svelte_events: usize,
+    pub unused_effect_layers: usize,
+    pub unused_tagged_errors: usize,
+    pub unproduced_catch_tags: usize,
     pub unused_server_actions: usize,
     pub unused_load_data_keys: usize,
     pub unresolved_imports: usize,
@@ -71,6 +77,7 @@ pub struct AnalysisCompleteParams {
     pub dev_dependencies_in_production: usize,
     pub circular_dependencies: usize,
     pub re_export_cycles: usize,
+    pub package_cycles: usize,
     pub boundary_violations: usize,
     pub stale_suppressions: usize,
     pub unused_catalog_entries: usize,
@@ -82,6 +89,8 @@ pub struct AnalysisCompleteParams {
     pub clone_groups: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_since_scope: Option<ChangedSinceScopeStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_baselines: Vec<PackageBaselineStatus>,
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +98,7 @@ pub struct AnalysisCompleteInput<'a> {
     results: &'a AnalysisResults,
     duplication: &'a DuplicationReport,
     changed_since_scope: Option<&'a ChangedSinceScopeStatus>,
+    package_baselines: &'a [PackageBaselineStatus],
 }
 
 impl<'a> AnalysisCompleteInput<'a> {
@@ -97,6 +107,7 @@ impl<'a> AnalysisCompleteInput<'a> {
             results,
             duplication,
             changed_since_scope: None,
+            package_baselines: &[],
         }
     }
 
@@ -107,6 +118,14 @@ impl<'a> AnalysisCompleteInput<'a> {
         self.changed_since_scope = changed_since_scope;
         self
     }
+
+    pub const fn with_package_baselines(
+        mut self,
+        package_baselines: &'a [PackageBaselineStatus],
+    ) -> Self {
+        self.package_baselines = package_baselines;
+        self
+    }
 }
 
 pub fn analysis_complete_params(input: AnalysisCompleteInput<'_>) -> AnalysisCompleteParams {
@@ -114,6 +133,7 @@ pub fn analysis_complete_params(input: AnalysisCompleteInput<'_>) -> AnalysisCom
         results,
         duplication,
         changed_since_scope,
+        package_baselines,
     } = input;
     let boundary_violations = results.boundary_violations.len()
         + results.boundary_coverage_violations.len()
@@ -133,10 +153,14 @@ pub fn analysis_complete_params(input: AnalysisCompleteInput<'_>) -> AnalysisCom
         unprovided_injects: results.unprovided_injects.len(),
         unrendered_components: results.unrendered_components.len(),
         unused_component_props: results.unused_component_props.len(),
+        absent_component_props: results.absent_component_props.len(),
         unused_component_emits: results.unused_component_emits.len(),
         unused_component_inputs: results.unused_component_inputs.len(),
         unused_component_outputs: results.unused_component_outputs.len(),
         unused_svelte_events: results.unused_svelte_events.len(),
+        unused_effect_layers: results.unused_effect_layers.len(),
+        unused_tagged_errors: results.unused_tagged_errors.len(),
+        unproduced_catch_tags: results.unproduced_catch_tags.len(),
         unused_server_actions: results.unused_server_actions.len(),
         unused_load_data_keys: results.unused_load_data_keys.len(),
         unresolved_imports: results.unresolved_imports.len(),
@@ -147,6 +171,7 @@ pub fn analysis_complete_params(input: AnalysisCompleteInput<'_>) -> AnalysisCom
         dev_dependencies_in_production: results.dev_dependencies_in_production.len(),
         circular_dependencies: results.circular_dependencies.len(),
         re_export_cycles: results.re_export_cycles.len(),
+        package_cycles: results.package_cycles.len(),
         boundary_violations,
         stale_suppressions: results.stale_suppressions.len(),
         unused_catalog_entries: results.unused_catalog_entries.len(),
@@ -157,6 +182,7 @@ pub fn analysis_complete_params(input: AnalysisCompleteInput<'_>) -> AnalysisCom
         duplication_percentage: duplication.stats.duplication_percentage,
         clone_groups: duplication.stats.clone_groups,
         changed_since_scope: changed_since_scope.cloned(),
+        package_baselines: package_baselines.to_vec(),
     }
 }
 
@@ -194,10 +220,6 @@ pub fn diagnostic_issue_types() -> Vec<IssueTypeInfo> {
             label: meta.label.to_string(),
         })
         .collect()
-}
-
-pub fn diagnostic_issue_type_metas() -> impl Iterator<Item = &'static IssueKindMeta> {
-    diagnostic_issue_metas()
 }
 
 pub fn config_load_error_detail(

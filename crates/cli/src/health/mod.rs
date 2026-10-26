@@ -9,6 +9,9 @@
 //! telemetry recording, exit-code gating, and human / machine rendering.
 
 pub mod coverage;
+pub mod mutation_report;
+pub mod optimization_target;
+mod runtime_static_signals;
 
 /// Health scoring helpers, re-exported from the engine for CLI consumers that
 /// still address them through `crate::health::scoring`.
@@ -25,7 +28,7 @@ use fallow_engine::health::{
     RuntimeCoverageSeamInput, execute_health_inner, validate_health_churn_file,
 };
 
-use crate::check::{get_changed_files, resolve_workspace_scope};
+use crate::check::resolve_workspace_scope;
 use crate::error::emit_error;
 use crate::report;
 use crate::report::OwnershipResolver;
@@ -96,6 +99,7 @@ fn build_health_group_resolver(
         opts.group_by,
         opts.root,
         config.codeowners.as_deref(),
+        &config.workspace_patterns,
         opts.output,
     )
 }
@@ -152,26 +156,36 @@ fn runtime_coverage_seam(
             codeowners_path: input.codeowners_path,
             quiet: input.quiet,
             output: input.output,
+            test_reach: input.test_reach,
         },
     )
 }
 
 /// Resolve the command-neutral scope inputs the engine needs: changed files,
 /// the diff index, workspace roots, and the grouping resolver.
+///
+/// `files` is the analyzed set, which sizes the scope an applied
+/// `--changed-since` leaves.
 fn build_health_scope_inputs<'a>(
     opts: &HealthOptions<'a>,
     config: &fallow_config::ResolvedConfig,
+    files: &[fallow_types::discover::DiscoveredFile],
 ) -> Result<HealthScopeInputs<'a, OwnershipResolver>, ExitCode> {
     let changed_files = opts
         .changed_since
-        .and_then(|git_ref| get_changed_files(opts.root, git_ref));
+        .and_then(|git_ref| crate::requests::resolve_changed_since(opts.root, git_ref));
+    crate::requests::measure_changed_since_scope(files);
     let diff_index = health_diff_index(opts);
-    let ws_roots = resolve_workspace_scope(
+    let mut ws_roots = resolve_workspace_scope(
         opts.root,
         opts.workspace,
         opts.changed_workspaces,
+        &config.workspace_patterns,
         opts.output,
     )?;
+    if let Some(scope) = opts.scope.as_ref() {
+        ws_roots.get_or_insert_with(Vec::new).push(scope.clone());
+    }
     let group_resolver = build_health_group_resolver(opts, config)?;
     Ok(HealthScopeInputs {
         changed_files,
@@ -193,29 +207,41 @@ fn health_err_to_exit(error: HealthError, output: OutputFormat) -> ExitCode {
 }
 
 /// Load config for a health run, validating coverage-root and churn-file inputs
-/// up front (loud exit 2 on a malformed input).
+/// and the baseline destination up front (loud exit 2 on a malformed input).
 pub fn load_health_config(
     opts: &HealthOptions<'_>,
 ) -> Result<(fallow_config::ResolvedConfig, f64), ExitCode> {
+    if let Some(code) = crate::baseline_gate::refuse_save_before_analysis(
+        opts.save_baseline,
+        fallow_engine::baseline::BaselineKind::Health,
+        opts.output,
+    ) {
+        return Err(code);
+    }
     fallow_engine::health::validate_coverage_root_absolute(opts.coverage_inputs.coverage_root)
         .map_err(|e| emit_error(&e, 2, opts.output))?;
     validate_health_churn_file(opts).map_err(|e| health_err_to_exit(e, opts.output))?;
     let t = Instant::now();
-    let config = crate::load_config_for_analysis(
+    let mut config = crate::load_config_for_analysis(
         opts.root,
         opts.config_path,
         crate::ConfigLoadOptions {
             output: opts.output,
             no_cache: opts.no_cache,
             threads: opts.threads,
-            production_override: opts
-                .production_override
-                .or_else(|| opts.production.then_some(true)),
+            production_override:
+                fallow_engine::project_config::ProductionFlags::single_analysis_override(
+                    opts.production,
+                    opts.production_override,
+                ),
             quiet: opts.quiet,
             allow_remote_extends: opts.allow_remote_extends,
         },
         fallow_config::ProductionAnalysis::Health,
     )?;
+    if opts.gates.fail_on_parse_error {
+        config.fail_on_parse_error = true;
+    }
     let config_ms = t.elapsed().as_secs_f64() * 1000.0;
     Ok((config, config_ms))
 }
@@ -223,12 +249,15 @@ pub fn load_health_config(
 /// Run health analysis using pre-parsed modules from the dead-code pipeline.
 ///
 /// Skips file discovery and parsing (saves ~1.9s on 21K-file projects).
+/// `pre_computed_duplication` is a duplication report over the same files and
+/// duplicates config; health then skips its own duplicate detection.
 pub fn execute_health_with_shared_parse(
     opts: &HealthOptions<'_>,
     shared: HealthSharedParseData,
+    pre_computed_duplication: Option<fallow_engine::duplicates::DuplicationReport>,
 ) -> Result<HealthResult, ExitCode> {
     let (config, config_ms) = load_health_config(opts)?;
-    let scope_inputs = build_health_scope_inputs(opts, &config)?;
+    let scope_inputs = build_health_scope_inputs(opts, &config, &shared.files)?;
     let workspace_diagnostics = fallow_config::workspace_diagnostics_for(&config.root);
     let workspaces = shared.workspaces;
     let seams = health_seams();
@@ -246,7 +275,7 @@ pub fn execute_health_with_shared_parse(
             pre_computed_analysis: shared.analysis_output,
             dead_code_results: shared.dead_code_results,
             styling_artifacts: None,
-            pre_computed_duplication: None,
+            pre_computed_duplication,
             workspaces,
             workspace_diagnostics,
         },
@@ -302,7 +331,7 @@ fn execute_health_with_config_and_seams(
     let parse_ms = parts.parse_ms;
     let parse_cpu_ms = parts.parse_cpu_ms;
 
-    let scope_inputs = build_health_scope_inputs(opts, &config)?;
+    let scope_inputs = build_health_scope_inputs(opts, &config, &files)?;
     execute_health_inner(
         opts,
         HealthPipelineInputs {
@@ -349,6 +378,7 @@ pub fn benchmark_execute_health_with_response(
                 codeowners_path: input.codeowners_path,
                 quiet: input.quiet,
                 output: input.output,
+                test_reach: input.test_reach,
             },
             |request, _quiet, output| {
                 let (response, len) =
@@ -370,8 +400,14 @@ pub fn run_health(
     opts: &HealthOptions<'_>,
     json_style: crate::json_style::JsonStyle,
     type_aware: &TypeAwareHealthOptions<'_>,
+    mutation_report: Option<&std::path::Path>,
 ) -> ExitCode {
-    let mut completeness_failed = false;
+    let mutation_evidence = match mutation_report.map(mutation_report::read_mutation_evidence) {
+        Some(Err(error)) => {
+            return crate::error::emit_programmatic_error(&error, opts.output, json_style);
+        }
+        evidence => evidence.and_then(Result::ok),
+    };
     let (config, config_ms) = match load_health_config(opts) {
         Ok(config) => config,
         Err(code) => return code,
@@ -381,6 +417,7 @@ pub fn run_health(
         Err(message) => return emit_error(&message, 2, opts.output),
     };
     let requested = type_aware.requested || (type_aware.unfiltered && resolved_type_aware.enabled);
+    let mut degraded_meta = None;
     let semantic = if requested {
         let enabled = resolved_type_aware.enabled;
         if !enabled {
@@ -392,19 +429,25 @@ pub fn run_health(
         }
         let projects = resolved_type_aware.projects;
         let require = resolved_type_aware.require;
-        let outcome = match fallow_api::analyze_type_coupling(opts.root, &projects, &[]) {
-            Ok(outcome) => outcome,
+        match fallow_api::analyze_type_coupling(opts.root, &projects, &[]) {
+            Ok(outcome) => Some(outcome),
             Err(error) => {
-                return emit_error(
-                    &format!("Type-aware coupling failed: {error}"),
-                    2,
-                    opts.output,
-                );
+                match crate::type_aware_degrade::degrade_or_fail(
+                    &crate::type_aware_degrade::DegradeContext {
+                        root: opts.root,
+                        error: &error.to_string(),
+                        failure_label: "Type-aware coupling failed",
+                        require,
+                        quiet: opts.quiet,
+                        output: opts.output,
+                    },
+                ) {
+                    Ok(meta) => degraded_meta = Some(meta),
+                    Err(code) => return code,
+                }
+                None
             }
-        };
-        completeness_failed = require == fallow_config::TypeAwareRequire::Complete
-            && outcome.report.status != fallow_types::semantic::SemanticCompleteness::Complete;
-        Some(outcome)
+        }
     } else {
         None
     };
@@ -419,21 +462,39 @@ pub fn run_health(
         Ok(result) => result,
         Err(code) => return code,
     };
-    let required_completeness = result.config.type_aware.require.into();
-    result.type_aware_meta = semantic.map(|outcome| {
-        let mut meta = outcome.type_aware.meta;
-        meta.required_completeness = Some(required_completeness);
-        meta
-    });
+    // The policy this run resolved from the flag, the environment or the
+    // config. The config alone misses `--type-aware-require`.
+    let required_completeness = resolved_type_aware.require.into();
+    result.type_aware_meta = semantic
+        .map(|outcome| {
+            let mut meta = outcome.type_aware.meta;
+            meta.required_completeness = Some(required_completeness);
+            meta
+        })
+        .or(degraded_meta);
+    if let Some(evidence) = mutation_evidence.as_ref() {
+        mutation_report::attach_to_result(&mut result, evidence);
+    }
     if let Some(ref timings) = result.timings {
         report::print_health_performance(timings, opts.output, json_style);
     }
-    let code = print_health_result(
+    report_loaded_baseline(&mut result, opts.baseline);
+    if let Some(grouping) = result.grouping.as_ref() {
+        crate::requests::record_group_filter(grouping, opts.quiet);
+    }
+    // The standalone run owns the parse-error gate. The config already holds
+    // the flag, and it also holds the `failOnParseError` key.
+    let gates = fallow_engine::health::HealthGateOptions {
+        fail_on_parse_error: result.config.fail_on_parse_error,
+        ..opts.gates
+    };
+    print_health_result(
         &result,
         HealthPrintOptions {
             quiet: opts.quiet,
             explain: opts.explain,
-            gates: opts.gates,
+            gates,
+            baseline_path: opts.baseline,
             summary: opts.summary,
             summary_heading: true,
             show_explain_tip: true,
@@ -441,13 +502,9 @@ pub fn run_health(
             skip_score_and_trend: false,
             css_requested: opts.css,
             json_style,
+            exit_reason: true,
         },
-    );
-    if code == ExitCode::SUCCESS && completeness_failed {
-        ExitCode::from(1)
-    } else {
-        code
-    }
+    )
 }
 
 pub struct ResolvedTypeAwareHealthOptions {
@@ -520,8 +577,9 @@ pub type HealthResult =
 ///
 /// Exit-code gating (when `report_only` is `false`): the score gate
 /// (`--min-score`), the findings gate (`--min-severity`, or any finding when
-/// no gate flag is set), the runtime-coverage gate, and the coverage-gap gate
-/// are OR-combined. `report_only` short-circuits all of them to
+/// no gate flag is set), the runtime-coverage gate, the opt-in stale-baseline
+/// gate (`--fail-on-stale-baseline`) and the coverage-gap gate are
+/// OR-combined. `report_only` short-circuits all of them to
 /// `ExitCode::SUCCESS` after rendering. Combined and audit callers pass
 /// `report_only: false` (they own their own gate semantics).
 ///
@@ -531,10 +589,14 @@ pub type HealthResult =
 /// cannot evaluate, so a direct API caller that requests a score gate without
 /// computing the score would get a permissive `ExitCode::SUCCESS`.
 #[derive(Clone, Copy)]
-pub struct HealthPrintOptions {
+pub struct HealthPrintOptions<'a> {
     pub quiet: bool,
     pub explain: bool,
     pub gates: HealthGateOptions,
+    /// Loaded `--baseline` path, so the stale-baseline gate can name the file
+    /// to re-save. `None` when no baseline was loaded, which makes the gate
+    /// inert.
+    pub baseline_path: Option<&'a std::path::Path>,
     pub summary: bool,
     pub summary_heading: bool,
     pub show_explain_tip: bool,
@@ -545,9 +607,13 @@ pub struct HealthPrintOptions {
     /// silently omitted. Defaults `false` for callers that do not request CSS.
     pub css_requested: bool,
     pub json_style: crate::json_style::JsonStyle,
+    /// Print the stderr line that names the gates behind a non-zero exit. False
+    /// when the caller owns the exit code, as `audit` does, or prints one line
+    /// for all its sections, as the bare run does.
+    pub exit_reason: bool,
 }
 
-pub fn print_health_result(result: &HealthResult, options: HealthPrintOptions) -> ExitCode {
+pub fn print_health_result(result: &HealthResult, options: HealthPrintOptions<'_>) -> ExitCode {
     let ctx = health_report_context(result, options);
     let report_code = report::print_health_report(
         &result.report,
@@ -560,26 +626,47 @@ pub fn print_health_result(result: &HealthResult, options: HealthPrintOptions) -
         return report_code;
     }
 
-    if options.gates.report_only {
-        return ExitCode::SUCCESS;
+    // `--report-only` keeps every gate advisory except type-aware completeness,
+    // which the envelope always states as enforced.
+    let type_aware_code = crate::exit_codes::gate_failed_exit_code(
+        fallow_output::GateName::TypeAwareRequire,
+        type_aware_completeness_incomplete(result),
+    );
+    let code = if options.gates.report_only {
+        note_stale_baseline_gate_stood_down(result, options);
+        type_aware_code
+    } else {
+        health_exit_code(result, options).max(type_aware_code)
+    };
+    if code == 0 {
+        if !options.gates.report_only {
+            maybe_print_score_gate_note(result, options);
+        }
+    } else if options.exit_reason {
+        crate::gates::print_exit_reason(&crate::gates::ExitReason {
+            gates: health_gate_outcomes(result, options).as_ref(),
+            code,
+            fail_on_issues: options.gates.fail_on_issues,
+            quiet: options.quiet,
+            output: result.config.output,
+            own_lines: &[],
+        });
     }
-
-    if health_exit_gate_failed(result, options) {
-        return ExitCode::from(1);
-    }
-    if result.should_fail_on_coverage_gaps && result.coverage_gaps_has_findings {
-        return ExitCode::from(1);
-    }
-    maybe_print_score_gate_note(result, options);
-
-    ExitCode::SUCCESS
+    crate::exit_codes::run_exit_code([code])
 }
 
-fn health_report_context(
-    result: &HealthResult,
-    options: HealthPrintOptions,
-) -> report::ReportContext<'_> {
+/// Whether the type-aware completeness gate of this health result fails.
+/// The health print and the gate of the bare run both read this rule.
+pub fn type_aware_completeness_incomplete(result: &HealthResult) -> bool {
+    crate::report::ci::required_type_aware_incomplete(result.type_aware_meta.as_ref())
+}
+
+fn health_report_context<'a>(
+    result: &'a HealthResult,
+    options: HealthPrintOptions<'a>,
+) -> report::ReportContext<'a> {
     report::ReportContext {
+        package_baselines: &[],
         root: &result.config.root,
         rules: &result.config.rules,
         workspace_diagnostics: &result.workspace_diagnostics,
@@ -594,20 +681,237 @@ fn health_report_context(
         summary_heading: options.summary_heading,
         show_explain_tip: options.show_explain_tip,
         baseline_matched: None,
+        baseline_staleness: None,
+        finding_id_query: None,
+        gate_outcomes: health_gate_outcomes(result, options),
         config_fixable: false,
+        failed_parse_files: 0,
         skip_score_and_trend: options.skip_score_and_trend,
         css_requested: options.css_requested,
         json_style: options.json_style,
+        include_fragments: true,
+        architecture_layout: report::ArchitectureLayout::Embedded,
     }
 }
 
-fn health_exit_gate_failed(result: &HealthResult, options: HealthPrintOptions) -> bool {
-    score_gate_failed(result, options)
-        || findings_gate_failed(result, options)
-        || has_failing_runtime_coverage(result)
+/// The gates a health run armed, for the envelope's `gate_outcomes`. The
+/// verdicts read the same values as the exit path.
+fn health_gate_outcomes(
+    result: &HealthResult,
+    options: HealthPrintOptions<'_>,
+) -> Option<fallow_output::GateOutcomes> {
+    crate::gates::health_gate_outcomes(&crate::gates::HealthGateInputs {
+        report_only: options.gates.report_only,
+        min_score: options.gates.min_score.map(|threshold| {
+            (
+                threshold,
+                result.report.health_score.as_ref().map(|score| score.score),
+            )
+        }),
+        min_severity: options.gates.min_severity.map(|floor| {
+            (
+                floor,
+                blocking_findings(result)
+                    .filter(|finding| finding.severity >= floor)
+                    .count(),
+            )
+        }),
+        coverage_gaps: result
+            .should_fail_on_coverage_gaps
+            .then_some(result.coverage_gaps_has_findings),
+        runtime_coverage: result
+            .report
+            .runtime_coverage
+            .is_some()
+            .then(|| has_failing_runtime_coverage(result)),
+        baseline_staleness: result.report.summary.baseline_staleness.as_ref(),
+        fail_on_stale_baseline: options.gates.fail_on_stale_baseline,
+        blocking_findings: blocking_findings(result).count(),
+        type_aware_meta: result.type_aware_meta.as_ref(),
+        parse_error: health_parse_error_outcome(result, options),
+    })
 }
 
-fn score_gate_failed(result: &HealthResult, options: HealthPrintOptions) -> bool {
+/// The `parse-error` gate of a health run, `None` unless this print owns the
+/// gate and the gate is armed. Built with `enforced: true`; the gate builder
+/// clamps it under `--report-only`.
+fn health_parse_error_outcome(
+    result: &HealthResult,
+    options: HealthPrintOptions<'_>,
+) -> Option<fallow_output::GateOutcome> {
+    crate::gates::parse_error_outcome(
+        options.gates.fail_on_parse_error,
+        true,
+        &crate::gates::parse_degraded_files(&result.config.root, &result.workspace_diagnostics),
+    )
+}
+
+/// The exit code of every health exit gate, with each gate evaluated before
+/// the codes are combined so that none of them can swallow another's stderr
+/// line.
+///
+/// The baseline gate is why this is not a short-circuiting chain: the score and
+/// findings gates have their condition in the human report and in the
+/// exit-reason line, a stale baseline has it nowhere, so a run that already
+/// fails the findings gate would exit 1 with nothing about the baseline the
+/// user explicitly gated on.
+fn health_exit_code(result: &HealthResult, options: HealthPrintOptions<'_>) -> u8 {
+    use crate::exit_codes::gate_failed_exit_code;
+    use fallow_output::GateName;
+
+    let findings_gate = if options.gates.min_severity.is_some() {
+        GateName::HealthMinSeverity
+    } else {
+        GateName::HealthFindings
+    };
+    let parse_error = health_parse_error_outcome(result, options);
+    let parse_error_failed = parse_error
+        .as_ref()
+        .is_some_and(fallow_output::GateOutcome::fails_run);
+    if let Some(outcome) = parse_error.as_ref().filter(|_| parse_error_failed) {
+        crate::gates::print_parse_error_gate_failure(&outcome.files);
+    }
+    [
+        gate_failed_exit_code(GateName::HealthMinScore, score_gate_failed(result, options)),
+        gate_failed_exit_code(findings_gate, findings_gate_failed(result, options)),
+        gate_failed_exit_code(
+            GateName::HealthRuntimeCoverage,
+            has_failing_runtime_coverage(result),
+        ),
+        gate_failed_exit_code(
+            GateName::StaleBaseline,
+            stale_baseline_gate_failed(result, options),
+        ),
+        gate_failed_exit_code(
+            GateName::HealthCoverageGaps,
+            result.should_fail_on_coverage_gaps && result.coverage_gaps_has_findings,
+        ),
+        gate_failed_exit_code(GateName::ParseError, parse_error_failed),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+}
+
+/// Say what this run made of the loaded baseline, and record it for the
+/// `recheck-baseline` next step.
+///
+/// Both happen here rather than at the engine's load site, which cannot reach
+/// CLI runtime state or print a CLI note, and only for the standalone command:
+/// `audit` and the combined run build their next steps from their own builders
+/// and would otherwise offer a `health` path on an envelope that is not
+/// health's.
+/// The note also records the writer in `baseline_staleness.saved_by`, which
+/// the gate line reads, so the note, the gate line and the envelope agree.
+fn report_loaded_baseline(result: &mut HealthResult, baseline_path: Option<&std::path::Path>) {
+    let Some(path) = baseline_path else {
+        return;
+    };
+    note_unrecognised_health_baseline(result, baseline_path, "--baseline");
+    let Some(staleness) = result.report.summary.baseline_staleness.as_ref() else {
+        return;
+    };
+    crate::output_runtime::set_loaded_baseline(crate::output_runtime::LoadedBaselineRecheck {
+        command: "health",
+        path: path.display().to_string(),
+        baseline_entries: staleness.baseline_entries,
+        scope_reasons: staleness.scope_reasons,
+    });
+}
+
+/// Say that the loaded baseline is not a health baseline.
+///
+/// Split from [`report_loaded_baseline`] because `fallow audit` needs the note
+/// and must not get the `recheck-baseline` record beside it: the audit envelope
+/// is not health's, so a `fallow health` next step on it would point at the
+/// wrong report. `dupes` and `dead-code` reach their notes through their own
+/// load sites, which audit shares.
+///
+/// `flag` is the argument that carried the path: `--health-baseline` on an audit
+/// and `--baseline` on the standalone command.
+///
+/// The engine classifies the file as a health baseline only, and the bytes are
+/// gone when the CLI prints. So this function reads the file one time, finds
+/// the known command that saved it, and writes that command into
+/// `baseline_staleness.saved_by`. The note, the gate line and the envelope all
+/// read that one value.
+pub fn note_unrecognised_health_baseline(
+    result: &mut HealthResult,
+    baseline_path: Option<&std::path::Path>,
+    flag: &str,
+) {
+    let Some(path) = baseline_path else {
+        return;
+    };
+    let Some(staleness) = result.report.summary.baseline_staleness.as_mut() else {
+        return;
+    };
+    if !staleness.unrecognised_format {
+        return;
+    }
+    let saved_by = saved_by_another_command(path);
+    staleness.saved_by = saved_by.map(fallow_engine::baseline::BaselineKind::as_str);
+    crate::baseline_gate::note_unrecognised_baseline(
+        Some(path),
+        true,
+        saved_by,
+        fallow_engine::baseline::BaselineKind::Health,
+        flag,
+    );
+}
+
+/// The known command that saved a baseline file, when it is not `health`.
+/// `None` for a file that names no known writer, which includes every baseline
+/// saved before `kind` existed, and for a file that can no longer be read.
+fn saved_by_another_command(
+    path: &std::path::Path,
+) -> Option<fallow_engine::baseline::BaselineKind> {
+    let content = std::fs::read_to_string(path).ok()?;
+    fallow_engine::baseline::classify_baseline_file(
+        &content,
+        fallow_engine::baseline::BaselineKind::Health,
+    )
+    .saved_by()
+}
+
+/// Say that `--report-only` suppressed the gate, so a job that passes both
+/// flags learns its baseline was never judged instead of going green forever.
+///
+/// `--report-only` is an explicit request never to fail the run, so the gate
+/// obeys it rather than overriding it; it just does not obey it in silence.
+fn note_stale_baseline_gate_stood_down(result: &HealthResult, options: HealthPrintOptions<'_>) {
+    let Some(staleness) = result.report.summary.baseline_staleness.as_ref() else {
+        return;
+    };
+    // A baseline with no entries gives the gate nothing to judge, so no gate
+    // stands down. A file this command cannot read as its own carries the same
+    // zero, and there the gate rule holds. `--report-only` then suppresses a real
+    // verdict, and it must say so.
+    if staleness.baseline_entries == 0 && !staleness.unrecognised_format {
+        return;
+    }
+    crate::baseline_gate::note_stood_down(
+        options.baseline_path,
+        options.gates.fail_on_stale_baseline,
+        "--report-only never fails a run",
+    );
+}
+
+/// The opt-in `--fail-on-stale-baseline` gate. Reads the staleness the engine
+/// already put in the report, so no extra plumbing crosses the engine boundary.
+fn stale_baseline_gate_failed(result: &HealthResult, options: HealthPrintOptions<'_>) -> bool {
+    let Some(staleness) = result.report.summary.baseline_staleness.as_ref() else {
+        return false;
+    };
+    crate::baseline_gate::gate_failed_from_envelope(
+        staleness,
+        options.baseline_path,
+        options.gates.fail_on_stale_baseline,
+        fallow_engine::baseline::BaselineKind::Health,
+    )
+}
+
+fn score_gate_failed(result: &HealthResult, options: HealthPrintOptions<'_>) -> bool {
     let Some(threshold) = options.gates.min_score else {
         return false;
     };
@@ -618,7 +922,9 @@ fn score_gate_failed(result: &HealthResult, options: HealthPrintOptions) -> bool
         return false;
     }
 
-    if !options.quiet {
+    // The exit-reason line states this gate under `--quiet` and in the machine
+    // formats, so this line is for the human report only.
+    if !options.quiet && matches!(result.config.output, fallow_config::OutputFormat::Human) {
         eprintln!(
             "Health score {:.1} ({}) is below minimum threshold {:.0}",
             hs.score, hs.grade, threshold
@@ -627,14 +933,26 @@ fn score_gate_failed(result: &HealthResult, options: HealthPrintOptions) -> bool
     true
 }
 
-fn findings_gate_failed(result: &HealthResult, options: HealthPrintOptions) -> bool {
+fn findings_gate_failed(result: &HealthResult, options: HealthPrintOptions<'_>) -> bool {
     if let Some(min_sev) = options.gates.min_severity {
-        result.report.findings.iter().any(|f| f.severity >= min_sev)
+        blocking_findings(result).any(|f| f.severity >= min_sev)
     } else if options.gates.min_score.is_none() {
-        !result.report.findings.is_empty()
+        blocking_findings(result).next().is_some()
     } else {
         false
     }
+}
+
+/// The findings whose `complexity-*` rule is `error`.
+///
+/// The rule applies first. `--min-severity` then filters these findings by
+/// band, so a `warn` finding never fails the run, whatever its band.
+fn blocking_findings(result: &HealthResult) -> impl Iterator<Item = &fallow_output::HealthFinding> {
+    result
+        .report
+        .findings
+        .iter()
+        .filter(|finding| finding.blocks())
 }
 
 fn has_failing_runtime_coverage(result: &HealthResult) -> bool {
@@ -654,7 +972,7 @@ fn is_failing_runtime_coverage(finding: &fallow_output::RuntimeCoverageFinding) 
     )
 }
 
-fn maybe_print_score_gate_note(result: &HealthResult, options: HealthPrintOptions) {
+fn maybe_print_score_gate_note(result: &HealthResult, options: HealthPrintOptions<'_>) {
     if options.gates.min_score.is_none()
         || options.gates.min_severity.is_some()
         || options.quiet
@@ -694,6 +1012,7 @@ mod tests {
                 | ExceededThreshold::All => 25,
                 _ => 8,
             },
+            standard_cyclomatic: None,
             cognitive: match exceeded {
                 ExceededThreshold::Cognitive
                 | ExceededThreshold::Both
@@ -708,8 +1027,10 @@ mod tests {
             react_prop_count: 0,
             react_hook_profile: None,
             exceeded,
+            effective_severity: None,
             severity: FindingSeverity::Moderate,
             crap: exceeded.includes_crap().then_some(30.0),
+            mutation: None,
             coverage_pct: None,
             coverage_tier: None,
             coverage_source: None,
@@ -770,6 +1091,7 @@ mod tests {
         fallow_output::RuntimeCoverageEvidence {
             static_status: static_status.to_owned(),
             test_coverage: test_coverage.to_owned(),
+            test_only_reference: None,
             v8_tracking: v8_tracking.to_owned(),
             untracked_reason: None,
             observation_days: 7,
@@ -804,6 +1126,7 @@ mod tests {
         score: Option<fallow_output::HealthScore>,
     ) -> HealthResult {
         HealthResult {
+            branching_by_file: fallow_engine::health::BranchingByFile::default(),
             report: fallow_output::HealthReport {
                 findings,
                 health_score: score,
@@ -818,6 +1141,7 @@ mod tests {
             type_aware_meta: None,
             coverage_gaps_has_findings: false,
             should_fail_on_coverage_gaps: false,
+            changed_files_analyzed: None,
         }
     }
 
@@ -847,7 +1171,11 @@ mod tests {
                     min_score,
                     min_severity,
                     report_only,
+                    fail_on_stale_baseline: false,
+                    fail_on_parse_error: false,
+                    fail_on_issues: false,
                 },
+                baseline_path: None,
                 summary: false,
                 summary_heading: true,
                 show_explain_tip: true,
@@ -855,6 +1183,7 @@ mod tests {
                 skip_score_and_trend: false,
                 css_requested: false,
                 json_style: crate::json_style::JsonStyle::Compact,
+                exit_reason: true,
             },
         )
     }
@@ -966,6 +1295,7 @@ mod tests {
 
     fn fx_low_traffic_runtime_result() -> HealthResult {
         HealthResult {
+            branching_by_file: fallow_engine::health::BranchingByFile::default(),
             report: fallow_output::HealthReport {
                 runtime_coverage: Some(fallow_output::RuntimeCoverageReport {
                     schema_version: fallow_output::RuntimeCoverageSchemaVersion::V1,
@@ -1007,6 +1337,7 @@ mod tests {
             type_aware_meta: None,
             coverage_gaps_has_findings: false,
             should_fail_on_coverage_gaps: false,
+            changed_files_analyzed: None,
         }
     }
 
@@ -1021,6 +1352,7 @@ mod tests {
                     quiet: true,
                     explain: false,
                     gates: HealthGateOptions::default(),
+                    baseline_path: None,
                     summary: false,
                     summary_heading: true,
                     show_explain_tip: true,
@@ -1028,9 +1360,95 @@ mod tests {
                     skip_score_and_trend: false,
                     css_requested: false,
                     json_style: crate::json_style::JsonStyle::Compact,
+                    exit_reason: true,
                 },
             ),
             ExitCode::from(1),
+        );
+    }
+
+    /// A type-aware metadata block that asks for the `complete` policy and
+    /// holds a partial query, so the completeness gate fails.
+    fn incomplete_required_type_aware_meta() -> fallow_types::envelope::TypeAwareMeta {
+        fallow_types::envelope::TypeAwareMeta {
+            required_completeness: Some(
+                fallow_types::semantic::SemanticCompletenessRequirement::Complete,
+            ),
+            queries: vec![fallow_types::semantic::SemanticQuerySummary {
+                query_id: 0,
+                capability: fallow_types::semantic::SemanticCapability::TypeCoupling,
+                assertion: "type coupling".to_string(),
+                status: fallow_types::semantic::SemanticCompleteness::Partial,
+                reason_code: None,
+                total_evidence_count: 0,
+                truncated: false,
+                omissions: Vec::new(),
+                actions: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The type-aware completeness gate is part of the health exit path, so
+    /// the exit-reason line names it when it is the only failed gate. It also
+    /// fails a `--report-only` run, which keeps every other gate advisory.
+    #[test]
+    fn a_failed_type_aware_completeness_gate_fails_the_health_print() {
+        let mut result = fx_gate_result(vec![], Some(fx_health_score(100.0, "A")));
+        result.type_aware_meta = Some(incomplete_required_type_aware_meta());
+        assert_eq!(gate_exit(&result, None, None, false), ExitCode::from(1));
+        assert_eq!(gate_exit(&result, None, None, true), ExitCode::from(1));
+
+        let options = HealthPrintOptions {
+            quiet: true,
+            explain: false,
+            gates: HealthGateOptions::default(),
+            baseline_path: None,
+            summary: false,
+            summary_heading: true,
+            show_explain_tip: true,
+            type_aware_scope: None,
+            skip_score_and_trend: false,
+            css_requested: false,
+            json_style: crate::json_style::JsonStyle::Compact,
+            exit_reason: true,
+        };
+        let line = crate::report::gate_outcome_text::exit_reason_line(
+            health_gate_outcomes(&result, options).as_ref(),
+            1,
+            false,
+            &[],
+        );
+        assert_eq!(
+            line.as_deref(),
+            Some("Exit code 1: gate type-aware-require failed.")
+        );
+    }
+
+    #[test]
+    fn the_envelope_states_a_failed_type_aware_completeness_gate() {
+        let mut result = fx_gate_result(vec![], Some(fx_health_score(100.0, "A")));
+        result.type_aware_meta = Some(incomplete_required_type_aware_meta());
+        let options = HealthPrintOptions {
+            quiet: true,
+            explain: false,
+            gates: HealthGateOptions::default(),
+            baseline_path: None,
+            summary: false,
+            summary_heading: true,
+            show_explain_tip: true,
+            type_aware_scope: None,
+            skip_score_and_trend: false,
+            css_requested: false,
+            json_style: crate::json_style::JsonStyle::Compact,
+            exit_reason: true,
+        };
+        let gates = serde_json::to_value(health_gate_outcomes(&result, options))
+            .expect("gate outcomes serialize");
+        assert_eq!(
+            gates["type-aware-require"],
+            serde_json::json!({ "status": "fail", "enforced": true }),
+            "the run exits 1 on this gate, so the envelope must state it: {gates}"
         );
     }
 }

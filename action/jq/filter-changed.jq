@@ -1,3 +1,6 @@
+# This file serves every fallow version: it scopes the input for the native
+# renderer and for the legacy renderers. Keep it in step with new issue kinds.
+
 # Filter fallow results to only include issues in changed files.
 # Usage: jq --argjson changed '["src/a.ts","src/b.ts"]' -f filter-changed.jq results.json
 #
@@ -11,10 +14,20 @@ def in_changed: . as $path | $changed | any(. == $path);
 # type_only_dependencies, test_only_dependencies, dev_dependencies_in_production) are intentionally NOT filtered: they are
 # project-wide concerns not attributable to individual changed files. They are still counted in total_issues.
 def filter_check:
+  (if .prop_drilling_chains then
+    .prop_drilling_chains |= map(select(
+      if .effective_severity == "error" then
+        ((.hops // [] | length) == 0) or (.hops | any(.file | in_changed))
+      else
+        .hops[0].file | in_changed
+      end
+    ))
+  else . end) |
   (if .unused_files         then .unused_files         |= map(select(.path | in_changed))      else . end) |
   (if .unused_exports       then .unused_exports       |= map(select(.path | in_changed))      else . end) |
   (if .unused_types         then .unused_types         |= map(select(.path | in_changed))      else . end) |
   (if .private_type_leaks   then .private_type_leaks   |= map(select(.path | in_changed))      else . end) |
+  (if .deprecated_exports_in_use then .deprecated_exports_in_use |= map(select(.path | in_changed)) else . end) |
   (if .unused_enum_members  then .unused_enum_members  |= map(select(.path | in_changed))      else . end) |
   (if .unused_class_members then .unused_class_members |= map(select(.path | in_changed))      else . end) |
   (if .unused_store_members then .unused_store_members |= map(select(.path | in_changed))      else . end) |
@@ -30,6 +43,9 @@ def filter_check:
   else . end) |
   (if .re_export_cycles then
     .re_export_cycles |= map(select(.files | any(in_changed)))
+  else . end) |
+  (if .package_cycles then
+    .package_cycles |= map(select(.edges | any(.path | in_changed)))
   else . end) |
   (if .boundary_violations then
     .boundary_violations |= map(select(.from_path | in_changed))
@@ -82,6 +98,9 @@ def filter_check:
   (if .unused_component_props then
     .unused_component_props |= map(select(.path | in_changed))
   else . end) |
+  (if .absent_component_props then
+    .absent_component_props |= map(select(.path | in_changed))
+  else . end) |
   (if .unused_component_emits then
     .unused_component_emits |= map(select(.path | in_changed))
   else . end) |
@@ -93,6 +112,15 @@ def filter_check:
   else . end) |
   (if .unused_svelte_events then
     .unused_svelte_events |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_effect_layers then
+    .unused_effect_layers |= map(select(.path | in_changed))
+  else . end) |
+  (if .unused_tagged_errors then
+    .unused_tagged_errors |= map(select(.path | in_changed))
+  else . end) |
+  (if .unproduced_catch_tags then
+    .unproduced_catch_tags |= map(select(.path | in_changed))
   else . end) |
   (if .unprovided_injects then
     .unprovided_injects |= map(select(.path | in_changed))
@@ -107,6 +135,7 @@ def filter_check:
       (.unused_exports // [] | length) +
       (.unused_types // [] | length) +
       (.private_type_leaks // [] | length) +
+      (.deprecated_exports_in_use // [] | length) +
       (.unused_dependencies // [] | length) +
       (.unused_dev_dependencies // [] | length) +
       (.unused_optional_dependencies // [] | length) +
@@ -118,6 +147,7 @@ def filter_check:
       (.duplicate_exports // [] | length) +
       (.circular_dependencies // [] | length) +
       (.re_export_cycles // [] | length) +
+      (.package_cycles // [] | length) +
       (.boundary_violations // [] | length) +
       (.boundary_coverage_violations // [] | length) +
       (.boundary_call_violations // [] | length) +
@@ -139,12 +169,17 @@ def filter_check:
       (.unused_server_actions // [] | length) +
       (.unrendered_components // [] | length) +
       (.unused_component_props // [] | length) +
+      (.absent_component_props // [] | length) +
       (.unused_component_emits // [] | length) +
       (.unused_component_inputs // [] | length) +
       (.unused_component_outputs // [] | length) +
       (.unused_svelte_events // [] | length) +
+      (.unused_effect_layers // [] | length) +
+      (.unused_tagged_errors // [] | length) +
+      (.unproduced_catch_tags // [] | length) +
       (.unprovided_injects // [] | length) +
-      (.unused_load_data_keys // [] | length)
+      (.unused_load_data_keys // [] | length) +
+      (.prop_drilling_chains // [] | map(select(.effective_severity == "error")) | length)
     )
   else . end);
 
@@ -177,6 +212,12 @@ def filter_health:
   else . end) |
   (if .hotspots then
     .hotspots |= map(select(.path | in_changed))
+  else . end) |
+  # Keep a hidden coupling pair when either file changed. The partner file
+  # outside the diff is the point of the pair.
+  (if .change_coupling.pairs then
+    .change_coupling.pairs |= map(select((.path_a | in_changed) or (.path_b | in_changed))) |
+    .change_coupling.total_pairs = (.change_coupling.pairs | length)
   else . end) |
   (if .targets then
     .targets |= map(select(.path | in_changed))

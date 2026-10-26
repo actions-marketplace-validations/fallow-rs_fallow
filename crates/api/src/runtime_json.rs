@@ -7,17 +7,18 @@
 use crate::{
     ProgrammaticError,
     runtime::{
-        AuditProgrammaticOutput, BoundaryViolationsProgrammaticOutput,
-        CircularDependenciesProgrammaticOutput, CombinedProgrammaticOutput,
-        DeadCodeProgrammaticOutput, DecisionSurfaceProgrammaticOutput,
+        ArchitectureProgrammaticOutput, AuditProgrammaticOutput,
+        BoundaryViolationsProgrammaticOutput, CircularDependenciesProgrammaticOutput,
+        CombinedProgrammaticOutput, DeadCodeProgrammaticOutput, DecisionSurfaceProgrammaticOutput,
         DuplicationProgrammaticOutput, FeatureFlagsProgrammaticOutput, HealthJsonReportInput,
         HealthProgrammaticOutput, TraceCloneProgrammaticOutput, TraceDependencyProgrammaticOutput,
-        TraceExportProgrammaticOutput, TraceFileProgrammaticOutput, serialize_health_report_json,
+        TraceErrorProgrammaticOutput, TraceExportProgrammaticOutput, TraceFileProgrammaticOutput,
+        TraceImportPathProgrammaticOutput, serialize_health_report_json,
     },
 };
 use fallow_output::{
-    AUDIT_SCHEMA_VERSION, CheckOutput, GroupByMode, RootEnvelopeMode,
-    build_decision_surface_output, serialize_check_json_output,
+    AUDIT_SCHEMA_VERSION, CheckOutput, GroupByMode, build_decision_surface_output,
+    serialize_architecture_json_output, serialize_check_json_output,
     serialize_decision_surface_json_output, serialize_dupes_json_output,
     serialize_feature_flags_json_output, strip_root_prefix,
 };
@@ -45,12 +46,22 @@ pub fn serialize_combined_programmatic_json(
         elapsed,
         explain,
         next_steps,
-        envelope_mode,
         telemetry_analysis_run_id,
+        request_outcomes,
     } = output;
     let workspace_diagnostics =
         combined_workspace_diagnostics(dead_code.as_ref(), health.as_ref(), duplication.as_ref());
     crate::serialize_combined_json(crate::CombinedJsonOutputInput {
+        package_baselines: crate::first_package_baselines([
+            dead_code
+                .as_ref()
+                .map(|run| run.output.package_baselines.as_slice()),
+            duplication
+                .as_ref()
+                .map(|run| run.output.package_baselines.as_slice()),
+        ]),
+        gate_outcomes: None,
+        request_outcomes,
         check: dead_code
             .as_ref()
             .map(|dead_code| crate::CombinedCheckJsonSection {
@@ -70,7 +81,6 @@ pub fn serialize_combined_programmatic_json(
         type_aware: None,
         workspace_diagnostics,
         next_steps,
-        envelope_mode,
         telemetry_analysis_run_id: telemetry_analysis_run_id.as_deref(),
     })
     .map_err(|err| {
@@ -124,20 +134,16 @@ pub fn serialize_decision_surface_programmatic_json(
     let DecisionSurfaceProgrammaticOutput {
         surface,
         elapsed: _,
-        envelope_mode,
         telemetry_analysis_run_id,
     } = output;
     let payload = build_decision_surface_output(&surface);
-    serialize_decision_surface_json_output(
-        payload,
-        envelope_mode,
-        telemetry_analysis_run_id.as_deref(),
+    serialize_decision_surface_json_output(payload, telemetry_analysis_run_id.as_deref()).map_err(
+        |err| {
+            ProgrammaticError::new(format!("failed to serialize decision surface: {err}"), 2)
+                .with_code("FALLOW_SERIALIZE_DECISION_SURFACE")
+                .with_context("decision-surface")
+        },
     )
-    .map_err(|err| {
-        ProgrammaticError::new(format!("failed to serialize decision surface: {err}"), 2)
-            .with_code("FALLOW_SERIALIZE_DECISION_SURFACE")
-            .with_context("decision-surface")
-    })
 }
 
 /// Serialize typed audit output into the stable JSON compatibility contract.
@@ -167,6 +173,7 @@ pub fn serialize_audit_programmatic_json(
 
     crate::serialize_audit_json(
         crate::AuditJsonOutputInput {
+            gate_outcomes: None,
             header: crate::AuditJsonHeaderInput {
                 schema_version: SchemaVersion(AUDIT_SCHEMA_VERSION),
                 version: ToolVersion(env!("CARGO_PKG_VERSION").to_string()),
@@ -186,9 +193,9 @@ pub fn serialize_audit_programmatic_json(
             dead_code,
             duplication,
             complexity,
+            diff_risk: output.diff_risk,
             next_steps: output.next_steps,
         },
-        output.envelope_mode,
         output.telemetry_analysis_run_id.as_deref(),
     )
     .map_err(|err| {
@@ -330,13 +337,11 @@ pub fn serialize_dead_code_programmatic_json(
         output,
         root,
         config_fixable: _,
-        envelope_mode,
         telemetry_analysis_run_id,
     } = output;
     serialize_check_programmatic_output(
         output,
         &root,
-        envelope_mode,
         telemetry_analysis_run_id.as_deref(),
         "dead-code",
         "FALLOW_SERIALIZE_DEAD_CODE_REPORT",
@@ -354,17 +359,40 @@ pub fn serialize_circular_dependencies_programmatic_json(
     let CircularDependenciesProgrammaticOutput {
         output,
         root,
-        envelope_mode,
         telemetry_analysis_run_id,
     } = output;
     serialize_check_programmatic_output(
         output,
         &root,
-        envelope_mode,
         telemetry_analysis_run_id.as_deref(),
         "circular-dependencies",
         "FALLOW_SERIALIZE_CIRCULAR_DEPENDENCIES_REPORT",
     )
+}
+
+/// Serialize typed `fallow architecture` output into its JSON contract:
+/// `kind: "architecture"` with its own `schema_version`.
+///
+/// # Errors
+///
+/// Returns a structured error if the output contract cannot be serialized.
+pub fn serialize_architecture_programmatic_json(
+    output: ArchitectureProgrammaticOutput,
+) -> ProgrammaticResult<serde_json::Value> {
+    let ArchitectureProgrammaticOutput {
+        output,
+        root,
+        telemetry_analysis_run_id,
+    } = output;
+    let mut json = serialize_architecture_json_output(output, telemetry_analysis_run_id.as_deref())
+        .map_err(|err| {
+            ProgrammaticError::new(format!("failed to serialize architecture report: {err}"), 2)
+                .with_code("FALLOW_SERIALIZE_ARCHITECTURE_REPORT")
+                .with_context("architecture")
+        })?;
+    let root_prefix = format!("{}/", root.display());
+    strip_root_prefix(&mut json, &root_prefix);
+    Ok(json)
 }
 
 /// Serialize typed boundary-family output into the JSON compatibility contract.
@@ -378,13 +406,11 @@ pub fn serialize_boundary_violations_programmatic_json(
     let BoundaryViolationsProgrammaticOutput {
         output,
         root,
-        envelope_mode,
         telemetry_analysis_run_id,
     } = output;
     serialize_check_programmatic_output(
         output,
         &root,
-        envelope_mode,
         telemetry_analysis_run_id.as_deref(),
         "boundary-violations",
         "FALLOW_SERIALIZE_BOUNDARY_VIOLATIONS_REPORT",
@@ -394,13 +420,12 @@ pub fn serialize_boundary_violations_programmatic_json(
 fn serialize_check_programmatic_output(
     output: CheckOutput,
     root: &Path,
-    envelope_mode: RootEnvelopeMode,
     telemetry_analysis_run_id: Option<&str>,
     context: &'static str,
     code: &'static str,
 ) -> ProgrammaticResult<serde_json::Value> {
-    let mut json = serialize_check_json_output(output, envelope_mode, telemetry_analysis_run_id)
-        .map_err(|err| {
+    let mut json =
+        serialize_check_json_output(output, telemetry_analysis_run_id).map_err(|err| {
             ProgrammaticError::new(format!("failed to serialize {context} report: {err}"), 2)
                 .with_code(code)
                 .with_context(context)
@@ -422,16 +447,14 @@ pub fn serialize_duplication_programmatic_json(
         output,
         root,
         threshold: _,
-        envelope_mode,
         telemetry_analysis_run_id,
     } = output;
-    let mut json =
-        serialize_dupes_json_output(output, envelope_mode, telemetry_analysis_run_id.as_deref())
-            .map_err(|err| {
-                ProgrammaticError::new(format!("failed to serialize duplication report: {err}"), 2)
-                    .with_code("FALLOW_SERIALIZE_DUPLICATION_REPORT")
-                    .with_context("dupes")
-            })?;
+    let mut json = serialize_dupes_json_output(output, telemetry_analysis_run_id.as_deref())
+        .map_err(|err| {
+            ProgrammaticError::new(format!("failed to serialize duplication report: {err}"), 2)
+                .with_code("FALLOW_SERIALIZE_DUPLICATION_REPORT")
+                .with_context("dupes")
+        })?;
     let root_prefix = format!("{}/", root.display());
     strip_root_prefix(&mut json, &root_prefix);
     Ok(json)
@@ -445,19 +468,15 @@ pub fn serialize_duplication_programmatic_json(
 pub fn serialize_feature_flags_programmatic_json(
     output: FeatureFlagsProgrammaticOutput,
 ) -> ProgrammaticResult<serde_json::Value> {
-    serialize_feature_flags_json_output(
-        output.output,
-        output.envelope_mode,
-        output.telemetry_analysis_run_id.as_deref(),
-    )
-    .map_err(|err| {
-        ProgrammaticError::new(
-            format!("failed to serialize feature flags report: {err}"),
-            2,
-        )
-        .with_code("FALLOW_SERIALIZE_FEATURE_FLAGS_REPORT")
-        .with_context("feature-flags")
-    })
+    serialize_feature_flags_json_output(output.output, output.telemetry_analysis_run_id.as_deref())
+        .map_err(|err| {
+            ProgrammaticError::new(
+                format!("failed to serialize feature flags report: {err}"),
+                2,
+            )
+            .with_code("FALLOW_SERIALIZE_FEATURE_FLAGS_REPORT")
+            .with_context("feature-flags")
+        })
 }
 
 /// Serialize typed export-trace output into the JSON compatibility contract.
@@ -492,6 +511,22 @@ pub fn serialize_trace_file_programmatic_json(
     )
 }
 
+/// Serialize typed import-path-trace output into the JSON compatibility contract.
+///
+/// # Errors
+///
+/// Returns a structured error if the trace output cannot be serialized.
+pub fn serialize_trace_import_path_programmatic_json(
+    output: TraceImportPathProgrammaticOutput,
+) -> ProgrammaticResult<serde_json::Value> {
+    serialize_trace_programmatic_output(
+        output.output,
+        "import path trace",
+        "FALLOW_SERIALIZE_TRACE_IMPORT_PATH",
+        "trace_import_path",
+    )
+}
+
 /// Serialize typed dependency-trace output into the JSON compatibility contract.
 ///
 /// # Errors
@@ -505,6 +540,22 @@ pub fn serialize_trace_dependency_programmatic_json(
         "dependency trace",
         "FALLOW_SERIALIZE_TRACE_DEPENDENCY",
         "trace_dependency",
+    )
+}
+
+/// Serialize typed stack-trace resolution into the JSON compatibility contract.
+///
+/// # Errors
+///
+/// Returns a structured error if the trace output cannot be serialized.
+pub fn serialize_trace_error_programmatic_json(
+    output: TraceErrorProgrammaticOutput,
+) -> ProgrammaticResult<serde_json::Value> {
+    serialize_trace_programmatic_output(
+        output.output,
+        "stack-trace resolution",
+        "FALLOW_SERIALIZE_TRACE_ERROR",
+        "trace_error",
     )
 }
 
@@ -553,16 +604,19 @@ pub fn serialize_health_programmatic_json(
         explain,
         workspace_diagnostics,
         next_steps,
-        envelope_mode,
         telemetry_analysis_run_id,
+        request_outcomes,
     } = output;
-    let (grouped_by, groups) = grouping.map_or((None, None), |grouping| {
+    let (grouped_by, groups, group_filter) = grouping.map_or((None, None, None), |grouping| {
         (
             group_by_mode_from_label(grouping.mode),
             Some(grouping.groups),
+            grouping.filter,
         )
     });
     serialize_health_report_json(HealthJsonReportInput {
+        gate_outcomes: None,
+        request_outcomes,
         report,
         root: &root,
         elapsed,
@@ -570,9 +624,9 @@ pub fn serialize_health_programmatic_json(
         type_aware: None,
         grouped_by,
         groups,
+        group_filter,
         workspace_diagnostics,
         next_steps,
-        envelope_mode,
         telemetry_analysis_run_id: telemetry_analysis_run_id.as_deref(),
     })
     .map_err(|err| {
@@ -594,9 +648,7 @@ fn group_by_mode_from_label(label: &str) -> Option<GroupByMode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RootEnvelopeMode, serialize_audit_dead_code, serialize_combined_programmatic_json,
-    };
+    use super::{serialize_audit_dead_code, serialize_combined_programmatic_json};
     use crate::DupesReportPayload;
     use crate::runtime::{
         CombinedProgrammaticOutput, DeadCodeProgrammaticOutput, DuplicationProgrammaticOutput,
@@ -629,7 +681,6 @@ mod tests {
             }),
             root: root.to_path_buf(),
             config_fixable: false,
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         }
     }
@@ -678,8 +729,8 @@ mod tests {
             explain: false,
             workspace_diagnostics,
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
+            request_outcomes: None,
         }
     }
 
@@ -689,10 +740,17 @@ mod tests {
     ) -> DuplicationProgrammaticOutput {
         DuplicationProgrammaticOutput {
             output: build_dupes_output(DupesOutputInput {
+                gate_outcomes: None,
+                request_outcomes: None,
+                baseline_staleness: None,
                 schema_version: DUPES_SCHEMA_VERSION,
                 version: "0.0.0-test".to_owned(),
                 elapsed: Duration::ZERO,
                 report: DupesReportPayload::from_report(&DuplicationReport::default()),
+                clone_groups_shown: 0,
+                clone_groups_omitted: 0,
+                clone_families_shown: 0,
+                clone_families_omitted: 0,
                 grouped_by: None,
                 total_issues: None,
                 groups: None,
@@ -702,7 +760,6 @@ mod tests {
             }),
             root: root.to_path_buf(),
             threshold: 0.0,
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
         }
     }
@@ -729,8 +786,8 @@ mod tests {
             elapsed: Duration::ZERO,
             explain: false,
             next_steps: Vec::new(),
-            envelope_mode: RootEnvelopeMode::Tagged,
             telemetry_analysis_run_id: None,
+            request_outcomes: None,
         }
     }
 

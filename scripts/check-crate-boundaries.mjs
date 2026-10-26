@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 import { runCliMain } from "./cli-main.mjs";
+import { pathToFileURL } from "node:url";
 
 const PROTOCOL_CRATES = new Set(["fallow-cli", "fallow-lsp", "fallow-mcp", "fallow-node"]);
 const FOUNDATION_CRATES = new Set([
@@ -15,6 +16,7 @@ const FOUNDATION_CRATES = new Set([
   "fallow-engine",
   "fallow-output",
   "fallow-process",
+  "fallow-mutation",
   "fallow-api",
 ]);
 const ANALYSIS_STARTERS = new Set(["fallow-core", "fallow-engine", "fallow-api"]);
@@ -25,6 +27,11 @@ const boundaryRules = [
     rule: "process-must-remain-independent",
     matches: ({ from }) => from === "fallow-process",
     message: ({ to }) => `fallow-process must not depend on workspace crate ${to}`,
+  },
+  {
+    rule: "mutation-must-remain-independent",
+    matches: ({ from }) => from === "fallow-mutation",
+    message: ({ to }) => `fallow-mutation must not depend on workspace crate ${to}`,
   },
   {
     rule: "foundation-must-not-depend-on-protocol",
@@ -189,6 +196,6 @@ export const main = (args = process.argv.slice(2)) => {
   return 1;
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runCliMain(main);
 }

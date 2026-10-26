@@ -2,10 +2,12 @@
 //!
 //! Surfaces malformed `package.json`, unreachable glob matches, missing
 //! tsconfig references, undeclared workspaces, and source files skipped during
-//! source discovery as typed [`WorkspaceDiagnostic`] values. Each diagnostic
-//! also emits a deduplicated `tracing::warn!` so users running fallow with
-//! default tracing filters see the cause of "fallow doesn't see my package" or
-//! "fallow ate all my memory."
+//! source discovery as typed [`WorkspaceDiagnostic`] values. A diagnostic that
+//! reports a DEGRADED run also emits a deduplicated `tracing::warn!` so users
+//! running fallow with default tracing filters see the cause of "fallow doesn't
+//! see my package" or "fallow ate all my memory."
+//! [`WorkspaceDiagnosticKind::warns_on_stderr`] decides which kinds those are;
+//! the rest reach consumers through `workspace_diagnostics[]` only.
 //!
 //! Repeated `GlobMatchedNoPackageJson` diagnostics are aggregated by glob
 //! pattern at emission time so a wide glob matching hundreds of package-less
@@ -23,21 +25,9 @@ use std::sync::{Mutex, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET;
+use fallow_types::path_util::display_relative;
 pub use fallow_types::workspace::{WorkspaceDiagnostic, WorkspaceDiagnosticKind};
-
-/// Render `path` relative to `root` with forward slashes. Mirrors the private
-/// helper of the same name in `fallow_types::workspace`, kept here for the
-/// aggregated stderr-message builders ([`build_glob_group_message`] and
-/// [`build_tsconfig_refs_message`]) so the per-instance and aggregated message
-/// surfaces format paths identically (the forward-slash normalisation is
-/// load-bearing for cross-platform output stability).
-fn display_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
-}
 
 /// Workspace-discovery failures that prevent analysis from proceeding.
 ///
@@ -122,6 +112,7 @@ struct WarningGroups<'a> {
     plans: Vec<PlannedWarning>,
     glob_groups: Vec<(&'a str, Vec<&'a WorkspaceDiagnostic>)>,
     tsconfig_ref_misses: Vec<&'a WorkspaceDiagnostic>,
+    missing_dir_groups: Vec<(&'a Path, Vec<&'a WorkspaceDiagnostic>)>,
 }
 
 /// Turn a batch of workspace diagnostics into the bounded set of stderr
@@ -131,6 +122,12 @@ struct WarningGroups<'a> {
 ///   per pattern instead of one line per package-less directory.
 /// - `TsconfigReferenceDirMissing`: aggregated together, one summary line
 ///   instead of one per missing `references[]` entry in the root tsconfig.
+/// - `WorkspacePatternDirMissing`: aggregated by declaring file, one summary
+///   line per file instead of one per pattern (`vite`, `vite/packages/*`).
+///
+/// Kinds that [`WorkspaceDiagnosticKind::warns_on_stderr`] answers `false` for
+/// plan no warning at all: they describe a check the user never configured
+/// rather than a degraded run, and belong only in the structured array.
 ///
 /// Pure: no tracing, no dedupe-set mutation. A group of exactly one keeps
 /// today's per-instance message byte-for-byte (no regression for the common
@@ -144,6 +141,7 @@ fn plan_warnings(root: &Path, diagnostics: &[WorkspaceDiagnostic]) -> Vec<Planne
         mut plans,
         glob_groups,
         tsconfig_ref_misses,
+        missing_dir_groups,
     } = group_warning_diagnostics(diagnostics, &canonical);
 
     for (pattern, group) in glob_groups {
@@ -177,6 +175,21 @@ fn plan_warnings(root: &Path, diagnostics: &[WorkspaceDiagnostic]) -> Vec<Planne
         });
     }
 
+    for (source, group) in missing_dir_groups {
+        if let [only] = group.as_slice() {
+            plans.push(per_instance_warning(&canonical, only));
+            continue;
+        }
+        plans.push(PlannedWarning {
+            dedupe_key: format!(
+                "{}::workspace-pattern-dir-missing-agg::{}",
+                canonical.display(),
+                source.display()
+            ),
+            message: build_missing_dir_group_message(root, source, &group),
+        });
+    }
+
     plans
 }
 
@@ -187,7 +200,11 @@ fn group_warning_diagnostics<'a>(
     let mut plans: Vec<PlannedWarning> = Vec::new();
     let mut glob_groups: Vec<(&str, Vec<&WorkspaceDiagnostic>)> = Vec::new();
     let mut tsconfig_ref_misses: Vec<&WorkspaceDiagnostic> = Vec::new();
+    let mut missing_dir_groups: Vec<(&Path, Vec<&WorkspaceDiagnostic>)> = Vec::new();
     for diag in diagnostics {
+        if !diag.kind.warns_on_stderr() {
+            continue;
+        }
         match &diag.kind {
             WorkspaceDiagnosticKind::GlobMatchedNoPackageJson { pattern } => {
                 match glob_groups.iter_mut().find(|(p, _)| *p == pattern.as_str()) {
@@ -196,6 +213,13 @@ fn group_warning_diagnostics<'a>(
                 }
             }
             WorkspaceDiagnosticKind::TsconfigReferenceDirMissing => tsconfig_ref_misses.push(diag),
+            WorkspaceDiagnosticKind::WorkspacePatternDirMissing { .. } => {
+                let source = diag.path.as_path();
+                match missing_dir_groups.iter_mut().find(|(p, _)| *p == source) {
+                    Some((_, group)) => group.push(diag),
+                    None => missing_dir_groups.push((source, vec![diag])),
+                }
+            }
             _ => plans.push(per_instance_warning(canonical, diag)),
         }
     }
@@ -203,16 +227,31 @@ fn group_warning_diagnostics<'a>(
         plans,
         glob_groups,
         tsconfig_ref_misses,
+        missing_dir_groups,
     }
 }
 
+/// Plan one per-instance warning, keyed on what it PRINTS rather than on the
+/// kind id plus the path.
+///
+/// The dedupe exists so combined mode and watch-mode reruns print one line per
+/// logical diagnostic, and two entries that render different sentences are two
+/// logical diagnostics however much of the key they share. An id-and-path key
+/// swallowed the second of them: one Module Federation config whose `exposes`
+/// AND `remotes` are both unreadable produces two entries on one path under one
+/// kind, and only the first was ever printed (issue #2736). Matching
+/// `merge_workspace_diagnostics`, which keys on the whole kind for the same
+/// reason, the message stands in for the payload here: it is rendered from the
+/// kind and the path, so two entries whose sentences are byte-identical would
+/// print the same line twice and are still one key.
 fn per_instance_warning(canonical: &Path, diag: &WorkspaceDiagnostic) -> PlannedWarning {
     PlannedWarning {
         dedupe_key: format!(
-            "{}::{}::{}",
+            "{}::{}::{}::{}",
             canonical.display(),
             diag.kind.id(),
-            diag.path.display()
+            diag.path.display(),
+            diag.message
         ),
         message: diag.message.clone(),
     }
@@ -234,7 +273,7 @@ pub(super) fn emit_diagnostics(root: &Path, diagnostics: &[WorkspaceDiagnostic])
 
     for plan in plan_warnings(root, diagnostics) {
         if should_emit(plan.dedupe_key) {
-            tracing::warn!("fallow: {}", plan.message);
+            tracing::warn!(target: ANALYSIS_DIAGNOSTIC_LOG_TARGET, "fallow: {}", plan.message);
         }
     }
 }
@@ -282,6 +321,38 @@ fn build_tsconfig_refs_message(root: &Path, paths: &[&Path]) -> String {
         "tsconfig.json references {count} directories that do not exist \
          (e.g. {listed}). Update or remove the references, or restore the \
          missing directories."
+    )
+}
+
+/// Build the aggregated message for the `workspace-pattern-dir-missing`
+/// entries of one declaring file (always called with two or more entries).
+fn build_missing_dir_group_message(
+    root: &Path,
+    source: &Path,
+    group: &[&WorkspaceDiagnostic],
+) -> String {
+    let display = display_relative(root, source);
+    let source = if display.is_empty() || display == "." {
+        "The fallow config `workspaces.patterns`".to_owned()
+    } else {
+        format!("'{display}'")
+    };
+    let patterns: Vec<String> = group
+        .iter()
+        .filter_map(|diag| match &diag.kind {
+            WorkspaceDiagnosticKind::WorkspacePatternDirMissing { pattern } => {
+                Some(format!("'{pattern}'"))
+            }
+            _ => None,
+        })
+        .collect();
+    format!(
+        "{source} declares {count} workspace patterns whose directories do not exist ({list}). \
+         Fallow analyzes no package from them. Unused catalog entries are not reported in \
+         this run, because packages in those directories can use them. Create the \
+         directories before the run, or remove the patterns.",
+        count = patterns.len(),
+        list = patterns.join(", ")
     )
 }
 
@@ -364,7 +435,11 @@ static WORKSPACE_DIAGNOSTICS: OnceLock<Mutex<FxHashMap<PathBuf, Vec<WorkspaceDia
 /// are recorded by the analyze pass through [`record_workspace_diagnostics`],
 /// also after this stash, and are preserved for the same reason; each analyze
 /// pass refreshes them through [`clear_analysis_stage_diagnostics`] (issue
-/// #2366).
+/// #2366). Plugin-stage diagnostics
+/// ([`WorkspaceDiagnosticKind::is_plugin_stage`]) are preserved on the same
+/// grounds: framework plugins run after config load, and
+/// [`record_plugin_config_diagnostics`] refreshes their set in one operation
+/// (issue #2736).
 ///
 /// The stored set is deduplicated on the whole `(kind, path)` the way every
 /// fold is: a repository that declares one glob in both `package.json` and
@@ -377,7 +452,12 @@ pub fn stash_workspace_diagnostics(root: &Path, diagnostics: Vec<WorkspaceDiagno
         let preserved = map.get(&canonical).map_or_else(Vec::new, |existing| {
             existing
                 .iter()
-                .filter(|d| d.kind.is_source_discovery() || d.kind.is_analysis_stage())
+                .filter(|d| {
+                    d.kind.is_source_discovery()
+                        || d.kind.is_analysis_stage()
+                        || d.kind.is_health_stage()
+                        || d.kind.is_plugin_stage()
+                })
                 .cloned()
                 .collect()
         });
@@ -389,7 +469,13 @@ pub fn stash_workspace_diagnostics(root: &Path, diagnostics: Vec<WorkspaceDiagno
 }
 
 /// Append `additions` to the workspace-discovery diagnostics for `root`,
-/// skipping any entry whose `(kind id, canonical path)` is already present.
+/// skipping any entry whose `(kind id, canonical path, message)` is already
+/// present.
+///
+/// The message is part of the key because two entries of one kind on one path
+/// can state different facts: one source file can hold a dynamic
+/// `registerRemotes` call and a dynamic `loadRemote` call, and an id-and-path
+/// key kept only the first (issue #2795, the same failure as issue #2736).
 ///
 /// Used by the analyze pipeline's undeclared-workspace pass to fold its
 /// findings into the registry without re-emitting diagnostics that the
@@ -404,7 +490,7 @@ pub fn append_workspace_diagnostics(root: &Path, additions: Vec<WorkspaceDiagnos
     let registry = WORKSPACE_DIAGNOSTICS.get_or_init(|| Mutex::new(FxHashMap::default()));
     if let Ok(mut map) = registry.lock() {
         let existing = map.entry(canonical).or_default();
-        let mut seen: FxHashSet<(String, String)> = existing
+        let mut seen: FxHashSet<(String, String, String)> = existing
             .iter()
             .map(|d| {
                 (
@@ -413,6 +499,7 @@ pub fn append_workspace_diagnostics(root: &Path, additions: Vec<WorkspaceDiagnos
                         .unwrap_or_else(|_| d.path.clone())
                         .display()
                         .to_string(),
+                    d.message.clone(),
                 )
             })
             .collect();
@@ -423,6 +510,7 @@ pub fn append_workspace_diagnostics(root: &Path, additions: Vec<WorkspaceDiagnos
                     .unwrap_or_else(|_| addition.path.clone())
                     .display()
                     .to_string(),
+                addition.message.clone(),
             );
             if seen.insert(key) {
                 existing.push(addition);
@@ -442,6 +530,39 @@ pub fn record_workspace_diagnostics(root: &Path, diagnostics: Vec<WorkspaceDiagn
     }
     emit_diagnostics(root, &diagnostics);
     append_workspace_diagnostics(root, diagnostics);
+}
+
+/// Replace the plugin-stage diagnostics for `root` with `diagnostics` in ONE
+/// registry operation, emit their deduplicated stderr warnings, and hand the
+/// same list back to the caller.
+///
+/// Called once per analysis, at the end of the plugin run, which is the single
+/// point where the root and workspace plugin results have converged. The
+/// replacement is what keeps the set CURRENT across reruns, the way
+/// [`replace_source_discovery_diagnostics`] does for a walk: a config the user
+/// fixed drops out on the next run with no separate clear, and a long-lived
+/// engine session or a watch-mode rerun does not accumulate stale entries.
+///
+/// Deliberately NOT [`append_workspace_diagnostics`], whose dedupe key is the
+/// kind id plus the canonical path. One Module Federation config file can hold
+/// two unreadable keys, which is two entries under one kind on one path, and
+/// that key drops the second. This one dedupes the incoming list on the whole
+/// `(kind, path)` the way every other fold does (issue #2736).
+#[must_use]
+pub fn record_plugin_config_diagnostics(
+    root: &Path,
+    diagnostics: Vec<WorkspaceDiagnostic>,
+) -> Vec<WorkspaceDiagnostic> {
+    let diagnostics = fallow_types::workspace::dedupe_workspace_diagnostics(diagnostics);
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let registry = WORKSPACE_DIAGNOSTICS.get_or_init(|| Mutex::new(FxHashMap::default()));
+    if let Ok(mut map) = registry.lock() {
+        let existing = map.entry(canonical).or_default();
+        existing.retain(|diagnostic| !diagnostic.kind.is_plugin_stage());
+        existing.extend(diagnostics.iter().cloned());
+    }
+    emit_diagnostics(root, &diagnostics);
+    diagnostics
 }
 
 /// Replace source-read-failure diagnostics for `root` with the failures from
@@ -475,6 +596,96 @@ pub fn record_source_read_failures(
             !matches!(
                 diagnostic.kind,
                 WorkspaceDiagnosticKind::SourceReadFailure { .. }
+            )
+        });
+        existing.extend(diagnostics.iter().cloned());
+    }
+    emit_diagnostics(root, &diagnostics);
+    diagnostics
+}
+
+/// Whether `root` should have a `node_modules` directory and does not.
+///
+/// The single predicate behind [`WorkspaceDiagnosticKind::NodeModulesMissing`].
+/// A Deno project with no `package.json` legitimately runs without one, so it
+/// is not reported.
+#[must_use]
+pub fn node_modules_missing(root: &Path) -> bool {
+    !root.join("node_modules").is_dir() && !super::is_deno_without_node_modules(root)
+}
+
+/// The install state of `root`, by the same rule as [`node_modules_missing`].
+/// A Deno project without `package.json` counts as present.
+#[must_use]
+pub fn node_modules_state(root: &Path) -> fallow_types::workspace::NodeModulesState {
+    if node_modules_missing(root) {
+        fallow_types::workspace::NodeModulesState::Missing
+    } else {
+        fallow_types::workspace::NodeModulesState::Present
+    }
+}
+
+/// Build the missing-`node_modules` diagnostic for `root`, or `None` once the
+/// project has been installed.
+///
+/// Replaces the previous per-pipeline `tracing::warn!`, which existed twice
+/// byte-identically and reached neither JSON output nor `fallow doctor`. The
+/// source walk folds this into its own diagnostic set, so it reaches an
+/// analysis by value like every other walk-recorded kind instead of through a
+/// second registry writer.
+#[must_use]
+pub fn missing_node_modules_diagnostic(root: &Path) -> Option<WorkspaceDiagnostic> {
+    node_modules_missing(root).then(|| {
+        WorkspaceDiagnostic::new(
+            root,
+            root.join("node_modules"),
+            WorkspaceDiagnosticKind::NodeModulesMissing,
+        )
+    })
+}
+
+/// Replace source-parse-degraded diagnostics for `root` with the degradations
+/// from the current parse while preserving every workspace and discovery
+/// diagnostic produced by other stages.
+///
+/// Mirrors [`record_source_read_failures`]: the parse stage owns this kind, so
+/// a fixed file drops out of the set on the next run instead of persisting.
+///
+/// Returns the structured diagnostics so session-owned outputs can carry the
+/// exact same values as the process registry used by direct core and CLI paths.
+#[must_use]
+pub fn record_source_parse_degradations(
+    config: &crate::ResolvedConfig,
+    degradations: &[fallow_types::extract::SourceParseDegradation],
+) -> Vec<WorkspaceDiagnostic> {
+    let root = config.root.as_path();
+    let diagnostics: Vec<WorkspaceDiagnostic> = degradations
+        .iter()
+        .filter(|degradation| {
+            !config
+                .ignore_findings
+                .is_ignored_path(root, &degradation.path)
+        })
+        .map(|degradation| {
+            let kind = degradation.nesting_limit.map_or(
+                WorkspaceDiagnosticKind::SourceParseDegraded {
+                    error_count: degradation.error_count,
+                    panicked: degradation.panicked,
+                },
+                |limit| WorkspaceDiagnosticKind::SourceNestingTooDeep { limit },
+            );
+            WorkspaceDiagnostic::new(root, degradation.path.clone(), kind)
+        })
+        .collect();
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let registry = WORKSPACE_DIAGNOSTICS.get_or_init(|| Mutex::new(FxHashMap::default()));
+    if let Ok(mut map) = registry.lock() {
+        let existing = map.entry(canonical).or_default();
+        existing.retain(|diagnostic| {
+            !matches!(
+                diagnostic.kind,
+                WorkspaceDiagnosticKind::SourceParseDegraded { .. }
+                    | WorkspaceDiagnosticKind::SourceNestingTooDeep { .. }
             )
         });
         existing.extend(diagnostics.iter().cloned());
@@ -551,6 +762,56 @@ pub fn clear_analysis_stage_diagnostics(root: &Path) {
     }
 }
 
+/// Remove all health-stage diagnostics (see
+/// [`WorkspaceDiagnosticKind::is_health_stage`]) for `root` from the registry,
+/// keeping every other entry.
+///
+/// Called at the START of each health run so a stale `shallow-clone` or
+/// `ownership-unavailable` entry from a previous run over the same root (a
+/// watch-mode rerun, a long-lived engine session, the two passes of `fallow
+/// audit`) is dropped before the pipeline re-records only what still applies.
+/// Mirrors [`clear_analysis_stage_diagnostics`] and pairs with the preserve in
+/// [`stash_workspace_diagnostics`] (issue #2689).
+pub fn clear_health_stage_diagnostics(root: &Path) {
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(registry) = WORKSPACE_DIAGNOSTICS.get() else {
+        return;
+    };
+    if let Ok(mut map) = registry.lock()
+        && let Some(existing) = map.get_mut(&canonical)
+    {
+        existing.retain(|d| !d.kind.is_health_stage());
+    }
+}
+
+/// Read only the health-stage diagnostics (see
+/// [`WorkspaceDiagnosticKind::is_health_stage`]) the registry holds for `root`.
+///
+/// The health envelope captures `workspace_diagnostics` before the analysis
+/// runs, so the pipeline's own diagnostics reach it through this read at
+/// finalize time rather than by threading a mutable list through scoring,
+/// churn, ownership, trend and coverage resolution (issue #2689).
+#[must_use]
+pub fn health_stage_workspace_diagnostics(root: &Path) -> Vec<WorkspaceDiagnostic> {
+    let canonical = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(registry) = WORKSPACE_DIAGNOSTICS.get() else {
+        return Vec::new();
+    };
+    registry
+        .lock()
+        .ok()
+        .map(|map| {
+            map.get(&canonical).map_or_else(Vec::new, |existing| {
+                existing
+                    .iter()
+                    .filter(|d| d.kind.is_health_stage())
+                    .cloned()
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Read the workspace-discovery diagnostics produced by the most recent
 /// `stash_workspace_diagnostics` + any subsequent
 /// `append_workspace_diagnostics` calls for `root`. Returns an empty vector
@@ -589,18 +850,34 @@ pub fn workspace_diagnostics_for(root: &Path) -> Vec<WorkspaceDiagnostic> {
 /// non-walk kind (workspace discovery, analysis stage) is likewise still read,
 /// which is what lets `--skip check` and `--only health` report what their
 /// analyses recorded after the section captured its list.
+///
+/// The result is ordered by `(path, kind id, message)` rather than by arrival.
+/// Analysis-stage detectors record into the registry from a rayon pool, so
+/// arrival order is a scheduling artefact: `boundaries-not-configured` and
+/// `rule-packs-not-configured` swapped places between a one-worker and an
+/// eight-worker run of the same command, on a `required` wire array. Ordering
+/// the registry leg fixes that at the single point every consumer reads it.
+/// The caller's own list keeps its meaningful discovery order; only this leg
+/// is sorted, and `merge_workspace_diagnostics` puts it after that list.
 #[must_use]
 pub fn registry_diagnostics_to_fold(root: &Path) -> Vec<WorkspaceDiagnostic> {
-    workspace_diagnostics_for(root)
+    let mut diagnostics: Vec<WorkspaceDiagnostic> = workspace_diagnostics_for(root)
         .into_iter()
         .filter(|diagnostic| !diagnostic.kind.is_source_walk_recorded())
-        .collect()
+        .collect();
+    diagnostics.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.id().cmp(right.kind.id()))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics
 }
 
 /// Directories that are conventionally NOT workspace packages even when a
 /// glob like `packages/*` matches them. Mirrors pnpm/npm/yarn behavior of
-/// silently filtering these out, and extends fallow's existing
-/// `should_skip_workspace_scan_dir` list with build artifacts and tooling
+/// silently filtering these out. Shared by workspace discovery and glob
+/// diagnostics so both exclude hidden directories, build artifacts and tooling
 /// caches.
 #[must_use]
 pub(super) fn is_skip_listed_dir(name: &str) -> bool {
@@ -614,14 +891,14 @@ pub(super) fn is_skip_listed_dir(name: &str) -> bool {
 #[must_use]
 pub(super) fn is_ignored_workspace_dir(
     relative_dir: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &crate::IgnorePatternSet,
 ) -> bool {
     if ignore_patterns.is_empty() {
         return false;
     }
     let relative_str = relative_dir.to_string_lossy().replace('\\', "/");
-    ignore_patterns.is_match(relative_str.as_str())
-        || ignore_patterns.is_match(format!("{relative_str}/package.json").as_str())
+    ignore_patterns.excludes(relative_str.as_str())
+        || ignore_patterns.excludes(format!("{relative_str}/package.json").as_str())
 }
 
 #[cfg(test)]
@@ -638,94 +915,6 @@ mod tests {
                 pattern: pattern.to_owned(),
             },
         )
-    }
-
-    #[test]
-    fn skipped_large_file_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("src/vendor/app.bundle.js"),
-            WorkspaceDiagnosticKind::SkippedLargeFile {
-                size_bytes: 6 * 1024 * 1024,
-            },
-        );
-        assert_eq!(diag.kind.id(), "skipped-large-file");
-        assert!(
-            diag.message.contains("src/vendor/app.bundle.js"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("6.0 MB"),
-            "message reports the size: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--max-file-size"),
-            "message names the override flag: {}",
-            diag.message
-        );
-    }
-
-    #[test]
-    fn skipped_minified_file_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join("src/assets/index-abc123.js"),
-            WorkspaceDiagnosticKind::SkippedMinifiedFile {
-                size_bytes: 2 * 1024 * 1024,
-            },
-        );
-        assert_eq!(diag.kind.id(), "skipped-minified-file");
-        assert!(
-            diag.message.contains("src/assets/index-abc123.js"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("2.0 MB"),
-            "message reports the size: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--max-file-size 0"),
-            "message names the opt-out: {}",
-            diag.message
-        );
-    }
-
-    #[test]
-    fn skipped_source_dotdir_diagnostic_id_and_message() {
-        let root = Path::new("/project");
-        let diag = WorkspaceDiagnostic::new(
-            root,
-            root.join(".claude"),
-            WorkspaceDiagnosticKind::SkippedSourceDotdir,
-        );
-        assert_eq!(diag.kind.id(), "skipped-source-dotdir");
-        assert!(
-            diag.message.contains(".claude"),
-            "message names the project-relative path: {}",
-            diag.message
-        );
-        assert!(
-            diag.message
-                .contains("Its imports and exports are not analyzed."),
-            "message states the consequence: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("--root"),
-            "message names the real remedy: {}",
-            diag.message
-        );
-        assert!(
-            diag.message.contains("no config field"),
-            "the message must say plainly that no config field traverses it: {}",
-            diag.message
-        );
     }
 
     #[test]
@@ -980,6 +1169,210 @@ mod tests {
         );
     }
 
+    /// The health pipeline appends after config load, so combined mode's
+    /// per-analysis config re-load must preserve its entries. It must also not
+    /// preserve them past the next health run, or a fixed CODEOWNERS is
+    /// reported forever (issue #2689).
+    #[test]
+    fn health_stage_entries_survive_a_config_reload_and_not_the_next_health_run() {
+        let root = Path::new("/fallow-test-2689-health-stage");
+        stash_workspace_diagnostics(
+            root,
+            vec![WorkspaceDiagnostic::new(
+                root,
+                root.join("pkg"),
+                WorkspaceDiagnosticKind::UndeclaredWorkspace,
+            )],
+        );
+        append_workspace_diagnostics(
+            root,
+            vec![
+                WorkspaceDiagnostic::new(
+                    root,
+                    root.to_path_buf(),
+                    WorkspaceDiagnosticKind::HotspotsSkipped {
+                        cause: "not-a-repository".to_owned(),
+                    },
+                ),
+                WorkspaceDiagnostic::new(
+                    root,
+                    root.join("coverage/coverage-final.json"),
+                    WorkspaceDiagnosticKind::CoverageAutoDetected,
+                ),
+            ],
+        );
+
+        // Combined mode re-loads config for the next analysis.
+        stash_workspace_diagnostics(
+            root,
+            vec![WorkspaceDiagnostic::new(
+                root,
+                root.join("pkg"),
+                WorkspaceDiagnosticKind::UndeclaredWorkspace,
+            )],
+        );
+        let after_reload = workspace_diagnostics_for(root);
+        assert_eq!(count_kind(&after_reload, "hotspots-skipped"), 1);
+        assert_eq!(count_kind(&after_reload, "coverage-auto-detected"), 1);
+
+        // The dead-code analyze pass inside the health run must not take them.
+        clear_analysis_stage_diagnostics(root);
+        assert_eq!(
+            health_stage_workspace_diagnostics(root).len(),
+            2,
+            "the analysis-stage clear must leave health-stage entries alone"
+        );
+
+        clear_health_stage_diagnostics(root);
+        let after = workspace_diagnostics_for(root);
+        assert!(
+            !after.iter().any(|d| d.kind.is_health_stage()),
+            "the next health run starts from nothing: {after:?}"
+        );
+        assert_eq!(
+            count_kind(&after, "undeclared-workspace"),
+            1,
+            "the workspace-discovery diagnostic survives the health-stage clear"
+        );
+    }
+
+    fn plugin_diagnostic(root: &Path, key: &str, reason: &str) -> WorkspaceDiagnostic {
+        WorkspaceDiagnostic::new(
+            root,
+            root.join("module-federation.config.ts"),
+            WorkspaceDiagnosticKind::PluginConfigUnreadable {
+                plugin: "module-federation".to_owned(),
+                key: key.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )
+    }
+
+    /// Plugins run after config load, so combined mode's per-analysis config
+    /// re-load must preserve their entries, and the next plugin run must
+    /// replace rather than accumulate them so a fixed config drops out
+    /// (issue #2736).
+    #[test]
+    fn plugin_stage_entries_survive_a_config_reload_and_are_replaced_by_the_next_run() {
+        let root = Path::new("/fallow-test-2736-plugin-stage");
+        let undeclared = || {
+            WorkspaceDiagnostic::new(
+                root,
+                root.join("pkg"),
+                WorkspaceDiagnosticKind::UndeclaredWorkspace,
+            )
+        };
+        stash_workspace_diagnostics(root, vec![undeclared()]);
+        let recorded = record_plugin_config_diagnostics(
+            root,
+            vec![plugin_diagnostic(root, "exposes", "not-object-literal")],
+        );
+        assert_eq!(recorded.len(), 1, "the caller gets its own copy back");
+
+        // Combined mode re-loads config for the next analysis.
+        stash_workspace_diagnostics(root, vec![undeclared()]);
+        let after_reload = workspace_diagnostics_for(root);
+        assert_eq!(
+            count_kind(&after_reload, "plugin-config-unreadable"),
+            1,
+            "the plugin entry survives the combined-mode re-stash exactly once: {after_reload:?}"
+        );
+        assert_eq!(count_kind(&after_reload, "undeclared-workspace"), 1);
+
+        // The dead-code analyze pass clears its own stage on entry, and plugins
+        // run inside that pass's prelude.
+        clear_analysis_stage_diagnostics(root);
+        assert_eq!(
+            count_kind(&workspace_diagnostics_for(root), "plugin-config-unreadable"),
+            1,
+            "the analysis-stage clear must leave plugin-stage entries alone"
+        );
+
+        // A rerun after the config was fixed reports nothing, and the stale
+        // entry goes with it.
+        let _ = record_plugin_config_diagnostics(root, Vec::new());
+        let after = workspace_diagnostics_for(root);
+        assert!(
+            !after.iter().any(|d| d.kind.is_plugin_stage()),
+            "each plugin run replaces the previous set: {after:?}"
+        );
+        assert_eq!(
+            count_kind(&after, "undeclared-workspace"),
+            1,
+            "the workspace-discovery diagnostic survives the plugin replace"
+        );
+    }
+
+    /// One config file can hold two unreadable keys. They share a kind id and a
+    /// path, so both the registry write and the stderr dedupe have to key on
+    /// the payload, or the second one is invisible (issue #2736).
+    #[test]
+    fn two_unreadable_keys_in_one_config_are_recorded_and_printed_twice() {
+        let root = Path::new("/fallow-test-2736-two-keys");
+        let (_, captured) = capture_workspace_warnings(|| {
+            record_plugin_config_diagnostics(
+                root,
+                vec![
+                    plugin_diagnostic(root, "exposes", "not-object-literal"),
+                    plugin_diagnostic(root, "remotes", "spread"),
+                ],
+            )
+        });
+        assert_eq!(
+            captured.len(),
+            2,
+            "both keys reach the emitter: {captured:?}"
+        );
+        let stored = workspace_diagnostics_for(root);
+        assert_eq!(
+            count_kind(&stored, "plugin-config-unreadable"),
+            2,
+            "both keys are recorded: {stored:?}"
+        );
+
+        let plans = plan_warnings(
+            root,
+            &[
+                plugin_diagnostic(root, "exposes", "not-object-literal"),
+                plugin_diagnostic(root, "remotes", "spread"),
+            ],
+        );
+        assert_eq!(plans.len(), 2, "two distinct lines are planned: {plans:?}");
+        assert_ne!(
+            plans[0].dedupe_key, plans[1].dedupe_key,
+            "the process-wide dedupe must not swallow the second key: {plans:?}"
+        );
+    }
+
+    /// The quiet kind reaches the registry and never the stderr plan, so a
+    /// project whose `nuxt.config` fallow does not model is reported once in
+    /// the envelope and never warned about again.
+    #[test]
+    fn the_not_modeled_kind_is_recorded_without_a_stderr_line() {
+        let root = Path::new("/fallow-test-2736-not-modeled");
+        let diagnostic = WorkspaceDiagnostic::new(
+            root,
+            root.join("nuxt.config.ts"),
+            WorkspaceDiagnosticKind::PluginEffectNotModeled {
+                plugin: "nuxt".to_owned(),
+                key: "components".to_owned(),
+                reason: "key-effect-not-modeled".to_owned(),
+            },
+        );
+        let _ = record_plugin_config_diagnostics(root, vec![diagnostic.clone()]);
+        assert_eq!(
+            count_kind(
+                &workspace_diagnostics_for(root),
+                "plugin-effect-not-modeled"
+            ),
+            1
+        );
+        assert!(
+            plan_warnings(root, &[diagnostic]).is_empty(),
+            "a kind that does not degrade the run plans no stderr line"
+        );
+    }
+
     #[test]
     fn build_glob_group_message_caps_examples_and_summarises_tail() {
         let root = Path::new("/project");
@@ -1090,17 +1483,20 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].message, diag.message);
         // The key embeds `diag.path` through a raw `Display`, so the expected
-        // tail carries the platform separator: the stored path is rebuilt from
-        // its components and renders with backslashes on Windows.
-        let expected_tail = Path::new("packages").join("scratch");
+        // path segment carries the platform separator: the stored path is
+        // rebuilt from its components and renders with backslashes on Windows.
+        // It ends with the rendered message, which is what stands in for the
+        // payload so two entries sharing a kind and a path stay two lines.
+        let expected_path = Path::new("packages").join("scratch");
         assert!(
             plans[0]
                 .dedupe_key
                 .contains("::glob-matched-no-package-json::")
                 && plans[0]
                     .dedupe_key
-                    .ends_with(&expected_tail.display().to_string()),
-            "per-instance key is `root::kind::path`, not the `-agg::pattern` form: {}",
+                    .contains(&expected_path.display().to_string())
+                && plans[0].dedupe_key.ends_with(&diag.message),
+            "per-instance key is `root::kind::path::message`, not the `-agg::pattern` form: {}",
             plans[0].dedupe_key
         );
         assert!(
@@ -1138,6 +1534,73 @@ mod tests {
             plans
                 .iter()
                 .all(|p| !p.message.contains("directories with no package.json"))
+        );
+    }
+
+    /// The unconfigured-check kinds fire in the product's DEFAULT state, on
+    /// every project that never opted into boundaries or rule packs, so a
+    /// stderr warning for them is permanent noise whose only remedy is to write
+    /// config to silence a warning about not having written config. They stay
+    /// in `workspace_diagnostics[]` for a consumer that wants them.
+    #[test]
+    fn plan_warnings_drops_the_unconfigured_check_kinds() {
+        let root = Path::new("/project");
+        let diagnostics = vec![
+            WorkspaceDiagnostic::new(
+                root,
+                root.to_path_buf(),
+                WorkspaceDiagnosticKind::BoundariesNotConfigured,
+            ),
+            WorkspaceDiagnostic::new(
+                root,
+                root.to_path_buf(),
+                WorkspaceDiagnosticKind::RulePacksNotConfigured,
+            ),
+        ];
+
+        assert!(
+            plan_warnings(root, &diagnostics).is_empty(),
+            "an unconfigured check is not a degraded run and warns nobody"
+        );
+    }
+
+    /// A missing dependency tree really does change what the analysis can see,
+    /// so it keeps its stderr line while the unconfigured-check kinds lose
+    /// theirs, even when both arrive in the same batch.
+    #[test]
+    fn plan_warnings_keeps_the_degradation_kinds_alongside_dropped_ones() {
+        let root = Path::new("/project");
+        let diagnostics = vec![
+            WorkspaceDiagnostic::new(
+                root,
+                root.to_path_buf(),
+                WorkspaceDiagnosticKind::BoundariesNotConfigured,
+            ),
+            WorkspaceDiagnostic::new(
+                root,
+                root.join("node_modules"),
+                WorkspaceDiagnosticKind::NodeModulesMissing,
+            ),
+            WorkspaceDiagnostic::new(
+                root,
+                root.to_path_buf(),
+                WorkspaceDiagnosticKind::RulePacksNotConfigured,
+            ),
+        ];
+
+        let messages: Vec<String> = plan_warnings(root, &diagnostics)
+            .into_iter()
+            .map(|plan| plan.message)
+            .collect();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the degradation warns: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("node_modules"),
+            "the surviving line is the missing dependency tree: {messages:?}"
         );
     }
 
@@ -1204,6 +1667,39 @@ mod tests {
     }
 
     #[test]
+    fn plan_warnings_aggregates_missing_pattern_dirs_per_declaring_file() {
+        let root = Path::new("/project");
+        let missing = |pattern: &str| {
+            WorkspaceDiagnostic::new(
+                root,
+                root.join("pnpm-workspace.yaml"),
+                WorkspaceDiagnosticKind::WorkspacePatternDirMissing {
+                    pattern: pattern.to_owned(),
+                },
+            )
+        };
+        let diagnostics = vec![
+            missing("vite"),
+            missing("vite/packages/*"),
+            missing("rolldown"),
+        ];
+
+        let plans = plan_warnings(root, &diagnostics);
+
+        let [plan] = plans.as_slice() else {
+            panic!("expected one aggregated warning: {plans:?}");
+        };
+        assert!(
+            plan.message.starts_with(
+                "'pnpm-workspace.yaml' declares 3 workspace patterns whose directories do not \
+                 exist ('vite', 'vite/packages/*', 'rolldown')."
+            ),
+            "{}",
+            plan.message
+        );
+    }
+
+    #[test]
     fn plan_warnings_mixed_aggregatable_kinds_each_collapse_independently() {
         let root = Path::new("/project");
         let mut diagnostics: Vec<WorkspaceDiagnostic> = (0..5)
@@ -1240,7 +1736,7 @@ mod tests {
 
         let (_, diagnostics) = crate::workspace::discover_workspaces_with_diagnostics(
             dir.path(),
-            &globset::GlobSet::empty(),
+            &crate::IgnorePatternSet::empty(),
         )
         .expect("root package.json is valid");
 

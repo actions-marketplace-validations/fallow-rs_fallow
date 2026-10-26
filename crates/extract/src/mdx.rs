@@ -455,9 +455,14 @@ fn parse_statement_body(
 
     let allocator = Allocator::default();
     let parser_return = Parser::new(&allocator, &extraction.body, SourceType::tsx()).parse();
-    let accepted = !parser_return.panicked && parser_return.errors.is_empty();
+    let accepted = !parser_return.fatal_error && parser_return.diagnostics.is_empty();
     let mut extractor = ModuleInfoExtractor::new();
     extractor.visit_program(&parser_return.program);
+    crate::parse::compute_semantic_usage_for_extractor(
+        &parser_return.program,
+        &mut extractor,
+        &rustc_hash::FxHashSet::default(),
+    );
     extractor.remap_spans_with(|span| extraction.remap_span(span));
     (
         extractor.into_module_info(file_id, content_hash, parsed_suppressions),
@@ -482,10 +487,13 @@ fn statement_block_is_accepted(block: &[(usize, &str)]) -> bool {
 /// "Accept" means the parse was not fatal, the criterion the whole-body parse
 /// uses: a head the parser recovers from is classified the way that parse
 /// would have treated it anyway.
+///
+/// The MDX scan also runs outside extraction (search visibility reads the
+/// statements of an MDX file), so this parse sizes its own stack.
 fn parses_as_typescript(source: &str) -> bool {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::tsx()).parse();
-    !parsed.panicked && parsed.errors.is_empty()
+    crate::parse_bounded_or_default(source, SourceType::tsx(), |parsed| {
+        !parsed.fatal_error && parsed.diagnostics.is_empty()
+    })
 }
 
 fn lines_with_offsets(source: &str) -> impl Iterator<Item = (usize, &str)> {

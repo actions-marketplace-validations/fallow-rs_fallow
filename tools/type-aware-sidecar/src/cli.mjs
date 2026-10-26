@@ -2,13 +2,19 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 
 import {
-  ANALYSIS_OPERATION,
+  MUTANT_TYPECHECK_OPERATION,
   SESSION_ENVELOPE_TYPES,
   STATUS_OPERATION,
   WIRE_PROTOCOL_VERSION,
 } from "./generated-protocol.mjs";
 import { analyzeSemanticQueries, createSemanticSession } from "./semantic.mjs";
-import { createSemanticResponse, createStatusResponse, parseRequest } from "./protocol.mjs";
+import { checkMutants } from "./mutant-typecheck.mjs";
+import {
+  createMutantTypecheckResponse,
+  createSemanticResponse,
+  createStatusResponse,
+  parseRequest,
+} from "./protocol.mjs";
 
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const [ANALYZE_ENVELOPE, SHUTDOWN_ENVELOPE] = SESSION_ENVELOPE_TYPES;
@@ -33,20 +39,6 @@ export const readAll = async (input, maximumBytes = MAX_REQUEST_BYTES) => {
 
 const writeJson = (output, value) => {
   output.write(`${JSON.stringify(value)}\n`);
-};
-
-const handleArguments = (args, output) => {
-  if (args.length === 1 && args[0] === "--status") {
-    writeJson(output, createStatusResponse());
-    return true;
-  }
-  if (args.length === 1 && args[0] === "--session") {
-    return false;
-  }
-  if (args.length > 0) {
-    throw new Error(`unknown argument: ${args[0]}`);
-  }
-  return false;
 };
 
 const sessionFileChanges = (value, root) => {
@@ -106,6 +98,9 @@ const runSession = async (input, output) => {
         throw new Error("invalid semantic session envelope");
       }
       const request = parseRequest(envelope.request);
+      if (request.operation === MUTANT_TYPECHECK_OPERATION) {
+        throw new Error("a semantic session does not accept a mutant-typecheck request");
+      }
       if (!session) {
         root = request.root;
         session = createSemanticSession(root);
@@ -119,7 +114,7 @@ const runSession = async (input, output) => {
       writeJson(output, {
         request_id: envelope.request_id,
         revision: envelope.revision,
-        response: responseFor(request, result, performance.now() - startedAt),
+        response: responseFor(result, performance.now() - startedAt),
       });
     }
   } finally {
@@ -139,19 +134,20 @@ const isStatusRequest = (request) =>
   Object.keys(request ?? {}).length === STATUS_FIELDS.length &&
   STATUS_FIELDS.every(([name, value]) => request[name] === value);
 
-const responseFor = (request, result, elapsedMs) => {
-  if (request.protocolVersion !== WIRE_PROTOCOL_VERSION) {
-    throw new Error(`unsupported protocol_version ${String(request.protocolVersion)}`);
-  }
-  return createSemanticResponse({ ...result, elapsedMs });
-};
+const responseFor = (result, elapsedMs) => createSemanticResponse({ ...result, elapsedMs });
 
 export const run = async ({ input, output, args = [] }) => {
-  if (args.length === 1 && args[0] === "--session") {
-    await runSession(input, output);
-    return;
+  if (args.length > 0) {
+    if (args.length === 1 && args[0] === "--session") {
+      await runSession(input, output);
+      return;
+    }
+    if (args.length === 1 && args[0] === "--status") {
+      writeJson(output, createStatusResponse());
+      return;
+    }
+    throw new Error(`unknown argument: ${args[0]}`);
   }
-  if (handleArguments(args, output)) return;
   const startedAt = performance.now();
   const rawRequest = parseJsonRequest(await readAll(input));
   if (isStatusRequest(rawRequest)) {
@@ -159,9 +155,14 @@ export const run = async ({ input, output, args = [] }) => {
     return;
   }
   const request = parseRequest(rawRequest);
-  if (rawRequest.operation !== ANALYSIS_OPERATION) {
-    throw new Error(`unsupported operation ${String(rawRequest.operation)}`);
+  if (request.operation === MUTANT_TYPECHECK_OPERATION) {
+    const results = checkMutants(request);
+    writeJson(
+      output,
+      createMutantTypecheckResponse({ results, elapsedMs: performance.now() - startedAt }),
+    );
+    return;
   }
   const result = analyzeSemanticQueries(request);
-  writeJson(output, responseFor(request, result, performance.now() - startedAt));
+  writeJson(output, responseFor(result, performance.now() - startedAt));
 };

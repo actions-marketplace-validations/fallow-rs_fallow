@@ -2,10 +2,15 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fallow_config::{ResolvedConfig, WorkspaceDiagnostic, WorkspaceDiagnosticKind};
+use fallow_config::{
+    DEFAULT_IGNORE_PATTERNS, IgnorePatternSet, ResolvedConfig, WorkspaceDiagnostic,
+    WorkspaceDiagnosticKind,
+};
 use fallow_types::discover::{DiscoveredFile, FileId};
+use fallow_types::path_util::display_relative;
+use fallow_types::workspace::glob_first_literal_segment;
 use ignore::WalkBuilder;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{ALLOWED_HIDDEN_DIRS, SCRIPT_SCOPE_DENYLIST};
 
@@ -34,6 +39,114 @@ type SizedFile = (PathBuf, u64);
 /// borrow a local nor mutate captured state directly, and the predicate runs
 /// on every walker thread.
 type SkippedDotdirSink = Arc<Mutex<Vec<PathBuf>>>;
+
+/// Candidate source files ONE built-in ignore pattern removed from a walk,
+/// with the directories they sat in (issue #2638).
+///
+/// The scope map is deliberately uncapped, and its size is not the risk it
+/// looks like. For a directory-shaped pattern every file under one matched
+/// directory collapses to a single key, the one built-in that could span a
+/// whole dependency tree is never tallied at all (see
+/// [`UNREPORTED_DEFAULT_IGNORES`]), and only the file-shaped patterns
+/// (`**/*.min.js` and friends) key on a file's parent, on files that are rare
+/// by construction. The map is therefore strictly smaller than the file list
+/// the same walk already holds. A ceiling would buy nothing and would cost
+/// both determinism and honesty: the parallel walk fills per-thread maps in
+/// nondeterministic order, so "the first N directories" is not a stable set,
+/// the anchor picked from a truncated set would differ between runs of the
+/// same command, and `directory_count` would become a floor rather than a
+/// count.
+#[derive(Default)]
+struct ExcludedByPattern {
+    /// Candidate source files this pattern excluded. Exact.
+    file_count: u32,
+    /// Excluded files per scope directory, project-root-relative.
+    scopes: FxHashMap<PathBuf, u32>,
+}
+
+impl ExcludedByPattern {
+    fn record(&mut self, scope: PathBuf) {
+        self.file_count = self.file_count.saturating_add(1);
+        *self.scopes.entry(scope).or_insert(0) += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.file_count = self.file_count.saturating_add(other.file_count);
+        for (scope, count) in other.scopes {
+            *self.scopes.entry(scope).or_insert(0) += count;
+        }
+    }
+
+    /// Distinct directories this pattern MATCHED at, which for a
+    /// directory-shaped pattern is not the number of directories that held
+    /// the files: everything under one matched `dist/` collapses to that one
+    /// scope. Exact, and the number the message needs to say whether
+    /// [`Self::anchor`] names the whole exclusion or one matched location of
+    /// several.
+    fn directory_count(&self) -> u32 {
+        u32::try_from(self.scopes.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The matched directory this pattern excluded the most files from, ties
+    /// broken by the lexicographically first path so two runs on one tree
+    /// report the same anchor.
+    fn anchor(&self) -> PathBuf {
+        self.scopes
+            .iter()
+            .max_by(|(left_path, left_count), (right_path, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_path.cmp(left_path))
+            })
+            .map(|(path, _)| path.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Per-built-in-pattern exclusion tallies, keyed by index into
+/// [`DEFAULT_IGNORE_PATTERNS`].
+type ExclusionTally = FxHashMap<usize, ExcludedByPattern>;
+
+/// Built-in ignore patterns whose exclusions are never reported (issue #2638).
+///
+/// The diagnostic exists to say "first-party source of yours was dropped".
+/// `**/node_modules/**` drops installed dependencies, which are nobody's
+/// first-party source: on a project whose `node_modules` is not gitignored it
+/// would report a five-figure count whose only honest remedy is "that is your
+/// dependency tree", and it would be the one built-in able to dominate the
+/// walk's memory with per-package scope directories. `**/.git/**` cannot fire
+/// at all, because hidden directories are not traversed; it is listed so the
+/// two exclusions read as one policy rather than as an accident.
+const UNREPORTED_DEFAULT_IGNORES: &[&str] = &["**/node_modules/**", "**/.git/**"];
+
+/// The directory a built-in pattern excluded a file "at": the LONGEST prefix
+/// of the file's project-relative parent directory ending in the pattern's
+/// literal segment, or the parent itself when the pattern has no literal
+/// segment.
+///
+/// `**/build/**` with `projects/app/build/static/js/main.js` gives
+/// `projects/app/build`, which is the directory a reader can act on and the
+/// one `fallow --root` takes. The deepest match is what makes that remedy
+/// true: the glob is tested against the path relative to the run root, so on
+/// `build/tools/build/a.ts` an anchor at the outer `build` leaves the inner
+/// one in the relative path and the built-in matches again. `**/*.min.js` has
+/// no literal segment, so `vendor/a.min.js` gives `vendor`. A root-level match
+/// returns the empty path, which the diagnostic renders as the root itself.
+fn exclusion_scope(relative: &Path, pattern: &str) -> PathBuf {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let Some(literal) = glob_first_literal_segment(pattern) else {
+        return parent.to_path_buf();
+    };
+    let mut prefix = PathBuf::new();
+    let mut deepest = None;
+    for component in parent.components() {
+        prefix.push(component);
+        if component.as_os_str() == OsStr::new(literal) {
+            deepest = Some(prefix.clone());
+        }
+    }
+    deepest.unwrap_or_else(|| parent.to_path_buf())
+}
 
 /// Number of example file paths named in the aggregated skipped-large-file and
 /// largest-files stderr notes before the tail collapses to "and N more". Keeps
@@ -181,7 +294,7 @@ fn summarize_examples(root: &Path, examples: &[SizedFile]) -> String {
         .iter()
         .take(NOTE_EXAMPLE_CAP)
         .map(|(path, size)| {
-            let display = display_relative_path(root, path);
+            let display = display_relative(root, path);
             format!("{display} ({})", format_size_mb(*size))
         })
         .collect();
@@ -223,6 +336,24 @@ fn partition_minified_generated_js(
 /// emit one aggregated `tracing::warn!` so a human running `fallow` sees what
 /// was dropped. Mirrors the JSON-plus-gated-warn pattern used for undeclared
 /// workspaces. The caller writes the returned list to the registry.
+/// Report an uninstalled dependency tree as part of the walk's own
+/// source-discovery set.
+///
+/// It belongs here rather than beside the two pipelines that used to warn
+/// about it: the walk owns this root's source-discovery diagnostics, and any
+/// second writer would be replaced by whichever walk finished last.
+fn report_missing_node_modules(config: &ResolvedConfig) -> Vec<WorkspaceDiagnostic> {
+    let Some(diagnostic) = fallow_config::missing_node_modules_diagnostic(&config.root) else {
+        return Vec::new();
+    };
+    if !config.quiet
+        && should_emit_note_once(format!("node-modules-missing::{}", config.root.display()))
+    {
+        tracing::warn!("fallow: {}", diagnostic.message);
+    }
+    vec![diagnostic]
+}
+
 fn report_skipped_large_files(
     config: &ResolvedConfig,
     skipped: &[SizedFile],
@@ -261,6 +392,35 @@ fn report_skipped_large_files(
         );
     }
     diagnostics
+}
+
+/// Warn once for each config glob that matches fewer discovered files now
+/// that a single `*` or `?` stays within one path segment.
+///
+/// The old matcher compiles only for patterns with a single-segment
+/// wildcard, and one pass over the discovered files counts every pattern.
+/// The warning goes to stderr only; JSON output does not change.
+fn warn_legacy_glob_narrowings(config: &ResolvedConfig, files: &[DiscoveredFile]) {
+    if config.quiet || config.legacy_glob_groups.is_empty() {
+        return;
+    }
+    let relative: Vec<&Path> = files
+        .iter()
+        .map(|file| file.path.strip_prefix(&config.root).unwrap_or(&file.path))
+        .collect();
+    for narrowing in
+        fallow_config::find_legacy_glob_narrowings(&config.legacy_glob_groups, &relative)
+    {
+        let message = narrowing.message();
+        if should_emit_note_once(format!(
+            "legacy-glob::{}::{}::{}",
+            config.root.display(),
+            narrowing.field,
+            narrowing.pattern
+        )) {
+            tracing::warn!("{message}");
+        }
+    }
 }
 
 /// Build the typed diagnostics for generated minified JS files skipped before
@@ -313,7 +473,7 @@ fn summarize_paths(root: &Path, examples: &[&PathBuf]) -> String {
     let shown: Vec<String> = examples
         .iter()
         .take(NOTE_EXAMPLE_CAP)
-        .map(|path| display_relative_path(root, path))
+        .map(|path| display_relative(root, path))
         .collect();
     let remaining = examples.len().saturating_sub(NOTE_EXAMPLE_CAP);
     if remaining > 0 {
@@ -329,23 +489,13 @@ fn summarize_paths_open_ended(root: &Path, examples: &[&PathBuf]) -> String {
     let shown: Vec<String> = examples
         .iter()
         .take(NOTE_EXAMPLE_CAP)
-        .map(|path| display_relative_path(root, path))
+        .map(|path| display_relative(root, path))
         .collect();
     if examples.len() > NOTE_EXAMPLE_CAP {
         format!("{}, and more", shown.join(", "))
     } else {
         shown.join(", ")
     }
-}
-
-/// Render `path` relative to `root` with forward slashes. Cross-platform
-/// output stability depends on the slash normalisation.
-fn display_relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
 }
 
 /// Whether a candidate file inside a skipped dotdir is one this run had
@@ -389,8 +539,8 @@ fn has_module_extension(path: &Path) -> bool {
 /// `1 + DOTDIR_SCAN_MAX_ENTRIES` directory reads for one dotdir, and
 /// [`DOTDIR_SCAN_TOTAL_ENTRIES`] across the whole walk.
 ///
-/// Runs on `ignore::WalkBuilder` with the same git settings as the source walk
-/// rather than a bare `read_dir`, because "the project has not excluded it" has
+/// Runs on `fallow_config::source_walk_builder`, the git settings of the
+/// source walk, rather than a bare `read_dir`, because "the project has not excluded it" has
 /// to mean what git means. Only the DIRECTORY form of a gitignore rule
 /// (`.build-tools/`) prunes a dotdir before the walk's own filter sees it: the
 /// `dir/**`, `dir/*`, `**/dir/**` and file-level (`*.ts`) forms all leave the
@@ -412,12 +562,8 @@ fn scan_for_reportable_source(
     dir: &Path,
     budget: &mut usize,
 ) -> bool {
-    let mut builder = WalkBuilder::new(dir);
+    let mut builder = fallow_config::source_walk_builder(dir);
     builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
         .follow_links(false)
         .max_depth(Some(DOTDIR_SCAN_MAX_DEPTH + 1))
         .threads(1);
@@ -515,6 +661,80 @@ fn dotdir_is_scan_candidate(config: &ResolvedConfig, dir: &Path) -> bool {
     })
 }
 
+/// Build the typed diagnostics for the built-in ignore patterns that removed
+/// candidate source files from this walk (issue #2638).
+///
+/// One entry per pattern, in [`DEFAULT_IGNORE_PATTERNS`] order, so the array
+/// grows by at most the number of built-in patterns on a project of any size
+/// and its order does not depend on the parallel walk. No stderr output: the
+/// kind answers `warns_on_stderr()` with `false`, and the CLI prints a note
+/// only under `--explain-skipped`.
+fn report_default_ignore_exclusions(
+    config: &ResolvedConfig,
+    tally: &ExclusionTally,
+) -> Vec<WorkspaceDiagnostic> {
+    let mut indices: Vec<usize> = tally.keys().copied().collect();
+    indices.sort_unstable();
+    indices
+        .into_iter()
+        .filter_map(|index| {
+            let excluded = tally.get(&index)?;
+            let pattern = DEFAULT_IGNORE_PATTERNS.get(index)?;
+            Some(
+                WorkspaceDiagnostic::new(
+                    &config.root,
+                    config.root.join(excluded.anchor()),
+                    WorkspaceDiagnosticKind::ExcludedByDefaultIgnore {
+                        pattern: (*pattern).to_owned(),
+                        file_count: excluded.file_count,
+                        directory_count: excluded.directory_count(),
+                    },
+                )
+                // A file-shaped built-in that matched a file directly at the
+                // analysis root anchors at the root, and `root.join("")` is the
+                // root itself. The analysis envelopes' post-serialisation strip
+                // only removes a `root + separator` prefix, so without this the
+                // entry would carry the absolute host path into every JSON
+                // surface while its siblings render `.`.
+                .into_root_relative(&config.root),
+            )
+        })
+        .collect()
+}
+
+/// Report that the walk finished with nothing to analyze (issue #2686).
+///
+/// The condition is the file list being empty, not any particular exclusion,
+/// so it also covers a docs-only repository, a workspace member with no
+/// TypeScript and a path filter that matched nothing. The built-in-ignore
+/// tally rides along as `excluded_file_count` so the common cause stays
+/// attributable without making it the trigger.
+///
+/// Recorded by discovery rather than by the CLI's human note, so every envelope
+/// built from a diagnostics snapshot carries it: the MCP tools and the
+/// programmatic routes share this list, and a kind that existed on the CLI path
+/// alone would break that.
+fn report_no_source_files_analyzed(
+    config: &ResolvedConfig,
+    analyzed_file_count: usize,
+    tally: &ExclusionTally,
+) -> Vec<WorkspaceDiagnostic> {
+    if analyzed_file_count > 0 {
+        return Vec::new();
+    }
+    let excluded_file_count = tally.values().map(|excluded| excluded.file_count).sum();
+    vec![
+        WorkspaceDiagnostic::new(
+            &config.root,
+            config.root.clone(),
+            WorkspaceDiagnosticKind::NoSourceFilesAnalyzed {
+                excluded_file_count,
+            },
+        )
+        .into_root_relative(&config.root),
+    ]
+}
+
 /// Build the typed diagnostics for the dot-prefixed directories this walk
 /// dropped that hold source files the project has not excluded, and emit one
 /// aggregated `tracing::warn!` so the otherwise silent skip is visible on
@@ -566,7 +786,7 @@ fn report_skipped_source_dotdirs(
             config.root.display(),
             reportable
                 .first()
-                .map_or_else(String::new, |dir| display_relative_path(&config.root, dir))
+                .map_or_else(String::new, |dir| display_relative(&config.root, dir))
         ))
     {
         tracing::warn!(
@@ -604,14 +824,16 @@ fn build_skipped_dotdirs_note(root: &Path, reportable: &[&PathBuf], truncated: b
     let verb = if count == 1 { "contains" } else { "contain" };
     let at_least = if truncated { "at least " } else { "" };
     let (target, pronoun) = match reportable {
-        [only] => (display_relative_path(root, only), "it"),
+        [only] => (display_relative(root, only), "it"),
         _ => ("<dir>".to_owned(), "one"),
     };
     format!(
         "fallow: skipped {at_least}{count} hidden {noun} that {verb} source files ({examples}). \
-         Hidden directories are not traversed and no config field adds one: analyze {pronoun} \
-         with fallow --root {target} if it holds first-party source, or add '{target}/**' to \
-         ignorePatterns to silence this."
+         Hidden directories are not traversed, so a file, export or dependency used only \
+         there can be reported as unused: add '!{target}/**' to ignorePatterns to analyze \
+         {pronoun}, or add it to entry, ignoreExports or ignoreDependencies, or add \
+         '{target}/**' to ignorePatterns to silence this. fallow --root {target} analyzes \
+         {pronoun} on its own and does not fix this run."
     )
 }
 
@@ -772,12 +994,71 @@ impl HiddenDirScope {
 struct FileVisitor<'a> {
     root: &'a Path,
     canonical_root: Option<&'a Path>,
-    ignore_patterns: &'a globset::GlobSet,
+    ignore_patterns: &'a IgnorePatternSet,
+    /// Globs at the front of `ignore_patterns` that came from the project's
+    /// own `ignorePatterns`; the built-in defaults follow them.
+    user_ignore_pattern_count: usize,
+    /// Plugin- and script-contributed hidden directory scopes. Read only when
+    /// the project wrote a `!` exception, to tell a hidden directory that the
+    /// exception opened from one the walk always opens.
+    hidden_dir_scopes: &'a [HiddenDirScope],
     production_excludes: &'a Option<globset::GlobSet>,
     shared: &'a Mutex<Vec<(std::path::PathBuf, u64)>>,
     config_shared: Option<&'a Mutex<Vec<std::path::PathBuf>>>,
+    excluded_shared: &'a Mutex<ExclusionTally>,
     local: Vec<(std::path::PathBuf, u64)>,
     config_local: Vec<std::path::PathBuf>,
+    excluded_local: ExclusionTally,
+    /// Reused across every excluded candidate so attribution allocates once
+    /// per walker thread rather than once per file.
+    match_buf: Vec<usize>,
+}
+
+impl FileVisitor<'_> {
+    /// Attribute one excluded candidate source file to the built-in pattern
+    /// that removed it (issue #2638), and credit the `ignorePatterns` globs
+    /// that removed any file that no built-in matches (issue #3824).
+    ///
+    /// Runs only on files `is_match` already rejected, so the kept-file path
+    /// still pays a single boolean match.
+    fn record_ignore_exclusion(&mut self, relative: &Path, is_source: bool) {
+        // Cheap pre-filter, not a second rule: `**/node_modules/**` is in
+        // UNREPORTED_DEFAULT_IGNORES, and it is also the one built-in that
+        // fires on an entire dependency tree. Testing a path component beats
+        // running the whole glob union over tens of thousands of files whose
+        // attribution the report would then discard.
+        if (!is_source && self.user_ignore_pattern_count == 0)
+            || relative
+                .components()
+                .any(|component| component.as_os_str() == OsStr::new("node_modules"))
+        {
+            return;
+        }
+        self.match_buf.clear();
+        self.ignore_patterns
+            .excluded_matches_into(relative, &mut self.match_buf);
+        // globset returns ascending indices, so the first match is both the
+        // cheapest user-pattern test and the lowest-index built-in.
+        let Some(&first) = self.match_buf.first().filter(|_| is_source) else {
+            return;
+        };
+        if first < self.user_ignore_pattern_count {
+            // An `ignorePatterns` entry also matched. The project chose this
+            // exclusion, so reporting it as a surprise would be wrong.
+            return;
+        }
+        let Some(pattern) = DEFAULT_IGNORE_PATTERNS.get(first - self.user_ignore_pattern_count)
+        else {
+            return;
+        };
+        if UNREPORTED_DEFAULT_IGNORES.contains(pattern) {
+            return;
+        }
+        self.excluded_local
+            .entry(first - self.user_ignore_pattern_count)
+            .or_default()
+            .record(exclusion_scope(relative, pattern));
+    }
 }
 
 impl ignore::ParallelVisitor for FileVisitor<'_> {
@@ -793,12 +1074,19 @@ impl ignore::ParallelVisitor for FileVisitor<'_> {
             .strip_prefix(self.root)
             .unwrap_or_else(|_| entry.path());
         if self.ignore_patterns.is_match(relative) {
+            self.record_ignore_exclusion(relative, has_source_extension(entry.path()));
             return ignore::WalkState::Continue;
         }
         if self
             .production_excludes
             .as_ref()
             .is_some_and(|excludes| excludes.is_match(relative))
+        {
+            return ignore::WalkState::Continue;
+        }
+        if self.ignore_patterns.has_exceptions()
+            && is_under_exception_only_hidden_dir(self.root, entry.path(), self.hidden_dir_scopes)
+            && !self.ignore_patterns.is_lifted(relative)
         {
             return ignore::WalkState::Continue;
         }
@@ -857,6 +1145,15 @@ impl Drop for FileVisitor<'_> {
                 .expect("walk config collector lock poisoned")
                 .append(&mut self.config_local);
         }
+        if !self.excluded_local.is_empty() {
+            let mut shared = self
+                .excluded_shared
+                .lock()
+                .expect("walk exclusion collector lock poisoned");
+            for (index, tally) in std::mem::take(&mut self.excluded_local) {
+                shared.entry(index).or_default().merge(tally);
+            }
+        }
     }
 }
 
@@ -864,10 +1161,13 @@ impl Drop for FileVisitor<'_> {
 struct FileVisitorBuilder<'a> {
     root: &'a Path,
     canonical_root: Option<&'a Path>,
-    ignore_patterns: &'a globset::GlobSet,
+    ignore_patterns: &'a IgnorePatternSet,
+    user_ignore_pattern_count: usize,
+    hidden_dir_scopes: &'a [HiddenDirScope],
     production_excludes: &'a Option<globset::GlobSet>,
     shared: &'a Mutex<Vec<(std::path::PathBuf, u64)>>,
     config_shared: Option<&'a Mutex<Vec<std::path::PathBuf>>>,
+    excluded_shared: &'a Mutex<ExclusionTally>,
 }
 
 impl<'s> ignore::ParallelVisitorBuilder<'s> for FileVisitorBuilder<'s> {
@@ -876,11 +1176,16 @@ impl<'s> ignore::ParallelVisitorBuilder<'s> for FileVisitorBuilder<'s> {
             root: self.root,
             canonical_root: self.canonical_root,
             ignore_patterns: self.ignore_patterns,
+            user_ignore_pattern_count: self.user_ignore_pattern_count,
+            hidden_dir_scopes: self.hidden_dir_scopes,
             production_excludes: self.production_excludes,
             shared: self.shared,
             config_shared: self.config_shared,
+            excluded_shared: self.excluded_shared,
             local: Vec::new(),
             config_local: Vec::new(),
+            excluded_local: ExclusionTally::default(),
+            match_buf: Vec::new(),
         })
     }
 }
@@ -905,6 +1210,7 @@ pub const PRODUCTION_EXCLUDE_PATTERNS: &[&str] = &[
     "**/__mocks__/**",
     "**/__snapshots__/**",
     "**/__fixtures__/**",
+    "**/test-d/**",
     "**/test/**",
     "**/tests/**",
     "*.config.*",
@@ -965,6 +1271,27 @@ fn is_allowed_hidden_with_scopes(
         || is_allowed_scoped_hidden_dir(name, entry.path(), additional_hidden_dir_scopes)
 }
 
+/// True when a parent directory of `path` is hidden and only a `!` exception
+/// in `ignorePatterns` opened it: the allowlist and the plugin and script
+/// scopes do not admit it. A file there is kept only when an exception
+/// matches the file itself.
+fn is_under_exception_only_hidden_dir(
+    root: &Path,
+    path: &Path,
+    hidden_dir_scopes: &[HiddenDirScope],
+) -> bool {
+    path.ancestors()
+        .skip(1)
+        .take_while(|dir| *dir != root && dir.starts_with(root))
+        .any(|dir| {
+            dir.file_name().is_some_and(|name| {
+                name.to_string_lossy().starts_with('.')
+                    && !is_allowed_hidden_dir(name)
+                    && !is_allowed_scoped_hidden_dir(name, dir, hidden_dir_scopes)
+            })
+        })
+}
+
 /// Discover all source files in the project.
 ///
 /// # Panics
@@ -993,6 +1320,18 @@ fn config_candidate_basename_globs() -> &'static [String] {
             for pattern in plugin.config_patterns() {
                 let basename = pattern.rsplit('/').next().unwrap_or(pattern);
                 set.insert(basename.to_string());
+            }
+            // Tooling evidence resolves always-used files, such as `.c8rc.json`,
+            // in workspace directories against the candidate index. A wildcard
+            // basename such as `*` would capture every file, so it stays out.
+            if plugin.tooling_dependencies().is_empty() {
+                continue;
+            }
+            for pattern in plugin.always_used() {
+                let basename = pattern.rsplit('/').next().unwrap_or(pattern);
+                if !basename.starts_with('!') && !basename.contains(['*', '?', '[']) {
+                    set.insert(basename.to_string());
+                }
             }
         }
         let mut globs: Vec<String> = set.into_iter().collect();
@@ -1056,12 +1395,8 @@ fn build_source_walk_builder(
     capture_config: bool,
     skipped_dotdirs: &SkippedDotdirSink,
 ) -> WalkBuilder {
-    let mut walk_builder = WalkBuilder::new(&config.root);
+    let mut walk_builder = fallow_config::source_walk_builder(&config.root);
     walk_builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
         .types(build_walk_types(capture_config))
         .threads(config.threads);
     // One filter, not two: `filter_entry` replaces rather than chains, and the
@@ -1070,8 +1405,24 @@ fn build_source_walk_builder(
     // are excluded by construction (issue #461).
     let scopes = additional_hidden_dir_scopes.to_vec();
     let sink = Arc::clone(skipped_dotdirs);
+    let root = config.root.clone();
+    let ignore_patterns = config.ignore_patterns.clone();
     walk_builder.filter_entry(move |entry| {
         if is_allowed_hidden_with_scopes(entry, &scopes) {
+            return true;
+        }
+        // A `!` entry in `ignorePatterns` that can match a file in this hidden
+        // directory opens it (issue #2452). The visitor then keeps only the
+        // files an exception matches.
+        if ignore_patterns.has_exceptions()
+            && entry.file_type().is_some_and(|ft| ft.is_dir())
+            && ignore_patterns.admits_hidden_dir(
+                entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or_else(|_| entry.path()),
+            )
+        {
             return true;
         }
         if entry.file_type().is_some_and(|ft| ft.is_dir())
@@ -1186,15 +1537,20 @@ pub fn discover_files_config_candidates_and_diagnostics(
 
     let collected: Mutex<Vec<(std::path::PathBuf, u64)>> = Mutex::new(Vec::new());
     let config_collected: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+    let excluded_collected: Mutex<ExclusionTally> = Mutex::new(ExclusionTally::default());
     let mut visitor_builder = FileVisitorBuilder {
         root: &config.root,
         canonical_root: canonical_root.as_deref(),
         ignore_patterns: &config.ignore_patterns,
+        user_ignore_pattern_count: config.user_ignore_pattern_count,
+        hidden_dir_scopes: additional_hidden_dir_scopes,
         production_excludes: &production_excludes,
         shared: &collected,
         config_shared: capture_config.then_some(&config_collected),
+        excluded_shared: &excluded_collected,
     };
     walk_builder.build_parallel().visit(&mut visitor_builder);
+    config.ignore_patterns.mark_walked();
 
     let mut raw = collected
         .into_inner()
@@ -1212,6 +1568,10 @@ pub fn discover_files_config_candidates_and_diagnostics(
         .into_inner()
         .expect("walk config collector lock poisoned");
     config_candidates.sort_unstable();
+
+    let excluded_by_default_ignore = excluded_collected
+        .into_inner()
+        .expect("walk exclusion collector lock poisoned");
 
     // The parallel walk records dotdirs in nondeterministic thread order, and
     // the diagnostic array order is part of the JSON contract, so sort and
@@ -1239,6 +1599,16 @@ pub fn discover_files_config_candidates_and_diagnostics(
                 production_excludes.as_ref(),
                 &dotdir_candidates,
             ))
+            .chain(report_default_ignore_exclusions(
+                config,
+                &excluded_by_default_ignore,
+            ))
+            .chain(report_missing_node_modules(config))
+            .chain(report_no_source_files_analyzed(
+                config,
+                kept.len(),
+                &excluded_by_default_ignore,
+            ))
             .collect(),
     );
 
@@ -1253,6 +1623,7 @@ pub fn discover_files_config_candidates_and_diagnostics(
         .collect();
 
     note_largest_files(config, &files);
+    warn_legacy_glob_narrowings(config, &files);
 
     DiscoveredSources {
         files,
@@ -1268,14 +1639,140 @@ mod tests {
 
     use super::*;
 
+    /// Issue #2638: the anchor a directory-shaped built-in reports is the
+    /// directory a reader can act on and the one `fallow --root` takes, not
+    /// the deepest directory that happens to hold the file.
+    #[test]
+    fn exclusion_scope_stops_at_the_patterns_literal_directory_segment() {
+        assert_eq!(
+            exclusion_scope(
+                Path::new("projects/app/build/static/js/main.js"),
+                "**/build/**"
+            ),
+            PathBuf::from("projects/app/build")
+        );
+        assert_eq!(
+            exclusion_scope(Path::new("dist/a.ts"), "**/dist/**"),
+            PathBuf::from("dist")
+        );
+        assert_eq!(
+            exclusion_scope(
+                Path::new("node_modules/react/index.js"),
+                "**/node_modules/**"
+            ),
+            PathBuf::from("node_modules"),
+            "the helper is shape-only: `**/node_modules/**` is never tallied, \
+             but a directory-shaped pattern still collapses to its literal segment"
+        );
+    }
+
+    /// The DEEPEST matching segment wins, because the anchor is the directory
+    /// the `--root` remedy names. Anchoring at the outermost `build` would
+    /// leave the inner one in the path relative to the new root, so the
+    /// built-in would match again and the advertised remedy would recover
+    /// nothing.
+    #[test]
+    fn exclusion_scope_takes_the_deepest_matching_segment() {
+        assert_eq!(
+            exclusion_scope(Path::new("build/tools/build/a.ts"), "**/build/**"),
+            PathBuf::from("build/tools/build")
+        );
+        assert_eq!(
+            exclusion_scope(Path::new("dist/pkg/dist/inner/a.ts"), "**/dist/**"),
+            PathBuf::from("dist/pkg/dist")
+        );
+    }
+
+    /// A file-shaped pattern has no literal segment to stop at, so the file's
+    /// own directory is the most specific honest answer.
+    #[test]
+    fn exclusion_scope_falls_back_to_the_parent_for_a_file_shaped_pattern() {
+        assert_eq!(
+            exclusion_scope(Path::new("vendor/a.min.js"), "**/*.min.js"),
+            PathBuf::from("vendor")
+        );
+        assert_eq!(
+            exclusion_scope(Path::new("a.min.js"), "**/*.min.js"),
+            PathBuf::new(),
+            "a root-level match anchors at the root itself"
+        );
+    }
+
+    /// A pattern whose literal segment is absent from the path (only reachable
+    /// through a future pattern shape) degrades to the parent rather than
+    /// returning the whole path.
+    #[test]
+    fn exclusion_scope_falls_back_when_the_literal_segment_is_absent() {
+        assert_eq!(
+            exclusion_scope(Path::new("src/nested/a.ts"), "**/build/**"),
+            PathBuf::from("src/nested")
+        );
+    }
+
+    /// Issue #2638: `directory_count` distinguishes one contained tree from an
+    /// exclusion scattered over sibling packages, which is what keeps the
+    /// rendered message from claiming a majority it does not have.
+    #[test]
+    fn the_directory_count_is_the_number_of_distinct_scopes() {
+        let mut one_tree = ExcludedByPattern::default();
+        one_tree.record(PathBuf::from("packages/web/build"));
+        one_tree.record(PathBuf::from("packages/web/build"));
+        assert_eq!(one_tree.file_count, 2);
+        assert_eq!(one_tree.directory_count(), 1);
+
+        let mut scattered = ExcludedByPattern::default();
+        scattered.record(PathBuf::from("packages/a/dist"));
+        scattered.record(PathBuf::from("packages/b/dist"));
+        assert_eq!(scattered.directory_count(), 2);
+    }
+
+    /// Issue #2638 (AC2): the anchor is the directory with the most excluded
+    /// files, and a tie resolves to the lexicographically first path so two
+    /// runs on one tree report the same location.
+    #[test]
+    fn the_anchor_is_the_largest_group_with_ties_broken_by_path() {
+        let mut tally = ExcludedByPattern::default();
+        for _ in 0..3 {
+            tally.record(PathBuf::from("packages/web/build"));
+        }
+        tally.record(PathBuf::from("packages/api/build"));
+        assert_eq!(tally.file_count, 4);
+        assert_eq!(tally.anchor(), PathBuf::from("packages/web/build"));
+
+        let mut tied = ExcludedByPattern::default();
+        tied.record(PathBuf::from("z/build"));
+        tied.record(PathBuf::from("a/build"));
+        assert_eq!(tied.anchor(), PathBuf::from("a/build"));
+    }
+
+    /// Per-thread tallies merge into one exact total, which is what makes
+    /// `file_count` trustworthy on a parallel walk.
+    #[test]
+    fn merging_two_thread_tallies_keeps_the_count_exact() {
+        let mut left = ExcludedByPattern::default();
+        left.record(PathBuf::from("dist"));
+        left.record(PathBuf::from("dist"));
+        let mut right = ExcludedByPattern::default();
+        right.record(PathBuf::from("dist"));
+        right.record(PathBuf::from("packages/ui/dist"));
+
+        left.merge(right);
+        assert_eq!(left.file_count, 4);
+        assert_eq!(left.scopes.get(Path::new("dist")), Some(&3));
+        assert_eq!(left.anchor(), PathBuf::from("dist"));
+    }
+
     #[test]
     fn skipped_dotdirs_note_names_the_directory_when_there_is_one() {
         let root = Path::new("/repo");
         let only = PathBuf::from("/repo/.tooling");
         let note = build_skipped_dotdirs_note(root, &[&only], false);
         assert!(note.contains("skipped 1 hidden directory that contains source files"));
-        assert!(note.contains("analyze it with fallow --root .tooling"));
+        assert!(note.contains("add it to entry, ignoreExports or ignoreDependencies"));
+        assert!(note.contains("fallow --root .tooling analyzes it on its own"));
+        assert!(note.contains("does not fix this run"));
         assert!(note.contains("add '.tooling/**' to"));
+        assert!(note.contains("add '!.tooling/**' to ignorePatterns to analyze it"));
         assert!(
             !note.contains("<dir>"),
             "the single-directory remedy must be copy-pasteable: {note}"
@@ -1289,7 +1786,7 @@ mod tests {
         let b = PathBuf::from("/repo/.b");
         let note = build_skipped_dotdirs_note(root, &[&a, &b], false);
         assert!(note.contains("skipped 2 hidden directories that contain source files"));
-        assert!(note.contains("analyze one with fallow --root <dir>"));
+        assert!(note.contains("fallow --root <dir> analyzes one on its own"));
     }
 
     #[test]
@@ -1546,74 +2043,52 @@ mod tests {
     }
 
     #[test]
-    fn source_extensions_include_typescript() {
-        assert!(SOURCE_EXTENSIONS.contains(&"ts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"tsx"));
-        assert!(SOURCE_EXTENSIONS.contains(&"mts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"cts"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gts"));
+    fn source_extensions_are_exactly_the_supported_set() {
+        let mut actual = SOURCE_EXTENSIONS.to_vec();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "ts", "tsx", "mts", "cts", "gts", "js", "jsx", "mjs", "cjs", "gjs", "vue", "svelte",
+            "astro", "mdx", "css", "scss", "sass", "less", "html", "graphql", "gql",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
+    /// The production exclude set that discovery uses in production mode.
+    fn production_excludes() -> globset::GlobSet {
+        let config = fallow_config::FallowConfig {
+            production: true.into(),
+            ..Default::default()
+        }
+        .resolve(
+            std::path::PathBuf::from("/project"),
+            fallow_config::OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        build_production_excludes(&config).expect("production mode builds an exclude set")
+    }
+
+    /// `build_production_excludes` drops a pattern that does not compile, so a
+    /// broken pattern would silently stop excluding its files.
     #[test]
-    fn source_extensions_include_javascript() {
-        assert!(SOURCE_EXTENSIONS.contains(&"js"));
-        assert!(SOURCE_EXTENSIONS.contains(&"jsx"));
-        assert!(SOURCE_EXTENSIONS.contains(&"mjs"));
-        assert!(SOURCE_EXTENSIONS.contains(&"cjs"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gjs"));
-    }
-
-    #[test]
-    fn source_extensions_include_sfc_formats() {
-        assert!(SOURCE_EXTENSIONS.contains(&"vue"));
-        assert!(SOURCE_EXTENSIONS.contains(&"svelte"));
-        assert!(SOURCE_EXTENSIONS.contains(&"astro"));
-    }
-
-    #[test]
-    fn source_extensions_include_styles() {
-        assert!(SOURCE_EXTENSIONS.contains(&"css"));
-        assert!(SOURCE_EXTENSIONS.contains(&"scss"));
-        assert!(SOURCE_EXTENSIONS.contains(&"sass"));
-        assert!(SOURCE_EXTENSIONS.contains(&"less"));
-    }
-
-    #[test]
-    fn source_extensions_exclude_non_source() {
-        assert!(!SOURCE_EXTENSIONS.contains(&"json"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"yaml"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"md"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"png"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"htm"));
-    }
-
-    #[test]
-    fn source_extensions_include_html() {
-        assert!(SOURCE_EXTENSIONS.contains(&"html"));
-    }
-
-    #[test]
-    fn source_extensions_include_graphql_documents() {
-        assert!(SOURCE_EXTENSIONS.contains(&"graphql"));
-        assert!(SOURCE_EXTENSIONS.contains(&"gql"));
-    }
-
-    fn build_production_glob_set() -> globset::GlobSet {
-        let mut builder = globset::GlobSetBuilder::new();
+    fn production_exclude_patterns_all_compile() {
         for pattern in PRODUCTION_EXCLUDE_PATTERNS {
-            builder.add(
+            assert!(
                 globset::GlobBuilder::new(pattern)
                     .literal_separator(true)
                     .build()
-                    .expect("valid glob pattern"),
+                    .is_ok(),
+                "production exclude pattern does not compile: {pattern}"
             );
         }
-        builder.build().expect("valid glob set")
     }
 
     #[test]
     fn production_excludes_test_files() {
-        let set = build_production_glob_set();
+        let set = production_excludes();
         assert!(set.is_match("src/Button.test.ts"));
         assert!(set.is_match("src/utils.spec.tsx"));
         assert!(set.is_match("src/__tests__/helper.ts"));
@@ -1623,7 +2098,7 @@ mod tests {
 
     #[test]
     fn production_excludes_story_files() {
-        let set = build_production_glob_set();
+        let set = production_excludes();
         assert!(set.is_match("src/Button.stories.tsx"));
         assert!(set.is_match("src/Card.story.ts"));
         assert!(!set.is_match("src/Button.tsx"));
@@ -1631,7 +2106,7 @@ mod tests {
 
     #[test]
     fn production_excludes_config_files_at_root_only() {
-        let set = build_production_glob_set();
+        let set = production_excludes();
         assert!(set.is_match("vitest.config.ts"));
         assert!(set.is_match("jest.config.js"));
         assert!(!set.is_match("src/app/app.config.ts"));
@@ -1641,28 +2116,8 @@ mod tests {
     }
 
     #[test]
-    fn production_patterns_are_valid_globs() {
-        let _ = build_production_glob_set();
-    }
-
-    #[test]
     fn disallowed_hidden_dirs_idea() {
         assert!(!is_allowed_hidden_dir(OsStr::new(".idea")));
-    }
-
-    #[test]
-    fn source_extensions_include_mdx() {
-        assert!(SOURCE_EXTENSIONS.contains(&"mdx"));
-    }
-
-    #[test]
-    fn source_extensions_exclude_image_and_data_formats() {
-        assert!(!SOURCE_EXTENSIONS.contains(&"png"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"jpg"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"svg"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"txt"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"csv"));
-        assert!(!SOURCE_EXTENSIONS.contains(&"wasm"));
     }
 
     #[test]
@@ -2209,7 +2664,7 @@ mod tests {
         }
 
         #[test]
-        fn includes_nested_build_directory() {
+        fn excludes_nested_build_directory() {
             let dir = tempfile::tempdir().expect("create temp dir");
 
             let nested_build = dir.path().join("src").join("build");
@@ -2221,8 +2676,8 @@ mod tests {
             let names = file_names(&files, dir.path());
 
             assert!(
-                names.contains(&"src/build/helper.ts".to_string()),
-                "nested build/ directories should be included"
+                !names.contains(&"src/build/helper.ts".to_string()),
+                "build/ is treated as generated output at any depth: {names:?}"
             );
         }
 
@@ -2355,6 +2810,7 @@ mod tests {
                 framework: vec![],
                 workspaces: None,
                 ignore_dependencies: vec![],
+                ignore_command_entries: vec![],
                 ignore_unresolved_imports: vec![],
                 ignore_exports: vec![],
                 ignore_catalog_references: vec![],
@@ -2364,8 +2820,10 @@ mod tests {
                 used_class_members: vec![],
                 ignore_decorators: vec![],
                 unused_component_props: fallow_config::UnusedComponentPropsConfig::default(),
+                circular_dependencies: fallow_config::CircularDependenciesConfig::default(),
                 duplicates: DuplicatesConfig::default(),
                 similar_code: fallow_config::SimilarCodeConfig::default(),
+                mutation: fallow_config::MutationConfig::default(),
                 health: HealthConfig::default(),
                 rules: RulesConfig::default(),
                 boundaries: fallow_config::BoundaryConfig::default(),
@@ -2384,7 +2842,9 @@ mod tests {
                 resolve: ResolveConfig::default(),
                 sealed: false,
                 include_entry_exports: false,
+                show_cascade: false,
                 auto_imports: false,
+                fail_on_parse_error: false,
                 cache: fallow_config::CacheConfig::default(),
             }
             .resolve(root, OutputFormat::Human, 1, true, true, None)
@@ -2465,7 +2925,7 @@ mod tests {
         }
 
         #[test]
-        fn default_ignore_patterns_exclude_root_build() {
+        fn default_ignore_patterns_exclude_build_at_any_depth() {
             let dir = tempfile::tempdir().expect("create temp dir");
 
             let build = dir.path().join("build");
@@ -2483,13 +2943,59 @@ mod tests {
             let files = discover_files(&config);
             let names = file_names(&files, dir.path());
 
+            assert_eq!(names, vec!["src/index.ts".to_string()]);
+        }
+
+        /// A monorepo keeps its generated output inside each package, so the
+        /// built-in exclusion has to survive the workspace prefix.
+        #[test]
+        fn default_ignore_patterns_exclude_nested_build() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+
+            let build = dir.path().join("build");
+            std::fs::create_dir_all(&build).unwrap();
+            std::fs::write(build.join("output.js"), "// built").unwrap();
+
+            let package_build = dir.path().join("projects").join("app").join("build");
+            std::fs::create_dir_all(&package_build).unwrap();
+            std::fs::write(package_build.join("index.js"), "// built").unwrap();
+
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("index.ts"), "export const x = 1;").unwrap();
+
+            let config = make_config(dir.path().to_path_buf(), false);
+            let files = discover_files(&config);
+            let names = file_names(&files, dir.path());
+
+            assert_eq!(names, vec!["src/index.ts".to_string()]);
+        }
+
+        /// `build` only counts as output when it is a whole path segment.
+        #[test]
+        fn default_ignore_patterns_keep_paths_that_merely_contain_build() {
+            let dir = tempfile::tempdir().expect("create temp dir");
+
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(src.join("rebuild")).unwrap();
+            std::fs::create_dir_all(src.join("buildings")).unwrap();
+            std::fs::write(src.join("build.ts"), "export const a = 1;").unwrap();
+            std::fs::write(src.join("rebuild").join("helper.ts"), "export const b = 1;").unwrap();
+            std::fs::write(src.join("buildings").join("a.ts"), "export const c = 1;").unwrap();
+
+            let config = make_config(dir.path().to_path_buf(), false);
+            let files = discover_files(&config);
+            let mut names = file_names(&files, dir.path());
+            names.sort();
+
             assert_eq!(
-                names.len(),
-                2,
-                "root build/ excluded, nested kept: {names:?}"
+                names,
+                vec![
+                    "src/build.ts".to_string(),
+                    "src/buildings/a.ts".to_string(),
+                    "src/rebuild/helper.ts".to_string(),
+                ]
             );
-            assert!(names.contains(&"src/index.ts".to_string()));
-            assert!(names.contains(&"src/build/helper.ts".to_string()));
         }
 
         /// Resolve a config then override the per-file size limit in bytes.

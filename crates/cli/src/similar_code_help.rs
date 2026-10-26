@@ -148,14 +148,18 @@ fn unsupported_universal_analysis_option(
     cli: &Cli,
     explicit_tolerance: bool,
 ) -> Option<&'static str> {
+    let dupes_flag = cli.dupes_overrides().first_global_flag();
     [
         (cli.churn_file.is_some(), "--churn-file"),
         (cli.baseline.is_some(), "--baseline"),
         (cli.baseline_mode.is_some(), "--baseline-mode"),
         (cli.parent_run.is_some(), "--parent-run"),
         (cli.save_baseline.is_some(), "--save-baseline"),
+        (cli.fail_on_baseline_growth, "--fail-on-baseline-growth"),
+        (cli.baseline_base.is_some(), "--baseline-base"),
         (cli.production, "--production"),
         (cli.no_production, "--no-production"),
+        (cli.no_package_baselines, "--no-package-baselines"),
         (cli.production_dead_code, "--production-dead-code"),
         (cli.production_health, "--production-health"),
         (cli.production_dupes, "--production-dupes"),
@@ -174,27 +178,19 @@ fn unsupported_universal_analysis_option(
             cli.save_regression_baseline.is_some(),
             "--save-regression-baseline",
         ),
-        (cli.dupes_mode.is_some(), "--dupes-mode"),
-        (cli.dupes_near, "--dupes-near"),
-        (cli.dupes_threshold.is_some(), "--dupes-threshold"),
-        (cli.dupes_min_tokens.is_some(), "--dupes-min-tokens"),
-        (cli.dupes_min_lines.is_some(), "--dupes-min-lines"),
-        (
-            cli.dupes_min_occurrences.is_some(),
-            "--dupes-min-occurrences",
-        ),
-        (cli.dupes_skip_local, "--dupes-skip-local"),
-        (cli.dupes_cross_language, "--dupes-cross-language"),
-        (cli.dupes_ignore_imports, "--dupes-ignore-imports"),
-        (cli.dupes_no_ignore_imports, "--dupes-no-ignore-imports"),
+        (dupes_flag.is_some(), dupes_flag.unwrap_or_default()),
         (!cli.only.is_empty(), "--only"),
         (!cli.skip.is_empty(), "--skip"),
         (cli.score, "--score"),
         (cli.trend, "--trend"),
+        (cli.trend_from.is_some(), "--trend-from"),
         (cli.save_snapshot.is_some(), "--save-snapshot"),
         (cli.coverage.is_some(), "--coverage"),
         (cli.coverage_root.is_some(), "--coverage-root"),
+        (cli.dupes_baseline.is_some(), "--dupes-baseline"),
+        (cli.health_baseline.is_some(), "--health-baseline"),
         (cli.include_entry_exports, "--include-entry-exports"),
+        (cli.show_cascade, "--show-cascade"),
         (cli.type_aware, "--type-aware"),
         (cli.no_type_aware, "--no-type-aware"),
         (!cli.type_aware_project.is_empty(), "--type-aware-project"),
@@ -300,6 +296,7 @@ fn option_consumes_next(arg: &str) -> bool {
             | "--baseline-mode"
             | "--parent-run"
             | "--save-baseline"
+            | "--baseline-base"
             | "-w"
             | "--workspace"
             | "--changed-workspaces"
@@ -611,6 +608,24 @@ mod tests {
             (
                 vec!["fallow", "--score", "similar-code", "status"],
                 "--score",
+            ),
+            (
+                vec![
+                    "fallow",
+                    "similar-code",
+                    "status",
+                    "--dupes-ignore-symlinks",
+                ],
+                "--dupes-ignore-symlinks",
+            ),
+            (
+                vec![
+                    "fallow",
+                    "similar-code",
+                    "status",
+                    "--dupes-no-ignore-symlinks",
+                ],
+                "--dupes-no-ignore-symlinks",
             ),
             (
                 vec![

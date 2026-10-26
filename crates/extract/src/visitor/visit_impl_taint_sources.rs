@@ -77,6 +77,10 @@ impl ModuleInfoExtractor {
             return;
         }
         for source_path in binding_source_path_candidates(expr) {
+            // At the cap each push scans the full set and records nothing.
+            if self.tainted_bindings_at_capacity() {
+                break;
+            }
             self.push_tainted_binding(
                 TaintedBinding {
                     local: name.to_string(),
@@ -305,7 +309,7 @@ impl ModuleInfoExtractor {
     }
 
     pub(super) fn record_next_arrow_param_sources(&mut self, expr: &ArrowFunctionExpression<'_>) {
-        if function_body_has_use_server(Some(&expr.body)) {
+        if function_body_has_use_server(expr.body.as_function_body()) {
             self.record_named_param_source(&expr.params, &["formData"], NEXT_FORM_DATA_SOURCE);
         }
     }

@@ -47,8 +47,9 @@ pub struct FlagsConfig {
     pub sdk_patterns: Vec<SdkPattern>,
 
     /// Environment variable prefixes that indicate feature flags.
-    /// Merged with built-in prefixes. Only `process.env.*` accesses matching
-    /// these prefixes are reported as feature flags.
+    /// Merged with built-in prefixes. Only `process.env.*` and
+    /// `import.meta.env.*` accesses matching these prefixes are reported as
+    /// feature flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_prefixes: Vec<String>,
 
@@ -58,4 +59,34 @@ pub struct FlagsConfig {
     /// Default: false (opt-in due to higher false positive rate).
     #[serde(default)]
     pub config_object_heuristics: bool,
+
+    /// Prefix to remove from each key of a `--flag-state` vendor export
+    /// before the key is compared with the flag names in the code. For
+    /// example, `"web."` makes the vendor key `web.new-checkout` match the
+    /// code flag `new-checkout`. A key without the prefix is compared as it
+    /// is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_key_prefix: Option<String>,
+}
+
+impl FlagsConfig {
+    /// The detection patterns this config adds to the built-in ones.
+    #[must_use]
+    pub fn patterns(&self) -> fallow_types::extract::FlagPatterns {
+        fallow_types::extract::FlagPatterns {
+            sdk_patterns: self
+                .sdk_patterns
+                .iter()
+                .map(|pattern| {
+                    (
+                        pattern.function.clone(),
+                        pattern.name_arg,
+                        pattern.provider.clone().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            env_prefixes: self.env_prefixes.clone(),
+            config_object_heuristics: self.config_object_heuristics,
+        }
+    }
 }

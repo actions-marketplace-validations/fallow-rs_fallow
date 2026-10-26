@@ -18,7 +18,7 @@ use fallow_types::suppress::{PolicyRuleSuppression, SuppressionTarget};
 
 /// Seconds-since-Unix-epoch from the wall clock, saturating to 0 if the
 /// system clock is set before the epoch. Used as the LRU bookkeeping
-/// timestamp on `CachedModule.last_access_secs`. Wall-clock (not monotonic)
+/// timestamp on `CachedModule.last_seen_secs`. Wall-clock (not monotonic)
 /// is the right source here because the value persists across process
 /// invocations.
 #[must_use]
@@ -66,6 +66,8 @@ fn cached_exports_to_module(exports: &[CachedExport]) -> Vec<crate::ExportInfo> 
                 _ => VisibilityTag::None,
             },
             expected_unused_reason: export.expected_unused_reason.clone(),
+            deprecated: export.deprecated,
+            deprecated_reason: export.deprecated_reason.clone(),
             span: Span::new(export.span_start, export.span_end),
             members: export
                 .members
@@ -78,6 +80,7 @@ fn cached_exports_to_module(exports: &[CachedExport]) -> Vec<crate::ExportInfo> 
                     decorator_names: member.decorator_names.clone(),
                     is_instance_returning_static: member.is_instance_returning_static,
                     is_self_returning: member.is_self_returning,
+                    override_base: member.override_base.clone(),
                 })
                 .collect(),
             super_class: export.super_class.clone(),
@@ -132,6 +135,7 @@ fn cached_dynamic_imports_to_module(
             destructured_names: dynamic_import.destructured_names.clone(),
             local_name: dynamic_import.local_name.clone(),
             is_speculative: dynamic_import.is_speculative,
+            value_escapes: dynamic_import.value_escapes,
         })
         .collect()
 }
@@ -160,6 +164,7 @@ fn cached_dynamic_patterns_to_module(
         .map(|pattern| crate::DynamicImportPattern {
             prefix: pattern.prefix.clone(),
             suffix: pattern.suffix.clone(),
+            excludes: pattern.excludes.clone(),
             span: Span::new(pattern.span_start, pattern.span_end),
             mechanism: pattern.mechanism,
         })
@@ -232,6 +237,7 @@ fn cached_signature_refs_to_module(
             export_name: reference.export_name.clone(),
             type_name: reference.type_name.clone(),
             span: Span::new(reference.span_start, reference.span_end),
+            from_satisfies: reference.from_satisfies,
         })
         .collect()
 }
@@ -262,6 +268,8 @@ fn module_exports_to_cached(exports: &[crate::ExportInfo]) -> Vec<CachedExport> 
             is_side_effect_used: export.is_side_effect_used,
             visibility: export.visibility as u8,
             expected_unused_reason: export.expected_unused_reason.clone(),
+            deprecated: export.deprecated,
+            deprecated_reason: export.deprecated_reason.clone(),
             local_name: export.local_name.clone(),
             span_start: export.span.start,
             span_end: export.span.end,
@@ -277,6 +285,7 @@ fn module_exports_to_cached(exports: &[crate::ExportInfo]) -> Vec<CachedExport> 
                     decorator_names: member.decorator_names.clone(),
                     is_instance_returning_static: member.is_instance_returning_static,
                     is_self_returning: member.is_self_returning,
+                    override_base: member.override_base.clone(),
                 })
                 .collect(),
             super_class: export.super_class.clone(),
@@ -341,6 +350,7 @@ fn module_dynamic_imports_to_cached(
             destructured_names: dynamic_import.destructured_names.clone(),
             local_name: dynamic_import.local_name.clone(),
             is_speculative: dynamic_import.is_speculative,
+            value_escapes: dynamic_import.value_escapes,
         })
         .collect()
 }
@@ -371,6 +381,7 @@ fn module_dynamic_patterns_to_cached(
         .map(|pattern| CachedDynamicImportPattern {
             prefix: pattern.prefix.clone(),
             suffix: pattern.suffix.clone(),
+            excludes: pattern.excludes.clone(),
             span_start: pattern.span.start,
             span_end: pattern.span.end,
             mechanism: pattern.mechanism,
@@ -444,6 +455,7 @@ fn module_signature_refs_to_cached(
             type_name: reference.type_name.clone(),
             span_start: reference.span.start,
             span_end: reference.span.end,
+            from_satisfies: reference.from_satisfies,
         })
         .collect()
 }
@@ -471,6 +483,10 @@ fn cached_opt_to_arc<T: Clone>(cached: Option<&[T]>) -> Arc<[T]> {
 /// `Vec<FunctionComplexity>` clone on warm runs of commands (e.g. `fallow dead-code`)
 /// that don't consume complexity, which adds up across tens of thousands of files.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat field projection preserves the complete extraction cache contract"
+)]
 pub fn cached_to_module_opts(
     cached: &CachedModule,
     file_id: fallow_types::discover::FileId,
@@ -485,12 +501,18 @@ pub fn cached_to_module_opts(
         dynamic_import_patterns: cached_dynamic_patterns_to_module(&cached.dynamic_import_patterns),
         require_calls: cached_require_calls_to_module(&cached.require_calls),
         package_path_references: cached.package_path_references.clone(),
+        type_package_references: cached.type_package_references.clone(),
+        bin_path_references: cached.bin_path_references.clone(),
+        package_resolve_sites: cached.package_resolve_sites.clone(),
         member_accesses: cached.member_accesses.clone().into(),
         semantic_facts: cached_opt_to_arc(cached.semantic_facts.as_deref()),
         whole_object_uses: Arc::from(&*cached.whole_object_uses),
         has_cjs_exports: cached.has_cjs_exports,
         has_angular_component_template_url: cached.has_angular_component_template_url,
         content_hash: cached.content_hash,
+        parse_error_count: cached.parse_error_count,
+        parse_panicked: cached.parse_panicked,
+        parse_nesting_too_deep: cached.parse_nesting_too_deep,
         suppressions: cached_suppressions_to_module(&cached.suppressions),
         unknown_suppression_kinds: cached_unknown_suppressions_to_module(
             &cached.unknown_suppression_kinds,
@@ -505,6 +527,7 @@ pub fn cached_to_module_opts(
             Vec::new()
         },
         flag_uses: cached.flag_uses.clone(),
+        flag_registry_facts: cached.flag_registry_facts.clone(),
         class_heritage: cached.class_heritage.clone(),
         exported_factory_returns: cached_opt_to_arc(cached.exported_factory_returns.as_deref()),
         exported_factory_return_object_shapes: cached_opt_to_arc(
@@ -531,14 +554,22 @@ pub fn cached_to_module_opts(
         sanitized_sink_args: cached.sanitized_sink_args.clone(),
         security_control_sites: cached.security_control_sites.clone(),
         callee_uses: cached.callee_uses.clone(),
+        imported_call_sites: cached.imported_call_sites.clone().into(),
+        import_binding_references: cached.import_binding_references.clone().into(),
         misplaced_directives: cached.misplaced_directives.clone(),
         inline_server_action_exports: cached.inline_server_action_exports.clone(),
         di_key_sites: cached.di_key_sites.clone(),
         has_dynamic_provide: cached.has_dynamic_provide,
+        is_server_action_module: cached.is_server_action_module,
+        has_global_declarations: cached.has_global_declarations,
+        triple_slash_reference_paths: cached.triple_slash_reference_paths.clone(),
+        jsx_runtime_from_config: cached.jsx_runtime_from_config,
         // Derived in `release_resolution_payload` from `imports` + `unused_import_bindings`
         // (both cached); never persisted, so the cache-load path leaves it empty.
         referenced_import_bindings: Vec::new(),
         component_props: cached.component_props.clone(),
+        component_contracts: cached.component_contracts.clone(),
+        effect_facts: cached.effect_facts.clone(),
         has_props_attrs_fallthrough: cached.has_props_attrs_fallthrough,
         has_define_expose: cached.has_define_expose,
         has_define_model: cached.has_define_model,
@@ -581,23 +612,43 @@ pub fn cached_to_module_opts(
 pub fn module_to_cached(
     module: &crate::ModuleInfo,
     fingerprint: fallow_types::source_fingerprint::SourceFingerprint,
+    complexity_extracted: bool,
 ) -> CachedModule {
+    let mut cached = module_to_cached_payload(module);
+    cached.mtime_ns = fingerprint.mtime_ns;
+    cached.ctime_ns = fingerprint.ctime_ns;
+    cached.file_size = fingerprint.file_size;
+    cached.complexity_extracted = complexity_extracted;
+    cached
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat field projection preserves the complete extraction cache contract"
+)]
+fn module_to_cached_payload(module: &crate::ModuleInfo) -> CachedModule {
     CachedModule {
         content_hash: module.content_hash,
-        mtime_ns: fingerprint.mtime_ns,
-        file_size: fingerprint.file_size,
-        last_access_secs: current_unix_seconds(),
+        mtime_ns: 0,
+        ctime_ns: 0,
+        file_size: 0,
+        last_seen_secs: current_unix_seconds(),
         exports: module_exports_to_cached(&module.exports),
         imports: module_imports_to_cached(&module.imports),
         re_exports: module_re_exports_to_cached(&module.re_exports),
         dynamic_imports: module_dynamic_imports_to_cached(&module.dynamic_imports),
         require_calls: module_require_calls_to_cached(&module.require_calls),
         package_path_references: module.package_path_references.clone(),
+        type_package_references: module.type_package_references.clone(),
+        bin_path_references: module.bin_path_references.clone(),
+        package_resolve_sites: module.package_resolve_sites.clone(),
         member_accesses: module.member_accesses.to_vec(),
-        semantic_facts: (!module.semantic_facts.is_empty())
-            .then(|| Box::from(&*module.semantic_facts)),
+        semantic_facts: cached_semantic_facts(&module.semantic_facts),
         whole_object_uses: Box::from(&*module.whole_object_uses),
         dynamic_import_patterns: module_dynamic_patterns_to_cached(&module.dynamic_import_patterns),
+        parse_error_count: module.parse_error_count,
+        parse_panicked: module.parse_panicked,
+        parse_nesting_too_deep: module.parse_nesting_too_deep,
         has_cjs_exports: module.has_cjs_exports,
         has_angular_component_template_url: module.has_angular_component_template_url,
         unused_import_bindings: module.unused_import_bindings.clone(),
@@ -609,7 +660,9 @@ pub fn module_to_cached(
         ),
         line_offsets: module.line_offsets.clone(),
         complexity: module.complexity.clone(),
+        complexity_extracted: false,
         flag_uses: module.flag_uses.clone(),
+        flag_registry_facts: module.flag_registry_facts.clone(),
         class_heritage: module.class_heritage.clone(),
         exported_factory_returns: (!module.exported_factory_returns.is_empty())
             .then(|| Box::from(&*module.exported_factory_returns)),
@@ -639,11 +692,19 @@ pub fn module_to_cached(
         sanitized_sink_args: module.sanitized_sink_args.clone(),
         security_control_sites: module.security_control_sites.clone(),
         callee_uses: module.callee_uses.clone(),
+        imported_call_sites: module.imported_call_sites.to_vec(),
+        import_binding_references: module.import_binding_references.to_vec(),
         misplaced_directives: module.misplaced_directives.clone(),
         inline_server_action_exports: module.inline_server_action_exports.clone(),
         di_key_sites: module.di_key_sites.clone(),
         has_dynamic_provide: module.has_dynamic_provide,
+        is_server_action_module: module.is_server_action_module,
+        has_global_declarations: module.has_global_declarations,
+        triple_slash_reference_paths: module.triple_slash_reference_paths.clone(),
+        jsx_runtime_from_config: module.jsx_runtime_from_config,
         component_props: module.component_props.clone(),
+        component_contracts: module.component_contracts.clone(),
+        effect_facts: module.effect_facts.clone(),
         has_props_attrs_fallthrough: module.has_props_attrs_fallthrough,
         has_define_expose: module.has_define_expose,
         has_define_model: module.has_define_model,
@@ -687,5 +748,12 @@ pub fn module_to_cached_from_parts(
     module_to_cached(
         module,
         fallow_types::source_fingerprint::SourceFingerprint::new(mtime_ns, file_size),
+        !module.complexity.is_empty(),
     )
+}
+
+fn cached_semantic_facts(
+    facts: &[fallow_types::extract::SemanticFact],
+) -> Option<Box<[fallow_types::extract::SemanticFact]>> {
+    (!facts.is_empty()).then(|| Box::from(facts))
 }

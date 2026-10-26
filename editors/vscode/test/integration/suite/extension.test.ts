@@ -4,6 +4,7 @@ import * as path from "node:path";
 // VS Code injects this module into the extension host at runtime.
 // fallow-ignore-next-line unlisted-dependency
 import * as vscode from "vscode";
+import { openFileCommand } from "../../../src/openFileCommand.js";
 import type { FallowCheckResult, FallowDupesResult, FallowFixResult } from "../../../src/types.js";
 
 interface ExtensionApi {
@@ -143,6 +144,7 @@ describe("Fallow VS Code extension", () => {
       .update("changedSince", "", vscode.ConfigurationTarget.Workspace);
     const config = vscode.workspace.getConfiguration("fallow");
     for (const key of [
+      "security.enabled",
       "duplication.mode",
       "duplication.near",
       "duplication.threshold",
@@ -152,6 +154,7 @@ describe("Fallow VS Code extension", () => {
       "duplication.skipLocal",
       "duplication.crossLanguage",
       "duplication.ignoreImports",
+      "duplication.ignoreSymlinks",
     ]) {
       await config.update(key, undefined, vscode.ConfigurationTarget.Workspace);
     }
@@ -169,6 +172,15 @@ describe("Fallow VS Code extension", () => {
     assert.ok(commands.includes("fallow.reloadAnalysis"));
     assert.ok(commands.includes("fallow.health.reload"));
     assert.ok(commands.includes("fallow.audit"));
+    assert.ok(commands.includes("fallow.analyzeSecurity"));
+    for (const command of [
+      "fallow.license.activate",
+      "fallow.license.status",
+      "fallow.license.refresh",
+      "fallow.license.deactivate",
+    ]) {
+      assert.ok(commands.includes(command), `${command} should be registered`);
+    }
     assert.ok(commands.includes("fallow.setBaselineAtHead"));
     assert.ok(commands.includes("fallow.fix"));
     assert.ok(commands.includes("fallow.fixDryRun"));
@@ -176,9 +188,39 @@ describe("Fallow VS Code extension", () => {
     // Escape hatch for a stuck-hidden workspace (discussion #287); if it is
     // unregistered the startup nudge's "Show all findings" action throws.
     assert.ok(commands.includes("fallow.resetDiagnosticFilters"));
-    // The "N references" Code Lens routes here; if it is unregistered, clicking a
+    // The "imported by N files" Code Lens routes here; if it is unregistered, clicking a
     // lens throws "command 'fallow.showReferences' not found".
     assert.ok(commands.includes("fallow.showReferences"));
+  });
+
+  it("opens a Unicode finding path within the Unicode workspace", async () => {
+    const uri = vscode.Uri.joinPath(workspaceFolder().uri, "src", "漢 字.ts");
+    fs.writeFileSync(uri.fsPath, "// first line\nexport const value = true;\n", "utf8");
+    const command = openFileCommand(uri.fsPath, 2);
+
+    await vscode.commands.executeCommand(command.command, ...(command.arguments ?? []));
+
+    const editor = vscode.window.activeTextEditor;
+    assert.equal(editor?.document.uri.fsPath, uri.fsPath);
+    assert.equal(editor?.selection.active.line, 1);
+  });
+
+  it("frames completed security scans as unverified candidates in the actual toast", async () => {
+    const messages: string[] = [];
+    windowApi.showInformationMessage = async (message: string) => {
+      messages.push(message);
+      return undefined;
+    };
+    await vscode.workspace
+      .getConfiguration("fallow")
+      .update("security.enabled", true, vscode.ConfigurationTarget.Workspace);
+    await vscode.commands.executeCommand("fallow.analyzeSecurity");
+
+    assert.ok(readCliLog().some((entry) => entry.command === "security"));
+    const toast = messages.find((message) => message.includes("security candidate"));
+    assert.ok(toast, "a completed scan with findings should show a toast");
+    assert.match(toast, /security candidate/i);
+    assert.match(toast, /NOT verified vulnerabilities; verify each before acting/);
   });
 
   it("runs analysis against the configured CLI and filters disabled issue types", async () => {

@@ -57,35 +57,39 @@ pub(super) fn apply_specifier_upgrades(
     resolved: &mut [ResolvedModule],
     mock_operations: &mut [ResolvedVitestMockOperation],
 ) {
-    let mut specifier_upgrades: FxHashMap<String, ResolveResult> = FxHashMap::default();
+    let mut specifier_upgrades: FxHashMap<String, FileId> = FxHashMap::default();
     for module in resolved.iter() {
         for imp in module
             .resolved_imports
             .iter()
             .chain(module.resolved_dynamic_imports.iter())
         {
-            if is_bare_specifier(&imp.info.source) && imp.target.internal_file_id().is_some() {
+            if is_bare_specifier(&imp.info.source)
+                && let Some(file_id) = imp.target.internal_file_id()
+            {
                 specifier_upgrades
                     .entry(imp.info.source.clone())
-                    .or_insert_with(|| imp.target.clone().into_es_module());
+                    .or_insert(file_id);
             }
         }
         for re in &module.re_exports {
-            if is_bare_specifier(&re.info.source) && re.target.internal_file_id().is_some() {
+            if is_bare_specifier(&re.info.source)
+                && let Some(file_id) = re.target.internal_file_id()
+            {
                 specifier_upgrades
                     .entry(re.info.source.clone())
-                    .or_insert_with(|| re.target.clone().into_es_module());
+                    .or_insert(file_id);
             }
         }
     }
 
     for operation in mock_operations.iter() {
         if is_bare_specifier(&operation.source_specifier)
-            && operation.target.internal_file_id().is_some()
+            && let Some(file_id) = operation.target.internal_file_id()
         {
             specifier_upgrades
                 .entry(operation.source_specifier.clone())
-                .or_insert_with(|| operation.target.clone().into_es_module());
+                .or_insert(file_id);
         }
     }
 
@@ -118,21 +122,18 @@ pub(super) fn apply_specifier_upgrades(
 fn upgrade_bare_target(
     source_specifier: &str,
     target: &mut ResolveResult,
-    specifier_upgrades: &FxHashMap<String, ResolveResult>,
+    specifier_upgrades: &FxHashMap<String, FileId>,
 ) {
     if !target.is_bare_package() {
         return;
     }
-    let Some(upgraded_target) = specifier_upgrades.get(source_specifier) else {
-        return;
-    };
-    let Some(file_id) = upgraded_target.internal_file_id() else {
+    let Some(&file_id) = specifier_upgrades.get(source_specifier) else {
         return;
     };
 
     let (package_name, is_commonjs_require) = match target {
-        ResolveResult::NpmPackage(package_name) => (package_name.clone(), false),
-        ResolveResult::CommonJsNpmPackage(package_name) => (package_name.clone(), true),
+        ResolveResult::NpmPackage(package_name) => (std::mem::take(package_name), false),
+        ResolveResult::CommonJsNpmPackage(package_name) => (std::mem::take(package_name), true),
         _ => return,
     };
     *target = if is_commonjs_require {
@@ -183,6 +184,7 @@ mod tests {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         }
     }
 

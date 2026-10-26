@@ -4,9 +4,13 @@
 //! `fallow-core` directly. The goal is to keep core-backed orchestration
 //! contained while the engine-owned contracts continue to stabilize.
 
-use fallow_config::{ExternalPluginDef, PackageJson, ResolvedConfig};
-use fallow_types::trace::PipelineTimings;
+use fallow_config::{
+    ExternalPluginDef, PackageJson, ResolvedConfig, WorkspaceDiagnostic, WorkspaceInfo,
+};
+use fallow_types::cache_rejection::CacheRejection;
+use fallow_types::trace::{PipelineCounters, PipelineTimings};
 use rustc_hash::FxHashSet;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -23,7 +27,10 @@ use crate::{
 pub use fallow_core::plugins::manifest_entries::{
     CheckWarning, ManifestResult, RuleReport, WarningKind, check_manifest_entries,
 };
+pub use fallow_core::plugins::registry::builtin_config_patterns;
+pub use fallow_core::plugins::registry::builtin_plugin_names;
 pub use fallow_core::plugins::registry::is_external_plugin_active;
+pub use fallow_core::plugins::types_package_target;
 
 // Discovery vocabulary owned by the surviving core walk, re-exported so the
 // engine boundary keeps one definition per constant.
@@ -38,6 +45,18 @@ pub struct ParseMetrics {
     pub cache_hits: usize,
     pub cache_misses: usize,
     pub parse_cpu_ms: f64,
+    /// Why the persisted parse cache was not reused, when it was not.
+    pub cache_rejection: Option<CacheRejection>,
+    /// Source files whose bytes the parse stage read.
+    pub files_read: u64,
+    /// Source bytes the parse stage read.
+    pub source_bytes_read: u64,
+    /// Parse cache bytes read from disk.
+    pub parse_cache_bytes_read: u64,
+    /// Source bytes that the CSS comment mask read during the parse.
+    pub css_masked_bytes: u64,
+    /// The part of `parse_ms` that reads and decodes the parse cache.
+    pub parse_cache_load_ms: f64,
 }
 
 pub struct DeadCodeBackendPrelude<'a> {
@@ -67,6 +86,15 @@ impl DeadCodeEntryPoints {
 
     pub fn elapsed_ms(&self) -> f64 {
         self.inner.elapsed_ms()
+    }
+
+    pub fn spans(&self) -> fallow_types::trace::EntryPointSpans {
+        self.inner.spans()
+    }
+
+    /// Every entry point the analysis uses, deduplicated.
+    pub fn all(&self) -> &[EntryPoint] {
+        self.inner.all()
     }
 }
 
@@ -102,6 +130,19 @@ impl DeadCodeBackendPrelude<'_> {
 
     pub fn script_used_packages(&self) -> FxHashSet<String> {
         self.inner.script_used_packages()
+    }
+
+    pub fn trace_provenance(
+        &self,
+        modules: &[fallow_types::extract::ModuleInfo],
+        retain_graph: bool,
+    ) -> fallow_types::trace::TraceProvenance {
+        self.inner.trace_provenance(modules, retain_graph)
+    }
+
+    /// The plugin stage's result, as the analysis sees it.
+    pub fn plugin_result(&self) -> BackendAggregatedPluginResult {
+        BackendAggregatedPluginResult::from_core(self.inner.plugin_result().clone())
     }
 
     pub fn finish(&self) {
@@ -154,21 +195,44 @@ pub fn discover_files_config_candidates_and_diagnostics(
     fallow_core::discover::discover_files_config_candidates_and_diagnostics(config, &scopes)
 }
 
-/// Discover configured and inferred entry points via the shared core implementation.
+/// Whether a package name is a platform built-in (Node.js, Bun, Deno and
+/// others), such as `node:fs` or `fs`.
+pub fn is_builtin_module(name: &str) -> bool {
+    fallow_core::analyze::is_builtin_module(name)
+}
+
+/// The used packages that list `package_name` as a peer dependency, required
+/// or optional, via the shared unused-dependency implementation. The root
+/// closure and each workspace closure run as in the unused-dependency check.
+pub fn peer_dependency_hosts(
+    graph: &crate::graph::ModuleGraph,
+    root: &Path,
+    workspace_roots: &[&Path],
+    ignore_patterns: &fallow_config::IgnorePatternSet,
+    package_name: &str,
+    extra_seeds: &fallow_types::trace::PeerClosureSeeds,
+) -> Vec<String> {
+    fallow_core::analyze::peer_dependency_hosts(
+        graph,
+        root,
+        workspace_roots,
+        ignore_patterns,
+        package_name,
+        extra_seeds,
+    )
+}
+
+/// Discover the root and workspace package entry points via the shared core
+/// implementation.
 ///
 /// Entry-point discovery has one implementation, in fallow-core, so the
 /// analysis pipeline and list inventory can never drift apart.
-pub fn discover_entry_points(config: &ResolvedConfig, files: &[DiscoveredFile]) -> Vec<EntryPoint> {
-    fallow_core::discover::discover_entry_points(config, files)
-}
-
-/// Discover workspace entry points via the shared core implementation.
-pub fn discover_workspace_entry_points(
-    ws_root: &Path,
+pub fn discover_entry_points(
     config: &ResolvedConfig,
-    all_files: &[DiscoveredFile],
+    files: &[DiscoveredFile],
+    workspaces: &[WorkspaceInfo],
 ) -> Vec<EntryPoint> {
-    fallow_core::discover::discover_workspace_entry_points(ws_root, config, all_files)
+    fallow_core::discover::discover_entry_points(config, files, workspaces)
 }
 
 /// Discover plugin-derived entry points via the shared core implementation.
@@ -205,11 +269,17 @@ pub fn discover_dead_code_entry_points(
     }
 }
 
+/// Try to reuse the persisted module graph, naming why it was refused.
+///
+/// # Errors
+///
+/// `Err(Some(reason))` is the refusal the perf table reports; `Err(None)` means
+/// the run disabled caching, so there was nothing to refuse.
 pub fn try_load_dead_code_graph_cache(
     prelude: &DeadCodeBackendPrelude<'_>,
     entry_points: &DeadCodeEntryPoints,
     modules: &[ModuleInfo],
-) -> Option<(DeadCodeResolvedModules, DeadCodeGraphRun)> {
+) -> Result<(DeadCodeResolvedModules, DeadCodeGraphRun), Option<CacheRejection>> {
     fallow_core::try_load_dead_code_graph_cache(&prelude.inner, &entry_points.inner, modules).map(
         |(resolved, graph)| {
             (
@@ -290,6 +360,8 @@ pub struct DeadCodePipelineProfileInput<'a> {
     pub detector: &'a DeadCodeDetectorRun,
     pub file_count: usize,
     pub workspace_count: usize,
+    /// Why the persisted module graph was not reused, when it was not.
+    pub graph_cache_rejection: Option<CacheRejection>,
 }
 
 pub fn dead_code_pipeline_profile(
@@ -307,6 +379,7 @@ pub fn dead_code_pipeline_profile(
         detector,
         file_count,
         workspace_count,
+        graph_cache_rejection,
     } = input;
     EngineDeadCodePipelineProfile {
         timings: retain_timings.then_some(PipelineTimings {
@@ -318,29 +391,39 @@ pub fn dead_code_pipeline_profile(
             script_analysis_ms: prelude_timings.scripts_ms,
             parse_extract_ms: parse_metrics.parse_ms,
             parse_cpu_ms: parse_metrics.parse_cpu_ms,
+            parse_cache_load_ms: parse_metrics.parse_cache_load_ms,
             module_count,
             cache_hits: parse_metrics.cache_hits,
             cache_misses: parse_metrics.cache_misses,
+            cache_rejection: parse_metrics.cache_rejection,
+            graph_cache_rejection,
             cache_update_ms: parse_metrics.cache_ms,
             entry_points_ms: entry_points.elapsed_ms(),
+            entry_point_spans: entry_points.spans(),
             entry_point_count: entry_points.count(),
             resolve_imports_ms: resolved.elapsed_ms,
             build_graph_ms: graph.elapsed_ms,
             analyze_ms: detector.elapsed_ms,
             duplication_ms: None,
             total_ms: prelude.elapsed_ms(),
+            counters: pipeline_counters(&parse_metrics, &resolved.project.work),
         }),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendPluginRegexValidationError {
-    message: String,
-}
-
-impl BackendPluginRegexValidationError {
-    pub fn message(&self) -> String {
-        self.message.clone()
+fn pipeline_counters(
+    parse: &ParseMetrics,
+    resolve: &fallow_graph::resolve::ResolveWork,
+) -> PipelineCounters {
+    PipelineCounters {
+        files_read: parse.files_read,
+        source_bytes_read: parse.source_bytes_read,
+        parse_cache_bytes_read: parse.parse_cache_bytes_read,
+        css_masked_bytes: parse.css_masked_bytes,
+        resolve_specifier_calls: resolve.specifier_calls,
+        unique_specifiers: resolve.unique_specifiers,
+        oxc_resolve_calls: resolve.oxc_resolve_calls,
+        canonicalize_calls: resolve.canonicalize_calls,
     }
 }
 
@@ -358,17 +441,79 @@ impl BackendAggregatedPluginResult {
         &self.inner.active_plugins
     }
 
-    pub fn merge_active_plugins_from(&mut self, other: &Self) {
-        for plugin_name in &other.inner.active_plugins {
-            if !self.inner.active_plugins.contains(plugin_name) {
-                self.inner.active_plugins.push(plugin_name.clone());
-            }
+    /// The config file globs of the active plugins, sorted and without
+    /// duplicates. A workspace run keeps its active plugins but not its
+    /// config globs, so the built-in globs come from the plugin names. The
+    /// globs of an external plugin are here only when the plugin is active
+    /// at the root. A glob is relative to the directory that the plugin
+    /// searches.
+    pub fn config_patterns(&self) -> Vec<String> {
+        let mut patterns: Vec<String> =
+            fallow_core::plugins::registry::builtin_config_patterns_of(&self.inner.active_plugins)
+                .into_iter()
+                .map(str::to_owned)
+                .chain(self.inner.config_patterns.iter().cloned())
+                .collect();
+        patterns.sort_unstable();
+        patterns.dedup();
+        patterns
+    }
+
+    /// The always-used globs of the active built-in plugins, sorted and
+    /// without duplicates. A plugin can list its config file here instead
+    /// of in its config globs.
+    pub fn always_used_patterns(&self) -> Vec<String> {
+        let mut patterns: Vec<String> =
+            fallow_core::plugins::registry::builtin_always_used_patterns_of(
+                &self.inner.active_plugins,
+            )
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        patterns.sort_unstable();
+        patterns.dedup();
+        patterns
+    }
+
+    /// The setup files that the plugins found in tool configs, such as
+    /// Vitest `setupFiles`, absolute or relative to the root.
+    pub fn setup_files(&self) -> Vec<PathBuf> {
+        self.inner
+            .setup_files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// The plugin used-export rules, compiled for path lookups.
+    pub fn used_export_names(&self) -> BackendUsedExportNames {
+        BackendUsedExportNames {
+            inner: self.inner.used_export_names(),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_active_plugin_for_test(&mut self, plugin_name: impl Into<String>) {
-        self.inner.active_plugins.push(plugin_name.into());
+    /// The plugin stage's advisories (`plugin-config-unreadable`,
+    /// `plugin-effect-not-modeled`), rendered against the project root.
+    pub fn plugin_diagnostics(&self, root: &Path) -> Vec<WorkspaceDiagnostic> {
+        self.inner
+            .config_diagnostics
+            .iter()
+            .cloned()
+            .map(|diagnostic| diagnostic.into_workspace_diagnostic(root))
+            .collect()
+    }
+}
+
+/// The plugin used-export rules of one plugin run, compiled for path lookups.
+pub struct BackendUsedExportNames {
+    inner: fallow_core::plugins::UsedExportNames,
+}
+
+impl BackendUsedExportNames {
+    /// The export names that a plugin marks as used in the file at the
+    /// project-root-relative `rel_path`. The name `*` means each export.
+    pub fn names_for(&self, rel_path: &str) -> BTreeSet<&str> {
+        self.inner.names_for(rel_path)
     }
 }
 
@@ -385,24 +530,5 @@ impl BackendPluginRegistry {
 
     pub fn discovery_hidden_dirs(&self, pkg: &PackageJson, root: &Path) -> Vec<String> {
         self.inner.discovery_hidden_dirs(pkg, root)
-    }
-
-    pub fn try_run(
-        &self,
-        pkg: &PackageJson,
-        root: &Path,
-        discovered_files: &[PathBuf],
-    ) -> Result<BackendAggregatedPluginResult, Vec<BackendPluginRegexValidationError>> {
-        self.inner
-            .try_run(pkg, root, discovered_files)
-            .map(BackendAggregatedPluginResult::from_core)
-            .map_err(|errors| {
-                errors
-                    .into_iter()
-                    .map(|error| BackendPluginRegexValidationError {
-                        message: error.to_string(),
-                    })
-                    .collect()
-            })
     }
 }

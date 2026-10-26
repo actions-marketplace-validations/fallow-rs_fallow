@@ -1,5 +1,5 @@
 name: 'Fallow - Codebase Intelligence'
-description: 'Deterministic codebase intelligence for TypeScript/JavaScript in CI: quality, PR risk, hotspots, duplication, architecture.'
+description: 'Codebase intelligence for TypeScript and JavaScript in CI: gate PRs on complexity, duplication, architecture, unused code.'
 author: 'Bart Waardenburg'
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   command:
-    description: 'Command to run: dead-code (unused code), dupes (code duplication), health (complexity), audit (changed-file quality gate), security (security candidates), fix (auto-remove unused code). Default runs all analyses. Legacy alias: check = dead-code.'
+    description: 'Command to run: dead-code (unused code), architecture (import cycles, boundaries and policy rules), dupes (code duplication), health (complexity), audit (changed-file quality gate), security (security candidates), fix (auto-remove unused code). Default runs all analyses. Legacy alias: check = dead-code.'
     required: false
     default: ''
   root:
@@ -43,7 +43,7 @@ inputs:
     required: false
     default: 'false'
   fail-on-issues:
-    description: 'Exit with code 1 if issues are found'
+    description: 'Exit with code 1 if issues are found. This gates on the issue count only. Every other gate fails the job independently of it, through the input that owns it: fail-on-regression, threshold, min-severity, min-score, security-gate, fail-on-stale-baseline, type-aware-require and fail-on-empty-analysis. Audit is the exception: command: audit gates on its verdict through this input, so audit with fail-on-issues: false stays a reporting configuration.'
     required: false
     default: 'true'
   changed-since:
@@ -54,11 +54,15 @@ inputs:
     required: false
     default: 'true'
   baseline:
-    description: 'Path to baseline file for comparison'
+    description: 'Path to baseline file for comparison. Used by dead-code, architecture, dupes, health and the combined run. On the combined run it holds the dead-code baseline only: use health-baseline and dupes-baseline for the other two analyses. The fix, audit and security commands reject it with exit 2 (audit uses dead-code-baseline, health-baseline and dupes-baseline).'
     required: false
   save-baseline:
-    description: 'Save current results as a baseline file'
+    description: 'Save current results as a baseline file. Used by dead-code, architecture, dupes, health and the combined run. On the combined run it saves the dead-code baseline only: save the others with `fallow health --save-baseline` and `fallow dupes --save-baseline`. The fix, audit and security commands reject it with exit 2.'
     required: false
+  fail-on-stale-baseline:
+    description: 'Fail the job when the loaded baseline has entries that match nothing this run. The staleness warning itself needs no input: any run that loads a baseline reports it, and a run scoped to changed files re-reads the baseline over the whole project first, because a scoped run cannot judge a whole-project baseline. This input only decides whether that verdict fails the job. On the combined run it also judges health-baseline and dupes-baseline. When the run still cannot judge the baseline (`production`, `workspace`, `changed-workspaces`, or a positional path passed through `args`) it warns and stands down instead of passing silently. Independent of `fail-on-issues`.'
+    required: false
+    default: 'false'
   version:
     description: 'Fallow version override. When omitted, the action uses the project package.json fallow dependency spec if present, otherwise latest. The action ref (uses: fallow-rs/fallow@...) and this CLI version are independent; see the README CI section (https://github.com/fallow-rs/fallow#ci) for the resolution order. Pin a current fallow version so Ed25519 + SHA-256 binary verification can run.'
     required: false
@@ -80,15 +84,15 @@ inputs:
     required: false
     default: ${{ github.token }}
   branded-token:
-    description: 'Post PR comments and reviews as the Fallow app (branded) when the workflow grants `permissions: id-token: write`. Set to false to always post with github-token. Falls back to github-token automatically when id-token is unavailable.'
+    description: 'Post PR comments and reviews as the Fallow app (branded) when the workflow grants `permissions: id-token: write`. The action requests the branded token only when `comment` or `review-comments` is true. `auto` (default) falls back to github-token silently when id-token is unavailable. `true` does the same, but logs one notice for the fallback. `false` always posts with github-token.'
     required: false
-    default: 'true'
+    default: 'auto'
   broker-url:
     description: 'Base URL of the Fallow token broker used to mint the branded app token. Defaults to Fallow Cloud.'
     required: false
     default: 'https://api.fallow.cloud'
   annotations:
-    description: 'Emit findings as inline PR annotations via workflow commands (no Advanced Security required). On fallow >= 3.4.2 the action renders these natively via `fallow report --format github-annotations`; older binaries fall back to the bundled jq renderers, and version: latest users flip to the native path silently. The step log line "fallow: annotations rendered via native github-annotations" (or "via jq fallback") tells you which renderer ran.'
+    description: 'Emit findings as inline PR annotations via workflow commands (no Advanced Security required). On fallow >= 3.4.2 the action renders these natively via `fallow report --format github-annotations`; older fallow versions use a frozen legacy renderer, and the step log shows a notice to upgrade. The step log line "fallow: annotations rendered via native github-annotations" (or "via legacy jq renderer") tells you which renderer ran. The job summary follows the same rule with `github-summary`.'
     required: false
     default: 'true'
   review-comments:
@@ -233,8 +237,15 @@ inputs:
     required: false
     default: 'false'
   min-severity:
-    description: 'Only fail for findings at or above this severity (moderate, high, critical). Use "critical" to only fail on critical complexity findings.'
+    description: 'health command only: fail when a complexity finding reaches this severity (moderate, high, critical). The fail-on-issues count gate is separate and still counts every finding; set fail-on-issues: false to gate on severity alone.'
     required: false
+  min-score:
+    description: 'health command only: fail when the health score drops below this threshold (0-100). Implies --score, so the action also passes --complexity unless a health section input is set, keeping findings, annotations and SARIF populated; target_thresholds and hotspot_summary are not restored. When this is set the CLI turns its own findings rule off and the fail-on-issues count gate stands down with it, so the score alone decides the run.'
+    required: false
+  fail-on-empty-analysis:
+    description: 'Fail the job when the run analyzed no source file at all, so every count it reports is zero because nothing was measured. Warns and passes by default, because a repository whose scope legitimately holds no source should keep passing.'
+    required: false
+    default: 'false'
   save-snapshot:
     description: 'Save vital signs snapshot to .fallow/snapshots/ for trend tracking. Use actions/cache to persist across runs. Provide a path or leave empty for default. Works with health and bare command.'
     required: false
@@ -243,10 +254,10 @@ inputs:
     required: false
   # Check-specific inputs
   issue-types:
-    description: 'Comma-separated issue types to report (dead-code command). Valid: unused-files, unused-exports, unused-types, unused-deps, unused-enum-members, unused-class-members, unresolved-imports, unlisted-deps, duplicate-exports, circular-deps'
+    description: 'Comma-separated issue types to report (dead-code and architecture commands). Valid for dead-code: unused-files, unused-exports, unused-types, unused-deps, unused-enum-members, unused-class-members, unresolved-imports, unlisted-deps, duplicate-exports, circular-deps. Valid for architecture: cycles, boundaries, policy.'
     required: false
   include-entry-exports:
-    description: 'Report unused exports in entry files instead of auto-marking them as used. Catches framework export typos. Applied to dead-code analysis; also configurable persistently via includeEntryExports in your fallow config.'
+    description: 'Report unused exports in entry files instead of auto-marking them as used. Catches framework export typos. Applied to dead-code analysis (not applied to architecture); also configurable persistently via includeEntryExports in your fallow config.'
     required: false
     default: 'false'
   type-aware:
@@ -265,6 +276,9 @@ inputs:
   gate:
     description: 'Audit verdict gate: new-only (default) fails only introduced findings, all fails on every finding in changed files.'
     required: false
+  worsened:
+    description: 'Audit effect of an inherited complexity finding that got worse under gate new-only: warn (default) gives at least a warn verdict, error counts it like an introduced finding, off reports only the growth of an exceeded metric as worsened.'
+    required: false
   security-gate:
     description: 'Security regression gate: new fails on candidates introduced on changed lines, newly-reachable fails on existing candidates that became reachable from entry points.'
     required: false
@@ -272,25 +286,25 @@ inputs:
     description: 'Path to a dead-code baseline for the audit command.'
     required: false
   health-baseline:
-    description: 'Path to a health baseline for the audit command.'
+    description: 'Path to a health baseline for the audit command and the combined run (empty command). Create it with `fallow health --save-baseline`. On the combined run the baseline input holds the dead-code baseline only, so pass the health baseline here. Other commands ignore it.'
     required: false
   dupes-baseline:
-    description: 'Path to a duplication baseline for the audit command.'
+    description: 'Path to a duplication baseline for the audit command and the combined run (empty command). Create it with `fallow dupes --save-baseline`. On the combined run the baseline input holds the dead-code baseline only, so pass the duplication baseline here. Other commands ignore it.'
     required: false
   # Regression detection
   fail-on-regression:
-    description: 'Exit with code 1 if issue counts regressed compared to baseline (dead-code command)'
+    description: 'Exit with code 1 if issue counts regressed compared to baseline (dead-code and architecture commands)'
     required: false
     default: 'false'
   tolerance:
-    description: 'Allowed regression tolerance before failing (e.g. "2%" or "5") (dead-code command)'
+    description: 'Allowed regression tolerance before failing (e.g. "2%" or "5") (dead-code and architecture commands)'
     required: false
     default: '0'
   regression-baseline:
-    description: 'Path to regression baseline file for comparison (dead-code command)'
+    description: 'Path to regression baseline file for comparison (dead-code and architecture commands)'
     required: false
   save-regression-baseline:
-    description: 'Save current results as a regression baseline file (dead-code command)'
+    description: 'Save current results as a regression baseline file (dead-code and architecture commands)'
     required: false
   # Fix-specific inputs
   dry-run:
@@ -305,12 +319,12 @@ inputs:
   threads:
     description: 'Number of parser threads (default: available CPU cores)'
     required: false
-  # Bare invocation selectors
+  # Analysis selectors for the bare invocation and for `audit`
   only:
-    description: 'Run only these analyses when no command is specified (comma-separated: dead-code,dupes,health)'
+    description: 'Run only these analyses when no command is specified or the command is audit (comma-separated: dead-code,architecture,dupes,health). For audit it replaces the audit.deadCode, audit.health and audit.dupes config selection'
     required: false
   skip:
-    description: 'Skip these analyses when no command is specified (comma-separated: dead-code,dupes,health)'
+    description: 'Skip these analyses when no command is specified or the command is audit (comma-separated: dead-code,architecture,dupes,health). With audit, a baseline input for a skipped analysis fails the run'
     required: false
 
 outputs:
@@ -321,7 +335,7 @@ outputs:
     description: 'Path to SARIF results file'
     value: ${{ steps.analyze.outputs.sarif }}
   issues:
-    description: 'Number of issues (dead-code), clone groups (dupes), security candidates (security), introduced findings counted by the audit verdict (audit), or fixes proposed/applied (fix). Audit count is gate-aware: with `gate: new-only` (default) it sums attribution.*_introduced; with `gate: all` it sums summary.* totals. Security count is gate-aware when `security-gate` is set. For audit, prefer `outputs.verdict` for severity-aware gating.'
+    description: 'Number of issues (dead-code and architecture), clone groups (dupes), security candidates (security), introduced findings counted by the audit verdict (audit), or fixes proposed/applied (fix). Audit count is gate-aware: with `gate: new-only` (default) it sums attribution.*_introduced, plus attribution.complexity_worsened when `worsened: error`; with `gate: all` it sums summary.* totals. Security count is gate-aware when `security-gate` is set. For audit, prefer `outputs.verdict` for severity-aware gating.'
     value: ${{ steps.analyze.outputs.issues }}
   verdict:
     description: 'Audit verdict (pass/warn/fail). Empty when command is not audit. The threshold step gates on this for audit so warn-tier findings do not fail CI.'
@@ -332,6 +346,54 @@ outputs:
   changed-files-unavailable:
     description: 'true when the analyze step could not enumerate PR-changed files (transient GitHub API failure, expired token, missing permissions); false on the happy path. Always emitted, regardless of whether changed-since was requested. Gate on this in downstream workflow steps to detect when analysis ran unscoped vs scoped.'
     value: ${{ steps.analyze.outputs.changed_files_unavailable }}
+  baseline-entries:
+    description: 'Entries in the loaded baseline. Empty when no baseline was loaded or the fallow version predates the staleness envelope. On a pull request these six outputs describe the unscoped baseline re-read, not the scoped analysis, because a scoped run cannot judge a whole-project baseline. They describe the baseline input only, so on the combined run they never describe health-baseline or dupes-baseline.'
+    value: ${{ steps.analyze.outputs.baseline_entries }}
+  baseline-matched:
+    description: 'Baseline entries that matched a current finding. Empty when no baseline was loaded.'
+    value: ${{ steps.analyze.outputs.baseline_matched }}
+  baseline-stale-entries:
+    description: 'Baseline entries that matched nothing this run. Empty when no baseline was loaded.'
+    value: ${{ steps.analyze.outputs.baseline_stale_entries }}
+  baseline-advisory:
+    description: 'Which staleness advisory the baseline earned: none, partial, or zero-overlap. Empty when no baseline was loaded.'
+    value: ${{ steps.analyze.outputs.baseline_advisory }}
+  baseline-change-scoped:
+    description: 'true when the run behind these numbers analyzed only part of the project, so the baseline could not be judged. Read this before dividing baseline-matched by baseline-entries.'
+    value: ${{ steps.analyze.outputs.baseline_change_scoped }}
+  baseline-scope-reasons:
+    description: 'Names of the channels that narrowed the run, in the order fallow publishes them, separated by a comma and a space (for example "changed-since, production"). Empty when the run was not narrowed or the fallow version predates the member. Read it to tell narrowing you can remove from narrowing you chose.'
+    value: ${{ steps.analyze.outputs.baseline_scope_reasons }}
+  baseline-unrecognised:
+    description: 'true when the loaded file carries no key the running command writes into its own baselines, so it is a baseline another command saved or an object with nothing of that command in it. Empty when no baseline was loaded, when the baseline belongs to the command that read it, or when the fallow version predates the member. A baseline saved on a project with nothing to record is empty and is NOT reported here.'
+    value: ${{ steps.analyze.outputs.baseline_unrecognised }}
+  baseline-saved-by:
+    description: 'The command that saved the loaded baseline (dead-code, dupes or health), when baseline-unrecognised is true and the file names a writer that fallow knows. A baseline that the architecture command saves is a dead-code baseline, so it reports dead-code. Empty otherwise, and when the fallow version predates the member. The value set is open: a later fallow can add a writer.'
+    value: ${{ steps.analyze.outputs.baseline_saved_by }}
+  baseline-gate-trips:
+    description: 'true when the baseline has entries that match nothing and the run could judge it, or when the loaded file is not this command''s own baseline. That is what fail-on-stale-baseline exits on. Gate on this in a downstream step to report staleness without failing the job.'
+    value: ${{ steps.analyze.outputs.baseline_gate_trips }}
+  baseline-path:
+    description: 'The baseline the run compared against, as the baseline input spelled it. Empty when no baseline was loaded and when one reached the run through the args input, where this action never sees the path.'
+    value: ${{ steps.analyze.outputs.baseline_path }}
+  gates-failed:
+    description: 'Comma-separated names of the gates whose status is fail. A gate appears here whether or not its owning input made it fail the job.'
+    value: ${{ steps.analyze.outputs.gates_failed }}
+  gates-warned:
+    description: 'Comma-separated names of the gates whose status is warn.'
+    value: ${{ steps.analyze.outputs.gates_warned }}
+  gates-skipped:
+    description: 'Comma-separated names of the gates that stood down without judging the run.'
+    value: ${{ steps.analyze.outputs.gates_skipped }}
+  gates-passed:
+    description: 'Comma-separated names of the gates that ran and passed.'
+    value: ${{ steps.analyze.outputs.gates_passed }}
+  analysis-degraded:
+    description: 'true when the run recorded a diagnostic meaning its findings were computed over less than the whole project. Read from the envelope root, or from the dead_code section on command: audit.'
+    value: ${{ steps.analyze.outputs.analysis_degraded }}
+  requests-unapplied:
+    description: 'Comma-separated names of the narrowing requests the run could not apply, each with its reason in parentheses (for example "changed-since (git-failed)"). Empty when every narrowing request applied and when nothing was asked for. Any entry means the report covers MORE than was requested, so a changed-code review read it as if it were scoped. Only requests that narrow the report are listed (the envelope entries whose affects is "scope"); a request that writes a file beside the report, such as sarif-file, never appears here, because its failure does not change what the report covers.'
+    value: ${{ steps.analyze.outputs.requests_unapplied }}
   post-skipped-reason:
     description: 'Reason the Post review comments step skipped posting (pagination_failure / none). Set to pagination_failure only when the inline-review POST was actually aborted to avoid duplicate threads (multi-comment dedup lookup failed). Empty when the Post review comments step did not run.'
     value: ${{ steps.review.outputs.post_skipped_reason }}
@@ -353,19 +415,43 @@ runs:
 
     - name: Fallow branded token
       id: fallow-token
+      if: >-
+        github.event_name == 'pull_request' &&
+        inputs.command != 'security' &&
+        (inputs.comment == 'true' ||
+          (inputs.review-comments == 'true' && inputs.command != 'fix'))
       shell: bash
       env:
         BRANDED_TOKEN: ${{ inputs.branded-token }}
         BROKER_URL: ${{ inputs.broker-url }}
       run: bash ${{ github.action_path }}/action/scripts/broker-token.sh
 
+    # `restore-keys` are literal string-prefix matches, so `inputs.root` cannot
+    # go into the key raw: the restore prefix for `root=packages/app` is
+    # `fallow-cache-<os>-packages/app-`, which is a literal prefix of the real
+    # key for `root=packages/app-admin`, and the first job silently restores the
+    # second's parse cache. A fixed-width digest ends the root segment at a
+    # known length, so no root's prefix can extend into another's.
+    - name: Fallow cache key
+      id: fallow-cache-key
+      shell: bash
+      env:
+        INPUT_ROOT: ${{ inputs.root }}
+      run: |
+        if command -v sha256sum > /dev/null 2>&1; then
+          digest=$(printf '%s' "${INPUT_ROOT:-.}" | sha256sum)
+        else
+          digest=$(printf '%s' "${INPUT_ROOT:-.}" | shasum -a 256)
+        fi
+        printf 'root_digest=%s\n' "${digest:0:16}" >> "$GITHUB_OUTPUT"
+
     - name: Cache analysis results
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
       with:
         path: ${{ inputs.root }}/.fallow
-        key: fallow-cache-${{ runner.os }}-${{ hashFiles(format('{0}/**/package.json', inputs.root)) }}
+        key: fallow-cache-${{ runner.os }}-${{ steps.fallow-cache-key.outputs.root_digest }}-${{ hashFiles(format('{0}/**/package.json', inputs.root)) }}
         restore-keys: |
-          fallow-cache-${{ runner.os }}-
+          fallow-cache-${{ runner.os }}-${{ steps.fallow-cache-key.outputs.root_digest }}-
 
     - name: Run analysis
       id: analyze
@@ -389,6 +475,7 @@ runs:
         GH_REPO: ${{ github.repository }}
         INPUT_BASELINE: ${{ inputs.baseline }}
         INPUT_SAVE_BASELINE: ${{ inputs.save-baseline }}
+        INPUT_FAIL_ON_STALE_BASELINE: ${{ inputs.fail-on-stale-baseline }}
         INPUT_ARGS: ${{ inputs.args }}
         INPUT_DUPES_MODE: ${{ inputs.dupes-mode }}
         INPUT_MIN_TOKENS: ${{ inputs.min-tokens }}
@@ -419,6 +506,9 @@ runs:
         INPUT_MIN_COMMITS: ${{ inputs.min-commits }}
         INPUT_SCORE: ${{ inputs.score }}
         INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
+        INPUT_MIN_SCORE: ${{ inputs.min-score }}
+        INPUT_FAIL_ON_EMPTY_ANALYSIS: ${{ inputs.fail-on-empty-analysis }}
+        INPUT_FAIL_ON_ISSUES: ${{ inputs.fail-on-issues }}
         INPUT_SAVE_SNAPSHOT: ${{ inputs.save-snapshot }}
         INPUT_TREND: ${{ inputs.trend }}
         INPUT_ISSUE_TYPES: ${{ inputs.issue-types }}
@@ -427,6 +517,7 @@ runs:
         INPUT_TYPE_AWARE_PROJECTS: ${{ inputs.type-aware-projects }}
         INPUT_TYPE_AWARE_REQUIRE: ${{ inputs.type-aware-require }}
         INPUT_GATE: ${{ inputs.gate }}
+        INPUT_WORSENED: ${{ inputs.worsened }}
         INPUT_SECURITY_GATE: ${{ inputs.security-gate }}
         INPUT_DEAD_CODE_BASELINE: ${{ inputs.dead-code-baseline }}
         INPUT_HEALTH_BASELINE: ${{ inputs.health-baseline }}
@@ -469,7 +560,7 @@ runs:
         steps.analyze.outputs.sarif != '' &&
         steps.ghas-check.outputs.available == 'true' &&
         always()
-      uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+      uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
       with:
         sarif_file: ${{ steps.analyze.outputs.sarif }}
         category: fallow
@@ -543,6 +634,18 @@ runs:
         FALLOW_SCOPED_RESULTS_FILE: ${{ inputs.artifacts-dir }}/fallow-results-scoped.json
         FALLOW_CHANGED_FILES_FILE: ${{ inputs.artifacts-dir }}/fallow-changed-files.json
         FALLOW_PR_COMMENT_ENVELOPE_FILE: ${{ inputs.artifacts-dir }}/fallow-pr-comment-envelope.json
+        FALLOW_BASELINE_ADVISORY: ${{ steps.analyze.outputs.baseline_advisory }}
+        FALLOW_BASELINE_STALE_ENTRIES: ${{ steps.analyze.outputs.baseline_stale_entries }}
+        FALLOW_BASELINE_ENTRIES: ${{ steps.analyze.outputs.baseline_entries }}
+        FALLOW_BASELINE_GATE_TRIPS: ${{ steps.analyze.outputs.baseline_gate_trips }}
+        FALLOW_BASELINE_UNRECOGNISED: ${{ steps.analyze.outputs.baseline_unrecognised }}
+        FALLOW_BASELINE_SAVED_BY: ${{ steps.analyze.outputs.baseline_saved_by }}
+        FALLOW_BASELINE_PATH: ${{ steps.analyze.outputs.baseline_path }}
+        FALLOW_GATES_FAILED: ${{ steps.analyze.outputs.gates_failed }}
+        FALLOW_GATES_WARNED: ${{ steps.analyze.outputs.gates_warned }}
+        FALLOW_GATES_SKIPPED: ${{ steps.analyze.outputs.gates_skipped }}
+        FALLOW_GATES_PASSED: ${{ steps.analyze.outputs.gates_passed }}
+        FALLOW_ANALYSIS_DEGRADED: ${{ steps.analyze.outputs.analysis_degraded }}
       run: bash ${{ github.action_path }}/action/scripts/summary.sh
 
     - name: Post review comments
@@ -577,44 +680,3 @@ runs:
         FALLOW_API_RETRIES: ${{ inputs.api-retries }}
         FALLOW_API_RETRY_DELAY: ${{ inputs.api-retry-delay }}
       run: bash ${{ github.action_path }}/action/scripts/review.sh
-
-    - name: Check threshold
-      if: always() && steps.analyze.outputs.issues != ''
-      shell: bash
-      env:
-        INPUT_COMMAND: ${{ inputs.command }}
-        INPUT_FAIL_ON_ISSUES: ${{ inputs.fail-on-issues }}
-        INPUT_GATE: ${{ inputs.gate }}
-        INPUT_SECURITY_GATE: ${{ inputs.security-gate }}
-        ISSUES: ${{ steps.analyze.outputs.issues }}
-        VERDICT: ${{ steps.analyze.outputs.verdict }}
-      run: |
-        if [ "$INPUT_FAIL_ON_ISSUES" != "true" ]; then exit 0; fi
-        if [ "$INPUT_COMMAND" = "audit" ]; then
-          # Audit gates on rule severity. Verdict already encodes the gate
-          # decision: pass -> no issues, warn -> warn-tier only (do not fail),
-          # fail -> error-tier (fail). Counting introduced findings instead
-          # would re-introduce the bug issue #302 was filed to fix.
-          if [ "$VERDICT" = "fail" ]; then
-            echo "::error::Fallow audit failed (gate: ${INPUT_GATE:-new-only}, ${ISSUES} finding(s) at error severity in changed files)"
-            exit 1
-          fi
-          exit 0
-        fi
-        if [ "$ISSUES" -gt 0 ]; then
-          case "$INPUT_COMMAND" in
-            dead-code|check) echo "::error::Fallow found ${ISSUES} unused code issues" ;;
-            dupes)           echo "::error::Fallow found ${ISSUES} clone groups" ;;
-            health)          echo "::error::Fallow found ${ISSUES} health findings" ;;
-            security)
-              if [ -n "$INPUT_SECURITY_GATE" ]; then
-                echo "::error::Fallow security gate failed (gate: ${INPUT_SECURITY_GATE}, ${ISSUES} candidate(s))"
-                exit 8
-              fi
-              echo "::error::Fallow found ${ISSUES} security candidates"
-              ;;
-            fix)             echo "::error::Fallow found ${ISSUES} fixable issues" ;;
-            "")              echo "::error::Fallow found ${ISSUES} issues" ;;
-          esac
-          exit 1
-        fi

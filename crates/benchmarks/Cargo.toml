@@ -22,6 +22,10 @@ name = "representative_sources"
 harness = false
 
 [[bench]]
+name = "component_cache"
+harness = false
+
+[[bench]]
 name = "component_config"
 harness = false
 
@@ -37,17 +41,22 @@ harness = false
 name = "component_output"
 harness = false
 
+[[bench]]
+name = "lsp_save_publish"
+harness = false
+
 [dev-dependencies]
 criterion = { workspace = true }
 fallow-api = { workspace = true }
-fallow-cli = { version = "3.21.0", path = "../cli" }
+fallow-cli = { version = "3.36.0", path = "../cli" }
 fallow-config = { workspace = true }
 fallow-engine = { workspace = true }
 fallow-extract = { workspace = true }
 fallow-graph = { workspace = true }
+fallow-lsp = { version = "3.36.0", path = "../lsp" }
 fallow-output = { workspace = true }
 fallow-types = { workspace = true }
-globset = { workspace = true }
+rayon = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

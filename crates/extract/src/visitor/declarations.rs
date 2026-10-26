@@ -4,11 +4,12 @@
 //! declaration AST nodes, binding patterns, and require/import patterns.
 
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Declaration, Expression, ImportExpression,
-    TSEnumMemberName, TSImportEqualsDeclaration, TSModuleDeclarationName, TSModuleReference,
-    VariableDeclarator,
+    Argument, ArrayExpressionElement, ArrayPattern, BindingPattern, CallExpression, Declaration,
+    Expression, IdentifierReference, Statement, TSEnumMemberName, TSImportEqualsDeclaration,
+    TSModuleReference, TSNamespaceDeclaration, TSNamespaceDeclarationBody, VariableDeclarator,
 };
 
+use crate::js_text::JsText;
 use crate::{
     ExportInfo, ExportName, MemberInfo, MemberKind, RequireCallInfo, SemanticFact,
     StringEnumMemberValueFact, VisibilityTag,
@@ -20,7 +21,10 @@ use super::helpers::{
     extract_class_members, extract_class_type_parameter_names, extract_implemented_interface_names,
     extract_super_class_name, extract_super_class_type_args, has_angular_class_decorator,
 };
-use super::{MemberAccess, ModuleInfoExtractor, extract_destructured_names};
+use super::{
+    MemberAccess, ModuleInfoExtractor, collect_static_import_specifiers,
+    extract_destructured_names, extract_import_expression,
+};
 
 impl ModuleInfoExtractor {
     pub(crate) fn record_string_enum_member_values(
@@ -34,7 +38,7 @@ impl ModuleInfoExtractor {
             let member_name = match &member.id {
                 TSEnumMemberName::Identifier(id) => id.name.to_string(),
                 TSEnumMemberName::String(name) | TSEnumMemberName::ComputedString(name) => {
-                    name.value.to_string()
+                    name.value.text().into_owned()
                 }
                 TSEnumMemberName::ComputedTemplateString(_) => continue,
             };
@@ -43,7 +47,7 @@ impl ModuleInfoExtractor {
                     StringEnumMemberValueFact {
                         enum_name: enumd.id.name.to_string(),
                         member_name,
-                        value: value.value.to_string(),
+                        value: value.value.text().into_owned(),
                     },
                 ));
         }
@@ -94,8 +98,25 @@ impl ModuleInfoExtractor {
             Declaration::TSEnumDeclaration(enumd) => {
                 self.extract_enum_declaration_export(enumd, is_type_only);
             }
-            Declaration::TSModuleDeclaration(module) => {
-                self.extract_module_declaration_export(module, is_type_only);
+            Declaration::TSNamespaceDeclaration(namespace) => {
+                let structurally_type_only =
+                    !is_type_only && !namespace.declare && !namespace_is_instantiated(namespace);
+                if structurally_type_only {
+                    self.structural_type_only_namespace_spans
+                        .push(namespace.id.span);
+                }
+                self.extract_module_declaration_export(
+                    namespace.id.name.to_string(),
+                    namespace.id.span,
+                    is_type_only || namespace.declare || structurally_type_only,
+                );
+            }
+            Declaration::TSExternalModuleDeclaration(module) => {
+                self.extract_module_declaration_export(
+                    module.id.value.text().into_owned(),
+                    module.id.span,
+                    module.declare || is_type_only,
+                );
             }
             Declaration::TSImportEqualsDeclaration(import_equals) => {
                 self.record_exported_import_equals(import_equals);
@@ -127,6 +148,8 @@ impl ModuleInfoExtractor {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             });
         }
     }
@@ -172,6 +195,8 @@ impl ModuleInfoExtractor {
             span: id.span,
             members,
             super_class,
+            deprecated: false,
+            deprecated_reason: None,
         });
     }
 
@@ -188,7 +213,7 @@ impl ModuleInfoExtractor {
                 let name = match &member.id {
                     TSEnumMemberName::Identifier(id) => id.name.to_string(),
                     TSEnumMemberName::String(s) | TSEnumMemberName::ComputedString(s) => {
-                        s.value.to_string()
+                        s.value.text().into_owned()
                     }
                     TSEnumMemberName::ComputedTemplateString(_) => return None,
                 };
@@ -200,6 +225,7 @@ impl ModuleInfoExtractor {
                     decorator_names: Vec::new(),
                     is_instance_returning_static: false,
                     is_self_returning: false,
+                    override_base: None,
                 })
             })
             .collect();
@@ -213,19 +239,46 @@ impl ModuleInfoExtractor {
             members,
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         });
+    }
+
+    /// A namespace that holds only types still merges with a function, class,
+    /// enum, or variable of the same name into one runtime binding. Keep the
+    /// namespace entry a value in that case, so a value import of the merged
+    /// name credits it and it does not surface as a separate unused type.
+    pub(super) fn keep_value_merged_namespaces_as_values(&mut self) {
+        if self.structural_type_only_namespace_spans.is_empty() {
+            return;
+        }
+        let spans = std::mem::take(&mut self.structural_type_only_namespace_spans);
+        let merged_value_names: Vec<ExportName> = self
+            .exports
+            .iter()
+            .filter(|export| spans.contains(&export.span))
+            .filter(|namespace| {
+                self.exports.iter().any(|other| {
+                    !other.is_type_only
+                        && other.name == namespace.name
+                        && !spans.contains(&other.span)
+                })
+            })
+            .map(|namespace| namespace.name.clone())
+            .collect();
+        for export in &mut self.exports {
+            if spans.contains(&export.span) && merged_value_names.contains(&export.name) {
+                export.is_type_only = false;
+            }
+        }
     }
 
     fn extract_module_declaration_export(
         &mut self,
-        module: &oxc_ast::ast::TSModuleDeclaration<'_>,
-        is_type_only: bool,
+        name: String,
+        span: oxc_span::Span,
+        ns_type_only: bool,
     ) {
-        let ns_type_only = module.declare || is_type_only;
-        let (name, span) = match &module.id {
-            TSModuleDeclarationName::Identifier(id) => (id.name.to_string(), id.span),
-            TSModuleDeclarationName::StringLiteral(lit) => (lit.value.to_string(), lit.span),
-        };
         self.exports.push(ExportInfo {
             name: ExportName::Named(name.clone()),
             local_name: Some(name),
@@ -236,6 +289,8 @@ impl ModuleInfoExtractor {
             members: vec![],
             is_side_effect_used: false,
             super_class: None,
+            deprecated: false,
+            deprecated_reason: None,
         });
     }
 
@@ -251,6 +306,8 @@ impl ModuleInfoExtractor {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             });
         }
     }
@@ -267,7 +324,7 @@ impl ModuleInfoExtractor {
         };
         let body_has_use_server = match init {
             Expression::ArrowFunctionExpression(arrow) => {
-                super::visit_impl::function_body_has_use_server(Some(&arrow.body))
+                super::visit_impl::function_body_has_use_server(arrow.body.as_function_body())
             }
             Expression::FunctionExpression(func) => {
                 super::visit_impl::function_body_has_use_server(func.body.as_deref())
@@ -314,14 +371,12 @@ impl ModuleInfoExtractor {
             Declaration::TSTypeAliasDeclaration(alias) => {
                 self.push_namespace_member(alias.id.name.to_string(), alias.id.span);
             }
-            Declaration::TSModuleDeclaration(module) => match &module.id {
-                TSModuleDeclarationName::Identifier(id) => {
-                    self.push_namespace_member(id.name.to_string(), id.span);
-                }
-                TSModuleDeclarationName::StringLiteral(lit) => {
-                    self.push_namespace_member(lit.value.to_string(), lit.span);
-                }
-            },
+            Declaration::TSNamespaceDeclaration(namespace) => {
+                self.push_namespace_member(namespace.id.name.to_string(), namespace.id.span);
+            }
+            Declaration::TSExternalModuleDeclaration(module) => {
+                self.push_namespace_member(module.id.value.text().into_owned(), module.id.span);
+            }
             Declaration::TSImportEqualsDeclaration(import_equals) => {
                 self.record_exported_import_equals(import_equals);
             }
@@ -342,6 +397,7 @@ impl ModuleInfoExtractor {
             decorator_names: Vec::new(),
             is_instance_returning_static: false,
             is_self_returning: false,
+            override_base: None,
         });
     }
 
@@ -426,7 +482,7 @@ impl ModuleInfoExtractor {
         self.record_namespace_binding_name(local.clone());
         self.import_equals_bindings.push(local.clone());
         self.require_calls.push(RequireCallInfo {
-            source: reference.expression.value.to_string(),
+            source: reference.expression.value.text().into_owned(),
             // The `require('./y')` reference, matching the call span a
             // `const X = require('./y')` declaration records.
             span: reference.span,
@@ -499,7 +555,7 @@ impl ModuleInfoExtractor {
                     if let Some(name) = prop.key.static_name() {
                         self.member_accesses.push(MemberAccess {
                             object: ident_name.to_string(),
-                            member: name.to_string(),
+                            member: name.text().into_owned(),
                         });
                     }
                 }
@@ -519,23 +575,160 @@ impl ModuleInfoExtractor {
     /// posture; a grouped conditional edge would be needed for branch precision.
     pub(super) fn handle_dynamic_import_declaration(
         &mut self,
-        declarator: &VariableDeclarator<'_>,
-        import_expr: &ImportExpression<'_>,
+        pattern: &BindingPattern<'_>,
+        import_span: oxc_span::Span,
         sources: &[String],
     ) {
-        match &declarator.id {
+        match pattern {
+            BindingPattern::AssignmentPattern(assign) => {
+                self.handle_dynamic_import_declaration(&assign.left, import_span, sources);
+            }
             BindingPattern::ObjectPattern(obj_pat) => {
                 let names = extract_destructured_names(obj_pat);
-                self.push_dynamic_import_branches(sources, import_expr.span, &names, None);
-                self.handled_import_spans.insert(import_expr.span);
+                self.push_dynamic_import_branches(sources, import_span, &names, None);
+                self.handled_import_spans.insert(import_span);
             }
             BindingPattern::BindingIdentifier(id) => {
                 let local = id.name.to_string();
                 self.record_namespace_binding_name(local.clone());
-                self.push_dynamic_import_branches(sources, import_expr.span, &[], Some(&local));
-                self.handled_import_spans.insert(import_expr.span);
+                self.push_dynamic_import_branches(sources, import_span, &[], Some(&local));
+                self.handled_import_spans.insert(import_span);
             }
-            _ => {}
+            BindingPattern::ArrayPattern(_) => {}
+        }
+    }
+
+    /// Record dynamic-import edges for
+    /// `const [a, b] = await Promise.all([import('./a'), import('./b')])`.
+    ///
+    /// Each pattern element binds the module of the array element at the same
+    /// index, so each pair gets the same credit as a single
+    /// `const a = await import('./a')`. A rest identifier receives every later
+    /// module inside an array, so those modules get a whole-object credit. A
+    /// hole binds nothing, so that `import()` stays a plain load.
+    pub(super) fn handle_promise_all_dynamic_imports(
+        &mut self,
+        pattern: &ArrayPattern<'_>,
+        elements: &[ArrayExpressionElement<'_>],
+    ) {
+        for (index, element) in elements.iter().enumerate() {
+            let Some(import_expr) = element.as_expression().and_then(extract_import_expression)
+            else {
+                continue;
+            };
+            let mut sources = Vec::new();
+            collect_static_import_specifiers(&import_expr.source, &mut sources);
+            if sources.is_empty() {
+                continue;
+            }
+            if let Some(binding) = pattern.elements.get(index) {
+                if let Some(binding) = binding {
+                    self.handle_dynamic_import_declaration(binding, import_expr.span, &sources);
+                } else {
+                    self.discarded_import_spans.insert(import_expr.span);
+                }
+                continue;
+            }
+            match &pattern.rest {
+                Some(rest) => {
+                    if let BindingPattern::BindingIdentifier(id) = &rest.argument {
+                        let local = id.name.to_string();
+                        self.push_whole_object_use(local.clone());
+                        self.push_dynamic_import_branches(
+                            &sources,
+                            import_expr.span,
+                            &[],
+                            Some(&local),
+                        );
+                        self.handled_import_spans.insert(import_expr.span);
+                    }
+                }
+                None => {
+                    self.discarded_import_spans.insert(import_expr.span);
+                }
+            }
+        }
+    }
+
+    /// Record dynamic-import edges for `name = await import(...)`, where `name`
+    /// is a binding declared elsewhere (for example a module-level `let` that a
+    /// setup function fills). The binding then acts as a namespace, the same as
+    /// `const name = await import(...)`: member reads through `name` credit
+    /// only those exports, and a whole-value use credits the whole module. The
+    /// assignment target itself is a write, not a whole-value use.
+    pub(super) fn handle_dynamic_import_assignment(
+        &mut self,
+        target: &IdentifierReference<'_>,
+        right: &Expression<'_>,
+    ) {
+        let Some(import_expr) = super::extract_import_expression(right) else {
+            return;
+        };
+        let mut sources = Vec::new();
+        super::collect_static_import_specifiers(&import_expr.source, &mut sources);
+        if sources.is_empty() {
+            return;
+        }
+        let name = target.name.as_str();
+        if super::is_unawaited_import(right) {
+            self.promise_import_bindings.insert(name.to_string());
+        }
+        self.record_assigned_namespace_binding_name(name.to_string());
+        self.push_dynamic_import_branches(&sources, import_expr.span, &[], Some(name));
+        self.handled_import_spans.insert(import_expr.span);
+        self.structured_namespace_reference_spans
+            .insert(target.span);
+    }
+}
+
+/// Whether a TypeScript namespace emits JavaScript, following the TypeScript
+/// rule for instantiated namespaces. A namespace that holds only interfaces,
+/// type aliases, ambient (`declare`) declarations, type-only imports and
+/// exports, and nested namespaces of the same kind emits nothing, so its name
+/// exists only in type space. Any other statement, exported or not, makes the
+/// namespace a runtime object. A `const enum` and a non-type import alias count
+/// as values here, which keeps the classification conservative.
+pub(super) fn namespace_is_instantiated(namespace: &TSNamespaceDeclaration<'_>) -> bool {
+    if namespace.declare {
+        return false;
+    }
+    match &namespace.body {
+        TSNamespaceDeclarationBody::TSNamespaceDeclaration(inner) => {
+            namespace_is_instantiated(inner)
+        }
+        TSNamespaceDeclarationBody::TSModuleBlock(block) => {
+            !block.directives.is_empty() || block.body.iter().any(statement_is_instantiated)
+        }
+    }
+}
+
+pub(super) fn statement_is_instantiated(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::EmptyStatement(_) => false,
+        Statement::ExportDeclaration(export) => {
+            !export.export_kind().is_type() && declaration_is_instantiated(&export.declaration)
+        }
+        Statement::ExportNamedDeclaration(export) => !export.export_kind.is_type(),
+        Statement::ImportDeclaration(import) => !import.import_kind.is_type(),
+        _ => statement
+            .as_declaration()
+            .is_none_or(declaration_is_instantiated),
+    }
+}
+
+fn declaration_is_instantiated(declaration: &Declaration<'_>) -> bool {
+    match declaration {
+        Declaration::TSTypeAliasDeclaration(_)
+        | Declaration::TSInterfaceDeclaration(_)
+        | Declaration::TSGlobalDeclaration(_) => false,
+        Declaration::VariableDeclaration(var) => !var.declare,
+        Declaration::FunctionDeclaration(func) => !func.declare && func.body.is_some(),
+        Declaration::ClassDeclaration(class) => !class.declare,
+        Declaration::TSEnumDeclaration(enumd) => !enumd.declare,
+        Declaration::TSNamespaceDeclaration(namespace) => namespace_is_instantiated(namespace),
+        Declaration::TSExternalModuleDeclaration(module) => !module.declare,
+        Declaration::TSImportEqualsDeclaration(import_equals) => {
+            !import_equals.import_kind.is_type()
         }
     }
 }

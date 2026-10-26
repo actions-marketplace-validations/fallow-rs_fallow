@@ -20,7 +20,7 @@ Create a file named `fallow-plugin-<name>.jsonc` in your project root:
 }
 ```
 
-That's it. Fallow automatically discovers `fallow-plugin-*` files in your project root.
+Fallow automatically discovers `fallow-plugin-*` files in your project root.
 
 ## Supported Formats
 
@@ -54,6 +54,7 @@ fallow plugin-schema
 | `entryPointRole` | string | Reachability role for entry points: runtime, test, or support |
 | `manifestEntries` | object[] | Entry points derived from framework manifest files |
 | `configPatterns` | string[] | Glob patterns for config files (marked always-used) |
+| `configDefaultExportOptOut` | string[] | Config patterns whose files do not get the `default` export credit |
 | `alwaysUsed` | string[] | Glob patterns for files always considered used |
 | `toolingDependencies` | string[] | Packages used via CLI, not source imports |
 | `usedExports` | object[] | Exports always considered used in matching files |
@@ -141,6 +142,9 @@ one entry template may expand to at most 4,096 concrete paths per manifest.
 Fallow skips the affected gate or template and reports a structured
 `plugin-check` warning instead of returning a partial result.
 
+Kibana `kibana.jsonc` manifests do not need an external plugin. The built-in
+`kibana` plugin uses the same engine to seed the plugin entries.
+
 Use `[*]` to traverse every object in a manifest array. For example,
 `${content_scripts[*].js}` emits every JavaScript path from every browser
 extension content-script object. The same syntax works in `when`; a wildcard
@@ -194,6 +198,72 @@ Glob patterns for framework config files. When the plugin is active, these files
 }
 ```
 
+Under `includeEntryExports`, the `default` export of a file that matches a
+`configPatterns` entry counts as used, because the tool loads the config file
+and reads its default export. Named exports of the file stay reportable. Add
+them to `usedExports` when the tool reads them. Without `includeEntryExports`,
+this rule does not change the output.
+
+Config discovery adds a `**/` prefix to a pattern that has no `/`, does not
+start with a dot and names only source extensions (`.ts`, `.js` and similar).
+The credit uses the same prefix, so `my-framework.config.ts` also matches
+`src/my-framework.config.ts`. A pattern such as `.my-frameworkrc.js` gets no
+prefix and gets the credit only at the project root and at the root of each
+workspace package.
+
+The prefix rule controls the credit, not the full config discovery. For a
+built-in plugin, config discovery also probes a pattern without the prefix in
+every ancestor directory of a source file. So `resolve_config` can receive a
+nested file that the tool never reads. When the tool reads its config from one
+directory only, return an empty result for a nested file in `resolve_config`.
+The Serverless plugin does this for a nested `serverless.ts`.
+Keep config patterns specific: a broad pattern such as `config*.ts` also
+gives the credit to source files such as `src/configUtils.ts`.
+
+A built-in plugin can opt a pattern out of this credit with
+`config_default_export_opt_out` (a `define_plugin!` field and a `Plugin`
+trait method). Use it when the tool reads named exports (Gatsby
+`gatsby-node`), or when the pattern also matches ordinary source files
+(GraphQL Codegen `codegen*`, Serverless `serverless.*`, Vercel `vercel.*`).
+Each opt-out entry must be identical to an entry of `config_patterns`.
+
+An external plugin uses `configDefaultExportOptOut` for the same purpose.
+Write each entry exactly as in `configPatterns`. Other entries have no
+effect. The opted-out file stays a config file and an always-used file.
+
+```jsonc
+{
+  "configPatterns": ["my-framework.config.ts", "my-framework-*.ts"],
+  "configDefaultExportOptOut": ["my-framework-*.ts"]
+}
+```
+
+A built-in plugin can also credit the exports of a config file with
+`config_file_exports` (a `define_plugin!` field and a `Plugin` trait method).
+Each entry is a pattern and the export names that the tool reads, or `"*"`
+for every export. Use it in these cases:
+
+- The tool config file is only in `always_used` (Capacitor
+  `capacitor.config.ts`, SVGO `svgo.config.js`).
+- The tool reads named exports (cucumber-js reads each named export of
+  `cucumber.js` as a profile).
+- The config pattern also matches ordinary source files, so only the file at
+  the root can get the credit (GraphQL Codegen `codegen*`, Serverless
+  `serverless.*`, Vercel `vercel.*`).
+
+These patterns are anchored. They get the workspace prefix, but no `**/`
+prefix, so they match only at the project root and at the root of each
+workspace package. Like the `default` credit, this credit applies only under
+`includeEntryExports`. A `resolve_config` result can give the same credit
+for the files that a config names, with
+`PluginResult::push_entry_export_credit`. The Serverless plugin uses it for
+the export that each `handler` names. Do not use `push_used_export_rule` for
+this: a used-export rule also makes the matching entry file reportable
+without `includeEntryExports`. External plugins have no anchored credit. The
+`usedExports` field is the nearest option, but it also applies without
+`includeEntryExports`: fallow then analyses the exports of a matching entry
+file.
+
 ### `alwaysUsed`
 
 Files that should always be considered used when this plugin is active, even if nothing imports them.
@@ -210,7 +280,7 @@ Files that should always be considered used when this plugin is active, even if 
 
 ### `toolingDependencies`
 
-Packages that are tooling dependencies -- used via CLI commands or config files, not imported in source code. These won't be flagged as unused dev dependencies.
+Packages used through CLI commands or config files, without source imports. Fallow does not flag them as unused dev dependencies when the project shows that it uses the tool: a file that matches the plugin's `configPatterns` or `alwaysUsed`, a top-level package.json key named after the plugin, or a package.json script, CI workflow or git hook that runs one of these packages or one of the `enablers`. An active plugin alone is not enough, because a declared package activates it.
 
 ```jsonc
 {
@@ -260,8 +330,8 @@ class or implements a named interface. A scoped rule must define `extends` or
 Fallow discovers external plugins in this order (first occurrence of a plugin name wins):
 
 1. **Explicit paths** from the `plugins` config field
-2. **`.fallow/plugins/`** directory -- all `*.jsonc`, `*.json`, `*.toml` files
-3. **Project root** -- `fallow-plugin-*.{jsonc,json,toml}` files
+2. **`.fallow/plugins/`** directory: all `*.jsonc`, `*.json`, `*.toml` files
+3. **Project root**: `fallow-plugin-*.{jsonc,json,toml}` files
 
 ### Using the `plugins` config field
 
@@ -371,7 +441,7 @@ my-project/
 
 ## Sharing Plugins
 
-External plugins are plain files -- share them however you share config:
+Share external plugin files with the rest of your configuration:
 
 - **Git**: check `fallow-plugin-*` files into your repo
 - **Monorepo**: put shared plugins in a central `tools/` directory and reference via `plugins` config
@@ -407,7 +477,7 @@ Reference it in your plugin files:
 | AST-based config parsing | Yes | No |
 | Custom detection logic | Yes | Yes (dependency, fileExists, all/any combinators) |
 
-External plugins cover the vast majority of use cases. AST-based config parsing (extracting entry points from `vite.config.ts`, resolving ESLint plugin short names, etc.) requires a built-in Rust plugin.
+AST-based config parsing requires a built-in Rust plugin. This includes extracting entry points from `vite.config.ts` and resolving ESLint plugin short names.
 
 ## Verifying
 

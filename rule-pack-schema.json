@@ -37,7 +37,7 @@
   ],
   "$defs": {
     "RulePackRule": {
-      "description": "One declarative policy rule inside a rule pack.\n\n`callees` applies only to `banned-call` rules; `specifiers` and\n`ignoreTypeOnly` apply only to `banned-import` rules; `effects` applies\nonly to `banned-effect` rules; `exports` applies only to `banned-export`\nrules. `zones` can scope any rule kind to files classified into one of the\nnamed boundary zones. Setting a field on the wrong kind is a load error\n(fail loud, never silently ignore policy).",
+      "description": "One declarative policy rule inside a rule pack.\n\n`callees` applies only to `banned-call` rules; `specifiers` and\n`ignoreTypeOnly` apply only to `banned-import` rules; `effects` applies\nonly to `banned-effect` rules; `exports` applies only to `banned-export`\nrules. `allowedFiles` and `proofKinds` apply only to `gdp-proof-producer`\nrules. `zones` can scope any rule kind to files classified into one of the\nnamed boundary zones. Setting a field on the wrong kind is a load error\n(fail loud, never silently ignore policy).",
       "type": "object",
       "properties": {
         "id": {
@@ -76,19 +76,33 @@
             "type": "string"
           }
         },
+        "allowedFiles": {
+          "description": "Project-root-relative globs allowed to call `@gdp-ts/core.defineProof`\n(`gdp-proof-producer` only). At least one pattern is required.\nA single `*` stays within one path segment; use `**` to match across directories.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "proofKinds": {
+          "description": "Exact literal proof labels checked by a `gdp-proof-producer` rule.\nEmpty or absent checks every recognized factory call, including calls\nwith dynamic labels. A nonempty list checks only static string labels.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "ignoreTypeOnly": {
           "description": "When `true`, type-only imports (`import type ...` and type-only\nre-exports) are ignored by `banned-import`; type-only exports are\nignored by `banned-export`. Defaults to `false`: type-only sites are\nflagged too.",
           "type": "boolean"
         },
         "files": {
-          "description": "Optional include globs (project-root-relative). Empty or absent means\nthe rule applies to every analyzed file.",
+          "description": "Optional include globs (project-root-relative). Empty or absent means\nthe rule applies to every analyzed file.\nA single `*` stays within one path segment; use `**` to match across directories.",
           "type": "array",
           "items": {
             "type": "string"
           }
         },
         "exclude": {
-          "description": "Optional exclude globs (project-root-relative), applied after `files`.",
+          "description": "Optional exclude globs (project-root-relative), applied after `files`.\nA single `*` stays within one path segment; use `**` to match across directories.",
           "type": "array",
           "items": {
             "type": "string"
@@ -148,6 +162,11 @@
           "description": "Ban exported names that match one of `exports`.",
           "type": "string",
           "const": "banned-export"
+        },
+        {
+          "description": "Restrict gdp-ts proof factory calls to explicitly allowed modules.",
+          "type": "string",
+          "const": "gdp-proof-producer"
         }
       ]
     },
@@ -222,15 +241,15 @@
       ]
     },
     "Severity": {
-      "description": "Severity level for rules.\n\nControls whether an issue type causes CI failure (`error`), is reported\nwithout failing (`warn`), or is suppressed entirely (`off`).",
+      "description": "Severity level for rules.\n\nControls whether an issue type sets a non-zero exit code (`error`), is\nreported without an effect on the exit code (`warn`), or is suppressed\nentirely (`off`). `--fail-on-issues` promotes `warn` to `error`. The\ndead-code count gate of the GitHub Action counts `warn` findings unless its\n`fail-on-issues` input is `false`.",
       "oneOf": [
         {
-          "description": "Report and fail CI (non-zero exit code).",
+          "description": "Report and set a non-zero exit code.",
           "type": "string",
           "const": "error"
         },
         {
-          "description": "Report but don't fail CI.",
+          "description": "Report without an effect on the exit code.",
           "type": "string",
           "const": "warn"
         },

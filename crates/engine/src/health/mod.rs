@@ -19,14 +19,20 @@ mod actions;
 mod analysis_data;
 mod assembly;
 mod baseline_io;
+mod branching;
+pub use branching::{BranchingByFile, branching_by_file};
+mod change_coupling_section;
 mod churn_file;
 mod component_rollup;
 mod core_pipeline;
 mod coverage_gaps;
 mod coverage_intelligence;
 mod coverage_settings;
+mod coverage_v8;
 mod css_analytics;
+mod cyclomatic_policy;
 mod derived_sections;
+pub(crate) mod diagnostics;
 mod execute;
 mod file_scores;
 mod filters;
@@ -35,9 +41,12 @@ mod findings;
 mod findings_pipeline;
 mod framework_health;
 mod grouping;
+pub use grouping::validate_group_filter;
 mod health_error;
 mod hotspots;
-mod ignore;
+pub(crate) mod ignore;
+mod inline;
+pub use inline::{InlineComplexity, inline_complexity};
 mod large_functions;
 mod output_build;
 pub mod ownership;
@@ -55,6 +64,7 @@ pub mod scoring;
 pub mod styling_score;
 mod tailwind_theme;
 mod targets;
+mod test_reach;
 mod threshold_overrides;
 mod timings;
 mod vital_data;
@@ -79,9 +89,10 @@ pub use hotspots::{
 };
 pub use pipeline::{HealthPipelineInputs, HealthScopeInputs};
 pub use runner::{
-    run_ungrouped_health, run_ungrouped_health_with_session,
+    UngroupedHealthSession, run_ungrouped_health_with_session,
     run_ungrouped_health_with_session_artifacts,
 };
+pub use test_reach::TestReachGraph;
 use vital_data::{HealthVitalData, HealthVitalDataInput, prepare_health_vital_data};
 use vital_signs_scope::{
     SubsetFilter, VitalSignsAndCountsInput, apply_duplication_metrics,
@@ -110,6 +121,11 @@ pub fn shared_parse_data_from_artifacts(
         return None;
     };
     let script_used_packages: FxHashSet<String> = script_used_packages.into_iter().collect();
+    // The vital signs and file scores measure the code, not the report, so
+    // they count the findings that the cascade filter hid. Standalone
+    // `health` runs no rule pass and sees the same set.
+    let mut results = results.clone();
+    results.restore_cascade_findings();
     let analysis_output = graph.map(|graph| DeadCodeAnalysisArtifacts {
         results: results.clone(),
         timings: None,
@@ -117,12 +133,13 @@ pub fn shared_parse_data_from_artifacts(
         modules: None,
         files: None,
         script_used_packages: script_used_packages.clone(),
+        trace_provenance: crate::trace::TraceProvenance::default(),
         file_hashes: FxHashMap::default(),
     });
     Some(HealthSharedParseData {
         files,
         modules,
-        dead_code_results: Some(results.clone()),
+        dead_code_results: Some(results),
         workspaces,
         analysis_output,
     })
@@ -228,6 +245,9 @@ pub struct RuntimeCoverageSeamInput<'a> {
     pub quiet: bool,
     /// Output format the seam should render its own diagnostics in.
     pub output: OutputFormat,
+    /// Full-project graph for test reachability in production mode. `None`
+    /// outside production mode: then `analysis_output` holds the test files.
+    pub test_reach: Option<&'a TestReachGraph>,
 }
 
 /// CLI-supplied callbacks the command-neutral health pipeline needs.
@@ -311,6 +331,16 @@ pub struct HealthGateOptions {
     pub min_severity: Option<FindingSeverity>,
     /// Render the score and findings but never fail CI on a health gate.
     pub report_only: bool,
+    /// Fail the run when a loaded `--baseline` has entries that match nothing.
+    pub fail_on_stale_baseline: bool,
+    /// Fail the run when a source file did not parse cleanly (the
+    /// `parse-error` gate). Set from `--fail-on-parse-error`; the CLI adds the
+    /// `failOnParseError` config key before the gate is evaluated.
+    pub fail_on_parse_error: bool,
+    /// Raise every `warn` complexity finding to `error`, for
+    /// `--fail-on-issues`. Dead-code `warn` findings are raised the same way,
+    /// so every finding of such a run fails it.
+    pub fail_on_issues: bool,
 }
 
 /// Input for deriving effective health sections from command-neutral flags.
@@ -481,6 +511,11 @@ pub struct HealthExecutionOptions<'a> {
     pub workspace: Option<&'a [String]>,
     /// Git ref selecting only workspaces with changes since it.
     pub changed_workspaces: Option<&'a str>,
+    /// Positional `[PATH]` scope: root-joined absolute file or directory inside
+    /// the root. Consumed CLI-side as one more workspace root (prefix scope),
+    /// so it composes with `workspace` the way multiple workspace roots
+    /// compose. `None` means whole-project scope.
+    pub scope: Option<PathBuf>,
     /// Baseline file to compare finding counts against.
     pub baseline: Option<&'a Path>,
     /// Path to write the run's finding counts as a new baseline.
@@ -555,6 +590,12 @@ pub struct HealthExecutionOptions<'a> {
     pub analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity,
     /// Optional grouping mode for typed health output.
     pub group_by: Option<GroupByMode>,
+    /// `--group` selector: keep only the groups whose key matches. Exact keys,
+    /// globs and `!`-prefixed negations. Ignored without `group_by`.
+    pub group_filter: Option<&'a [String]>,
+    /// `--trend-from`: compare against this snapshot file instead of the
+    /// newest file in `.fallow/snapshots/`. Implies `trend`.
+    pub trend_from: Option<&'a Path>,
 }
 
 /// Derive effective health section flags for CLI and embedders.
@@ -828,6 +869,7 @@ mod tests {
             use_shared_diff_index: false,
             workspace: Some(&workspace),
             changed_workspaces: None,
+            scope: None,
             baseline: Some(Path::new(".fallow/health-baseline.json")),
             save_baseline: None,
             baseline_mode: crate::baseline::HealthBaselineMode::Count,
@@ -851,6 +893,9 @@ mod tests {
                 min_score: Some(80.0),
                 min_severity: None,
                 report_only: false,
+                fail_on_stale_baseline: false,
+                fail_on_parse_error: false,
+                fail_on_issues: false,
             },
             since: Some("30d"),
             min_commits: Some(2),
@@ -864,6 +909,8 @@ mod tests {
             churn_file: Some(Path::new("churn.json")),
             analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
             group_by: Some(GroupByMode::Directory),
+            group_filter: None,
+            trend_from: None,
         };
 
         assert_eq!(options.root, root);
@@ -933,6 +980,7 @@ mod tests {
                 use_shared_diff_index: false,
                 workspace: None,
                 changed_workspaces: None,
+                scope: None,
                 baseline: None,
                 save_baseline: None,
                 baseline_mode: crate::baseline::HealthBaselineMode::Count,
@@ -965,8 +1013,49 @@ mod tests {
                 churn_file: None,
                 analysis_identity: fallow_types::semantic::SemanticAnalysisIdentity::default(),
                 group_by: None,
+                group_filter: None,
+                trend_from: None,
             }
         }
+    }
+
+    /// The churn-file re-read is a time-of-check path: the up-front gate
+    /// accepted the file and it changed before the analysis read it again. The
+    /// CLI gate exits 2 on a file that is malformed at check time, so this is
+    /// the level that can drive the branch, and without the diagnostic such a
+    /// run reports the hotspot, churn and ownership sections as zero rather than
+    /// as unmeasured (issue #2734).
+    #[test]
+    fn a_churn_file_that_fails_the_re_read_records_the_skip() {
+        let project = tempfile::tempdir().expect("temp dir");
+        let root = project.path();
+        let churn_file = root.join("churn.json");
+        std::fs::write(&churn_file, "{ not json").expect("churn file");
+        let fixture = HealthExecutionOptionsFixture::new();
+        let mut options = fixture.options(root);
+        options.churn_file = Some(&churn_file);
+
+        assert!(
+            hotspots::fetch_churn_data(&options, &root.join(".fallow")).is_none(),
+            "an unreadable churn file yields no churn"
+        );
+
+        let recorded = fallow_config::health_stage_workspace_diagnostics(root);
+        let skip = recorded
+            .iter()
+            .find(|entry| entry.kind.id() == "hotspots-skipped")
+            .expect("the skip is recorded");
+        assert_eq!(
+            skip.kind,
+            fallow_types::workspace::WorkspaceDiagnosticKind::HotspotsSkipped {
+                cause: "churn-file-unreadable".to_owned(),
+            }
+        );
+        assert!(
+            skip.message.contains("churn.json"),
+            "the remedy names the file: {}",
+            skip.message
+        );
     }
 
     #[test]

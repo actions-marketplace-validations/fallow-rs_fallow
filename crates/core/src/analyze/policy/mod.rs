@@ -1,15 +1,15 @@
+mod gdp;
+
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 
-use fallow_config::{
-    EffectKind, ResolvedBoundaryConfig, ResolvedConfig, RulePackDef, RulePackRule,
-    RulePackRuleKind, Severity,
-};
+use fallow_config::{EffectKind, ResolvedConfig, RulePackRule, RulePackRuleKind, Severity};
 use fallow_types::extract::ModuleInfo;
 use fallow_types::results::{PolicyRuleKind, PolicyViolation, PolicyViolationSeverity};
 
 use crate::discover::FileId;
 use crate::graph::ModuleGraph;
+use crate::resolve::ResolvedModule;
 use crate::suppress::SuppressionContext;
 
 use super::boundary_calls::canonical_callee_path;
@@ -26,6 +26,7 @@ struct CompiledRule<'a> {
     zones: FxHashSet<String>,
     files: Vec<globset::GlobMatcher>,
     exclude: Vec<globset::GlobMatcher>,
+    allowed_files: Vec<globset::GlobMatcher>,
 }
 
 impl CompiledRule<'_> {
@@ -68,44 +69,12 @@ impl CompiledRule<'_> {
     }
 }
 
-/// Return rule-pack rules whose file and zone scope applies to a path.
-#[must_use]
-pub fn rules_applying_to_path<'a>(
-    rule_packs: &'a [RulePackDef],
-    boundaries: &ResolvedBoundaryConfig,
-    rel_path: &str,
-) -> Vec<(&'a str, &'a RulePackRule)> {
-    let zone = boundaries.classify_zone(rel_path);
-    rule_packs
-        .iter()
-        .flat_map(|pack| {
-            pack.rules
-                .iter()
-                .filter(move |rule| raw_rule_scope_applies(rule, boundaries, rel_path, zone))
-                .map(|rule| (pack.name.as_str(), rule))
-        })
-        .collect()
-}
-
-fn raw_rule_scope_applies(
-    rule: &RulePackRule,
-    boundaries: &ResolvedBoundaryConfig,
-    relative: &str,
-    zone: Option<&str>,
-) -> bool {
-    let files = compile_scope_globs(&rule.files);
-    let exclude = compile_scope_globs(&rule.exclude);
-    let zones = rule.zones.iter().cloned().collect();
-    let zone = zone.or_else(|| boundaries.classify_zone(relative));
-    compiled_scope_applies(&files, &exclude, &zones, relative, zone)
-}
-
 fn compile_scope_globs(patterns: &[String]) -> Vec<globset::GlobMatcher> {
-    // Rule-pack loading validates these globs. Dropping an unexpected parse
-    // failure keeps this introspection helper defensive like `compile_rules`.
+    // Rule-pack loading validates these globs. An unexpected parse failure
+    // drops only that pattern, like the callee patterns in `compile_rules`.
     patterns
         .iter()
-        .filter_map(|pattern| globset::Glob::new(pattern).ok())
+        .filter_map(|pattern| fallow_config::compile_path_glob(pattern).ok())
         .map(|glob| glob.compile_matcher())
         .collect()
 }
@@ -122,9 +91,21 @@ fn compiled_scope_applies(
         && (zones.is_empty() || zone.is_some_and(|zone| zones.contains(zone)))
 }
 
-/// Detect banned calls, imports, and catalogue-derived effects declared by the
-/// configured rule packs (`rulePacks`), reporting one `policy-violation`
-/// finding per match.
+/// Shared graph, extraction, configuration, and source context for policy analysis.
+#[derive(Clone, Copy)]
+pub(super) struct PolicyAnalysisInput<'a> {
+    pub(super) graph: &'a ModuleGraph,
+    pub(super) modules: &'a [ModuleInfo],
+    pub(super) resolved_modules: &'a [ResolvedModule],
+    pub(super) config: &'a ResolvedConfig,
+    pub(super) declared_deps: &'a FxHashSet<String>,
+    pub(super) suppressions: &'a SuppressionContext<'a>,
+    pub(super) line_offsets_by_file: &'a LineOffsetsMap<'a>,
+}
+
+/// Detect banned calls, imports, catalogue-derived effects, and proof producer
+/// ownership declared by the configured rule packs (`rulePacks`), reporting one
+/// `policy-violation` finding per match.
 ///
 /// Severity model: each file's master severity is
 /// `resolve_rules_for_path(...).policy_violation` (so per-file `overrides`
@@ -147,15 +128,19 @@ fn compiled_scope_applies(
 /// boundary forbidden-call behavior). `banned-effect` follows the same first
 /// applicable rule policy over catalogue-derived effects. Every
 /// `banned-import` rule that matches a specifier emits its own finding, because
-/// each rule carries its own message and severity.
-pub fn find_policy_violations(
-    graph: &ModuleGraph,
-    modules: &[ModuleInfo],
-    config: &ResolvedConfig,
-    declared_deps: &FxHashSet<String>,
-    suppressions: &SuppressionContext<'_>,
-    line_offsets_by_file: &LineOffsetsMap<'_>,
-) -> Vec<PolicyViolation> {
+/// each rule carries its own message and severity. Proof-producer rules likewise
+/// report independently at every admitted factory call, including unreachable
+/// analyzed modules, and follow only unambiguous ESM symbol provenance.
+pub(super) fn find_policy_violations(input: PolicyAnalysisInput<'_>) -> Vec<PolicyViolation> {
+    let PolicyAnalysisInput {
+        graph,
+        modules,
+        resolved_modules,
+        config,
+        declared_deps,
+        suppressions,
+        line_offsets_by_file,
+    } = input;
     if config.rule_packs.is_empty() {
         return Vec::new();
     }
@@ -174,6 +159,14 @@ pub fn find_policy_violations(
     let mut scoped_file_counts: Vec<usize> = vec![0; rules.len()];
     let mut zones_by_file: FxHashMap<FileId, Option<&str>> = FxHashMap::default();
 
+    let producer_rules_enabled = rules
+        .iter()
+        .any(|rule| rule.rule.kind == RulePackRuleKind::GdpProofProducer);
+    let mut origins = gdp::ProofOrigins::new(if producer_rules_enabled {
+        resolved_modules
+    } else {
+        &[]
+    });
     let mut violations = Vec::new();
     for node in &graph.modules {
         let zone = *zones_by_file.entry(node.file_id).or_insert_with(|| {
@@ -182,18 +175,21 @@ pub fn find_policy_violations(
                 config.boundaries.classify_zone(&relative)
             })
         });
-        collect_node_policy_violations(&mut PolicyNodeInput {
-            node,
-            config,
-            rules: &rules,
-            zone,
-            modules_by_id: &modules_by_id,
-            declared_deps,
-            suppressions,
-            line_offsets_by_file,
-            scoped_file_counts: &mut scoped_file_counts,
-            violations: &mut violations,
-        });
+        collect_node_policy_violations(
+            &mut PolicyNodeInput {
+                node,
+                config,
+                rules: &rules,
+                zone,
+                modules_by_id: &modules_by_id,
+                declared_deps,
+                suppressions,
+                line_offsets_by_file,
+                scoped_file_counts: &mut scoped_file_counts,
+                violations: &mut violations,
+            },
+            &mut origins,
+        );
     }
 
     for (index, rule) in rules.iter().enumerate() {
@@ -225,10 +221,13 @@ struct PolicyNodeInput<'a> {
     violations: &'a mut Vec<PolicyViolation>,
 }
 
-/// Evaluate every banned-import / banned-effect / banned-call rule against one
-/// reachable-or-entry module, bumping per-rule scope counts and appending
-/// findings. Off-master and out-of-scope nodes are skipped.
-fn collect_node_policy_violations(input: &mut PolicyNodeInput<'_>) {
+/// Evaluate applicable rules for one analyzed module, bumping scope counts and
+/// appending findings. Only proof-producer rules apply to unreachable modules;
+/// off-master and out-of-scope nodes remain skipped.
+fn collect_node_policy_violations(
+    input: &mut PolicyNodeInput<'_>,
+    origins: &mut gdp::ProofOrigins<'_>,
+) {
     let node = input.node;
     let Some(scope) = scoped_policy_rules(
         node,
@@ -244,6 +243,20 @@ fn collect_node_policy_violations(input: &mut PolicyNodeInput<'_>) {
         return;
     };
 
+    gdp::collect_producer_violations(
+        &mut PolicyCollectionInput {
+            in_scope: &scope.in_scope,
+            module,
+            node,
+            master: scope.master,
+            declared_deps: input.declared_deps,
+            suppressions: input.suppressions,
+            line_offsets_by_file: input.line_offsets_by_file,
+            violations: input.violations,
+        },
+        origins,
+        &input.config.root,
+    );
     collect_banned_imports(&mut PolicyCollectionInput {
         in_scope: &scope.in_scope,
         module,
@@ -298,9 +311,6 @@ fn scoped_policy_rules<'a>(
     zone: Option<&str>,
     scoped_file_counts: &mut [usize],
 ) -> Option<ScopedPolicyRules<'a>> {
-    if !node.is_reachable() && !node.is_entry_point() {
-        return None;
-    }
     let Ok(relative) = node.path.strip_prefix(&config.root) else {
         return None;
     };
@@ -314,7 +324,12 @@ fn scoped_policy_rules<'a>(
     let in_scope: Vec<(usize, &CompiledRule<'_>)> = rules
         .iter()
         .enumerate()
-        .filter(|(_, rule)| rule.applies_to(&relative, zone))
+        .filter(|(_, rule)| {
+            (node.is_reachable()
+                || node.is_entry_point()
+                || rule.rule.kind == RulePackRuleKind::GdpProofProducer)
+                && rule.applies_to(&relative, zone)
+        })
         .collect();
     if in_scope.is_empty() {
         return None;
@@ -352,6 +367,7 @@ fn compile_rules(config: &ResolvedConfig) -> Vec<CompiledRule<'_>> {
                 zones,
                 files: compile_scope_globs(&rule.files),
                 exclude: compile_scope_globs(&rule.exclude),
+                allowed_files: compile_scope_globs(&rule.allowed_files),
             });
         }
     }
@@ -632,59 +648,12 @@ fn matcher_matches_callee(
     declared_deps: &FxHashSet<String>,
 ) -> bool {
     matcher.enabler_satisfied(declared_deps)
-        && provenance_satisfied(matcher, module, callee_path)
+        && matcher.provenance_satisfied(
+            module,
+            callee_path,
+            fallow_security::ProvenanceBindings::ImportsAndRequires,
+        )
         && matcher.first_matching_pattern(callee_path).is_some()
-}
-
-fn provenance_satisfied(
-    matcher: &super::security::Matcher,
-    module: &ModuleInfo,
-    callee_path: &str,
-) -> bool {
-    let Some(spec) = &matcher.import_provenance else {
-        return true;
-    };
-    let leading_ident = callee_path.split('.').next().unwrap_or(callee_path);
-    module.imports.iter().any(|imp| {
-        import_source_matches(&imp.source, spec)
-            && (!requires_binding_trace(matcher) || imp.local_name == leading_ident)
-    }) || module.require_calls.iter().any(|call| {
-        import_source_matches(&call.source, spec)
-            && (!requires_binding_trace(matcher)
-                || call.local_name.as_deref() == Some(leading_ident)
-                || call
-                    .destructured_names
-                    .iter()
-                    .any(|name| name == leading_ident))
-    })
-}
-
-fn requires_binding_trace(matcher: &super::security::Matcher) -> bool {
-    matches!(
-        matcher.id.as_str(),
-        "command-injection"
-            | "permissive-cors"
-            | "electron-unsafe-webpreferences"
-            | "insecure-temp-file"
-            | "jwt-alg-none"
-            | "jwt-verify-missing-algorithms"
-            | "tls-validation-disabled"
-            | "mysql-multiple-statements"
-            | "world-writable-permission"
-    ) || (matcher.id == "weak-crypto" && matcher.is_literal_aware())
-}
-
-fn import_source_matches(source: &str, spec: &str) -> bool {
-    fn strip_node_prefix(value: &str) -> &str {
-        value.strip_prefix("node:").unwrap_or(value)
-    }
-
-    let source = strip_node_prefix(source);
-    let spec = strip_node_prefix(spec);
-    source == spec
-        || source
-            .strip_prefix(spec)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Segment-aware raw-specifier match: the pattern matches exactly or at a

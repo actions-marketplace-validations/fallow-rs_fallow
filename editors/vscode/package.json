@@ -1,9 +1,9 @@
 {
   "name": "fallow-vscode",
   "displayName": "Fallow",
-  "description": "Codebase intelligence for TypeScript and JavaScript. Real-time diagnostics for unused code, duplication, complexity hotspots, architecture drift, and design-system styling, with optional runtime evidence via Fallow Runtime.",
+  "description": "Codebase intelligence for TypeScript and JavaScript in your editor: diagnostics for complexity, duplication, architecture drift, design-system styling, and unused code.",
   "version": "2.48.1",
-  "packageManager": "pnpm@11.10.0",
+  "packageManager": "pnpm@11.25.0",
   "publisher": "fallow-rs",
   "license": "MIT",
   "repository": {
@@ -12,7 +12,7 @@
     "directory": "editors/vscode"
   },
   "icon": "icon.png",
-  "homepage": "https://docs.fallow.tools",
+  "homepage": "https://fallow.tools/docs/",
   "bugs": {
     "url": "https://github.com/fallow-rs/fallow/issues"
   },
@@ -46,7 +46,6 @@
     "complexity",
     "typescript",
     "javascript",
-    "knip",
     "monorepo",
     "circular-dependencies"
   ],
@@ -54,7 +53,19 @@
     "vscode": "^1.96.0"
   },
   "activationEvents": [
-    "workspaceContains:**/package.json"
+    "workspaceContains:package.json",
+    "workspaceContains:.fallowrc.json",
+    "workspaceContains:.fallowrc.jsonc",
+    "workspaceContains:fallow.toml",
+    "workspaceContains:.fallow.toml",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:vue",
+    "onLanguage:svelte",
+    "onLanguage:astro",
+    "onLanguage:mdx"
   ],
   "main": "./dist/extension.js",
   "extensionKind": [
@@ -191,6 +202,10 @@
         "title": "Fallow: Hide Diagnostic Category"
       },
       {
+        "command": "fallow.copyFindingId",
+        "title": "Fallow: Copy Finding Id"
+      },
+      {
         "command": "fallow.license.activate",
         "title": "Fallow: Activate License",
         "category": "Fallow",
@@ -258,6 +273,12 @@
           "default": "best-effort",
           "markdownDescription": "Choose whether incomplete semantic evidence stays advisory or fails the analysis after emitting its conservative result."
         },
+        "fallow.typeAware.timeoutSeconds": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "Wall clock in seconds allowed for one semantic request, forwarded to the CLI as `FALLOW_TYPE_AWARE_TIMEOUT_SECS`. A semantic query scans the whole TypeScript program, so a very large program can need more than the 120-second default. `0` keeps the CLI default and any value already set in the environment."
+        },
         "fallow.autoDownload": {
           "type": "boolean",
           "default": true,
@@ -284,6 +305,7 @@
             "dev-dependencies-in-production": true,
             "circular-dependencies": true,
             "re-export-cycle": true,
+            "package-cycle": true,
             "boundary-violation": true,
             "policy-violation": true,
             "invalid-client-export": true,
@@ -292,12 +314,16 @@
             "unprovided-injects": true,
             "unrendered-components": true,
             "unused-component-props": true,
+            "absent-component-props": true,
             "unused-component-emits": true,
             "unused-component-inputs": true,
             "unused-component-outputs": true,
             "unused-svelte-events": true,
             "unused-server-actions": true,
             "unused-load-data-keys": true,
+            "unused-effect-layers": true,
+            "unused-tagged-errors": true,
+            "unproduced-catch-tags": true,
             "route-collision": true,
             "dynamic-segment-name-conflict": true,
             "stale-suppressions": true,
@@ -305,7 +331,10 @@
             "empty-catalog-groups": true,
             "unresolved-catalog-references": true,
             "unused-dependency-overrides": true,
-            "misconfigured-dependency-overrides": true
+            "misconfigured-dependency-overrides": true,
+            "prop-drilling": true,
+            "thin-wrapper": true,
+            "duplicate-prop-shape": true
           },
           "description": "Toggle individual issue types on or off. Uses kebab-case names matching fallow's rules config.",
           "properties": {
@@ -363,6 +392,9 @@
             "re-export-cycle": {
               "type": "boolean"
             },
+            "package-cycle": {
+              "type": "boolean"
+            },
             "boundary-violation": {
               "type": "boolean"
             },
@@ -387,6 +419,9 @@
             "unused-component-props": {
               "type": "boolean"
             },
+            "absent-component-props": {
+              "type": "boolean"
+            },
             "unused-component-emits": {
               "type": "boolean"
             },
@@ -403,6 +438,15 @@
               "type": "boolean"
             },
             "unused-load-data-keys": {
+              "type": "boolean"
+            },
+            "unused-effect-layers": {
+              "type": "boolean"
+            },
+            "unused-tagged-errors": {
+              "type": "boolean"
+            },
+            "unproduced-catch-tags": {
               "type": "boolean"
             },
             "route-collision": {
@@ -427,6 +471,15 @@
               "type": "boolean"
             },
             "misconfigured-dependency-overrides": {
+              "type": "boolean"
+            },
+            "prop-drilling": {
+              "type": "boolean"
+            },
+            "thin-wrapper": {
+              "type": "boolean"
+            },
+            "duplicate-prop-shape": {
               "type": "boolean"
             }
           }
@@ -501,6 +554,12 @@
           "default": true,
           "description": "Exclude import declarations from duplicate-code detection. Enabled by default: token-identical sorted import blocks are a formatting artifact, not copy-paste. Set to false to count import blocks as clone candidates again."
         },
+        "fallow.duplication.ignoreSymlinks": {
+          "scope": "resource",
+          "type": "boolean",
+          "default": false,
+          "description": "Omit clone instances whose path is a symlink or lies under a symlinked directory. When unset, the project config `duplicates.ignoreSymlinks` decides. Set to false to report symlinked instances when the project config ignores them."
+        },
         "fallow.production": {
           "scope": "resource",
           "type": "string",
@@ -534,6 +593,11 @@
           "default": "",
           "markdownDescription": "Show only issues in files changed since the given git ref. Run **Fallow: Set Baseline at HEAD** to create the local `fallow-baseline` tag and configure this setting in one step. The command never pushes or moves an existing tag. Mirrors the CLI's `--changed-since`. Empty = full scope."
         },
+        "fallow.packageBaselines": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Apply the per-package refs of `workspaces.changedSince` from the Fallow config. Turn off to analyze every workspace package in full scope. Mirrors the CLI's `--no-package-baselines`. `fallow.changedSince` takes precedence when set. Needs Fallow 3.31.0 or newer."
+        },
         "fallow.health.enabled": {
           "type": "boolean",
           "default": true,
@@ -542,7 +606,7 @@
         "fallow.health.hotspots": {
           "type": "boolean",
           "default": true,
-          "description": "Include git churn hotspots in the Health view. Hotspot analysis walks git history; disable on very large repositories to keep the Health refresh fast. Has no effect outside a git repository."
+          "description": "Show git churn hotspots in the Health view. Refactoring targets still use git history when this is disabled. Hotspots require a git repository."
         },
         "fallow.health.topFindings": {
           "type": "integer",
@@ -594,6 +658,23 @@
             "Fail on every finding in changed files (no base-snapshot attribution)."
           ],
           "markdownDescription": "Which findings affect the audit verdict shown in the editor. Mirrors `fallow audit --gate`."
+        },
+        "fallow.audit.worsened": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "warn",
+            "error",
+            "off"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Use `audit.worsened` from the project config. Without a config value, the CLI uses `warn`. This is the default.",
+            "A worsened finding makes the verdict at least warn. The exit code stays 0.",
+            "A worsened finding counts like an introduced finding and fails the verdict.",
+            "Only growth of an exceeded metric is worsened, and it makes the verdict at least warn. Other growth stays inherited."
+          ],
+          "markdownDescription": "How an inherited complexity finding that got worse affects the audit verdict shown in the editor. `auto` uses the project config. `warn` makes the verdict at least warn, `error` counts the finding like an introduced finding, and `off` reports only growth of an exceeded metric as worsened. Mirrors `fallow audit --worsened`. Needs Fallow 3.34.2 or newer."
         },
         "fallow.audit.statusBar.enabled": {
           "type": "boolean",
@@ -786,6 +867,10 @@
           "when": "false"
         },
         {
+          "command": "fallow.copyFindingId",
+          "when": "false"
+        },
+        {
           "command": "fallow.noop",
           "when": "false"
         }
@@ -922,21 +1007,21 @@
     "publish:ovsx": "ovsx publish --no-dependencies"
   },
   "dependencies": {
-    "vscode-languageclient": "10.1.0",
-    "vscode-languageserver-protocol": "3.18.2"
+    "vscode-languageclient": "10.1.2",
+    "vscode-languageserver-protocol": "3.18.4"
   },
   "devDependencies": {
-    "@types/node": "26.2.0",
+    "@types/node": "26.6.5",
     "@types/vscode": "1.96.0",
     "@types/mocha": "10.0.10",
     "@vscode/test-electron": "3.1.0",
-    "@vscode/vsce": "3.9.2",
-    "json-schema-to-typescript": "15.0.4",
+    "@vscode/vsce": "4.0.0",
+    "json-schema-to-typescript": "16.0.0",
     "mocha": "11.8.0",
-    "rolldown": "1.2.5",
-    "ovsx": "1.1.1",
+    "rolldown": "1.2.14",
+    "ovsx": "1.3.0",
     "typescript": "7.0.2",
-    "vitest": "4.1.11",
+    "vitest": "5.0.5",
     "yauzl": "3.4.0"
   }
 }

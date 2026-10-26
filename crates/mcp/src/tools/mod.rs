@@ -1,8 +1,14 @@
 mod analyze;
 mod api_runtime;
+mod architecture;
 mod audit;
+#[cfg(test)]
+mod base_root_fixture;
+mod cancellation;
 mod check_changed;
 mod check_runtime_coverage;
+mod cloud_reads;
+mod cloud_runtime_context;
 mod code_mode;
 #[cfg(test)]
 mod coverage_fixture;
@@ -12,13 +18,17 @@ mod explain;
 mod fallback_policy;
 mod fix;
 mod flags;
+mod gate_verdicts;
 mod guard;
 mod health;
 mod impact;
 mod inspect_target;
 mod list_boundaries;
+mod mutation;
 mod project_info;
 mod recommend;
+#[cfg(test)]
+mod route_parity;
 mod security;
 mod semantic;
 mod similar_code;
@@ -26,7 +36,10 @@ mod suppressions;
 mod trace;
 
 pub use analyze::{build_analyze_args, run_analyze};
+pub use architecture::{build_architecture_args, run_architecture};
 pub use audit::{build_audit_args, run_audit};
+pub use cancellation::request_cancellation;
+pub use cancellation::with_request_cancellation;
 pub use check_changed::{build_check_changed_args, run_check_changed};
 #[cfg(test)]
 pub use check_runtime_coverage::build_get_token_blast_radius_args;
@@ -36,6 +49,16 @@ pub use check_runtime_coverage::{
     run_check_runtime_coverage, run_get_blast_radius, run_get_cleanup_candidates,
     run_get_hot_paths, run_get_importance, run_get_token_blast_radius,
 };
+#[cfg(test)]
+pub use cloud_reads::{
+    build_get_cloud_deployment_changes_args, build_get_cloud_review_packet_args,
+};
+pub use cloud_reads::{run_get_cloud_deployment_changes, run_get_cloud_review_packet};
+#[cfg(test)]
+pub use cloud_runtime_context::build_get_cloud_runtime_context_args;
+pub use cloud_runtime_context::run_get_cloud_runtime_context;
+#[cfg(test)]
+pub use code_mode::code_mode_subprocess_aliases;
 pub use code_mode::execute_code_mode;
 pub use decision_surface::run_decision_surface;
 pub use dupes::{build_find_dupes_args, run_find_dupes};
@@ -55,20 +78,23 @@ pub use impact::{
 };
 pub use inspect_target::inspect_target;
 pub use list_boundaries::{build_list_boundaries_args, run_list_boundaries};
+pub use mutation::{run_mutation_inspect, run_mutation_plan};
 pub use project_info::{build_project_info_args, run_project_info};
 pub use recommend::run_recommend;
 pub use security::{build_security_candidates_args, run_security_candidates};
 pub use semantic::{run_symbol_impact, run_symbol_trace};
 #[cfg(test)]
-pub use similar_code::{build_find_similar_code_args, build_inspect_similar_code_args};
+pub use similar_code::{
+    build_find_similar_code_args, build_inspect_similar_code_args, parse_candidate_snapshot,
+};
 pub use similar_code::{run_find_similar_code, run_inspect_similar_code};
 #[cfg(test)]
 pub use suppressions::build_list_suppressions_args;
 pub use suppressions::run_list_suppressions;
 pub use trace::{
     build_trace_clone_args, build_trace_dependency_args, build_trace_export_args,
-    build_trace_file_args, run_trace_clone_tool, run_trace_dependency_tool, run_trace_export_tool,
-    run_trace_file_tool,
+    build_trace_file_args, run_trace_clone_tool, run_trace_dependency_tool, run_trace_error_tool,
+    run_trace_export_tool, run_trace_file_tool, run_trace_import_path_tool,
 };
 
 use std::io;
@@ -81,7 +107,9 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use fallow_process::{ProcessTree, cleanup_tokio_child, configure_tokio_command};
+use fallow_process::{
+    ProcessTree, cleanup_tokio_child, configure_tokio_command, spawn_tokio_retrying_busy_executable,
+};
 
 /// Default subprocess timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -104,9 +132,15 @@ fn push_type_aware(
     projects: Option<&[String]>,
     require: Option<crate::params::TypeAwareRequireParam>,
 ) {
-    if enabled == Some(true) || projects.is_some_and(|items| !items.is_empty()) || require.is_some()
-    {
+    let requested = enabled == Some(true)
+        || projects.is_some_and(|items| !items.is_empty())
+        || require.is_some();
+    if requested {
         args.push("--type-aware".to_string());
+    } else if enabled == Some(false) {
+        // `false` keeps the run syntactic also when the config turns
+        // type-aware analysis on, as on the typed route.
+        args.push("--no-type-aware".to_string());
     }
     if let Some(projects) = projects {
         for project in projects.iter().filter(|project| !project.is_empty()) {
@@ -148,10 +182,19 @@ fn push_global(
 
 /// Push production mode and workspace scope flags.
 fn push_scope(args: &mut Vec<String>, production: Option<bool>, workspace: Option<&str>) {
-    if production == Some(true) {
-        args.push("--production".to_string());
-    }
+    push_production(args, production);
     push_str_flag(args, "--workspace", workspace);
+}
+
+/// Push the production choice of a call. `false` is an explicit opt-out, as
+/// `production_override: Some(false)` is on the typed route, so it overrides
+/// a config that turns production mode on. `None` leaves it to the config.
+fn push_production(args: &mut Vec<String>, production: Option<bool>) {
+    match production {
+        Some(true) => args.push("--production".to_string()),
+        Some(false) => args.push("--no-production".to_string()),
+        None => {}
+    }
 }
 
 /// Push baseline comparison flags.
@@ -179,16 +222,76 @@ fn push_regression(
 /// Valid detection modes for the `find_dupes` tool.
 pub const VALID_DUPES_MODES: &[&str] = &["strict", "mild", "weak", "semantic"];
 
+/// Map the `mode` parameter to a duplication mode. An absent or empty value
+/// keeps the configured default.
+fn duplication_mode_from_param(
+    mode: Option<&str>,
+) -> Result<Option<fallow_api::DuplicationMode>, String> {
+    use fallow_api::DuplicationMode;
+    match mode {
+        None | Some("") => Ok(None),
+        Some("strict") => Ok(Some(DuplicationMode::Strict)),
+        Some("mild") => Ok(Some(DuplicationMode::Mild)),
+        Some("weak") => Ok(Some(DuplicationMode::Weak)),
+        Some("semantic") => Ok(Some(DuplicationMode::Semantic)),
+        Some(mode) => Err(validation_error_body(format!(
+            "Invalid mode '{mode}'. Valid values: {}",
+            VALID_DUPES_MODES.join(", ")
+        ))),
+    }
+}
+
+fn min_occurrences_from_param(value: Option<u32>) -> Result<Option<usize>, String> {
+    match value {
+        Some(value) if value < 2 => Err(validation_error_body(format!(
+            "min_occurrences must be at least 2 (got {value})"
+        ))),
+        Some(value) => Ok(Some(value as usize)),
+        None => Ok(None),
+    }
+}
+
+/// Reject an empty or whitespace-only required string. The error is the plain
+/// message; the caller picks the response body.
+fn require_non_empty(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
 /// Valid gate values for the `audit` tool.
 pub const VALID_AUDIT_GATES: &[&str] = &["new-only", "all"];
 
-/// Build a structured validation error body matching the shape `run_fallow` emits
+/// Valid `worsened` values for the `audit` tool.
+pub const VALID_AUDIT_WORSENED: &[&str] = &["warn", "error", "off"];
+
+/// Build a structured validation error body matching the shape `run_tool` emits
 /// for CLI-level errors.
 pub fn validation_error_body(message: impl Into<String>) -> String {
     serde_json::json!({
         "error": true,
         "message": message.into(),
         "exit_code": 2,
+    })
+    .to_string()
+}
+
+/// [`validation_error_body`] plus the three fields the API-backed refusals
+/// carry, so an agent can branch on a stable `code` instead of matching prose.
+pub fn typed_validation_error_body(
+    message: impl Into<String>,
+    code: &str,
+    help: &str,
+    context: &str,
+) -> String {
+    serde_json::json!({
+        "error": true,
+        "message": message.into(),
+        "exit_code": 2,
+        "code": code,
+        "help": help,
+        "context": context,
     })
     .to_string()
 }
@@ -210,24 +313,6 @@ fn timeout_duration() -> Duration {
     timeout_duration_with_default(DEFAULT_TIMEOUT_SECS)
 }
 
-/// Execute the fallow CLI binary with the given arguments and return the result.
-///
-/// Untagged variant retained for the subprocess-behavior tests (timeouts, exit
-/// codes, signal handling); production tool dispatch goes through `run_tool` so
-/// the spawned CLI's telemetry is attributed to the `mcp` surface.
-#[cfg(test)]
-pub async fn run_fallow(binary: &str, args: &[String]) -> Result<CallToolResult, McpError> {
-    spawn_fallow(
-        binary,
-        args,
-        None,
-        timeout_duration(),
-        DEFAULT_MAX_OUTPUT_BYTES,
-        None,
-    )
-    .await
-}
-
 /// Execute the fallow CLI for a named MCP tool. Tags the spawned process so its
 /// telemetry event is attributed to the `mcp` integration surface and the
 /// specific tool, instead of looking like any other `cli_json` run. The CLI
@@ -238,7 +323,36 @@ pub async fn run_tool(
     tool: &'static str,
     args: &[String],
 ) -> Result<CallToolResult, McpError> {
-    run_tool_with_timeout(binary, tool, args, timeout_duration()).await
+    run_tool_with_limit(binary, tool, args, None).await
+}
+
+/// Resolve one call's response cap. A request may only lower the default:
+/// the 16 MiB ceiling is what keeps a runaway subprocess from filling the
+/// caller's context, so it is a bound, not a suggestion.
+fn output_limit(requested: Option<usize>) -> usize {
+    requested
+        .filter(|bytes| *bytes > 0)
+        .map_or(DEFAULT_MAX_OUTPUT_BYTES, |bytes| {
+            bytes.min(DEFAULT_MAX_OUTPUT_BYTES)
+        })
+}
+
+/// Execute one named MCP tool with a caller-supplied response cap.
+pub async fn run_tool_with_limit(
+    binary: &str,
+    tool: &'static str,
+    args: &[String],
+    max_output_bytes: Option<usize>,
+) -> Result<CallToolResult, McpError> {
+    spawn_fallow(
+        binary,
+        args,
+        None,
+        timeout_duration(),
+        output_limit(max_output_bytes),
+        tool,
+    )
+    .await
 }
 
 /// Execute one named MCP tool with a tool-specific bounded timeout.
@@ -247,14 +361,15 @@ pub async fn run_tool_with_timeout(
     tool: &'static str,
     args: &[String],
     timeout: Duration,
+    max_output_bytes: Option<usize>,
 ) -> Result<CallToolResult, McpError> {
     spawn_fallow(
         binary,
         args,
         None,
         timeout,
-        DEFAULT_MAX_OUTPUT_BYTES,
-        Some(tool),
+        output_limit(max_output_bytes),
+        tool,
     )
     .await
 }
@@ -266,40 +381,15 @@ pub async fn run_tool_with_stdin_timeout(
     args: &[String],
     stdin: Vec<u8>,
     timeout: Duration,
+    max_output_bytes: Option<usize>,
 ) -> Result<CallToolResult, McpError> {
     spawn_fallow(
         binary,
         args,
         Some(stdin),
         timeout,
-        DEFAULT_MAX_OUTPUT_BYTES,
-        Some(tool),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub async fn run_fallow_with_timeout(
-    binary: &str,
-    args: &[String],
-    timeout: Duration,
-) -> Result<CallToolResult, McpError> {
-    spawn_fallow(binary, args, None, timeout, DEFAULT_MAX_OUTPUT_BYTES, None).await
-}
-
-#[cfg(all(test, unix))]
-pub async fn run_fallow_with_output_limit(
-    binary: &str,
-    args: &[String],
-    max_output_bytes: usize,
-) -> Result<CallToolResult, McpError> {
-    spawn_fallow(
-        binary,
-        args,
-        None,
-        timeout_duration(),
-        max_output_bytes,
-        None,
+        output_limit(max_output_bytes),
+        tool,
     )
     .await
 }
@@ -310,7 +400,7 @@ async fn spawn_fallow(
     stdin_input: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
-    tool: Option<&'static str>,
+    tool: &'static str,
 ) -> Result<CallToolResult, McpError> {
     let type_aware_complete_required = type_aware_complete_required(args);
     let mut command = Command::new(binary);
@@ -323,18 +413,16 @@ async fn spawn_fallow(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(tool) = tool {
-        // Re-tag the spawned CLI's telemetry event as the MCP surface + tool.
-        // The CLI inherits this process's env, so the existing telemetry path
-        // emits a single, correctly-attributed event (no second emit here).
-        command
-            .env("FALLOW_INTEGRATION_SURFACE", "mcp")
-            .env("FALLOW_MCP_TOOL", tool);
-    }
+    // Re-tag the spawned CLI's telemetry event as the MCP surface + tool.
+    // The CLI inherits this process's env, so the existing telemetry path
+    // emits a single, correctly-attributed event (no second emit here).
+    command
+        .env("FALLOW_INTEGRATION_SURFACE", "mcp")
+        .env("FALLOW_MCP_TOOL", tool);
     configure_tokio_command(&mut command);
 
-    let mut child = command
-        .spawn()
+    let mut child = spawn_tokio_retrying_busy_executable(&mut command)
+        .await
         .map_err(|error| subprocess_error(binary, error))?;
     let process_tree = match ProcessTree::for_tokio_child(&child) {
         Ok(process_tree) => process_tree,
@@ -389,7 +477,49 @@ async fn spawn_fallow(
         stderr_task,
         exit_one_is_error: type_aware_complete_required,
     };
-    complete_fallow_process(binary, process, timeout, max_output_bytes).await
+    let stop = ProcessStop {
+        deadline: tokio::time::Instant::now() + timeout,
+        timeout,
+        request: cancellation::request_cancellation(),
+    };
+    complete_fallow_process(binary, process, &stop, max_output_bytes).await
+}
+
+/// The two ends of a subprocess call: its response deadline and the
+/// cancellation of the request that started it.
+struct ProcessStop {
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    request: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// How a bounded wait on the subprocess ended.
+enum Waited<T> {
+    Done(T),
+    TimedOut,
+    Cancelled,
+}
+
+impl ProcessStop {
+    /// Wait for `work` until the deadline passes or the client cancels the
+    /// request, whichever comes first.
+    async fn wait<F: std::future::Future>(&self, work: F) -> Waited<F::Output> {
+        tokio::select! {
+            biased;
+            output = work => Waited::Done(output),
+            () = tokio::time::sleep_until(self.deadline) => Waited::TimedOut,
+            () = cancellation::request_cancelled(self.request.as_ref()) => Waited::Cancelled,
+        }
+    }
+
+    /// The result of a call that stopped before the subprocess finished.
+    fn stopped_result(&self, cancelled: bool, cleanup_errors: &[String]) -> CallToolResult {
+        if cancelled {
+            cancelled_result(cleanup_errors)
+        } else {
+            timeout_result(self.timeout, cleanup_errors)
+        }
+    }
 }
 
 struct RunningFallowProcess {
@@ -404,7 +534,7 @@ struct RunningFallowProcess {
 async fn complete_fallow_process(
     binary: &str,
     process: RunningFallowProcess,
-    timeout: Duration,
+    stop: &ProcessStop,
     max_output_bytes: usize,
 ) -> Result<CallToolResult, McpError> {
     let RunningFallowProcess {
@@ -415,47 +545,25 @@ async fn complete_fallow_process(
         mut stderr_task,
         exit_one_is_error,
     } = process;
-    let deadline = tokio::time::Instant::now() + timeout;
 
     #[cfg(unix)]
-    let (status, cleanup_errors) =
-        match tokio::time::timeout_at(deadline, process_tree.wait_for_exit_without_reaping()).await
-        {
-            Ok(Ok(())) => {
-                let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
-                let Some(status) = cleanup.status else {
-                    abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
-                    return Err(subprocess_error_with_cleanup(
-                        binary,
-                        io::Error::other("completed subprocess status unavailable"),
-                        &cleanup.errors,
-                    ));
-                };
-                (status, cleanup.errors)
-            }
-            Ok(Err(error)) => {
-                let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+    let (status, cleanup_errors) = match stop
+        .wait(process_tree.wait_for_exit_without_reaping())
+        .await
+    {
+        Waited::Done(Ok(())) => {
+            let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+            let Some(status) = cleanup.status else {
                 abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
                 return Err(subprocess_error_with_cleanup(
                     binary,
-                    error,
+                    io::Error::other("completed subprocess status unavailable"),
                     &cleanup.errors,
                 ));
-            }
-            Err(_) => {
-                let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
-                abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
-                return Ok(timeout_result(timeout, &cleanup.errors));
-            }
-        };
-
-    #[cfg(not(unix))]
-    let (status, cleanup_errors) = match tokio::time::timeout_at(deadline, child.wait()).await {
-        Ok(Ok(status)) => {
-            let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+            };
             (status, cleanup.errors)
         }
-        Ok(Err(error)) => {
+        Waited::Done(Err(error)) => {
             let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
             abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
             return Err(subprocess_error_with_cleanup(
@@ -464,10 +572,32 @@ async fn complete_fallow_process(
                 &cleanup.errors,
             ));
         }
-        Err(_) => {
+        stopped @ (Waited::TimedOut | Waited::Cancelled) => {
             let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
             abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
-            return Ok(timeout_result(timeout, &cleanup.errors));
+            return Ok(stop.stopped_result(matches!(stopped, Waited::Cancelled), &cleanup.errors));
+        }
+    };
+
+    #[cfg(not(unix))]
+    let (status, cleanup_errors) = match stop.wait(child.wait()).await {
+        Waited::Done(Ok(status)) => {
+            let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+            (status, cleanup.errors)
+        }
+        Waited::Done(Err(error)) => {
+            let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+            abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
+            return Err(subprocess_error_with_cleanup(
+                binary,
+                error,
+                &cleanup.errors,
+            ));
+        }
+        stopped @ (Waited::TimedOut | Waited::Cancelled) => {
+            let cleanup = cleanup_tokio_child(Some(&process_tree), &mut child).await;
+            abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
+            return Ok(stop.stopped_result(matches!(stopped, Waited::Cancelled), &cleanup.errors));
         }
     };
 
@@ -479,9 +609,9 @@ async fn complete_fallow_process(
         let stderr = (&mut stderr_task).await.map_err(io::Error::other)??;
         Ok::<_, io::Error>((stdout, stderr))
     };
-    let (stdout, stderr) = match tokio::time::timeout_at(deadline, drain_output).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
+    let (stdout, stderr) = match stop.wait(drain_output).await {
+        Waited::Done(Ok(output)) => output,
+        Waited::Done(Err(error)) => {
             abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
             return Err(subprocess_error_with_cleanup(
                 binary,
@@ -489,9 +619,9 @@ async fn complete_fallow_process(
                 &cleanup_errors,
             ));
         }
-        Err(_) => {
+        stopped @ (Waited::TimedOut | Waited::Cancelled) => {
             abort_process_tasks(stdin_task.as_ref(), &stdout_task, &stderr_task);
-            return Ok(timeout_result(timeout, &cleanup_errors));
+            return Ok(stop.stopped_result(matches!(stopped, Waited::Cancelled), &cleanup_errors));
         }
     };
     if !cleanup_errors.is_empty() {
@@ -522,32 +652,39 @@ fn cleanup_failure_result(cleanup_errors: &[String]) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
 }
 
+/// Translate one completed CLI run into the tool result.
+///
+/// `stderr` stays dropped on the paths that have a JSON envelope, and that is
+/// deliberate: `--quiet` removes most of what the CLI would have printed
+/// there anyway, and everything a gate says on stderr is also in the envelope.
+/// What the envelope does not do on its own is tell an agent to look, so both
+/// envelope-carrying paths run through
+/// [`gate_verdicts::annotate_gate_verdicts`] first. The exit code keeps its
+/// existing meaning: exit 1 is still a success carrying findings, exit 2 and
+/// above are still errors.
 fn captured_output_result(
     output: &CapturedOutput,
     max_output_bytes: usize,
     exit_one_is_error: bool,
 ) -> CallToolResult {
     if output.stdout.exceeded || output.stderr.exceeded {
-        return output_limit_result(max_output_bytes);
+        return output_limit_result(output, max_output_bytes);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout.bytes);
     let stderr = String::from_utf8_lossy(&output.stderr.bytes);
 
-    if !output.status.success() {
-        return non_success_result(
-            output.status.code().unwrap_or(-1),
-            &stdout,
-            &stderr,
-            exit_one_is_error,
-        );
-    }
-
-    if stdout.is_empty() {
-        return CallToolResult::success(vec![ContentBlock::text("{}".to_string())]);
-    }
-
-    CallToolResult::success(vec![ContentBlock::text(stdout.to_string())])
+    let exit_code = if output.status.success() {
+        0
+    } else {
+        output.status.code().unwrap_or(-1)
+    };
+    gate_verdicts::annotate_gate_verdicts(cli_exit_result(
+        exit_code,
+        &stdout,
+        &stderr,
+        exit_one_is_error,
+    ))
 }
 
 struct CapturedOutput {
@@ -559,6 +696,10 @@ struct CapturedOutput {
 struct CapturedPipe {
     bytes: Vec<u8>,
     exceeded: bool,
+    /// Bytes the stream produced, including the ones past the cap that were
+    /// read and dropped. Reported as `result_bytes` so a caller that hits the
+    /// limit learns how much it asked for.
+    total: usize,
 }
 
 async fn drain_pipe(
@@ -568,6 +709,7 @@ async fn drain_pipe(
     let mut bytes = Vec::with_capacity(max_output_bytes.min(PIPE_READ_CHUNK_BYTES));
     let mut buffer = [0; PIPE_READ_CHUNK_BYTES];
     let mut exceeded = false;
+    let mut total = 0;
 
     loop {
         let read = pipe.read(&mut buffer).await?;
@@ -575,12 +717,17 @@ async fn drain_pipe(
             break;
         }
 
+        total += read;
         let retained = read.min(max_output_bytes.saturating_sub(bytes.len()));
         bytes.extend_from_slice(&buffer[..retained]);
         exceeded |= retained < read;
     }
 
-    Ok(CapturedPipe { bytes, exceeded })
+    Ok(CapturedPipe {
+        bytes,
+        exceeded,
+        total,
+    })
 }
 
 fn abort_process_tasks(
@@ -620,43 +767,64 @@ fn subprocess_error_with_cleanup(
     )
 }
 
-/// Translate a non-zero CLI exit into the MCP result envelope. Exit 1 normally
-/// carries issue JSON as a success, but an explicitly incomplete type-aware
-/// result is an error when the caller required complete evidence.
-fn non_success_result(
+/// Translate one CLI exit into the MCP result envelope through [`cli_exit_body`].
+fn cli_exit_result(
     exit_code: i32,
     stdout: &str,
     stderr: &str,
     type_aware_complete_required: bool,
 ) -> CallToolResult {
+    match cli_exit_body(exit_code, stdout, stderr, type_aware_complete_required) {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
+    }
+}
+
+/// The exit-code policy of one completed CLI run, shared by the direct tool
+/// route and Code Mode so the two cannot drift: `Ok` is a success body and
+/// `Err` an error body.
+///
+/// Exit 0 and exit 1 carry results. Exit 1 is an error only when the caller
+/// required complete type-aware evidence and the run reports it incomplete.
+/// Every other exit is an error that keeps a JSON stdout envelope, or else
+/// wraps stderr in one.
+fn cli_exit_body(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    type_aware_complete_required: bool,
+) -> Result<String, String> {
+    let body_or_empty = || {
+        if stdout.is_empty() {
+            "{}".to_string()
+        } else {
+            stdout.to_string()
+        }
+    };
+    if exit_code == 0 {
+        return Ok(body_or_empty());
+    }
     if exit_code == 1 {
         let complete_required =
             type_aware_complete_required || type_aware_output_requires_complete(stdout);
         if complete_required && type_aware_evidence_is_incomplete(stdout) {
-            let text = if stdout.is_empty() {
-                serde_json::json!({
+            if stdout.is_empty() {
+                return Err(serde_json::json!({
                     "error": true,
                     "message": "type-aware completeness was required, but the semantic query was incomplete",
                     "exit_code": 1,
                     "code": "FALLOW_TYPE_AWARE_INCOMPLETE",
                     "context": "analysis.typeAware",
                 })
-                .to_string()
-            } else {
-                stdout.to_string()
-            };
-            return CallToolResult::error(vec![ContentBlock::text(text)]);
+                .to_string());
+            }
+            return Err(stdout.to_string());
         }
-        let text = if stdout.is_empty() {
-            "{}".to_string()
-        } else {
-            stdout.to_string()
-        };
-        return CallToolResult::success(vec![ContentBlock::text(text)]);
+        return Ok(body_or_empty());
     }
 
     if !stdout.is_empty() && serde_json::from_str::<serde_json::Value>(stdout).is_ok() {
-        return CallToolResult::error(vec![ContentBlock::text(stdout.to_string())]);
+        return Err(stdout.to_string());
     }
 
     let message = if stderr.is_empty() {
@@ -665,18 +833,30 @@ fn non_success_result(
         stderr.trim().to_string()
     };
 
-    let error_json = serde_json::json!({
+    Err(serde_json::json!({
         "error": true,
         "message": message,
         "exit_code": exit_code,
-    });
-
-    CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
+    })
+    .to_string())
 }
 
 fn type_aware_complete_required(args: &[String]) -> bool {
     args.windows(2)
         .any(|pair| pair == ["--type-aware-require", "complete"])
+        || is_semantic_dead_code_trace(args)
+}
+
+/// `dead-code --trace` and `dead-code --symbol-impact` exit 1 only when
+/// type-aware evidence was required complete and is not
+/// (`semantic_completeness_exit` in the CLI); every other failure exits 2.
+/// The requirement can come from the config, which the arguments do not
+/// show, so exit 1 of these runs is the requirement.
+fn is_semantic_dead_code_trace(args: &[String]) -> bool {
+    args.first().is_some_and(|command| command == "dead-code")
+        && args
+            .iter()
+            .any(|arg| arg == "--trace" || arg == "--symbol-impact")
 }
 
 fn type_aware_output_requires_complete(stdout: &str) -> bool {
@@ -760,6 +940,31 @@ fn collect_semantic_completeness(value: &serde_json::Value, signals: &mut Vec<bo
     }
 }
 
+/// The result of a subprocess call the client cancelled. The server killed
+/// the process tree; `cleanup_errors` names any part it could not stop.
+///
+/// No client receives this result: rmcp drops the response of a cancelled
+/// request, as the MCP specification requires. It exists so the handler
+/// returns, and so tests that call a tool directly can see the outcome.
+fn cancelled_result(cleanup_errors: &[String]) -> CallToolResult {
+    let mut error_json = serde_json::json!({
+        "error": true,
+        "message": "fallow subprocess was cancelled by the client",
+        "exit_code": 2,
+        "code": "FALLOW_MCP_CANCELLED",
+        "context": "subprocess",
+    });
+    if !cleanup_errors.is_empty()
+        && let Some(error) = error_json.as_object_mut()
+    {
+        error.insert(
+            "cleanup_errors".to_string(),
+            serde_json::json!(cleanup_errors),
+        );
+    }
+    CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
+}
+
 fn timeout_result(timeout: Duration, cleanup_errors: &[String]) -> CallToolResult {
     let mut error_json = serde_json::json!({
         "error": true,
@@ -780,41 +985,111 @@ fn timeout_result(timeout: Duration, cleanup_errors: &[String]) -> CallToolResul
     CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
 }
 
-fn output_limit_result(max_output_bytes: usize) -> CallToolResult {
-    let error_json = serde_json::json!({
+/// Leading bytes of an over-limit stream echoed back with the refusal, so the
+/// caller can see what it would have received. Matches Code Mode's preview.
+const OUTPUT_PREVIEW_BYTES: usize = 256;
+
+/// Report an over-limit response as a REFUSAL that still carries the
+/// measurement.
+///
+/// The caller received no analysis, so this stays `CallToolResult::error`:
+/// protocol-level `isError`, the `error: true` field every other fallow
+/// refusal carries, and `exit_code` are the three signals an agent already
+/// gates on, and a truncated 256-byte preview must never read as a completed
+/// run to any of them. What the earlier bounded-success shape was for is kept
+/// alongside them: `truncated`, `result_bytes`, `result_preview` and `stream`
+/// name how much came back and what it looked like, using the Code Mode
+/// result-refusal field names so an agent parses one shape on both surfaces.
+/// Code Mode refuses the same class of response with `isError: true` too, so
+/// the two surfaces now answer that question the same way.
+fn output_limit_result(output: &CapturedOutput, max_output_bytes: usize) -> CallToolResult {
+    let (stream, pipe) = if output.stdout.exceeded {
+        ("stdout", &output.stdout)
+    } else {
+        ("stderr", &output.stderr)
+    };
+    over_limit_result(
+        &OverLimit {
+            stream,
+            context: "subprocess",
+            captured: &String::from_utf8_lossy(&pipe.bytes),
+            total: pipe.total,
+        },
+        max_output_bytes,
+    )
+}
+
+/// One response that went over the output cap.
+struct OverLimit<'a> {
+    /// What produced the bytes: `stdout` or `stderr` of the CLI, or `result`
+    /// for a typed-route envelope.
+    stream: &'a str,
+    /// The route: `subprocess` or `typed`.
+    context: &'a str,
+    /// The retained bytes; only a short preview of them is returned.
+    captured: &'a str,
+    /// Every byte the response held, including the bytes past the cap.
+    total: usize,
+}
+
+/// The recovery hint for an over-limit refusal. Only the CLI route takes
+/// `max_output_bytes`, so the typed-route hint does not name that parameter.
+fn over_limit_help(context: &str) -> &'static str {
+    if context == "subprocess" {
+        "Narrow the requested analysis (filters, a workspace scope, a smaller issue-type set). \
+         max_output_bytes only LOWERS the 16 MiB default, so raising it for this call cannot help."
+    } else {
+        "Narrow the requested analysis (filters, a workspace scope, a smaller issue-type set). \
+         The typed route has a fixed 16 MiB cap and no max_output_bytes parameter."
+    }
+}
+
+/// The over-limit refusal body, shared by the CLI route and the typed route
+/// so an agent parses one shape and one `code` on both.
+fn over_limit_result(over: &OverLimit<'_>, max_output_bytes: usize) -> CallToolResult {
+    let OverLimit {
+        stream,
+        context,
+        captured,
+        total,
+    } = *over;
+    let source = if context == "subprocess" {
+        "fallow subprocess"
+    } else {
+        "fallow typed"
+    };
+    let body = serde_json::json!({
         "error": true,
-        "message": format!(
-            "fallow subprocess output exceeded {max_output_bytes} bytes per stream"
-        ),
+        "ok": false,
         "exit_code": 2,
-        "code": "FALLOW_MCP_SUBPROCESS_OUTPUT_LIMIT",
-        "help": "Narrow the requested analysis or reduce subprocess output.",
-        "context": "subprocess",
+        "truncated": true,
+        "result_bytes": total,
+        "result_preview": code_mode::clamp_utf8(
+            captured,
+            OUTPUT_PREVIEW_BYTES.min(max_output_bytes),
+        ),
         "limit_bytes": max_output_bytes,
+        "stream": stream,
+        "code": "FALLOW_MCP_SUBPROCESS_OUTPUT_LIMIT",
+        "context": context,
+        "message": format!(
+            "{source} {stream} produced {total} bytes, over the {max_output_bytes}-byte cap"
+        ),
+        "help": over_limit_help(context),
     });
-    CallToolResult::error(vec![ContentBlock::text(error_json.to_string())])
+    CallToolResult::error(vec![ContentBlock::text(body.to_string())])
 }
 
-/// Execute fallow and ensure successful JSON responses have a top-level
-/// `warnings` array for agent-facing runtime context tools. Untagged variant
-/// retained for tests; production goes through `run_tool_with_top_level_warnings`.
-#[cfg(all(test, unix))]
-pub async fn run_fallow_with_top_level_warnings(
-    binary: &str,
-    args: &[String],
-) -> Result<CallToolResult, McpError> {
-    Ok(ensure_top_level_warnings(run_fallow(binary, args).await?))
-}
-
-/// Tool-attributed variant of `run_fallow_with_top_level_warnings` (see
-/// `run_tool`).
+/// Execute one named MCP tool and make sure a successful JSON response has a
+/// top-level `warnings` array, for the runtime context tools.
 pub async fn run_tool_with_top_level_warnings(
     binary: &str,
     tool: &'static str,
     args: &[String],
+    max_output_bytes: Option<usize>,
 ) -> Result<CallToolResult, McpError> {
     Ok(ensure_top_level_warnings(
-        run_tool(binary, tool, args).await?,
+        run_tool_with_limit(binary, tool, args, max_output_bytes).await?,
     ))
 }
 
@@ -859,9 +1134,30 @@ mod completeness_tests {
         })
         .to_string();
 
-        let result = non_success_result(1, &output, "", false);
+        let result = cli_exit_result(1, &output, "", false);
 
         assert_eq!(result.is_error, Some(true));
+    }
+
+    /// `typeAware.require: complete` in config reaches neither the arguments
+    /// nor the trace output, so exit 1 of a `dead-code --trace` run alone
+    /// marks the requirement.
+    #[test]
+    fn incomplete_trace_exit_one_is_an_error_when_the_config_requires_complete() {
+        let args: Vec<String> = ["dead-code", "--format", "json", "--trace", "src/a.ts:a"]
+            .map(String::from)
+            .to_vec();
+        let output = serde_json::json!({
+            "semantic": { "identity": { "completeness": "partial" }, "status": "partial" }
+        })
+        .to_string();
+
+        let result = cli_exit_result(1, &output, "", type_aware_complete_required(&args));
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(!type_aware_complete_required(
+            &["dead-code", "--trace-file", "src/a.ts"].map(String::from)
+        ));
     }
 
     #[test]
@@ -876,7 +1172,7 @@ mod completeness_tests {
         })
         .to_string();
 
-        let result = non_success_result(1, &output, "", false);
+        let result = cli_exit_result(1, &output, "", false);
 
         assert_eq!(result.is_error, Some(false));
     }

@@ -23,9 +23,9 @@ oxc_span = { workspace = true }
 bitcode = { workspace = true }
 
 # JSON Schema generation for the public JSON output contract.
-# Gated by the `schema` feature so consumers (fallow-graph, fallow-extract,
-# fallow-cli, fallow-napi) do not pay the schemars compile cost
-# unless they explicitly opt in (only the schema-emit binary needs it).
+# Gated by the `schema` feature. fallow-config enables it for every build,
+# because the config schema embeds `SemanticAnalysisIdentity` through
+# `RegressionBaseline`, so in practice the derives always compile.
 schemars = { workspace = true, optional = true }
 # `serde_json` carries the free-form rule-object payload on
 # `AddToConfigValue::RuleObject` in the `output` module. The module is no
@@ -33,6 +33,8 @@ schemars = { workspace = true, optional = true }
 # `IssueAction` at runtime), so `serde_json` ships unconditionally.
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
+# Unique temp files for the atomic cache write in `atomic_file`.
+tempfile = { workspace = true }
 
 [features]
 # Adds `#[derive(schemars::JsonSchema)]` to result and extract types so the

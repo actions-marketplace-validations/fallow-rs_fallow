@@ -1,0 +1,1136 @@
+//! Detection of unused package manager catalog entries and unresolved references
+//! in workspace `package.json` files.
+//!
+//! pnpm 9+ supports two catalog forms in `pnpm-workspace.yaml`:
+//! - the top-level `catalog:` map ("default" catalog)
+//! - the top-level `catalogs:` map of named catalogs
+//!
+//! Bun supports matching catalog forms in root `package.json`, either under
+//! `workspaces.catalog` / `workspaces.catalogs` or top-level `catalog` /
+//! `catalogs`.
+//!
+//! Workspace packages reference catalog versions from their `dependencies` /
+//! `devDependencies` / `peerDependencies` / `optionalDependencies` via the
+//! `catalog:` protocol (`"react": "catalog:"`, `"old-react": "catalog:react17"`).
+//! pnpm also resolves the protocol in override values: the `overrides` section
+//! of `pnpm-workspace.yaml`, and `pnpm.overrides` and `resolutions` in the
+//! root `package.json` up to pnpm 10. When these `package.json` sources are
+//! not empty, pnpm 10 and earlier ignore the `pnpm-workspace.yaml` overrides.
+//! pnpm before 10.5.1 does not read the `pnpm-workspace.yaml` overrides at
+//! all. The `packageManager` field selects the sources; see
+//! `package_manager::PackageJsonOverrideReads` and
+//! `package_manager::pnpm_workspace_overrides_ignored`. These override
+//! values are catalog consumers too, keyed by the override target package.
+//!
+//! Two findings are emitted:
+//!
+//! 1. **`unused-catalog-entries`**: a catalog entry no workspace `package.json`
+//!    references via the `catalog:` protocol. Also tracks `hardcoded_consumers`:
+//!    workspace packages declaring the same package with a non-`catalog:`
+//!    version range. Helps users decide whether to delete the catalog entry or
+//!    switch the consumers to `catalog:`.
+//!
+//! 2. **`unresolved-catalog-references`**: the inverse. A `package.json`
+//!    references a `catalog:` or `catalog:<name>` that does not declare the
+//!    consumed package. `pnpm install` errors with
+//!    the package manager install; fallow surfaces this statically before any
+//!    install runs. Each finding carries
+//!    `available_in_catalogs`: other catalogs in the same workspace that DO
+//!    declare the package, so consumers can flip the reference instead of
+//!    adding a new catalog entry. Suppression: `ignoreCatalogReferences`
+//!    config rules (per-package, optionally scoped by catalog name and/or
+//!    consumer glob).
+//!
+//! The default catalog can be referenced as either `catalog:` (bare) or
+//! `catalog:default`; both forms are treated as identical per the pnpm spec.
+//!
+//! pnpm applies an override before it resolves a `catalog:` reference. A
+//! `package.json` reference to a package that a plain override key (`vite`,
+//! no version selector) or a `<consumer>>vite` key overrides is therefore not
+//! unresolved. pnpm 11 fails the install for a key with a version selector
+//! (`vite@^5`), so such a key does not suppress the finding.
+//!
+//! A workspace with its own `pnpm-workspace.yaml` that no root workspace
+//! pattern declares is an independent project. pnpm resolves its references
+//! against its own catalog, so its manifest is not a consumer here.
+
+use std::path::{Path, PathBuf};
+
+use fallow_config::{
+    CompiledIgnoreCatalogReferenceRule, PackageJson, PnpmCatalogData, PnpmOverrideData,
+    ResolvedConfig, WorkspaceDiagnostic, WorkspaceDiagnosticKind, WorkspaceInfo,
+    is_independent_pnpm_project, parse_bun_package_json_resolutions, parse_override_key,
+    parse_package_json_catalog_data, parse_pnpm_catalog_data, parse_pnpm_package_json_overrides,
+    parse_pnpm_workspace_overrides, record_workspace_diagnostics,
+};
+use fallow_types::results::{EmptyCatalogGroup, UnresolvedCatalogReference, UnusedCatalogEntry};
+use rustc_hash::FxHashSet;
+
+use super::package_manager::{
+    PackageJsonOverrideReads, declared_pnpm_major, pnpm_workspace_overrides_ignored,
+};
+
+mod suppressions;
+
+use suppressions::suppressed_yaml_catalog_entries;
+
+const PNPM_WORKSPACE_FILE: &str = "pnpm-workspace.yaml";
+const PACKAGE_JSON_FILE: &str = "package.json";
+
+/// Catalog analysis state: parsed catalog data and walked consumer references.
+/// Built once per analysis run so both detectors share parsing cost.
+pub struct PnpmCatalogState {
+    data: PnpmCatalogData,
+    consumers: CatalogConsumers,
+    source_path: PathBuf,
+    suppressed_entry_lines: FxHashSet<u32>,
+}
+
+/// Read catalog declarations and walk workspace `package.json` files to build
+/// shared catalog analysis state. `pnpm-workspace.yaml` stays the preferred
+/// source when present; otherwise Bun-style root `package.json` catalogs are
+/// read from `workspaces.catalog` / `workspaces.catalogs`.
+///
+/// Returns `None` when `pnpm-workspace.yaml` does not parse. pnpm reads the
+/// file with a more lenient parser, so its catalogs can still resolve; an
+/// empty catalog would report every `catalog:` reference as unresolved.
+pub fn gather_pnpm_catalog_state(
+    config: &ResolvedConfig,
+    workspaces: &[WorkspaceInfo],
+) -> Option<PnpmCatalogState> {
+    let yaml_path = config.root.join(PNPM_WORKSPACE_FILE);
+    let (data, source_path, suppressed_entry_lines) =
+        if let Ok(yaml_source) = std::fs::read_to_string(&yaml_path) {
+            let data = match parse_pnpm_catalog_data(&yaml_source) {
+                Ok(data) => data,
+                Err(error) => {
+                    report_malformed_pnpm_workspace_yaml(&config.root, &yaml_path, error);
+                    return None;
+                }
+            };
+            let suppressed = suppressed_yaml_catalog_entries(&yaml_source, &data);
+            (data, PathBuf::from(PNPM_WORKSPACE_FILE), suppressed)
+        } else {
+            let package_json_path = config.root.join(PACKAGE_JSON_FILE);
+            let package_json_source = std::fs::read_to_string(&package_json_path).ok()?;
+            let data = parse_package_json_catalog_data(&package_json_source);
+            if data.catalogs.is_empty() && data.empty_named_catalog_groups.is_empty() {
+                return None;
+            }
+            (data, PathBuf::from(PACKAGE_JSON_FILE), FxHashSet::default())
+        };
+    let consumer_pkg_paths = collect_consumer_pkg_paths(config, workspaces);
+    let mut consumers = collect_catalog_consumers(&consumer_pkg_paths, &config.root);
+    if source_path == Path::new(PNPM_WORKSPACE_FILE) {
+        collect_pnpm_override_consumers(&config.root, &mut consumers);
+    }
+
+    Some(PnpmCatalogState {
+        data,
+        consumers,
+        source_path,
+        suppressed_entry_lines,
+    })
+}
+
+/// Record the degraded-continue diagnostic for a `pnpm-workspace.yaml` that
+/// exists but fails to parse: catalog and override analysis proceeds with no
+/// entries, and the cause surfaces in `workspace_diagnostics[]` JSON and as
+/// one deduplicated stderr warning instead of being silently discarded.
+pub fn report_malformed_pnpm_workspace_yaml(root: &Path, yaml_path: &Path, error: String) {
+    record_workspace_diagnostics(
+        root,
+        vec![WorkspaceDiagnostic::new(
+            root,
+            yaml_path.to_path_buf(),
+            WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml { error },
+        )],
+    );
+}
+
+/// Whether this run can prove a catalog entry unused.
+///
+/// A workspace pattern whose directory is missing hides packages that can
+/// consume catalog entries, so no entry can be proven unused in this run.
+/// Discovery reports the pattern as `workspace-pattern-dir-missing`.
+pub fn can_prove_unused_catalog_entries(config: &ResolvedConfig) -> bool {
+    !fallow_config::has_missing_workspace_pattern_dirs(&config.root, &config.workspace_patterns)
+}
+
+/// Emit one `UnusedCatalogEntry` for every catalog entry not referenced by any
+/// workspace `package.json` via the `catalog:` protocol.
+pub fn find_unused_catalog_entries(state: &PnpmCatalogState) -> Vec<UnusedCatalogEntry> {
+    if state.data.catalogs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for catalog in &state.data.catalogs {
+        for entry in &catalog.entries {
+            let key = ConsumerKey {
+                package_name: entry.package_name.as_str(),
+                catalog_name: catalog.name.as_str(),
+            };
+            if state.suppressed_entry_lines.contains(&entry.line)
+                || state.consumers.references.contains(&key.owned())
+            {
+                continue;
+            }
+
+            let hardcoded_consumers = state
+                .consumers
+                .hardcoded
+                .iter()
+                .filter(|(name, _)| name == &entry.package_name)
+                .map(|(_, path)| path.clone())
+                .collect();
+
+            findings.push(UnusedCatalogEntry {
+                entry_name: entry.package_name.clone(),
+                catalog_name: catalog.name.clone(),
+                path: state.source_path.clone(),
+                line: entry.line,
+                hardcoded_consumers,
+            });
+        }
+    }
+
+    findings
+}
+
+/// Emit one `EmptyCatalogGroup` for every named `catalogs.<name>:` group
+/// that has no package entries. The top-level default `catalog:` map is
+/// intentionally ignored.
+pub fn find_empty_catalog_groups(state: &PnpmCatalogState) -> Vec<EmptyCatalogGroup> {
+    state
+        .data
+        .empty_named_catalog_groups
+        .iter()
+        .map(|group| EmptyCatalogGroup {
+            catalog_name: group.name.clone(),
+            path: state.source_path.clone(),
+            line: group.line,
+        })
+        .collect()
+}
+
+/// Emit one `UnresolvedCatalogReference` for every `catalog:` / `catalog:<name>`
+/// reference whose target catalog does not declare the consumed package.
+///
+/// `available_in_catalogs` lists OTHER catalogs in the same workspace that DO
+/// declare the package, sorted lexicographically. When non-empty, the suggested
+/// fix is to flip the reference to one of those catalogs; when empty, the fix
+/// is to add the missing entry to the named catalog or to remove the reference.
+///
+/// Findings matching any rule in `ignore_rules` are suppressed.
+pub fn find_unresolved_catalog_references(
+    state: &PnpmCatalogState,
+    ignore_rules: &[CompiledIgnoreCatalogReferenceRule],
+    root: &Path,
+) -> Vec<UnresolvedCatalogReference> {
+    let mut findings = Vec::new();
+
+    for reference in &state.consumers.referenced_with_locations {
+        if catalog_has_entry(
+            &state.data,
+            &reference.catalog_name,
+            &reference.package_name,
+        ) || state.consumers.is_overridden(reference)
+        {
+            continue;
+        }
+
+        let consumer_path_str = reference
+            .consumer_path
+            .strip_prefix(root)
+            .unwrap_or(&reference.consumer_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ignore_rules.iter().any(|rule| {
+            rule.matches(
+                &reference.package_name,
+                &reference.catalog_name,
+                &consumer_path_str,
+            )
+        }) {
+            continue;
+        }
+
+        let available_in_catalogs = collect_available_in_catalogs(
+            &state.data,
+            &reference.package_name,
+            &reference.catalog_name,
+        );
+
+        findings.push(UnresolvedCatalogReference {
+            entry_name: reference.package_name.clone(),
+            catalog_name: reference.catalog_name.clone(),
+            path: reference.consumer_path.clone(),
+            line: reference.line,
+            available_in_catalogs,
+        });
+    }
+
+    findings
+}
+
+fn catalog_has_entry(data: &PnpmCatalogData, catalog_name: &str, package_name: &str) -> bool {
+    data.catalogs
+        .iter()
+        .filter(|catalog| catalog.name == catalog_name)
+        .flat_map(|catalog| catalog.entries.iter())
+        .any(|entry| entry.package_name == package_name)
+}
+
+fn collect_available_in_catalogs(
+    data: &PnpmCatalogData,
+    package_name: &str,
+    excluded_catalog: &str,
+) -> Vec<String> {
+    let mut catalogs: Vec<String> = data
+        .catalogs
+        .iter()
+        .filter(|catalog| catalog.name != excluded_catalog)
+        .filter(|catalog| {
+            catalog
+                .entries
+                .iter()
+                .any(|entry| entry.package_name == package_name)
+        })
+        .map(|catalog| catalog.name.clone())
+        .collect();
+    catalogs.sort();
+    catalogs.dedup();
+    catalogs
+}
+
+/// Collect every `package.json` path that participates in the workspace:
+/// the project root plus each declared workspace package.
+fn collect_consumer_pkg_paths(
+    config: &ResolvedConfig,
+    workspaces: &[WorkspaceInfo],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(workspaces.len() + 1);
+    paths.push(config.root.join("package.json"));
+    for ws in workspaces {
+        if is_independent_pnpm_project(&config.root, &ws.root) {
+            continue;
+        }
+        paths.push(ws.root.join("package.json"));
+    }
+    paths
+}
+
+#[derive(Debug, Default)]
+struct CatalogConsumers {
+    /// `(package_name, catalog_name)` pairs referenced via `catalog:` protocol.
+    /// Catalog name `"default"` covers both the bare `catalog:` and explicit
+    /// `catalog:default` forms.
+    references: FxHashSet<OwnedConsumerKey>,
+    /// One entry per consumer-side `catalog:` reference, paired with the
+    /// consumer `package.json` location for `unresolved-catalog-references`
+    /// findings. Same package name appearing in `dependencies` AND
+    /// `devDependencies` produces two entries.
+    referenced_with_locations: Vec<ConsumerReference>,
+    /// `(package_name, path)` pairs declaring the package with a hardcoded
+    /// (non-`catalog:`) version range. Used to surface "this catalog entry
+    /// is unreferenced, but these consumers declare a hardcoded version."
+    hardcoded: Vec<(String, PathBuf)>,
+    /// `(parent, target)` pairs of the override keys that pnpm applies before
+    /// it resolves a `catalog:` reference to `target`. `parent` is `None` for
+    /// a plain key (`vite`) and the parent name for a `parent>vite` key.
+    overridden: FxHashSet<(Option<String>, String)>,
+}
+
+impl CatalogConsumers {
+    /// Whether an override replaces this `package.json` reference before pnpm
+    /// resolves it. A reference written in an override value is never
+    /// replaced.
+    fn is_overridden(&self, reference: &ConsumerReference) -> bool {
+        if reference.from_override {
+            return false;
+        }
+        let target = &reference.package_name;
+        self.overridden.contains(&(None, target.clone()))
+            || reference.consumer_package.as_ref().is_some_and(|consumer| {
+                self.overridden
+                    .contains(&(Some(consumer.clone()), target.clone()))
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerReference {
+    package_name: String,
+    catalog_name: String,
+    consumer_path: PathBuf,
+    line: u32,
+    /// The `name` of the consumer `package.json`, `None` for an override.
+    consumer_package: Option<String>,
+    /// Whether the reference is an override value, not a `package.json`
+    /// dependency.
+    from_override: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OwnedConsumerKey {
+    package_name: String,
+    catalog_name: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConsumerKey<'a> {
+    package_name: &'a str,
+    catalog_name: &'a str,
+}
+
+impl ConsumerKey<'_> {
+    fn owned(self) -> OwnedConsumerKey {
+        OwnedConsumerKey {
+            package_name: self.package_name.to_string(),
+            catalog_name: self.catalog_name.to_string(),
+        }
+    }
+}
+
+fn collect_catalog_consumers(pkg_paths: &[PathBuf], root: &Path) -> CatalogConsumers {
+    let mut consumers = CatalogConsumers::default();
+    for pkg_path in pkg_paths {
+        collect_catalog_consumers_from_package(pkg_path, root, &mut consumers);
+    }
+    consumers
+}
+
+fn collect_catalog_consumers_from_package(
+    pkg_path: &Path,
+    root: &Path,
+    consumers: &mut CatalogConsumers,
+) {
+    let Ok(raw_source) = std::fs::read_to_string(pkg_path) else {
+        return;
+    };
+    let Ok(pkg) = serde_json::from_str::<PackageJson>(&raw_source) else {
+        return;
+    };
+    let relative_path = pkg_path
+        .strip_prefix(root)
+        .map_or_else(|_| pkg_path.to_path_buf(), Path::to_path_buf);
+    let line_map = scan_dep_lines(&raw_source);
+    let ctx = CatalogConsumerContext {
+        line_map: &line_map,
+        absolute_path: pkg_path,
+        relative_path: &relative_path,
+        package_name: pkg.name.as_deref(),
+    };
+
+    for (section, deps) in [
+        (DepSection::Dependencies, pkg.dependencies.as_ref()),
+        (DepSection::DevDependencies, pkg.dev_dependencies.as_ref()),
+        (DepSection::PeerDependencies, pkg.peer_dependencies.as_ref()),
+        (
+            DepSection::OptionalDependencies,
+            pkg.optional_dependencies.as_ref(),
+        ),
+    ] {
+        let Some(deps) = deps else {
+            continue;
+        };
+        for (name, version) in deps {
+            collect_catalog_consumer_dependency(consumers, name, version, section, &ctx);
+        }
+    }
+}
+
+/// Per-package location context for catalog consumer attribution.
+struct CatalogConsumerContext<'a> {
+    line_map: &'a DepLineMap,
+    absolute_path: &'a Path,
+    relative_path: &'a Path,
+    package_name: Option<&'a str>,
+}
+
+fn collect_catalog_consumer_dependency(
+    consumers: &mut CatalogConsumers,
+    name: &str,
+    version: &str,
+    section: DepSection,
+    ctx: &CatalogConsumerContext<'_>,
+) {
+    if let Some(catalog) = parse_catalog_reference(version) {
+        consumers.references.insert(OwnedConsumerKey {
+            package_name: name.to_string(),
+            catalog_name: catalog.to_string(),
+        });
+        let line = ctx.line_map.line_for(section, name).unwrap_or(1);
+        consumers.referenced_with_locations.push(ConsumerReference {
+            package_name: name.to_string(),
+            catalog_name: catalog.to_string(),
+            consumer_path: ctx.absolute_path.to_path_buf(),
+            line,
+            consumer_package: ctx.package_name.map(str::to_owned),
+            from_override: false,
+        });
+    } else if is_hardcoded_version(version) {
+        consumers
+            .hardcoded
+            .push((name.to_string(), ctx.relative_path.to_path_buf()));
+    }
+}
+
+/// Record `catalog:` values in pnpm overrides as catalog consumers.
+///
+/// pnpm resolves the `catalog:` protocol in the `overrides` section of
+/// `pnpm-workspace.yaml`. pnpm 10 and earlier also read `pnpm.overrides` and
+/// the top-level `resolutions` of the root `package.json`; pnpm 11 and later
+/// ignore both. When these `package.json` sources are not empty, pnpm 10 and
+/// earlier ignore the `pnpm-workspace.yaml` overrides. pnpm before 10.5.1
+/// does not read the `pnpm-workspace.yaml` overrides at all. pnpm looks up the
+/// catalog entry by the override target package, so
+/// `"parent>child": "catalog:x"` consumes the `child` entry of catalog `x`. A
+/// malformed `pnpm-workspace.yaml` is already reported by the caller.
+///
+/// The same sources also fill `CatalogConsumers::overridden`.
+fn collect_pnpm_override_consumers(root: &Path, consumers: &mut CatalogConsumers) {
+    for (data, source_path) in pnpm_override_sources(root) {
+        collect_override_entries(&data, &source_path, consumers);
+        collect_overridden_targets(&data, consumers);
+    }
+}
+
+/// The override sources that the declared pnpm version reads, with the file
+/// each one comes from.
+fn pnpm_override_sources(root: &Path) -> Vec<(PnpmOverrideData, PathBuf)> {
+    let mut sources = Vec::new();
+    let package_json_path = root.join(PACKAGE_JSON_FILE);
+    let package_json_source = std::fs::read_to_string(&package_json_path).ok();
+    let yaml_ignored = package_json_source
+        .as_deref()
+        .and_then(|source| serde_json::from_str::<serde_json::Value>(source).ok())
+        .is_some_and(|manifest| pnpm_workspace_overrides_ignored(&manifest).is_some());
+
+    let yaml_path = root.join(PNPM_WORKSPACE_FILE);
+    if !yaml_ignored
+        && let Some(data) = std::fs::read_to_string(&yaml_path)
+            .ok()
+            .and_then(|source| parse_pnpm_workspace_overrides(&source).ok())
+    {
+        sources.push((data, yaml_path));
+    }
+
+    let Some(source) = package_json_source else {
+        return sources;
+    };
+    let reads = PackageJsonOverrideReads::for_pnpm_major(declared_pnpm_major(&source));
+    if !reads.pnpm_overrides {
+        return sources;
+    }
+    let overrides = parse_pnpm_package_json_overrides(&source);
+    let resolutions = reads
+        .resolutions
+        .then(|| pnpm_resolutions(&source, &overrides));
+    sources.push((overrides, package_json_path.clone()));
+    if let Some(resolutions) = resolutions {
+        sources.push((resolutions, package_json_path));
+    }
+    sources
+}
+
+/// Record the override keys that replace a `catalog:` reference before pnpm
+/// resolves it: a key with no version selector, whose value is not a `$`
+/// reference to a direct dependency and not a `catalog:` value. A `catalog:`
+/// value fails on its own when the entry is missing, and the override
+/// reference reports it.
+fn collect_overridden_targets(data: &PnpmOverrideData, consumers: &mut CatalogConsumers) {
+    for entry in &data.entries {
+        let Some(parsed_key) = entry.parsed_key.as_ref() else {
+            continue;
+        };
+        let Some(value) = entry.raw_value.as_deref() else {
+            continue;
+        };
+        if parsed_key.target_version_selector.is_some()
+            || parsed_key.parent_version_selector.is_some()
+            || value.starts_with('$')
+            || parse_catalog_reference(value).is_some()
+        {
+            continue;
+        }
+        consumers.overridden.insert((
+            parsed_key.parent_package.clone(),
+            parsed_key.target_package.clone(),
+        ));
+    }
+}
+
+/// The top-level `resolutions` entries that pnpm 10 applies. pnpm parses
+/// these keys with its own override grammar (a yarn path such as `a/b` fails
+/// the install), and a key in `pnpm.overrides` replaces the same key here.
+fn pnpm_resolutions(source: &str, pnpm_overrides: &PnpmOverrideData) -> PnpmOverrideData {
+    let shadowed: FxHashSet<&str> = pnpm_overrides
+        .entries
+        .iter()
+        .map(|entry| entry.raw_key.as_str())
+        .collect();
+    let mut data = parse_bun_package_json_resolutions(source);
+    data.entries
+        .retain(|entry| !shadowed.contains(entry.raw_key.as_str()));
+    for entry in &mut data.entries {
+        entry.parsed_key = parse_override_key(&entry.raw_key);
+    }
+    data
+}
+
+fn collect_override_entries(
+    data: &PnpmOverrideData,
+    source_path: &Path,
+    consumers: &mut CatalogConsumers,
+) {
+    for entry in &data.entries {
+        let Some(parsed_key) = entry.parsed_key.as_ref() else {
+            continue;
+        };
+        let Some(catalog) = entry.raw_value.as_deref().and_then(parse_catalog_reference) else {
+            continue;
+        };
+        let package_name = parsed_key.target_package.clone();
+        consumers.references.insert(OwnedConsumerKey {
+            package_name: package_name.clone(),
+            catalog_name: catalog.to_string(),
+        });
+        consumers.referenced_with_locations.push(ConsumerReference {
+            package_name,
+            catalog_name: catalog.to_string(),
+            consumer_path: source_path.to_path_buf(),
+            line: entry.line,
+            consumer_package: None,
+            from_override: true,
+        });
+    }
+}
+
+/// Parse a `catalog:` protocol value. Returns the catalog name (`"default"`
+/// for bare `catalog:` and explicit `catalog:default`, or the named catalog).
+/// Returns `None` for any non-catalog version string.
+fn parse_catalog_reference(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix("catalog:")?;
+    if rest.is_empty() || rest == "default" {
+        Some("default")
+    } else {
+        Some(rest)
+    }
+}
+
+/// Identify version strings that represent a hardcoded version range, as
+/// opposed to a workspace cross-reference (`workspace:*`, `workspace:^`),
+/// a filesystem path (`file:..`), or a symlinked dependency (`link:..`).
+/// Catalog references are handled by the caller and never reach this
+/// function. Surfacing only true hardcoded ranges keeps
+/// `hardcoded_consumers` actionable: the user can decide whether to switch
+/// the consumer to `catalog:` rather than chase an internal workspace
+/// reference.
+fn is_hardcoded_version(value: &str) -> bool {
+    !(value.starts_with("workspace:")
+        || value.starts_with("file:")
+        || value.starts_with("link:")
+        || value.starts_with("portal:"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DepSection {
+    Dependencies,
+    DevDependencies,
+    PeerDependencies,
+    OptionalDependencies,
+}
+
+const DEP_SECTIONS: &[DepSection] = &[
+    DepSection::Dependencies,
+    DepSection::DevDependencies,
+    DepSection::PeerDependencies,
+    DepSection::OptionalDependencies,
+];
+
+impl DepSection {
+    const fn json_key(self) -> &'static str {
+        match self {
+            Self::Dependencies => "dependencies",
+            Self::DevDependencies => "devDependencies",
+            Self::PeerDependencies => "peerDependencies",
+            Self::OptionalDependencies => "optionalDependencies",
+        }
+    }
+}
+
+/// Maps `(section, package_name)` to its 1-based line number in the
+/// `package.json` source. Built via a section-aware line scanner so we can
+/// surface the consumer-side reference location for
+/// `unresolved-catalog-references` findings.
+#[derive(Debug, Default)]
+struct DepLineMap {
+    entries: Vec<((DepSection, String), u32)>,
+}
+
+impl DepLineMap {
+    fn line_for(&self, section: DepSection, package_name: &str) -> Option<u32> {
+        self.entries
+            .iter()
+            .find(|((sec, pkg), _)| *sec == section && pkg == package_name)
+            .map(|(_, line)| *line)
+    }
+}
+
+/// Walk the raw package.json source and record the 1-based line for each
+/// `"name":` key under the four dep sections. Tracks brace depth so nested
+/// objects under unrelated keys (e.g., `bin`, `peerDependenciesMeta`) do not
+/// pollute the map.
+///
+/// Plain JSON: no comments, no trailing commas. A package.json with comments
+/// would fail `serde_json::from_str` upstream and never reach this scanner.
+fn scan_dep_lines(source: &str) -> DepLineMap {
+    let mut scanner = DepLineScanner::default();
+    for (idx, raw_line) in source.lines().enumerate() {
+        scanner.scan_line(idx, raw_line);
+    }
+    scanner.finish()
+}
+
+#[derive(Default)]
+struct DepLineScanner {
+    entries: Vec<((DepSection, String), u32)>,
+    current_section: Option<DepSection>,
+    section_depth_at_open: u32,
+    current_depth: u32,
+}
+
+impl DepLineScanner {
+    fn scan_line(&mut self, idx: usize, raw_line: &str) {
+        let line_no = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
+        let trimmed = raw_line.trim();
+        self.enter_section_if_opened(trimmed, raw_line);
+
+        let depth_before = self.current_depth;
+        let delta = brace_delta_outside_strings(raw_line);
+        self.record_dep_key_if_in_section(depth_before, trimmed, line_no);
+        self.current_depth = depth_before
+            .saturating_add(delta.opens)
+            .saturating_sub(delta.closes);
+        self.leave_section_if_closed();
+    }
+
+    fn enter_section_if_opened(&mut self, trimmed: &str, raw_line: &str) {
+        if self.current_section.is_some() {
+            return;
+        }
+
+        for section in DEP_SECTIONS {
+            let needle = format!("\"{}\"", section.json_key());
+            if trimmed.starts_with(&needle) && raw_line.contains('{') {
+                self.current_section = Some(*section);
+                self.section_depth_at_open = self.current_depth.saturating_add(1);
+                break;
+            }
+        }
+    }
+
+    fn record_dep_key_if_in_section(&mut self, depth_before: u32, trimmed: &str, line_no: u32) {
+        if let Some(section) = self.current_section
+            && depth_before == self.section_depth_at_open
+            && let Some(name) = parse_json_key(trimmed)
+        {
+            self.entries.push(((section, name), line_no));
+        }
+    }
+
+    fn leave_section_if_closed(&mut self) {
+        if self.current_section.is_some() && self.current_depth < self.section_depth_at_open {
+            self.current_section = None;
+        }
+    }
+
+    fn finish(self) -> DepLineMap {
+        DepLineMap {
+            entries: self.entries,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BraceDelta {
+    opens: u32,
+    closes: u32,
+}
+
+fn brace_delta_outside_strings(raw_line: &str) -> BraceDelta {
+    let mut delta = BraceDelta::default();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in raw_line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => delta.opens = delta.opens.saturating_add(1),
+            '}' => delta.closes = delta.closes.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    delta
+}
+
+/// Parse a JSON object key from a trimmed line of the form `"key": value,?`.
+/// Returns `None` for lines that do not start with a quoted key followed by
+/// `:`.
+fn parse_json_key(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let key = &rest[..end];
+    let after = rest[end.saturating_add(1)..].trim_start();
+    if after.starts_with(':') {
+        Some(key.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_pnpm_workspace_yaml_records_a_diagnostic_and_skips_catalog_analysis() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.2.0\n{this is\nnot: valid: yaml: at: all\n",
+        )
+        .expect("write pnpm-workspace.yaml");
+        let config = fallow_config::FallowConfig::default().resolve(
+            dir.path().to_path_buf(),
+            fallow_config::OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+
+        assert!(
+            gather_pnpm_catalog_state(&config, &[]).is_none(),
+            "an unparsed catalog must not report every `catalog:` reference as unresolved"
+        );
+        let diagnostics = fallow_config::workspace_diagnostics_for(dir.path());
+        assert!(
+            diagnostics.iter().any(|d| matches!(
+                d.kind,
+                WorkspaceDiagnosticKind::MalformedPnpmWorkspaceYaml { .. }
+            )),
+            "expected a malformed-pnpm-workspace-yaml diagnostic: {diagnostics:?}"
+        );
+    }
+
+    /// Write a pnpm root with a `packages/app` workspace, then return the
+    /// unresolved catalog references and the workspace list.
+    fn unresolved_for(
+        root_manifest: &str,
+        workspace_yaml: &str,
+        app_manifest: &str,
+    ) -> Vec<(String, String)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), root_manifest).expect("write root");
+        std::fs::write(root.join("pnpm-workspace.yaml"), workspace_yaml).expect("write yaml");
+        let app = root.join("packages/app");
+        std::fs::create_dir_all(&app).expect("mkdir");
+        std::fs::write(app.join("package.json"), app_manifest).expect("write app");
+        let config = fallow_config::FallowConfig::default().resolve(
+            root.to_path_buf(),
+            fallow_config::OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        let workspaces = fallow_config::discover_workspaces(root);
+        let state = gather_pnpm_catalog_state(&config, &workspaces).expect("catalog state");
+        find_unresolved_catalog_references(&state, &[], root)
+            .into_iter()
+            .map(|finding| {
+                let path = finding
+                    .path
+                    .strip_prefix(root)
+                    .unwrap_or(&finding.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (finding.entry_name, path)
+            })
+            .collect()
+    }
+
+    const APP_USES_VITE: &str =
+        r#"{"name":"app","devDependencies":{"vite":"catalog:","tool":"catalog:"}}"#;
+
+    fn yaml_with_overrides(overrides: &str) -> String {
+        format!("packages:\n  - packages/*\ncatalog:\n  lodash: ^4.0.0\noverrides:\n{overrides}")
+    }
+
+    #[test]
+    fn plain_override_key_suppresses_the_unresolved_reference() {
+        let found = unresolved_for(
+            r#"{"name":"root"}"#,
+            &yaml_with_overrides("  vite: workspace:@demo/core@*\n  tool: ^1.0.0\n"),
+            APP_USES_VITE,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn override_key_with_a_version_selector_does_not_suppress() {
+        let found = unresolved_for(
+            r#"{"name":"root"}"#,
+            &yaml_with_overrides("  vite@^5: ^5.4.0\n  tool@*: ^1.0.0\n"),
+            APP_USES_VITE,
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn parent_override_key_suppresses_only_for_that_consumer() {
+        let found = unresolved_for(
+            r#"{"name":"root"}"#,
+            &yaml_with_overrides("  app>vite: ^5.4.0\n  other>tool: ^1.0.0\n"),
+            APP_USES_VITE,
+        );
+        assert_eq!(
+            found,
+            [("tool".to_owned(), "packages/app/package.json".to_owned())]
+        );
+    }
+
+    #[test]
+    fn dollar_override_value_does_not_suppress() {
+        let found = unresolved_for(
+            r#"{"name":"root","devDependencies":{"vite":"^5.4.0"}}"#,
+            &yaml_with_overrides("  vite: $vite\n"),
+            r#"{"name":"app","devDependencies":{"vite":"catalog:"}}"#,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn override_with_an_unresolved_catalog_value_is_still_reported() {
+        let found = unresolved_for(
+            r#"{"name":"root"}"#,
+            &yaml_with_overrides("  vite: 'catalog:'\n"),
+            r#"{"name":"app","devDependencies":{"vite":"catalog:"}}"#,
+        );
+        let paths: Vec<&str> = found.iter().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["packages/app/package.json", "pnpm-workspace.yaml"],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn pnpm_11_ignores_package_json_overrides_for_the_suppression() {
+        let yaml = "packages:\n  - packages/*\ncatalog:\n  lodash: ^4.0.0\n";
+        let manifest = |pnpm: &str| {
+            format!(
+                r#"{{"name":"root","packageManager":"pnpm@{pnpm}","pnpm":{{"overrides":{{"vite":"^5.4.0"}}}}}}"#
+            )
+        };
+        let app = r#"{"name":"app","devDependencies":{"vite":"catalog:"}}"#;
+        assert!(unresolved_for(&manifest("10.20.0"), yaml, app).is_empty());
+        assert_eq!(unresolved_for(&manifest("11.28.5"), yaml, app).len(), 1);
+    }
+
+    #[test]
+    fn independent_pnpm_project_is_not_a_catalog_consumer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).expect("write root");
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\ncatalog:\n  vue: ^3.5.0\n",
+        )
+        .expect("write yaml");
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).expect("mkdir");
+        std::fs::write(
+            docs.join("package.json"),
+            r#"{"name":"docs","dependencies":{"vue":"catalog:","vitepress":"catalog:"}}"#,
+        )
+        .expect("write docs");
+        std::fs::write(
+            docs.join("pnpm-workspace.yaml"),
+            "catalog:\n  vitepress: ^1.0.0\n",
+        )
+        .expect("write docs yaml");
+        let config = fallow_config::FallowConfig::default().resolve(
+            root.to_path_buf(),
+            fallow_config::OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        let workspaces =
+            fallow_config::discover_workspaces_with_patterns(root, &["docs".to_owned()]);
+        assert!(
+            workspaces.iter().any(|ws| ws.name == "docs"),
+            "{workspaces:?}"
+        );
+
+        let state = gather_pnpm_catalog_state(&config, &workspaces).expect("catalog state");
+
+        assert!(find_unresolved_catalog_references(&state, &[], root).is_empty());
+        let unused: Vec<String> = find_unused_catalog_entries(&state)
+            .into_iter()
+            .map(|entry| entry.entry_name)
+            .collect();
+        assert_eq!(
+            unused,
+            ["vue"],
+            "the docs reference does not use the root entry"
+        );
+    }
+
+    #[test]
+    fn parses_bare_catalog_as_default() {
+        assert_eq!(parse_catalog_reference("catalog:"), Some("default"));
+        assert_eq!(parse_catalog_reference("catalog:default"), Some("default"));
+    }
+
+    #[test]
+    fn parses_named_catalog() {
+        assert_eq!(parse_catalog_reference("catalog:react17"), Some("react17"));
+    }
+
+    #[test]
+    fn non_catalog_versions_return_none() {
+        assert_eq!(parse_catalog_reference("^18.2.0"), None);
+        assert_eq!(parse_catalog_reference("workspace:*"), None);
+        assert_eq!(parse_catalog_reference("npm:other-pkg@^1.0.0"), None);
+        assert_eq!(parse_catalog_reference(""), None);
+    }
+
+    #[test]
+    fn workspace_and_link_protocols_are_not_hardcoded() {
+        assert!(!is_hardcoded_version("workspace:*"));
+        assert!(!is_hardcoded_version("workspace:^"));
+        assert!(!is_hardcoded_version("workspace:~"));
+        assert!(!is_hardcoded_version("file:../other-pkg"));
+        assert!(!is_hardcoded_version("link:../symlinked"));
+        assert!(!is_hardcoded_version("portal:../portal"));
+    }
+
+    #[test]
+    fn semver_ranges_and_npm_specs_are_hardcoded() {
+        assert!(is_hardcoded_version("^1.0.0"));
+        assert!(is_hardcoded_version("~2.5.0"));
+        assert!(is_hardcoded_version("1.2.3"));
+        assert!(is_hardcoded_version(">=1.0.0 <2.0.0"));
+        assert!(is_hardcoded_version("npm:other-pkg@^1.0.0"));
+        assert!(is_hardcoded_version("github:user/repo#commit"));
+        assert!(is_hardcoded_version("https://example.com/pkg.tgz"));
+    }
+
+    #[test]
+    fn scan_dep_lines_captures_each_section() {
+        let source = r#"{
+  "name": "demo",
+  "dependencies": {
+    "react": "catalog:react17",
+    "lodash": "^4.0.0"
+  },
+  "devDependencies": {
+    "vitest": "catalog:"
+  }
+}
+"#;
+        let map = scan_dep_lines(source);
+        assert_eq!(map.line_for(DepSection::Dependencies, "react"), Some(4));
+        assert_eq!(map.line_for(DepSection::Dependencies, "lodash"), Some(5));
+        assert_eq!(map.line_for(DepSection::DevDependencies, "vitest"), Some(8));
+        assert_eq!(map.line_for(DepSection::Dependencies, "vitest"), None);
+    }
+
+    #[test]
+    fn scan_dep_lines_ignores_nested_object_keys() {
+        let source = r#"{
+  "peerDependencies": {
+    "react": "*"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}
+"#;
+        let map = scan_dep_lines(source);
+        assert_eq!(map.line_for(DepSection::PeerDependencies, "react"), Some(3));
+        let peer_react_hits = map
+            .entries
+            .iter()
+            .filter(|((sec, name), _)| *sec == DepSection::PeerDependencies && name == "react")
+            .count();
+        assert_eq!(peer_react_hits, 1);
+    }
+
+    #[test]
+    fn declared_pnpm_major_reads_the_package_manager_field() {
+        let major = |field: &str| declared_pnpm_major(&format!(r#"{{"packageManager":{field}}}"#));
+        assert_eq!(major(r#""pnpm@10.34.5""#), Some(10));
+        assert_eq!(major(r#""pnpm@11.28.3+sha512.0123abcd""#), Some(11));
+        assert_eq!(major(r#""pnpm@9""#), Some(9));
+        assert_eq!(major(r#""yarn@4.5.0""#), None);
+        assert_eq!(major(r#""pnpm@latest""#), None);
+        assert_eq!(major("10"), None);
+        assert_eq!(declared_pnpm_major("{}"), None);
+        assert_eq!(declared_pnpm_major("not json"), None);
+    }
+
+    #[test]
+    fn collect_available_in_catalogs_excludes_the_unresolved_one() {
+        let data = parse_pnpm_catalog_data(
+            r"
+catalogs:
+  react17:
+    react: ^17.0.2
+  react18:
+    react: ^18.2.0
+",
+        )
+        .expect("valid yaml");
+        let available = collect_available_in_catalogs(&data, "react", "react17");
+        assert_eq!(available, vec!["react18".to_string()]);
+    }
+
+    #[test]
+    fn catalog_has_entry_default_form() {
+        let data = parse_pnpm_catalog_data(
+            r"
+catalog:
+  react: ^18.2.0
+",
+        )
+        .expect("valid yaml");
+        assert!(catalog_has_entry(&data, "default", "react"));
+        assert!(!catalog_has_entry(&data, "default", "vue"));
+        assert!(!catalog_has_entry(&data, "react17", "react"));
+    }
+}

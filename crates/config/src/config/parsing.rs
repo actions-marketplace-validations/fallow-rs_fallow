@@ -7,13 +7,20 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::FallowConfig;
 
-/// Supported config file names in priority order.
-pub(super) const CONFIG_NAMES: &[&str] = &[
+/// Config file names the loader accepts, in discovery priority order.
+///
+/// Public because surfaces outside config loading have to react to the same
+/// set: the language server registers a file watcher per name, so a name added
+/// here reaches the editor without a second list to keep in step.
+pub const CONFIG_FILE_NAMES: &[&str] = &[
     ".fallowrc.json",
     ".fallowrc.jsonc",
     "fallow.toml",
     ".fallow.toml",
 ];
+
+/// Supported config file names in priority order.
+pub(super) const CONFIG_NAMES: &[&str] = CONFIG_FILE_NAMES;
 
 pub(super) const MAX_EXTENDS_DEPTH: usize = 10;
 
@@ -481,11 +488,64 @@ enum ConfigResourceId {
     Remote(String),
 }
 
+/// A fetcher for walks that list the local config files only. It reads no
+/// remote config and gives an empty one in its place.
+struct NoRemoteFetcher;
+
+impl RemoteConfigFetcher for NoRemoteFetcher {
+    fn fetch(&mut self, _url: &str, _source: &str) -> Result<serde_json::Value, miette::Report> {
+        Ok(serde_json::Value::Object(serde_json::Map::new()))
+    }
+}
+
 struct ExtendsResolver<'a, Fetcher> {
     options: ConfigLoadOptions,
     active: FxHashSet<ConfigResourceId>,
-    resolved: FxHashMap<ConfigResourceId, serde_json::Value>,
+    resolved: FxHashMap<ConfigResourceId, ResolvedConfig>,
+    /// The canonical local files that the walk reads, in read order.
+    local_files: Vec<PathBuf>,
+    /// The merge order of each source that is resolving now, innermost
+    /// last. It is empty when the walk does not record the merge order. See
+    /// [`MergeOrder`].
+    order_frames: Vec<MergeOrder>,
+    /// The merge order of the walk after the root resolves, when the walk
+    /// records it.
+    merge_order: MergeOrder,
+    record_merge_order: bool,
     fetcher: &'a mut Fetcher,
+}
+
+/// Config sources in the order that the load merges their own keys: the
+/// extends targets of a file come before the file itself, so a later source
+/// overrides an earlier one. The merge can apply a source more than one
+/// time (a diamond or a lattice of extends). Only the last time matters,
+/// so each source keeps only its last position. The length is then at most
+/// the number of distinct sources.
+#[derive(Default, Clone)]
+struct MergeOrder(Vec<ConfigResourceId>);
+
+impl MergeOrder {
+    /// Append `sources` in order. A source that is already in the order
+    /// moves to its new, later position.
+    fn append(&mut self, sources: &[ConfigResourceId]) {
+        for source in sources {
+            if let Some(position) = self.0.iter().position(|known| known == source) {
+                self.0.remove(position);
+            }
+            self.0.push(source.clone());
+        }
+    }
+}
+
+/// A config source that the walk resolved once, kept for reuse.
+struct ResolvedConfig {
+    /// The merged value of the source and its extends chain.
+    value: serde_json::Value,
+    /// The merge order of the source: its extends chain, then the source
+    /// itself. A reuse appends it again, because the merge applies the full
+    /// cached value again. It is empty when the walk does not record the
+    /// merge order.
+    merge_order: MergeOrder,
 }
 
 #[derive(Clone, Copy)]
@@ -504,8 +564,47 @@ impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
             options,
             active: FxHashSet::default(),
             resolved: FxHashMap::default(),
+            local_files: Vec::new(),
+            order_frames: Vec::new(),
+            merge_order: MergeOrder::default(),
+            record_merge_order: false,
             fetcher,
         }
+    }
+
+    /// Record the merge order of the walk. A normal load does not need it.
+    fn recording_merge_order(mut self) -> Self {
+        self.record_merge_order = true;
+        self
+    }
+
+    /// Start the merge order of a source that resolves now.
+    fn open_order_frame(&mut self) {
+        if self.record_merge_order {
+            self.order_frames.push(MergeOrder::default());
+        }
+    }
+
+    /// Finish the merge order of the source that resolved now: append the
+    /// source itself, then give the order to the source that extends it.
+    fn close_order_frame(&mut self, identity: &ConfigResourceId, resolved: bool) -> MergeOrder {
+        if !self.record_merge_order {
+            return MergeOrder::default();
+        }
+        let mut order = self.order_frames.pop().unwrap_or_default();
+        if resolved {
+            order.append(std::slice::from_ref(identity));
+            self.append_to_parent_order(&order);
+        }
+        order
+    }
+
+    fn append_to_parent_order(&mut self, order: &MergeOrder) {
+        let parent = self
+            .order_frames
+            .last_mut()
+            .unwrap_or(&mut self.merge_order);
+        parent.append(&order.0);
     }
 
     fn resolve_local(
@@ -527,8 +626,8 @@ impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
             )
         })?;
         let identity = ConfigResourceId::Local(canonical.clone());
-        if let Some(value) = self.resolved.get(&identity) {
-            return Ok(value.clone());
+        if let Some(value) = self.reuse_resolved(&identity) {
+            return Ok(value);
         }
         if !self.active.insert(identity.clone()) {
             return Err(miette::miette!(
@@ -537,12 +636,43 @@ impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
             ));
         }
 
+        self.local_files.push(canonical.clone());
+        self.open_order_frame();
         let result = self.resolve_local_uncached(&canonical, depth);
         self.active.remove(&identity);
+        let order = self.close_order_frame(&identity, result.is_ok());
         if let Ok(value) = &result {
-            self.resolved.insert(identity, value.clone());
+            self.remember_resolved(identity, value, order);
         }
         result
+    }
+
+    /// The cached value of a source that the walk resolved before. The merge
+    /// applies the full cached value again, so the merge order gets the
+    /// sources of that value again, in their first order.
+    fn reuse_resolved(&mut self, identity: &ConfigResourceId) -> Option<serde_json::Value> {
+        let resolved = self.resolved.get(identity)?;
+        let value = resolved.value.clone();
+        if self.record_merge_order {
+            let order = resolved.merge_order.clone();
+            self.append_to_parent_order(&order);
+        }
+        Some(value)
+    }
+
+    fn remember_resolved(
+        &mut self,
+        identity: ConfigResourceId,
+        value: &serde_json::Value,
+        merge_order: MergeOrder,
+    ) {
+        self.resolved.insert(
+            identity,
+            ResolvedConfig {
+                value: value.clone(),
+                merge_order,
+            },
+        );
     }
 
     fn resolve_local_uncached(
@@ -648,8 +778,8 @@ impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
         }
 
         let identity = ConfigResourceId::Remote(normalize_url_for_dedup(url));
-        if let Some(value) = self.resolved.get(&identity) {
-            return Ok(value.clone());
+        if let Some(value) = self.reuse_resolved(&identity) {
+            return Ok(value);
         }
         if !self.active.insert(identity.clone()) {
             let url_display = remote_config_display(url);
@@ -658,10 +788,12 @@ impl<'a, Fetcher: RemoteConfigFetcher> ExtendsResolver<'a, Fetcher> {
             ));
         }
 
+        self.open_order_frame();
         let result = self.resolve_remote_uncached(url, depth);
         self.active.remove(&identity);
+        let order = self.close_order_frame(&identity, result.is_ok());
         if let Ok(value) = &result {
-            self.resolved.insert(identity, value.clone());
+            self.remember_resolved(identity, value, order);
         }
         result
     }
@@ -1170,6 +1302,53 @@ impl FallowConfig {
         load_with_fetcher(path, options, &mut fetcher)
     }
 
+    /// The local files that a load of the config file at `path` reads.
+    ///
+    /// The list holds `path` and each local or `npm:` `extends` target, as
+    /// canonical paths in the order that the load reads them. It leaves out
+    /// remote `https://` targets and does not fetch them. The walk stops at
+    /// the first entry that does not resolve, so a broken chain gives the
+    /// files up to that entry.
+    ///
+    /// A host that keeps a loaded config across runs compares these files to
+    /// know when to load the config again.
+    #[must_use]
+    pub fn local_source_files(path: &Path) -> Vec<PathBuf> {
+        let mut fetcher = NoRemoteFetcher;
+        let mut resolver = ExtendsResolver::new(
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        );
+        let _ = resolver.resolve_local(path, 0);
+        resolver.local_files
+    }
+
+    /// The config sources of the file at `path` in merge order, or `None`
+    /// when the extends chain does not resolve. A later entry overrides an
+    /// earlier one. A remote `https://` source is `None` and is not fetched.
+    pub(super) fn merge_order(path: &Path) -> Option<Vec<Option<PathBuf>>> {
+        let mut fetcher = NoRemoteFetcher;
+        let mut resolver = ExtendsResolver::new(
+            ConfigLoadOptions {
+                allow_remote_extends: true,
+            },
+            &mut fetcher,
+        )
+        .recording_merge_order();
+        resolver.resolve_local(path, 0).ok()?;
+        let sources = resolver
+            .merge_order
+            .0
+            .into_iter()
+            .map(|source| match source {
+                ConfigResourceId::Local(path) => Some(path),
+                ConfigResourceId::Remote(_) => None,
+            });
+        Some(sources.collect())
+    }
+
     fn from_merged(path: &Path, merged: serde_json::Value) -> Result<Self, miette::Report> {
         assert_binary_meets_minimum_version(path, &merged)?;
         warn_on_unknown_rule_keys(path, &merged);
@@ -1210,11 +1389,12 @@ impl FallowConfig {
                 "invalid config:\n  - security.requestReceivers entries must be non-empty strings"
             ));
         }
-        let threshold_override_errors = config.health.threshold_override_errors();
-        if !threshold_override_errors.is_empty() {
+        let mut health_errors = config.health.threshold_override_errors();
+        health_errors.extend(config.health.change_coupling.errors());
+        if !health_errors.is_empty() {
             return Err(miette::miette!(
                 "invalid config:\n  - {}",
-                threshold_override_errors.join("\n  - ")
+                health_errors.join("\n  - ")
             ));
         }
         if let Some(pattern) = &config.unused_component_props.ignore_pattern
@@ -1265,6 +1445,7 @@ impl FallowConfig {
         self.validate_top_level_globs(&mut errors);
         self.validate_ignore_rule_globs(&mut errors);
         self.validate_boundary_globs(&mut errors);
+        self.validate_workspace_baseline_keys(&mut errors);
 
         for plugin in &self.framework {
             if let Err(mut plugin_errors) = plugin.validate_user_globs() {
@@ -1286,13 +1467,15 @@ impl FallowConfig {
         errors: &mut Vec<super::glob_validation::GlobValidationError>,
     ) {
         use super::glob_validation::{
-            validate_user_finding_ignore_globs, validate_user_globs, validate_user_specifier_globs,
+            validate_user_dependency_globs, validate_user_finding_ignore_globs,
+            validate_user_globs, validate_user_ignore_pattern_globs, validate_user_specifier_globs,
         };
 
         validate_user_globs(&self.entry, "entry", errors);
-        validate_user_globs(&self.ignore_patterns, "ignorePatterns", errors);
+        validate_user_ignore_pattern_globs(&self.ignore_patterns, "ignorePatterns", errors);
         validate_user_finding_ignore_globs(&self.ignore_findings, "ignoreFindings", errors);
         validate_user_globs(&self.dynamically_loaded, "dynamicallyLoaded", errors);
+        validate_user_dependency_globs(&self.ignore_dependencies, "ignoreDependencies", errors);
         validate_user_specifier_globs(
             &self.ignore_unresolved_imports,
             "ignoreUnresolvedImports",
@@ -1363,6 +1546,25 @@ impl FallowConfig {
             "boundaries.coverage.allowUnmatched",
             errors,
         );
+    }
+
+    /// Validate the shape of the `workspaces.changedSince` keys. Whether a
+    /// key names a discovered workspace is known only after discovery, so the
+    /// engine checks that when a run reads the map.
+    fn validate_workspace_baseline_keys(
+        &self,
+        errors: &mut Vec<super::glob_validation::GlobValidationError>,
+    ) {
+        let Some(workspaces) = &self.workspaces else {
+            return;
+        };
+        for key in workspaces.changed_since.keys() {
+            if let Err(e) =
+                super::glob_validation::validate_workspace_root_key(key, "workspaces.changedSince")
+            {
+                errors.push(e);
+            }
+        }
     }
 
     /// Find the config file path without loading it.
@@ -1682,6 +1884,22 @@ ignoreDependencies = ["autoprefixer", "postcss"]
     }
 
     #[test]
+    fn fallow_config_deserialize_ignore_command_entries() {
+        let toml_config: FallowConfig =
+            toml::from_str(r#"ignoreCommandEntries = ["my-codegen", "*"]"#).unwrap();
+        assert_eq!(toml_config.ignore_command_entries, vec!["my-codegen", "*"]);
+
+        let json_config: FallowConfig =
+            serde_json::from_str(r#"{"ignoreCommandEntries": ["my-codegen"]}"#).unwrap();
+        assert_eq!(json_config.ignore_command_entries, vec!["my-codegen"]);
+
+        let default_config: FallowConfig = serde_json::from_str("{}").unwrap();
+        assert!(default_config.ignore_command_entries.is_empty());
+        let serialized = serde_json::to_value(&default_config).unwrap();
+        assert!(serialized.get("ignoreCommandEntries").is_none());
+    }
+
+    #[test]
     fn fallow_config_deserialize_ignore_unresolved_imports() {
         let toml_str = r#"
 ignoreUnresolvedImports = ["@example/icons", "@example/icons/**", "../generated/**"]
@@ -1923,6 +2141,33 @@ unknown_field = true
         assert!(obj.contains_key("properties"));
     }
 
+    /// Both `.fallowrc.json` and `.fallowrc.jsonc` are loaded through
+    /// [`crate::jsonc::parse_options`], so the published schema has to declare
+    /// the same dialect. Editors built on the JSON language service read
+    /// `allowComments` and `allowTrailingCommas` off the root schema object and
+    /// otherwise report syntax fallow accepts. Asserting against the parser's
+    /// own options makes the schema and the loader fail together if either one
+    /// moves.
+    #[test]
+    fn json_schema_advertises_the_jsonc_dialect_it_parses() {
+        let options = crate::jsonc::parse_options();
+        let schema = FallowConfig::json_schema();
+        let root = schema.as_object().expect("schema should be an object");
+
+        assert_eq!(
+            root.get("allowTrailingCommas")
+                .and_then(serde_json::Value::as_bool),
+            Some(options.allow_trailing_commas),
+            "schema should advertise the parser's trailing-comma support"
+        );
+        assert_eq!(
+            root.get("allowComments")
+                .and_then(serde_json::Value::as_bool),
+            Some(options.allow_comments),
+            "schema should advertise the parser's comment support"
+        );
+    }
+
     #[test]
     fn config_format_detection() {
         assert!(matches!(
@@ -2160,7 +2405,8 @@ unknown_field = true
             "duplicates": {
                 "minTokens": 100,
                 "minLines": 10,
-                "skipLocal": true
+                "skipLocal": true,
+                "ignoreSymlinks": true
             }
         }"#;
         let config: FallowConfig = serde_json::from_str(json_str).unwrap();
@@ -2171,6 +2417,7 @@ unknown_field = true
         assert_eq!(config.duplicates.min_tokens, 100);
         assert_eq!(config.duplicates.min_lines, 10);
         assert!(config.duplicates.skip_local);
+        assert!(config.duplicates.ignore_symlinks);
     }
 
     #[test]
@@ -3948,6 +4195,29 @@ thresholdOverrides = [
     }
 
     #[test]
+    fn fail_on_parse_error_reads_from_json_and_toml_and_reaches_the_resolved_config() {
+        let json: FallowConfig = serde_json::from_str(r#"{"failOnParseError": true}"#).unwrap();
+        assert!(json.fail_on_parse_error);
+        let toml: FallowConfig = toml::from_str("failOnParseError = true").unwrap();
+        assert!(toml.fail_on_parse_error);
+        let unset: FallowConfig = serde_json::from_str("{}").unwrap();
+        assert!(
+            !unset.fail_on_parse_error,
+            "the gate is never armed by default"
+        );
+
+        let resolved = json.resolve(
+            PathBuf::from("/tmp/test"),
+            OutputFormat::Human,
+            1,
+            true,
+            true,
+            None,
+        );
+        assert!(resolved.fail_on_parse_error);
+    }
+
+    #[test]
     fn config_format_defaults_to_toml_for_unknown() {
         assert!(matches!(
             ConfigFormat::from_path(Path::new("config.yaml")),
@@ -4063,12 +4333,6 @@ thresholdOverrides = [
         let json_str = r#"{"production": true}"#;
         let config: FallowConfig = serde_json::from_str(json_str).unwrap();
         assert!(config.production);
-    }
-
-    #[test]
-    fn fallow_config_production_defaults_false() {
-        let config: FallowConfig = serde_json::from_str("{}").unwrap();
-        assert!(!config.production);
     }
 
     #[test]
@@ -5232,6 +5496,49 @@ thresholdOverrides = [
         );
     }
 
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn local_source_files_follow_the_local_extends_chain() {
+        let dir = test_dir("local-sources");
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        std::fs::write(
+            root.join(".fallowrc.json"),
+            r#"{"extends": ["./shared/base.json", "https://example.com/remote.json"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared/base.json"),
+            r#"{"extends": "./leaf.json", "entry": []}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("shared/leaf.json"), r#"{"entry": []}"#).unwrap();
+
+        assert_eq!(
+            FallowConfig::local_source_files(&root.join(".fallowrc.json")),
+            vec![
+                root.join(".fallowrc.json"),
+                root.join("shared/base.json"),
+                root.join("shared/leaf.json"),
+            ],
+            "the list holds the config and each local extends target, and no remote one"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn local_source_files_stop_at_a_missing_extends_target() {
+        let dir = test_dir("local-sources-missing");
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("fallow.json"), r#"{"extends": "./gone.json"}"#).unwrap();
+
+        assert_eq!(
+            FallowConfig::local_source_files(&root.join("fallow.json")),
+            vec![root.join("fallow.json")]
+        );
+        assert!(FallowConfig::local_source_files(&root.join("absent.json")).is_empty());
+    }
+
     // ------------------------------------------------------------------
     // resolve_extends_file: depth limit reached
     // ------------------------------------------------------------------
@@ -5568,41 +5875,13 @@ thresholdOverrides = [
     }
 
     // ------------------------------------------------------------------
-    // validate_resolved_boundaries: tsconfig rootDir filtering
-    // (covers lines 1158-1160 - rootDir value is ".", starts with "..", or
-    // is absolute; all should fall back to "src")
-    // ------------------------------------------------------------------
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn validate_resolved_boundaries_with_preset_uses_src_fallback_when_no_tsconfig() {
-        // No tsconfig.json present; parse_tsconfig_root_dir returns None,
-        // unwrap_or_else supplies "src". This exercises the filter + fallback branch.
-        let dir = test_dir("boundaries-preset-no-tsconfig");
-        std::fs::create_dir_all(dir.path().join("src/features/auth")).unwrap();
-        let config = FallowConfig {
-            boundaries: crate::BoundaryConfig {
-                coverage: crate::BoundaryCoverageConfig::default(),
-                calls: crate::BoundaryCallsConfig::default(),
-                preset: Some(crate::BoundaryPreset::Bulletproof),
-                zones: vec![],
-                rules: vec![],
-            },
-            ..FallowConfig::default()
-        };
-        // Should not panic; no zone-ref errors expected since preset adds zones
-        let _ = config.validate_resolved_boundaries(dir.path());
-    }
-
-    // ------------------------------------------------------------------
     // validate_user_globs: framework plugin invalid glob triggers error path
     // (covers lines 970-974)
     // ------------------------------------------------------------------
 
     #[test]
     fn validate_user_globs_framework_plugin_invalid_entry_glob() {
-        use crate::ExternalPluginDef;
-        use crate::external_plugin::EntryPointRole;
+        use crate::{ExternalPluginDef, external_plugin::EntryPointRole};
         let config = FallowConfig {
             framework: vec![ExternalPluginDef {
                 schema: None,
@@ -5613,6 +5892,7 @@ thresholdOverrides = [
                 entry_point_role: EntryPointRole::Support,
                 manifest_entries: vec![],
                 config_patterns: vec![],
+                config_default_export_opt_out: vec![],
                 always_used: vec![],
                 tooling_dependencies: vec![],
                 used_exports: vec![],
@@ -5628,6 +5908,26 @@ thresholdOverrides = [
         );
         let errors = result.unwrap_err();
         assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn validate_user_globs_rejects_invalid_ignore_dependencies_glob() {
+        let config = FallowConfig {
+            ignore_dependencies: vec![
+                "lodash".to_owned(),
+                "@acme/*".to_owned(),
+                "@broken/[".to_owned(),
+            ],
+            ..FallowConfig::default()
+        };
+
+        let errors = config
+            .validate_user_globs()
+            .expect_err("an unclosed character class is not a valid glob");
+        assert_eq!(errors.len(), 1);
+        let message = errors[0].to_string();
+        assert!(message.contains("ignoreDependencies"), "{message}");
+        assert!(message.contains("@broken/["), "{message}");
     }
 
     // ------------------------------------------------------------------
@@ -5728,6 +6028,48 @@ thresholdOverrides = [
         let local = ConfigResourceId::Local(canonical.clone());
         let remote = ConfigResourceId::Remote(canonical.to_string_lossy().into_owned());
         assert_ne!(local, remote);
+    }
+
+    // ------------------------------------------------------------------
+    // merge_order stays bounded by the distinct sources of a lattice.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn merge_order_lists_each_source_of_an_extends_lattice_once() {
+        const LEVELS: usize = 4;
+        const WIDTH: usize = 3;
+        let dir = test_dir("merge-order-lattice");
+        let name = |level: usize, index: usize| format!("l{level}-{index}.json");
+        for level in 0..LEVELS {
+            for index in 0..WIDTH {
+                let extends: Vec<String> = if level == 0 {
+                    Vec::new()
+                } else {
+                    (0..WIDTH)
+                        .map(|below| format!("./{}", name(level - 1, below)))
+                        .collect()
+                };
+                let body = serde_json::json!({ "extends": extends });
+                std::fs::write(dir.path().join(name(level, index)), body.to_string()).unwrap();
+            }
+        }
+        let root = dir.path().join(".fallowrc.json");
+        let top: Vec<String> = (0..WIDTH)
+            .map(|index| format!("./{}", name(LEVELS - 1, index)))
+            .collect();
+        std::fs::write(&root, serde_json::json!({ "extends": top }).to_string()).unwrap();
+
+        let order = FallowConfig::merge_order(&root).expect("lattice resolves");
+
+        let distinct: FxHashSet<&Option<PathBuf>> = order.iter().collect();
+        assert_eq!(distinct.len(), order.len(), "each source appears once");
+        assert_eq!(order.len(), LEVELS * WIDTH + 1);
+        assert_eq!(
+            order.last(),
+            Some(&Some(dunce::canonicalize(&root).unwrap())),
+            "the root config merges last"
+        );
     }
 
     // ------------------------------------------------------------------

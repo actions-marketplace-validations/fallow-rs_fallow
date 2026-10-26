@@ -217,6 +217,67 @@ fn full_pipeline_1000_files(c: &mut Criterion) {
     });
 }
 
+/// Modules and bindings of the multi-binding import fixture.
+const MULTI_BINDING_MODULES: usize = 100;
+const MULTI_BINDING_BINDINGS: usize = 6;
+
+/// A project whose entry imports several bindings from each module in one
+/// statement. The extractor keeps one import entry for each binding, so the
+/// resolve step sees `MULTI_BINDING_MODULES * MULTI_BINDING_BINDINGS`
+/// specifier requests for `MULTI_BINDING_MODULES` distinct specifiers.
+fn create_multi_binding_input() -> ConfigInput {
+    use std::fmt::Write as _;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("fallow-bench-multi-binding-")
+        .tempdir()
+        .unwrap();
+    let root = temp_dir.path().to_path_buf();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name": "bench-project", "main": "src/index.ts"}"#,
+    )
+    .unwrap();
+
+    let mut imports = Vec::with_capacity(MULTI_BINDING_MODULES);
+    let mut uses = Vec::with_capacity(MULTI_BINDING_MODULES);
+    for i in 0..MULTI_BINDING_MODULES {
+        let names: Vec<String> = (0..MULTI_BINDING_BINDINGS)
+            .map(|b| format!("value{i}_{b}"))
+            .collect();
+        let mut exports = String::new();
+        for (b, name) in names.iter().enumerate() {
+            let _ = writeln!(exports, "export const {name} = {b};");
+        }
+        std::fs::write(root.join(format!("src/module{i}.ts")), exports).unwrap();
+        imports.push(format!(
+            "import {{ {} }} from './module{i}';",
+            names.join(", ")
+        ));
+        uses.push(format!("console.log({});", names.join(", ")));
+    }
+    std::fs::write(
+        root.join("src/index.ts"),
+        format!("{}\n{}\n", imports.join("\n"), uses.join("\n")),
+    )
+    .unwrap();
+
+    ConfigInput {
+        _temp_dir: temp_dir,
+        config: helpers::create_test_config(root),
+    }
+}
+
+fn full_pipeline_multi_binding_imports(c: &mut Criterion) {
+    c.bench_function("full_pipeline_multi_binding_imports", |bencher| {
+        bencher.iter_batched_ref(
+            create_multi_binding_input,
+            |input| fallow_core::analyze(&input.config),
+            BatchSize::LargeInput,
+        );
+    });
+}
+
 struct ReExportInput {
     files: Vec<fallow_core::discover::DiscoveredFile>,
     resolved_modules: Vec<fallow_core::resolve::ResolvedModule>,
@@ -366,6 +427,7 @@ fn empty_resolved_module(
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     }
 }
 
@@ -410,6 +472,8 @@ fn create_namespace_re_export_input() -> ReExportInput {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             })
             .collect();
         push_file(target, path, module);
@@ -497,11 +561,11 @@ fn namespace_re_export_propagation(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_namespace_re_export_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -525,6 +589,8 @@ fn effective_export_info(name: &str, slot: u32) -> fallow_core::extract::ExportI
         members: vec![],
         is_side_effect_used: false,
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     }
 }
 
@@ -712,6 +778,8 @@ fn create_namespace_object_alias_input() -> ReExportInput {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             })
             .collect();
         push_file(target, path, module);
@@ -804,11 +872,11 @@ fn namespace_object_alias_propagation(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_namespace_object_alias_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -886,6 +954,7 @@ fn create_re_export_input() -> ReExportInput {
         exported_factory_returns: std::sync::Arc::default(),
         exported_factory_return_object_shapes: std::sync::Arc::default(),
         type_member_types: std::sync::Arc::default(),
+        missing_export_targets: vec![],
     });
 
     for b in 0..barrel_count {
@@ -969,6 +1038,7 @@ fn create_re_export_input() -> ReExportInput {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         });
     }
 
@@ -993,6 +1063,8 @@ fn create_re_export_input() -> ReExportInput {
                         members: vec![],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                     ExportInfo {
                         name: ExportName::Named(format!("fn{e}")),
@@ -1004,6 +1076,8 @@ fn create_re_export_input() -> ReExportInput {
                         members: vec![],
                         is_side_effect_used: false,
                         super_class: None,
+                        deprecated: false,
+                        deprecated_reason: None,
                     },
                 ]
             })
@@ -1029,6 +1103,7 @@ fn create_re_export_input() -> ReExportInput {
             exported_factory_returns: std::sync::Arc::default(),
             exported_factory_return_object_shapes: std::sync::Arc::default(),
             type_member_types: std::sync::Arc::default(),
+            missing_export_targets: vec![],
         });
     }
 
@@ -1049,11 +1124,11 @@ fn resolve_re_export_chains(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_re_export_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -1087,6 +1162,8 @@ fn create_reverse_re_export_chain_input(chain_length: u32) -> ReExportInput {
         members: Vec::new(),
         is_side_effect_used: false,
         super_class: None,
+        deprecated: false,
+        deprecated_reason: None,
     }]
     .into();
     resolved_modules.push(leaf);
@@ -1171,6 +1248,103 @@ fn reverse_re_export_chain(c: &mut Criterion) {
     group.finish();
 }
 
+const STAR_MONOREPO_MODULES_PER_PACKAGE: u32 = 8;
+const STAR_MONOREPO_EXPORTS_PER_MODULE: u32 = 8;
+
+/// A monorepo where each package barrel `export *`s its modules, a root
+/// barrel `export *`s every package barrel, and one entry imports a name
+/// from each package through the root barrel. The work must grow linearly
+/// with the package count; a superlinear ratio between sizes is the
+/// barrel-heavy regression this guards.
+fn create_star_barrel_monorepo_input(packages: u32) -> ReExportInput {
+    use fallow_core::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
+    use fallow_core::extract::{ImportInfo, ImportedName};
+    use fallow_core::resolve::{ResolveResult, ResolvedImport};
+
+    let mut files = Vec::new();
+    let mut resolved_modules = Vec::new();
+    let mut push_module = |path: String| {
+        let id = FileId(u32::try_from(files.len()).expect("fixture file count fits in u32"));
+        let path = PathBuf::from(path);
+        files.push(DiscoveredFile {
+            id,
+            path: path.clone(),
+            size_bytes: 100,
+        });
+        resolved_modules.push(empty_resolved_module(id, path));
+        id
+    };
+
+    let entry = push_module("/project/src/main.ts".to_string());
+    let root_barrel = push_module("/project/packages/index.ts".to_string());
+    let mut package_barrels = Vec::new();
+    let mut package_modules = Vec::new();
+    for package in 0..packages {
+        let barrel = push_module(format!("/project/packages/p{package}/src/index.ts"));
+        package_barrels.push(barrel);
+        for module in 0..STAR_MONOREPO_MODULES_PER_PACKAGE {
+            let id = push_module(format!("/project/packages/p{package}/src/m{module}.ts"));
+            package_modules.push((package, module, barrel, id));
+        }
+    }
+
+    for &(package, module, barrel, id) in &package_modules {
+        resolved_modules[id.0 as usize].exports = (0..STAR_MONOREPO_EXPORTS_PER_MODULE)
+            .map(|slot| effective_export_info(&format!("p{package}m{module}e{slot}"), slot))
+            .collect();
+        resolved_modules[barrel.0 as usize]
+            .re_exports
+            .push(star_re_export(id));
+    }
+    for &barrel in &package_barrels {
+        resolved_modules[root_barrel.0 as usize]
+            .re_exports
+            .push(star_re_export(barrel));
+    }
+    resolved_modules[entry.0 as usize].resolved_imports = (0..packages)
+        .map(|package| ResolvedImport {
+            info: ImportInfo {
+                source: "@project/packages".to_string(),
+                imported_name: ImportedName::Named(format!("p{package}m0e0")),
+                local_name: format!("p{package}m0e0"),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: oxc_span::Span::default(),
+                source_span: oxc_span::Span::default(),
+            },
+            target: ResolveResult::InternalModule(root_barrel),
+        })
+        .collect();
+
+    ReExportInput {
+        entry_points: vec![EntryPoint {
+            path: files[entry.0 as usize].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }],
+        files,
+        resolved_modules,
+    }
+}
+
+fn star_barrel_monorepo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("star_barrel_monorepo");
+    for packages in [8_u32, 32, 128] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(packages),
+            &packages,
+            |b, &packages| {
+                b.iter_batched_ref(
+                    || create_star_barrel_monorepo_input(packages),
+                    |input| std::hint::black_box(build_effective_export_graph(input)),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "benchmark with extensive fixture setup"
@@ -1200,6 +1374,7 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                     MemberInfo {
                         name: "listUsers".to_string(),
@@ -1209,6 +1384,7 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                     MemberInfo {
                         name: "baseUrl".to_string(),
@@ -1218,10 +1394,13 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                 ],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             ExportInfo {
                 name: ExportName::Named("Status".to_string()),
@@ -1239,6 +1418,7 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                     MemberInfo {
                         name: "Inactive".to_string(),
@@ -1248,6 +1428,7 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                     MemberInfo {
                         name: "Pending".to_string(),
@@ -1257,10 +1438,13 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                         decorator_names: Vec::new(),
                         is_instance_returning_static: false,
                         is_self_returning: false,
+                        override_base: None,
                     },
                 ],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             ExportInfo {
                 name: ExportName::Default,
@@ -1272,6 +1456,8 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             ExportInfo {
                 name: ExportName::Named("Props".to_string()),
@@ -1283,6 +1469,8 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
             ExportInfo {
                 name: ExportName::Named("formatName".to_string()),
@@ -1294,6 +1482,8 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
                 members: vec![],
                 is_side_effect_used: false,
                 super_class: None,
+                deprecated: false,
+                deprecated_reason: None,
             },
         ]
         .into(),
@@ -1385,6 +1575,7 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
             destructured_names: vec![],
             local_name: None,
             is_speculative: false,
+            value_escapes: false,
         }],
         require_calls: vec![RequireCallInfo {
             source: "fs".to_string(),
@@ -1395,6 +1586,9 @@ fn create_cache_round_trip_input() -> fallow_core::extract::ModuleInfo {
             is_type_only: false,
         }],
         package_path_references: Box::default(),
+        type_package_references: Box::default(),
+        bin_path_references: Box::default(),
+        package_resolve_sites: Box::default(),
         member_accesses: vec![
             MemberAccess {
                 object: "Status".to_string(),
@@ -1425,8 +1619,8 @@ fn cache_round_trip(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_cache_round_trip_input,
             |module| {
-                let cached = module_to_cached(module, SourceFingerprint::new(0, 0));
-                let _ = cached_to_module(&cached, FileId(0));
+                let cached = module_to_cached(module, SourceFingerprint::new(0, 0), false);
+                std::hint::black_box(cached_to_module(&cached, FileId(0)))
             },
             BatchSize::LargeInput,
         );
@@ -1435,10 +1629,12 @@ fn cache_round_trip(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    star_barrel_monorepo,
     parse_single_file,
     full_pipeline_10_files,
     full_pipeline_100_files,
     full_pipeline_1000_files,
+    full_pipeline_multi_binding_imports,
     named_re_export_stub_build_5000,
     named_re_export_stub_build_9,
     workspace_file_bucketing,

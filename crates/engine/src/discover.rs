@@ -73,18 +73,38 @@ const SCRIPT_MULTIPLEXERS: &[&str] = &[
 ];
 const BUN_RUNTIME_FLAGS: &[&str] = &["--bun", "--watch", "--hot", "--smol", "--no-clear-screen"];
 
-/// Discover workspace packages through the engine boundary.
+/// Discover workspace packages from the manifests only, through the engine
+/// boundary.
 ///
-/// Use this for callers that only need workspace metadata and do not yet own an
-/// `AnalysisSession`. Session-backed flows should prefer
+/// This reads no config, so it ignores the `workspaces.patterns` config key.
+/// A caller that has a resolved config uses
+/// [`discover_workspace_packages_with_patterns`] with
+/// `config.workspace_patterns`. Session-backed flows should prefer
 /// [`AnalysisSession::workspaces`](crate::session::AnalysisSession::workspaces)
 /// so discovery is reused with the rest of the analysis context.
+///
+/// The remaining callers run before any config exists (`fallow init`), or on
+/// paths that load no config today (`fallow coverage setup`, the base worktree
+/// context, and the `scope-workspaces` next step). A config load on these paths
+/// would add trust checks and warnings to commands that do not report them.
 #[must_use]
 pub fn discover_workspace_packages(root: &Path) -> Vec<WorkspaceInfo> {
     discover_workspaces(root)
 }
 
-/// Discover workspace packages and diagnostics through the engine boundary.
+/// Like [`discover_workspace_packages`], with the `workspaces.patterns` of the
+/// resolved config added to the manifest patterns.
+#[must_use]
+pub fn discover_workspace_packages_with_patterns(
+    root: &Path,
+    workspace_patterns: &[String],
+) -> Vec<WorkspaceInfo> {
+    fallow_config::discover_workspaces_with_patterns(root, workspace_patterns)
+}
+
+/// Discover workspace packages and diagnostics through the engine boundary,
+/// with the `workspaces.patterns` of the resolved config added to the manifest
+/// patterns.
 ///
 /// This is for CLI/API surfaces that need to render workspace diagnostics but
 /// do not otherwise need a full [`AnalysisSession`](crate::session::AnalysisSession).
@@ -92,12 +112,17 @@ pub fn discover_workspace_packages(root: &Path) -> Vec<WorkspaceInfo> {
 /// # Errors
 ///
 /// Returns an engine error when workspace manifest loading fails.
-pub fn discover_workspace_packages_with_diagnostics(
+pub fn discover_workspace_packages_for_config(
     root: &Path,
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &fallow_config::IgnorePatternSet,
+    workspace_patterns: &[String],
 ) -> EngineResult<(Vec<WorkspaceInfo>, Vec<WorkspaceDiagnostic>)> {
-    fallow_config::discover_workspaces_with_diagnostics(root, ignore_patterns)
-        .map_err(|err| EngineError::new(err.to_string()))
+    fallow_config::discover_workspaces_with_diagnostics_and_patterns(
+        root,
+        ignore_patterns,
+        workspace_patterns,
+    )
+    .map_err(|err| EngineError::new(err.to_string()))
 }
 
 /// How a [`HiddenDirScope`] matches a hidden directory during the walk.
@@ -231,10 +256,9 @@ impl AnalysisDiscovery {
 /// Run engine-owned workspace and source discovery for a resolved project.
 #[must_use]
 pub(crate) fn prepare_analysis_discovery(config: &ResolvedConfig) -> AnalysisDiscovery {
-    warn_missing_node_modules(config);
-
     let workspaces_start = Instant::now();
-    let workspaces = discover_workspaces(&config.root);
+    let workspaces =
+        fallow_config::discover_workspaces_with_patterns(&config.root, &config.workspace_patterns);
     let workspaces_ms = workspaces_start.elapsed().as_secs_f64() * 1000.0;
     if !workspaces.is_empty() {
         tracing::info!(count = workspaces.len(), "workspaces discovered");
@@ -268,8 +292,6 @@ pub(crate) fn prepare_analysis_discovery_with_workspaces(
     workspaces: &[WorkspaceInfo],
     workspaces_ms: f64,
 ) -> AnalysisDiscovery {
-    warn_missing_node_modules(config);
-
     if !workspaces.is_empty() {
         tracing::info!(count = workspaces.len(), "workspaces discovered");
     }
@@ -288,19 +310,6 @@ pub(crate) fn prepare_analysis_discovery_with_workspaces(
         discover_ms,
         workspaces_ms,
     )
-}
-
-fn warn_missing_node_modules(config: &ResolvedConfig) {
-    if config.root.join("node_modules").is_dir() {
-        return;
-    }
-    if fallow_config::is_deno_without_node_modules(&config.root) {
-        return;
-    }
-
-    tracing::warn!(
-        "node_modules directory not found. Run `npm install` / `pnpm install` first for accurate results."
-    );
 }
 
 fn format_undeclared_workspace_warning(
@@ -361,7 +370,7 @@ fn format_undeclared_workspace_warning(
 fn warn_undeclared_workspaces(
     root: &Path,
     workspaces: &[WorkspaceInfo],
-    ignore_patterns: &globset::GlobSet,
+    ignore_patterns: &fallow_config::IgnorePatternSet,
     quiet: bool,
 ) {
     let undeclared = find_undeclared_workspaces_with_ignores(root, workspaces, ignore_patterns);
@@ -890,23 +899,15 @@ pub(crate) fn discover_files_config_candidates_and_diagnostics(
     )
 }
 
-/// Discover configured and inferred entry points.
+/// Discover the configured and inferred entry points of the root package and
+/// of each workspace package.
 #[must_use]
 pub(crate) fn discover_entry_points(
     config: &ResolvedConfig,
     files: &[DiscoveredFile],
+    workspaces: &[WorkspaceInfo],
 ) -> Vec<EntryPoint> {
-    crate::core_backend::discover_entry_points(config, files)
-}
-
-/// Discover entry points for a workspace package.
-#[must_use]
-pub(crate) fn discover_workspace_entry_points(
-    ws_root: &Path,
-    config: &ResolvedConfig,
-    all_files: &[DiscoveredFile],
-) -> Vec<EntryPoint> {
-    crate::core_backend::discover_workspace_entry_points(ws_root, config, all_files)
+    crate::core_backend::discover_entry_points(config, files, workspaces)
 }
 
 /// Discover entry points from plugin results.

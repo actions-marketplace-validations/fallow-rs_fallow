@@ -1,32 +1,25 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 
-import { version as typescriptVersion } from "typescript";
-
+import { BACKEND } from "./backend.mjs";
 import {
   ANALYSIS_OPERATION,
-  BACKEND_FAMILY,
-  BACKEND_VERSION,
+  MUTANT_TYPECHECK_OPERATION,
   QUERY_OPERATIONS as MANIFEST_QUERY_OPERATIONS,
   WIRE_PROTOCOL_VERSION,
 } from "./generated-protocol.mjs";
+import { canonicalFileIdentity } from "./file-identity.mjs";
 import { normalizePhaseTimings, normalizeSemanticResult } from "./response-normalization.mjs";
 
 const require = createRequire(import.meta.url);
 const { version: SIDECAR_VERSION } = require("../package.json");
 const QUERY_OPERATIONS = new Set(MANIFEST_QUERY_OPERATIONS);
 
-if (typescriptVersion !== BACKEND_VERSION) {
-  throw new Error(
-    `typescript backend version ${typescriptVersion} does not match protocol ${BACKEND_VERSION}`,
-  );
-}
-
 export const createStatusResponse = () => ({
   package_version: SIDECAR_VERSION,
   protocol_version: WIRE_PROTOCOL_VERSION,
-  backend_family: BACKEND_FAMILY,
-  backend_version: BACKEND_VERSION,
+  backend_family: BACKEND.family,
+  backend_version: BACKEND.version,
 });
 
 const BATCH_REQUEST_KEYS = new Set([
@@ -54,7 +47,13 @@ const API_SURFACE_QUERY_KEYS = new Set([
   "include_cycles",
   "private_leak_candidates",
 ]);
-const TYPE_COUPLING_QUERY_KEYS = new Set(["id", "operation", "entry_points", "include_cycles"]);
+const TYPE_COUPLING_QUERY_KEYS = new Set([
+  "id",
+  "operation",
+  "entry_points",
+  "include_cycles",
+  "evidence_limit",
+]);
 const PRIVATE_LEAK_CANDIDATE_KEYS = new Set(["id", "path", "export_name", "type_name"]);
 const SYMBOL_KEYS = new Set([
   "path",
@@ -75,6 +74,10 @@ const MAX_QUERIES = 25_000;
 const MAX_GRAPH_QUERIES = 256;
 const MAX_PRIVATE_LEAK_CANDIDATES = 25_000;
 const MAX_EVIDENCE_PER_RESULT = 40;
+// A type-coupling result is one project-wide report, so it can carry more
+// evidence than a per-symbol result. This bound keeps the response well below
+// the native client's semantic response byte limit.
+const MAX_TYPE_COUPLING_EVIDENCE = 10_000;
 const MAX_STRING_CHARS = 4_096;
 
 const isObject = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -255,13 +258,31 @@ const parseFrameworkContracts = (value, field) =>
 const parseIncludeCycles = (value, field) =>
   value === undefined ? false : requireBoolean(value, field);
 
+const parseTypeCouplingEvidenceLimit = (value, field) => {
+  const limit = requireInteger(value, field, 1);
+  if (limit > MAX_TYPE_COUPLING_EVIDENCE) {
+    throw new Error(`${field} exceeds the ${MAX_TYPE_COUPLING_EVIDENCE} item limit`);
+  }
+  return limit;
+};
+
 const parseGraphQuery = (value, field, root, query) => {
   const graphQuery = {
     ...query,
     entryPoints: parseEntryPoints(value.entry_points, `${field}.entry_points`, root),
     includeCycles: parseIncludeCycles(value.include_cycles, `${field}.include_cycles`),
   };
-  if (query.operation !== "api-surface") return graphQuery;
+  if (query.operation === "type-coupling") {
+    return value.evidence_limit === undefined
+      ? graphQuery
+      : {
+          ...graphQuery,
+          evidenceLimit: parseTypeCouplingEvidenceLimit(
+            value.evidence_limit,
+            `${field}.evidence_limit`,
+          ),
+        };
+  }
   return {
     ...graphQuery,
     privateLeakCandidates: parsePrivateLeakCandidates(
@@ -372,11 +393,78 @@ const parseBatchRequest = (value) => {
   validateGraphQueryCount(queries);
   requireUniqueCandidateIds(queries);
   const evidenceLimit = parseEvidenceLimit(value.evidence_limit);
-  return { protocolVersion: WIRE_PROTOCOL_VERSION, root, projects, queries, evidenceLimit };
+  return { root, projects, queries, evidenceLimit };
+};
+
+const MUTANT_TYPECHECK_REQUEST_KEYS = new Set(["protocol_version", "operation", "root", "files"]);
+const MUTANT_FILE_KEYS = new Set(["path", "source_sha256", "mutants"]);
+const MUTANT_KEYS = new Set(["id", "start", "end", "replacement"]);
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
+const MAX_MUTANTS = 25_000;
+const MAX_MUTANT_ID_CHARS = 64;
+
+const requireText = (value, field) => {
+  if (typeof value !== "string") throw new Error(`${field} must be a string`);
+  if ([...value].length > MAX_STRING_CHARS) {
+    throw new Error(`${field} exceeds the ${MAX_STRING_CHARS} character limit`);
+  }
+  return value;
+};
+
+const parseMutant = (value, field, ids) => {
+  requireObject(value, field);
+  requireExactKeys(value, MUTANT_KEYS, field);
+  const id = requireString(value.id, `${field}.id`);
+  if (id.length > MAX_MUTANT_ID_CHARS) {
+    throw new Error(`${field}.id exceeds the ${MAX_MUTANT_ID_CHARS} character limit`);
+  }
+  if (ids.has(id)) throw new Error(`duplicate mutant id ${id}`);
+  ids.add(id);
+  const start = requireInteger(value.start, `${field}.start`, 0);
+  const end = requireInteger(value.end, `${field}.end`, start);
+  return { id, start, end, replacement: requireText(value.replacement, `${field}.replacement`) };
+};
+
+const parseMutantFile = (value, field, root, ids) => {
+  requireObject(value, field);
+  requireExactKeys(value, MUTANT_FILE_KEYS, field);
+  const { candidatePath, absolutePath } = parseCandidatePath(value.path, `${field}.path`, root);
+  const sourceSha256 =
+    value.source_sha256 === undefined
+      ? null
+      : requireString(value.source_sha256, `${field}.source_sha256`);
+  if (sourceSha256 !== null && !SHA256_HEX.test(sourceSha256)) {
+    throw new Error(`${field}.source_sha256 must be a lowercase SHA-256 hex digest`);
+  }
+  return {
+    path: candidatePath,
+    absolutePath: canonicalFileIdentity(absolutePath),
+    sourceSha256,
+    mutants: requireBoundedArray(value.mutants, `${field}.mutants`, MAX_MUTANTS).map(
+      (mutant, index) => parseMutant(mutant, `${field}.mutants[${index}]`, ids),
+    ),
+  };
+};
+
+const parseMutantTypecheckRequest = (value) => {
+  requireExactKeys(value, MUTANT_TYPECHECK_REQUEST_KEYS, "request");
+  const root = parseRoot(value.root);
+  const ids = new Set();
+  const files = requireBoundedArray(value.files, "files", MAX_MUTANTS).map((file, index) =>
+    parseMutantFile(file, `files[${index}]`, root, ids),
+  );
+  if (ids.size > MAX_MUTANTS) throw new Error(`mutants exceed the ${MAX_MUTANTS} item limit`);
+  return { operation: MUTANT_TYPECHECK_OPERATION, root, files };
 };
 
 export const parseRequest = (value) => {
   requireObject(value, "request");
+  if (
+    value.protocol_version === WIRE_PROTOCOL_VERSION &&
+    value.operation === MUTANT_TYPECHECK_OPERATION
+  ) {
+    return parseMutantTypecheckRequest(value);
+  }
   if (value.protocol_version === WIRE_PROTOCOL_VERSION) {
     return parseBatchRequest(value);
   }
@@ -394,8 +482,8 @@ export const createSemanticResponse = ({
   protocol_version: WIRE_PROTOCOL_VERSION,
   operation: ANALYSIS_OPERATION,
   sidecar_version: SIDECAR_VERSION,
-  backend: BACKEND_FAMILY,
-  backend_version: BACKEND_VERSION,
+  backend: BACKEND.family,
+  backend_version: BACKEND.version,
   selected_tsconfigs: [...selectedTsconfigs].toSorted(compareText),
   projects: [...projectResults].toSorted((left, right) => compareText(left.config, right.config)),
   results: [...results]
@@ -403,5 +491,15 @@ export const createSemanticResponse = ({
     .toSorted((left, right) => left.query_id - right.query_id),
   phase_timings_ms: normalizePhaseTimings(phaseTimings),
   warnings: normalizeWarnings(warnings),
+  elapsed_ms: Math.max(0, Math.round(elapsedMs)),
+});
+
+export const createMutantTypecheckResponse = ({ results, elapsedMs }) => ({
+  protocol_version: WIRE_PROTOCOL_VERSION,
+  operation: MUTANT_TYPECHECK_OPERATION,
+  sidecar_version: SIDECAR_VERSION,
+  backend: BACKEND.family,
+  backend_version: BACKEND.version,
+  results,
   elapsed_ms: Math.max(0, Math.round(elapsedMs)),
 });

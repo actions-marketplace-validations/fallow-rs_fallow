@@ -10,7 +10,7 @@ use fallow_api::{
     EditorAnalysisResults as AnalysisResults, EditorDuplicationReport as DuplicationReport,
 };
 
-use super::doc_link_for_code;
+use super::{doc_link_for_code, finding_data};
 use crate::position::PositionMapper;
 
 pub fn push_duplicate_export_diagnostics(
@@ -18,10 +18,16 @@ pub fn push_duplicate_export_diagnostics(
     results: &AnalysisResults,
     mapper: &mut PositionMapper,
 ) {
-    for dup in &results.duplicate_exports {
-        let dup = &dup.export;
+    for finding in &results.duplicate_exports {
+        let dup = &finding.export;
         for loc in &dup.locations {
-            push_duplicate_export_location_diagnostic(map, dup, loc, mapper);
+            push_duplicate_export_location_diagnostic(
+                map,
+                dup,
+                loc,
+                finding.finding_id.as_deref(),
+                mapper,
+            );
         }
     }
 }
@@ -30,6 +36,7 @@ fn push_duplicate_export_location_diagnostic(
     map: &mut FxHashMap<Uri, Vec<Diagnostic>>,
     dup: &DuplicateExport,
     loc: &DuplicateLocation,
+    finding_id: Option<&str>,
     mapper: &mut PositionMapper,
 ) {
     let Some(uri) = Uri::from_file_path(&loc.path) else {
@@ -55,6 +62,7 @@ fn push_duplicate_export_location_diagnostic(
         code_description: doc_link_for_code("duplicate-export"),
         message: format!("Duplicate export '{}'", dup.export_name),
         related_information: (!related_info.is_empty()).then_some(related_info),
+        data: finding_data(finding_id),
         ..Default::default()
     });
 }
@@ -139,7 +147,7 @@ fn push_duplication_instance_diagnostic(
         severity: Some(DiagnosticSeverity::INFORMATION),
         source: Some("fallow".to_string()),
         code: Some(NumberOrString::String("code-duplication".to_string())),
-        code_description: "https://docs.fallow.tools/explanations/duplication"
+        code_description: "https://fallow.tools/docs/explanations/duplication/"
             .parse::<Uri>()
             .ok()
             .map(|href| CodeDescription { href }),
@@ -233,6 +241,7 @@ pub fn push_stale_suppression_diagnostics(
             code_description: doc_link_for_code("stale-suppression"),
             message,
             tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+            data: finding_data(s.finding_id.as_deref()),
             ..Default::default()
         });
     }
@@ -274,6 +283,7 @@ mod tests {
                 total_tokens: 0,
                 duplicated_tokens: 0,
                 clone_groups: 0,
+                clone_families: 0,
                 clone_instances: 0,
                 duplication_percentage: 0.0,
                 clone_groups_below_min_occurrences: 0,
@@ -346,6 +356,7 @@ mod tests {
             clone_groups: vec![CloneGroup {
                 instances: vec![
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/a.ts"),
                         start_line: 10,
                         end_line: 15,
@@ -354,6 +365,7 @@ mod tests {
                         fragment: "duplicated code".to_string(),
                     },
                     CloneInstance {
+                        is_symlink: false,
                         file: root.join("src/b.ts"),
                         start_line: 20,
                         end_line: 25,
@@ -376,6 +388,7 @@ mod tests {
                 total_tokens: 500,
                 duplicated_tokens: 100,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 2,
                 duplication_percentage: 12.0,
                 clone_groups_below_min_occurrences: 0,
@@ -422,6 +435,7 @@ mod tests {
         let duplication = DuplicationReport {
             clone_groups: vec![CloneGroup {
                 instances: vec![CloneInstance {
+                    is_symlink: false,
                     file: root.join("src/only.ts"),
                     start_line: 1,
                     end_line: 5,
@@ -443,6 +457,7 @@ mod tests {
                 total_tokens: 100,
                 duplicated_tokens: 20,
                 clone_groups: 1,
+                clone_families: 0,
                 clone_instances: 1,
                 duplication_percentage: 25.0,
                 clone_groups_below_min_occurrences: 0,
@@ -499,6 +514,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_types
@@ -510,6 +527,8 @@ mod tests {
                 col: 0,
                 span_start: 0,
                 is_re_export: false,
+                deprecated: false,
+                deprecated_reason: None,
             }));
         results
             .unused_files
@@ -543,7 +562,7 @@ mod tests {
             );
             let href = &d.code_description.as_ref().unwrap().href;
             assert!(
-                href.as_str().starts_with("https://docs.fallow.tools/"),
+                href.as_str().starts_with("https://fallow.tools/docs/"),
                 "Doc link should point to fallow docs: {href:?}"
             );
         }

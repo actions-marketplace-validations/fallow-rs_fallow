@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { cargoFallowBin } from "./cargo-target.mjs";
 import { runCliMain } from "./cli-main.mjs";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_MANIFEST = "scripts/public-smoke-projects.json";
 const DEFAULT_OUT_DIR = "target/public-smoke-conformance";
@@ -111,9 +113,12 @@ const findFallowBin = (explicit) => {
   if (explicit) {
     return explicit;
   }
-  for (const candidate of ["target/release/fallow", "target/debug/fallow"]) {
+  for (const candidate of [
+    cargoFallowBin(process.cwd(), "release"),
+    cargoFallowBin(process.cwd()),
+  ]) {
     if (existsSync(candidate)) {
-      return resolve(candidate);
+      return candidate;
     }
   }
   return "fallow";
@@ -274,6 +279,18 @@ export const runPublicSmoke = (options) => {
   };
 };
 
+// A run where every project is skipped compared nothing, so it must not read
+// as a pass.
+const reportStatus = (summary) => {
+  if (summary.failed > 0) {
+    return { label: "fail", exitCode: 1 };
+  }
+  if (summary.passed === 0) {
+    return { label: "no project ran", exitCode: 2 };
+  }
+  return { label: "pass", exitCode: 0 };
+};
+
 const markdownProjectRow = (project) =>
   [
     project.id,
@@ -289,7 +306,7 @@ const renderMarkdown = (report) => {
   return [
     "# Public Smoke Conformance",
     "",
-    `Status: ${report.summary.failed === 0 ? "pass" : "fail"}`,
+    `Status: ${reportStatus(report.summary).label}`,
     "",
     "| Project | Category | Status | Kind | Issues | Note |",
     "| --- | --- | --- | --- | ---: | --- |",
@@ -313,9 +330,13 @@ export const main = (argv = process.argv.slice(2)) => {
     `public smoke: ${report.summary.passed} passed, ${report.summary.failed} failed, ${report.summary.skipped} skipped`,
   );
   console.log(`artifacts: ${options.outDir}`);
-  return report.summary.failed === 0 ? 0 : 1;
+  const status = reportStatus(report.summary);
+  if (status.exitCode === 2) {
+    console.error("public smoke: no project ran; pass --clone, --root-dir, or --project id=/path");
+  }
+  return status.exitCode;
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runCliMain(main);
 }

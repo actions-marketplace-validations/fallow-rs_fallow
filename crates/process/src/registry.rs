@@ -10,7 +10,7 @@
 //! a dedicated process tree so signal cleanup also terminates descendants.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
@@ -64,6 +64,14 @@ pub fn deregister(id: u64) {
         .remove(&id);
 }
 
+#[cfg(test)]
+pub fn is_registered(id: u64) -> bool {
+    registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(&id)
+}
+
 /// Snapshot every registered PID and kill each. Polls for liveness
 /// with a bounded budget. Caller is the platform signal handler thread.
 ///
@@ -71,23 +79,45 @@ pub fn deregister(id: u64) {
 /// during the same shutdown skip the body to avoid re-entering the
 /// lock under signal storm.
 pub fn drain_and_kill() {
-    if DRAINING
-        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !begin_drain() {
         return;
     }
+    let targets: Vec<KillTarget> = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .map(|(_id, target)| target)
+        .collect();
+    kill_and_wait(&targets);
+}
 
-    let targets: Vec<KillTarget> = {
-        registry()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain()
-            .map(|(_id, target)| target)
-            .collect()
+/// Like [`drain_and_kill`], but returns at once when another thread holds
+/// the registry lock. A panic hook calls this: a blocking lock would
+/// deadlock when the panicking thread itself holds the lock.
+pub fn try_drain_and_kill() {
+    let targets: Vec<KillTarget> = match registry().try_lock() {
+        Ok(mut guard) => drain_targets(&mut guard),
+        Err(TryLockError::Poisoned(error)) => drain_targets(&mut error.into_inner()),
+        Err(TryLockError::WouldBlock) => return,
     };
+    kill_and_wait(&targets);
+}
 
-    for target in &targets {
+fn drain_targets(registry: &mut FxHashMap<u64, KillTarget>) -> Vec<KillTarget> {
+    if !begin_drain() {
+        return Vec::new();
+    }
+    registry.drain().map(|(_id, target)| target).collect()
+}
+
+fn begin_drain() -> bool {
+    DRAINING
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn kill_and_wait(targets: &[KillTarget]) {
+    for target in targets {
         kill_target(target);
     }
 
@@ -133,24 +163,27 @@ pub fn kill_pid(pid: u32) {
 pub fn kill_pid(pid: u32) {
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-    // SAFETY: OpenProcess returns null on failure (which we check),
-    // TerminateProcess with exit code 1 is a no-op if the handle is
-    // null. CloseHandle on a valid handle is well-defined.
-    unsafe {
-        let handle: HANDLE = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if handle.is_null() {
-            return;
-        }
-        let _ = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
+    // SAFETY: OpenProcess takes plain values and returns null on failure.
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
+    if handle.is_null() {
+        return;
     }
+    // SAFETY: `handle` is a valid process handle opened with PROCESS_TERMINATE.
+    let _ = unsafe { TerminateProcess(handle, 1) };
+    // SAFETY: `handle` is valid and this is its only close.
+    let _ = unsafe { CloseHandle(handle) };
 }
 
 #[cfg(not(any(unix, windows)))]
 pub fn kill_pid(_pid: u32) {}
 
+/// Whether `pid` is still running. On Linux a zombie counts as exited.
 #[cfg(unix)]
 pub fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(running) = crate::proc_state::process_is_running(pid) {
+        return running;
+    }
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())
@@ -169,16 +202,16 @@ pub fn pid_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
-    // SAFETY: identical safety contract as kill_pid.
-    unsafe {
-        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if handle.is_null() {
-            return false;
-        }
-        let result = WaitForSingleObject(handle, 0);
-        let _ = CloseHandle(handle);
-        result != WAIT_OBJECT_0
+    // SAFETY: OpenProcess takes plain values and returns null on failure.
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle.is_null() {
+        return false;
     }
+    // SAFETY: `handle` is a valid process handle; a zero timeout only polls.
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: `handle` is valid and this is its only close.
+    let _ = unsafe { CloseHandle(handle) };
+    result != WAIT_OBJECT_0
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -216,8 +249,27 @@ mod tests {
     fn register_deregister_roundtrip() {
         let id = register(42);
         assert!(id > 0);
+        assert!(is_registered(id));
         deregister(id);
+        assert!(!is_registered(id));
         deregister(id);
+        assert!(!is_registered(id));
+    }
+
+    /// A panic on a thread that holds the registry lock must not deadlock
+    /// the panic hook. The hook then skips the cleanup.
+    #[test]
+    fn try_drain_returns_while_the_lock_is_held() {
+        let id = register(42);
+        let guard = registry().lock().unwrap_or_else(|error| error.into_inner());
+        try_drain_and_kill();
+        let still_registered = guard.contains_key(&id);
+        drop(guard);
+        deregister(id);
+        assert!(
+            still_registered,
+            "a held lock must leave the registry as is"
+        );
     }
 
     #[cfg(unix)]
@@ -281,6 +333,57 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!pid_is_alive(child_pid), "descendant survived tree cleanup");
+    }
+
+    /// Poll `alive` for a bounded time and return its last answer.
+    #[cfg(target_os = "linux")]
+    fn still_alive_after_grace(alive: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        alive()
+    }
+
+    // The drain loop must not wait for a killed child that nobody has reaped
+    // yet: a zombie has already exited.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killed_unreaped_process_target_is_not_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let target = KillTarget::Process(child.id());
+        assert!(target_is_alive(&target), "running target counts as exited");
+
+        kill_target(&target);
+        let alive = still_alive_after_grace(|| target_is_alive(&target));
+        let _ = child.wait();
+
+        assert!(!alive, "killed and unreaped child still counts as alive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killed_unreaped_process_tree_target_is_not_alive() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        crate::process_tree::configure_std_command(&mut command);
+        let mut leader = command.spawn().expect("spawn process tree");
+        let target = KillTarget::ProcessTree(Arc::new(
+            ProcessTree::for_std_child(&leader).expect("own process tree"),
+        ));
+        assert!(target_is_alive(&target), "running target counts as exited");
+
+        kill_target(&target);
+        let alive = still_alive_after_grace(|| target_is_alive(&target));
+        let _ = leader.wait();
+
+        assert!(
+            !alive,
+            "killed and unreaped process tree still counts as alive"
+        );
     }
 
     #[test]

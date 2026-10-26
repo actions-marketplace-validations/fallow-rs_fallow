@@ -11,7 +11,27 @@ use serde_json::Value;
 use fallow_types::discover::FileId;
 
 use super::path_info::{extract_package_name, is_bare_specifier, is_valid_package_name};
-use super::types::{OUTPUT_DIRS, PackageManifestInfo, ResolveContext, ResolveResult, SOURCE_EXTS};
+use super::types::{
+    MISSING_ONLY_OUTPUT_DIRS, OUTPUT_DIRS, PackageManifestInfo, ResolveContext, ResolveResult,
+    SOURCE_EXTS,
+};
+
+#[path = "fallbacks_relative_package_root.rs"]
+mod relative_package_root;
+#[path = "fallbacks_scss_paths.rs"]
+mod scss_paths;
+#[path = "fallbacks_tsconfig_output.rs"]
+mod tsconfig_output;
+#[path = "fallbacks_workspace_package_asset.rs"]
+mod workspace_package_asset;
+
+pub(super) use relative_package_root::try_relative_package_root_source_fallback;
+use scss_paths::{find_scss_through_path_alias, lookup_scss_path};
+use tsconfig_output::try_tsconfig_output_source;
+pub(super) use tsconfig_output::{
+    try_canonical_source_fallbacks, try_relative_tsconfig_output_fallback,
+};
+use workspace_package_asset::{exports_target_asset, workspace_package_asset};
 
 /// Return the post-prefix remainder when `specifier` matches the alias `prefix`
 /// at a path boundary, else `None`.
@@ -36,6 +56,7 @@ fn alias_match_remainder<'a>(specifier: &'a str, prefix: &str) -> Option<&'a str
 pub(super) fn try_path_alias_fallback(
     ctx: &ResolveContext<'_>,
     specifier: &str,
+    style_context: bool,
 ) -> Option<ResolveResult> {
     for (prefix, replacement) in ctx.path_aliases {
         let Some(remainder) = alias_match_remainder(specifier, prefix) else {
@@ -48,7 +69,12 @@ pub(super) fn try_path_alias_fallback(
             (false, false) => format!("./{replacement}/{remainder}"),
         };
 
-        if let Ok(resolved) = ctx.resolver.resolve(ctx.root, &substituted) {
+        if let Ok(resolved) = super::specifier::resolve_with_extension_policy(
+            ctx,
+            ctx.root,
+            &substituted,
+            style_context,
+        ) {
             let resolved_path = resolved.path();
             if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
                 return Some(ResolveResult::InternalModule(file_id));
@@ -165,6 +191,7 @@ fn try_resolve_scss(
     from_file: &Path,
     specifier: &str,
 ) -> Option<ResolveResult> {
+    super::work::note_oxc_resolve();
     let resolved = ctx.resolver.resolve_file(from_file, specifier).ok()?;
     let resolved_path = resolved.path();
 
@@ -204,7 +231,7 @@ pub(super) fn try_scss_include_path_fallback(
     specifier: &str,
     from_style: bool,
 ) -> Option<ResolveResult> {
-    if ctx.scss_include_paths.is_empty() {
+    if ctx.scss_include_paths.is_empty() && ctx.path_aliases.is_empty() {
         return None;
     }
     let is_scss_importer = from_file
@@ -226,7 +253,7 @@ pub(super) fn try_scss_include_path_fallback(
             return Some(ResolveResult::InternalModule(file_id));
         }
     }
-    None
+    find_scss_through_path_alias(ctx, bare).map(ResolveResult::InternalModule)
 }
 
 /// Probe an SCSS include directory for a bare specifier, applying the standard
@@ -287,25 +314,6 @@ fn find_scss_in_dir(include_dir: &Path, bare: &str, ctx: &ResolveContext<'_>) ->
         let idx_plain = build(bare_path).join(format!("index{suffix}"));
         if let Some(fid) = lookup_scss_path(&idx_plain, ctx) {
             return Some(fid);
-        }
-    }
-    None
-}
-
-/// Look up an absolute candidate path in the file index, falling back to
-/// canonical path lookup for intra-project symlinks.
-fn lookup_scss_path(candidate: &Path, ctx: &ResolveContext<'_>) -> Option<FileId> {
-    if let Some(&file_id) = ctx.raw_path_to_id.get(candidate) {
-        return Some(file_id);
-    }
-    if let Some(canonical) = ctx.canonicalize_cache.get(candidate) {
-        if let Some(&file_id) = ctx.path_to_id.get(canonical.as_path()) {
-            return Some(file_id);
-        }
-        if let Some(fallback) = ctx.canonical_fallback
-            && let Some(file_id) = fallback.get(&canonical)
-        {
-            return Some(file_id);
         }
     }
     None
@@ -432,13 +440,45 @@ pub(super) fn try_source_fallback(
     resolved: &Path,
     path_to_id: &FxHashMap<&Path, FileId>,
 ) -> Option<FileId> {
-    let components: Vec<_> = resolved.components().collect();
+    try_source_fallback_with(Path::new(""), resolved, path_to_id, &[OUTPUT_DIRS])
+}
+
+/// Map a package manifest target below `lib/` to `src/`.
+///
+/// Callers run this only after the target is absent from the file set and
+/// after [`try_source_fallback`] found no match. `lib` (from
+/// `MISSING_ONLY_OUTPUT_DIRS`) applies only to the path below `package_root`,
+/// so a package directory named `lib` does not change the result. Generic
+/// relative imports never use this function.
+fn try_missing_only_source_fallback(
+    package_root: &Path,
+    resolved: &Path,
+    path_to_id: &FxHashMap<&Path, FileId>,
+) -> Option<FileId> {
+    let relative = resolved.strip_prefix(package_root).ok()?;
+    try_source_fallback_with(
+        package_root,
+        relative,
+        path_to_id,
+        &[OUTPUT_DIRS, MISSING_ONLY_OUTPUT_DIRS],
+    )
+}
+
+/// Map the last output directory component of `relative` (any name in
+/// `dir_lists`) to `src/`, and look up the result below `base` in `path_to_id`.
+fn try_source_fallback_with(
+    base: &Path,
+    relative: &Path,
+    path_to_id: &FxHashMap<&Path, FileId>,
+    dir_lists: &[&[&str]],
+) -> Option<FileId> {
+    let components: Vec<_> = relative.components().collect();
 
     let is_output_dir = |c: &std::path::Component| -> bool {
         if let std::path::Component::Normal(s) = c
             && let Some(name) = s.to_str()
         {
-            return OUTPUT_DIRS.contains(&name);
+            return dir_lists.iter().any(|dirs| dirs.contains(&name));
         }
         false
     };
@@ -450,19 +490,66 @@ pub(super) fn try_source_fallback(
         first_output_pos -= 1;
     }
 
-    let prefix: PathBuf = components[..first_output_pos].iter().collect();
+    let relative_prefix: PathBuf = components[..first_output_pos].iter().collect();
+    let prefix = if base.as_os_str().is_empty() {
+        relative_prefix
+    } else {
+        base.join(relative_prefix)
+    };
 
     let suffix: PathBuf = components[last_output_pos + 1..].iter().collect();
-    suffix.file_stem()?; // Ensure the suffix has a filename
+    let file_name = suffix.file_name()?.to_str()?;
+    let stem = output_source_stem(file_name);
+    let source_dir = match suffix.parent() {
+        Some(parent) => prefix.join("src").join(parent),
+        None => prefix.join("src"),
+    };
 
     for ext in SOURCE_EXTS {
-        let source_candidate = prefix.join("src").join(suffix.with_extension(ext));
+        let source_candidate = source_dir.join(format!("{stem}.{ext}"));
         if let Some(&file_id) = path_to_id.get(source_candidate.as_path()) {
             return Some(file_id);
         }
     }
 
+    // A package can copy a hand-written declaration file from `src/` to the
+    // output directory unchanged.
+    if is_declaration_file_name(file_name) {
+        return path_to_id
+            .get(source_dir.join(file_name).as_path())
+            .copied();
+    }
+
     None
+}
+
+/// Declaration suffixes that build tools emit next to the output files.
+const DECLARATION_SUFFIXES: &[&str] = &[".d.ts", ".d.mts", ".d.cts"];
+
+fn declaration_stem(file_name: &str) -> Option<&str> {
+    DECLARATION_SUFFIXES
+        .iter()
+        .find_map(|suffix| file_name.strip_suffix(suffix))
+        .filter(|stem| !stem.is_empty())
+}
+
+pub(super) fn is_declaration_file_name(file_name: &str) -> bool {
+    declaration_stem(file_name).is_some()
+}
+
+/// Return the source stem of a build output file name.
+///
+/// The stem keeps every dot in the base name. `feature.port.d.ts` and
+/// `feature.port.js` both give `feature.port`. `Path::with_extension` removes
+/// only the last extension, so it keeps `.d` in a declaration file name.
+pub(super) fn output_source_stem(file_name: &str) -> &str {
+    if let Some(stem) = declaration_stem(file_name) {
+        return stem;
+    }
+    match file_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => file_name,
+    }
 }
 
 /// Try to resolve a package `imports` entry from the nearest owning package.
@@ -502,36 +589,74 @@ pub(super) fn try_package_imports_fallback(
     )
 }
 
-/// Resolve a relative import that lands on a known package root whose built
-/// entry points are absent but whose package metadata points at source files.
-pub(super) fn try_relative_package_root_source_fallback(
+/// Return the workspace package that a package `imports` alias reached.
+///
+/// An alias such as `"#lib/*": "@acme/lib/*"` can resolve through the install
+/// symlink straight to the workspace source file. The file edge is correct, but
+/// the dependency on `@acme/lib` must still receive usage credit, the same as a
+/// direct `@acme/lib/...` import.
+///
+/// Only the package that owns `resolved_file` can receive the credit, and only
+/// when an alias target names it. Node.js resolves a fallback array such as
+/// `["./src/x.ts", "@acme/lib/x"]` to the local file, so `@acme/lib` receives
+/// no credit for it. A target that names a package outside the known package
+/// manifests also returns `None`.
+pub(super) fn package_imports_workspace_target(
     ctx: &ResolveContext<'_>,
     from_file: &Path,
     specifier: &str,
-) -> Option<ResolveResult> {
-    if !specifier.starts_with("./") && !specifier.starts_with("../") {
+    resolved_file: &Path,
+) -> Option<String> {
+    if !specifier.starts_with('#') {
         return None;
     }
+    let manifest = nearest_package_manifest(ctx.package_manifests, from_file)?;
+    let imports = manifest.package_json.imports.as_ref()?;
+    let PackageMapTarget::Targets(targets) =
+        package_map_target(imports, specifier, ctx.condition_names)
+    else {
+        return None;
+    };
+    let owner = nearest_package_manifest(ctx.package_manifests, resolved_file)?
+        .name
+        .as_deref()?;
+    targets
+        .iter()
+        .filter(|target| !target.starts_with('#'))
+        .filter_map(|target| package_import_external_target(target))
+        .find(|package_name| package_name == owner)
+}
 
-    let from_dir = from_file.parent()?;
-    let candidate = from_dir.join(specifier);
-    let normalized_candidate = normalize_path_lexically(&candidate);
-    #[cfg(not(miri))]
-    let canonical_candidate = ctx.canonicalize_cache.get(&candidate);
-    #[cfg(miri)]
-    let canonical_candidate: Option<PathBuf> = None;
-
-    ctx.package_manifests.iter().find_map(|manifest| {
-        let matches_manifest = candidate == manifest.root
-            || normalized_candidate == manifest.root
-            || canonical_candidate
-                .as_deref()
-                .is_some_and(|canonical| canonical == manifest.canonical_root);
-        matches_manifest
-            .then(|| try_source_subpath(ctx, manifest, Path::new("")))
-            .flatten()
-            .map(ResolveResult::InternalModule)
-    })
+/// Return the workspace package that a direct bare import reached through its
+/// install link.
+///
+/// npm, yarn and pnpm link a workspace package into `node_modules`, so an
+/// import such as `@acme/lib/x` resolves to the source file of the package.
+/// Node.js uses the first `node_modules/@acme/lib` in the ancestor directories
+/// of the importing file. The package receives the credit only when that link
+/// points at the workspace package root and the resolved file is inside it. An
+/// import that only a tsconfig `paths` alias or a bundler alias resolves has no
+/// such link, so it keeps its plain internal edge.
+pub(super) fn installed_workspace_package_target(
+    ctx: &ResolveContext<'_>,
+    from_file: &Path,
+    specifier: &str,
+    resolved_file: &Path,
+) -> Option<String> {
+    let name = super::package_credit::package_usage_name_for_external_bare_specifier(specifier)?;
+    let workspace_root = *ctx.workspace_roots.get(name.as_str())?;
+    let resolved = ctx
+        .canonicalize_cache
+        .get(resolved_file)
+        .unwrap_or_else(|| resolved_file.to_path_buf());
+    if !resolved.starts_with(workspace_root) {
+        return None;
+    }
+    let installed = from_file.ancestors().skip(1).find_map(|dir| {
+        ctx.canonicalize_cache
+            .get(&dir.join("node_modules").join(&name))
+    })?;
+    (installed == workspace_root).then_some(name)
 }
 
 pub(super) fn normalize_path_lexically(path: &Path) -> PathBuf {
@@ -715,16 +840,27 @@ fn resolve_package_map_target(
     target: &str,
     source_subpath: Option<&Path>,
 ) -> Option<FileId> {
-    let target = target.strip_prefix("./")?;
-    if target.starts_with("../") || target.starts_with('/') {
-        return None;
-    }
-    let target_path = manifest.root.join(target);
+    let target_path = package_map_target_path(manifest, target)?;
 
     lookup_internal_file_id(ctx, &target_path)
         .or_else(|| try_source_fallback(&target_path, ctx.raw_path_to_id))
         .or_else(|| try_source_fallback(&target_path, ctx.path_to_id))
+        .or_else(|| {
+            try_missing_only_source_fallback(&manifest.root, &target_path, ctx.raw_path_to_id)
+        })
+        .or_else(|| try_missing_only_source_fallback(&manifest.root, &target_path, ctx.path_to_id))
+        .or_else(|| try_tsconfig_output_source(ctx, &target_path))
         .or_else(|| source_subpath.and_then(|subpath| try_source_subpath(ctx, manifest, subpath)))
+}
+
+/// Join a package map target (`./src/index.ts`) to the package root. A target
+/// that leaves the package root is not a package path.
+fn package_map_target_path(manifest: &PackageManifestInfo, target: &str) -> Option<PathBuf> {
+    let target = target.strip_prefix("./")?;
+    if target.starts_with("../") || target.starts_with('/') {
+        return None;
+    }
+    Some(manifest.root.join(target))
 }
 
 fn resolve_package_map_targets(
@@ -965,6 +1101,7 @@ pub(super) fn try_pnpm_workspace_fallback(
 pub(super) fn try_workspace_package_fallback(
     ctx: &ResolveContext<'_>,
     specifier: &str,
+    style_context: bool,
 ) -> Option<ResolveResult> {
     if !super::path_info::is_bare_specifier(specifier) {
         return None;
@@ -990,7 +1127,7 @@ pub(super) fn try_workspace_package_fallback(
             *ctx.workspace_roots.get(pkg_name.as_str())?
         };
 
-    resolve_workspace_self_reference(ctx, ws_root, subpath, pkg_name)
+    resolve_workspace_self_reference(ctx, ws_root, subpath, pkg_name, style_context)
 }
 
 /// Outcome of attempting workspace resolution through a matching package
@@ -1017,22 +1154,22 @@ fn try_manifest_workspace_resolution(
     };
 
     if let Some(exports) = manifest.package_json.exports.as_ref() {
-        let export_key = if subpath.is_empty() {
-            ".".to_string()
-        } else {
-            format!("./{subpath}")
-        };
-        return match package_map_target(exports, &export_key, ctx.condition_names) {
+        return match package_map_target(exports, &export_key(subpath), ctx.condition_names) {
             PackageMapTarget::Targets(targets) => {
-                match resolve_package_map_targets(ctx, manifest, &targets, Some(source_subpath)) {
-                    Some(file_id) => ManifestWorkspaceResolution::Resolved(
+                if let Some(file_id) =
+                    resolve_package_map_targets(ctx, manifest, &targets, Some(source_subpath))
+                {
+                    return ManifestWorkspaceResolution::Resolved(
                         ResolveResult::InternalPackageModule {
                             file_id,
                             package_name: pkg_name.to_string(),
                         },
-                    ),
-                    None => ManifestWorkspaceResolution::Continue,
+                    );
                 }
+                exports_target_asset(manifest, &targets, pkg_name).map_or(
+                    ManifestWorkspaceResolution::Continue,
+                    ManifestWorkspaceResolution::Resolved,
+                )
             }
             PackageMapTarget::NoMatch | PackageMapTarget::Blocked => {
                 ManifestWorkspaceResolution::Blocked
@@ -1050,6 +1187,51 @@ fn try_manifest_workspace_resolution(
     ManifestWorkspaceResolution::Continue
 }
 
+/// The `exports` key that a package subpath matches: `.` for the package
+/// root, else `./<subpath>`.
+fn export_key(subpath: &str) -> String {
+    if subpath.is_empty() {
+        ".".to_string()
+    } else {
+        format!("./{subpath}")
+    }
+}
+
+/// Return the paths that the `exports` map of a project package names for a
+/// bare `specifier`, when no named path exists on disk.
+///
+/// Generated code (`./src/generated/enums.ts`) does not exist before the
+/// generator runs, so such an import does not resolve. The unresolved-import
+/// check uses these paths to find out if the repository ignores the target.
+/// The result is `None` when the specifier does not name a project package,
+/// when the package has no `exports` map, when no `exports` key matches the
+/// subpath, when a target leaves the package root, or when a target exists.
+pub(super) fn missing_package_export_paths(
+    ctx: &ResolveContext<'_>,
+    specifier: &str,
+) -> Option<Vec<PathBuf>> {
+    if !is_bare_specifier(specifier) {
+        return None;
+    }
+    let pkg_name = extract_package_name(specifier);
+    let manifest = find_package_manifest(ctx.package_manifests, &pkg_name)?;
+    let exports = manifest.package_json.exports.as_ref()?;
+    let subpath = specifier
+        .strip_prefix(pkg_name.as_str())
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or("");
+    let PackageMapTarget::Targets(targets) =
+        package_map_target(exports, &export_key(subpath), ctx.condition_names)
+    else {
+        return None;
+    };
+    let paths = targets
+        .iter()
+        .map(|target| package_map_target_path(manifest, target))
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty() && paths.iter().all(|path| !path.exists())).then_some(paths)
+}
+
 /// Resolve the stripped subpath as a relative import from inside the package
 /// root, mapping the resolved path back to an internal module via the id maps
 /// and source fallback.
@@ -1058,15 +1240,27 @@ fn resolve_workspace_self_reference(
     ws_root: &Path,
     subpath: &str,
     package_name: String,
+    style_context: bool,
 ) -> Option<ResolveResult> {
-    let root_file = ws_root.join("__fallow_ws_self_resolve__");
     let rel_spec = if subpath.is_empty() {
         "./".to_string()
     } else {
         format!("./{subpath}")
     };
 
-    let resolved = ctx.resolver.resolve_file(&root_file, &rel_spec).ok()?;
+    let root_file = ws_root.join("__fallow_ws_self_resolve__");
+    let super::specifier::ResolveFileAttempt::Resolved {
+        resolution: resolved,
+        ..
+    } = super::specifier::resolve_file_with_tsconfig_fallback(
+        ctx,
+        &root_file,
+        &rel_spec,
+        style_context,
+    )
+    else {
+        return None;
+    };
     let resolved_path = resolved.path();
 
     if let Some(&file_id) = ctx.raw_path_to_id.get(resolved_path) {
@@ -1097,20 +1291,38 @@ fn resolve_workspace_self_reference(
             });
         }
     }
-    None
+    workspace_package_asset(resolved_path, &package_name)
 }
 
 /// Convert a `DynamicImportPattern` to a glob string for file matching.
 pub(super) fn make_glob_from_pattern(
     pattern: &fallow_types::extract::DynamicImportPattern,
 ) -> String {
-    if pattern.prefix.contains('*') || pattern.prefix.contains('{') {
+    if has_wildcard_or_alternates(&pattern.prefix)
+        || fallow_config::extglob::has_extglob_group(&pattern.prefix)
+    {
         return pattern.prefix.clone();
     }
     pattern.suffix.as_ref().map_or_else(
         || format!("{}*", pattern.prefix),
         |suffix| format!("{}*{}", pattern.prefix, suffix),
     )
+}
+
+/// Whether `prefix` has a `*` or a `{` outside a one-character class. The
+/// extractor escapes a literal metacharacter as a one-character class, such
+/// as `[*]`, so an escaped character is not glob syntax.
+fn has_wildcard_or_alternates(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'[' if bytes.get(index + 2) == Some(&b']') => index += 3,
+            b'*' | b'{' => return true,
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1120,7 +1332,7 @@ mod tests {
     use fallow_types::extract::ModuleLoadMechanism;
     use rustc_hash::FxHashSet;
 
-    fn with_package_map_ctx(
+    pub(super) fn with_package_map_ctx(
         root: PathBuf,
         name: Option<&str>,
         package_json: fallow_config::PackageJson,
@@ -1146,8 +1358,10 @@ mod tests {
         let tsconfig_warned = std::sync::Mutex::new(FxHashSet::default());
         let tsconfig_cache = TsconfigCache::default();
         let canonicalize_cache = CanonicalizeCache::default();
+        let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
         let ctx = ResolveContext {
             resolver: &resolver,
+            script_resolver: &script_resolver,
             style_resolver: &resolver,
             extensions: &[],
             path_to_id: &path_to_id,
@@ -1159,6 +1373,7 @@ mod tests {
             path_aliases: &[],
             scss_include_paths: &[],
             static_dir_mappings: &[],
+            framework_static_dir_mappings: &[],
             root: &manifests[0].root,
             canonical_fallback: None,
             tsconfig_warned: &tsconfig_warned,
@@ -1563,23 +1778,76 @@ mod tests {
     }
 
     #[test]
-    fn package_map_targets_use_first_reachable_target() {
+    fn package_map_lib_target_maps_to_source_when_absent() {
+        let root = PathBuf::from("/project/packages/uses-lib");
+        let feature = root.join("src/features/feature.ts");
+        let index = root.join("src/index.ts");
+
+        with_package_map_ctx(
+            root,
+            Some("@repro/uses-lib"),
+            fallow_config::PackageJson::default(),
+            &[(feature, FileId(3)), (index, FileId(4))],
+            |ctx, manifest, _| {
+                assert_eq!(
+                    resolve_package_map_target(ctx, manifest, "./lib/features/feature.mjs", None),
+                    Some(FileId(3))
+                );
+                assert_eq!(
+                    resolve_package_map_target(ctx, manifest, "./lib/index.d.ts", None),
+                    Some(FileId(4))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn package_map_tracked_lib_target_wins_over_source() {
         let root = PathBuf::from("/project");
-        let src_path = root.join("src/feature.ts");
-        let targets = vec![
-            "./dist/missing.js".to_string(),
-            "./src/feature.ts".to_string(),
-        ];
+        let lib_path = root.join("lib/index.js");
+        let src_path = root.join("src/index.ts");
 
         with_package_map_ctx(
             root,
             Some("pkg"),
             fallow_config::PackageJson::default(),
-            &[(src_path, FileId(9))],
+            &[(lib_path, FileId(1)), (src_path, FileId(2))],
             |ctx, manifest, _| {
                 assert_eq!(
-                    resolve_package_map_targets(ctx, manifest, &targets, None),
-                    Some(FileId(9))
+                    resolve_package_map_target(ctx, manifest, "./lib/index.js", None),
+                    Some(FileId(1))
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn generic_source_fallback_does_not_map_lib() {
+        let src_path = PathBuf::from("/project/src/x.ts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(0));
+
+        assert_eq!(
+            try_source_fallback(Path::new("/project/lib/x.js"), &path_to_id),
+            None
+        );
+    }
+
+    #[test]
+    fn package_map_dist_lib_target_prefers_output_dirs_mapping() {
+        let root = PathBuf::from("/project");
+        let nested = root.join("src/lib/x.ts");
+        let flat = root.join("src/x.ts");
+
+        with_package_map_ctx(
+            root,
+            Some("pkg"),
+            fallow_config::PackageJson::default(),
+            &[(nested, FileId(6)), (flat, FileId(7))],
+            |ctx, manifest, _| {
+                assert_eq!(
+                    resolve_package_map_target(ctx, manifest, "./dist/lib/x.js", None),
+                    Some(FileId(6))
                 );
             },
         );
@@ -1613,6 +1881,59 @@ mod tests {
     }
 
     #[test]
+    fn package_imports_workspace_target_names_only_known_packages() {
+        let root = PathBuf::from("/project");
+        with_package_map_ctx(
+            root,
+            Some("pkg"),
+            fallow_config::PackageJson {
+                imports: Some(serde_json::json!({
+                    "#self/*": "pkg/*",
+                    "#pad": "left-pad",
+                    "#local/*": "./src/*.ts"
+                })),
+                ..Default::default()
+            },
+            &[],
+            |ctx, _, root| {
+                let from = root.join("src/index.ts");
+                let feature = root.join("src/feature.ts");
+                assert_eq!(
+                    package_imports_workspace_target(ctx, &from, "#self/feature", &feature),
+                    Some("pkg".to_string())
+                );
+                assert_eq!(
+                    package_imports_workspace_target(
+                        ctx,
+                        &from,
+                        "#self/feature",
+                        Path::new("/elsewhere/feature.ts")
+                    ),
+                    None,
+                    "a file outside the named package must not credit it"
+                );
+                assert_eq!(
+                    package_imports_workspace_target(
+                        ctx,
+                        &from,
+                        "#pad",
+                        &root.join("node_modules/left-pad/index.js")
+                    ),
+                    None
+                );
+                assert_eq!(
+                    package_imports_workspace_target(ctx, &from, "#local/feature", &feature),
+                    None
+                );
+                assert_eq!(
+                    package_imports_workspace_target(ctx, &from, "pkg/feature", &feature),
+                    None
+                );
+            },
+        );
+    }
+
+    #[test]
     fn package_imports_fallback_supports_unnamed_packages() {
         let root = PathBuf::from("/project");
         let src_path = root.join("src/runtime/task.ts");
@@ -1632,33 +1953,6 @@ mod tests {
                 assert!(matches!(
                     result,
                     Some(ResolveResult::InternalModule(FileId(7)))
-                ));
-            },
-        );
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn relative_package_root_source_fallback_uses_package_source_entry() {
-        let root = PathBuf::from("/project");
-        let source_path = root.join("custom/entry.js");
-        with_package_map_ctx(
-            root,
-            Some("pkg"),
-            fallow_config::PackageJson {
-                source: Some("custom/entry.js".to_string()),
-                ..Default::default()
-            },
-            &[(source_path, FileId(11))],
-            |ctx, _, root| {
-                let result = try_relative_package_root_source_fallback(
-                    ctx,
-                    &root.join("test/shared/exports.test.js"),
-                    "../../",
-                );
-                assert!(matches!(
-                    result,
-                    Some(ResolveResult::InternalModule(FileId(11)))
                 ));
             },
         );
@@ -1867,8 +2161,33 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./locales/*");
+    }
+
+    #[test]
+    fn make_glob_passthrough_extglob_group() {
+        let pattern = fallow_types::extract::DynamicImportPattern {
+            prefix: "./locales/@(en|nl).js".to_string(),
+            suffix: None,
+            span: oxc_span::Span::default(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        };
+        assert_eq!(make_glob_from_pattern(&pattern), "./locales/@(en|nl).js");
+    }
+
+    #[test]
+    fn make_glob_keeps_suffix_after_escaped_metacharacters() {
+        let pattern = fallow_types::extract::DynamicImportPattern {
+            prefix: "./[{]group[}]/[*]/".to_string(),
+            suffix: Some(".js".to_string()),
+            span: oxc_span::Span::default(),
+            mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
+        };
+        assert_eq!(make_glob_from_pattern(&pattern), "./[{]group[}]/[*]/*.js");
     }
 
     #[test]
@@ -1878,6 +2197,7 @@ mod tests {
             suffix: Some(".json".to_string()),
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./locales/*.json");
     }
@@ -1889,6 +2209,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./pages/**/*.tsx");
     }
@@ -1900,6 +2221,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./i18n/{en,de,fr}.json");
     }
@@ -1911,6 +2233,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "*");
     }
@@ -1922,6 +2245,7 @@ mod tests {
             suffix: Some(".ts".to_string()),
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "*.ts");
     }
@@ -1933,19 +2257,9 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./pages/*");
-    }
-
-    #[test]
-    fn make_glob_template_literal_with_extension_suffix() {
-        let pattern = fallow_types::extract::DynamicImportPattern {
-            prefix: "./locales/".to_string(),
-            suffix: Some(".json".to_string()),
-            span: oxc_span::Span::default(),
-            mechanism: ModuleLoadMechanism::EsModule,
-        };
-        assert_eq!(make_glob_from_pattern(&pattern), "./locales/*.json");
     }
 
     #[test]
@@ -1955,19 +2269,9 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./modules/*");
-    }
-
-    #[test]
-    fn make_glob_string_concat_prefix() {
-        let pattern = fallow_types::extract::DynamicImportPattern {
-            prefix: "./pages/".to_string(),
-            suffix: None,
-            span: oxc_span::Span::default(),
-            mechanism: ModuleLoadMechanism::EsModule,
-        };
-        assert_eq!(make_glob_from_pattern(&pattern), "./pages/*");
     }
 
     #[test]
@@ -1977,6 +2281,7 @@ mod tests {
             suffix: Some(".vue".to_string()),
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./views/*.vue");
     }
@@ -1988,6 +2293,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(
             make_glob_from_pattern(&pattern),
@@ -2003,6 +2309,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(
             make_glob_from_pattern(&pattern),
@@ -2018,6 +2325,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(
             make_glob_from_pattern(&pattern),
@@ -2033,6 +2341,7 @@ mod tests {
             suffix: Some(".extra".to_string()),
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(
             make_glob_from_pattern(&pattern),
@@ -2048,6 +2357,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./*");
     }
@@ -2059,6 +2369,7 @@ mod tests {
             suffix: None,
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "./config*");
     }
@@ -2070,6 +2381,7 @@ mod tests {
             suffix: Some(".ts".to_string()),
             span: oxc_span::Span::default(),
             mechanism: ModuleLoadMechanism::EsModule,
+            excludes: Vec::new(),
         };
         assert_eq!(make_glob_from_pattern(&pattern), "../shared/*.ts");
     }
@@ -2119,6 +2431,76 @@ mod tests {
             try_source_fallback(&dist_path, &path_to_id),
             Some(FileId(6)),
             "dist/utils.mjs should fall back to src/utils.mts"
+        );
+    }
+
+    #[test]
+    fn test_try_source_fallback_declaration_with_dotted_name() {
+        let src_path = PathBuf::from("/project/packages/lib/src/x.port.ts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(6));
+
+        let dist_path = PathBuf::from("/project/packages/lib/dist/x.port.d.ts");
+        assert_eq!(
+            try_source_fallback(&dist_path, &path_to_id),
+            Some(FileId(6)),
+            "dist/x.port.d.ts should fall back to src/x.port.ts"
+        );
+    }
+
+    #[test]
+    fn test_try_source_fallback_module_declaration() {
+        let src_path = PathBuf::from("/project/packages/lib/src/x.mts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(6));
+
+        let dist_path = PathBuf::from("/project/packages/lib/dist/x.d.mts");
+        assert_eq!(
+            try_source_fallback(&dist_path, &path_to_id),
+            Some(FileId(6)),
+            "dist/x.d.mts should fall back to src/x.mts"
+        );
+    }
+
+    #[test]
+    fn test_try_source_fallback_commonjs_declaration_in_subdir() {
+        let src_path = PathBuf::from("/project/packages/lib/src/sub/x.cts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(6));
+
+        let dist_path = PathBuf::from("/project/packages/lib/dist/sub/x.d.cts");
+        assert_eq!(
+            try_source_fallback(&dist_path, &path_to_id),
+            Some(FileId(6)),
+            "dist/sub/x.d.cts should fall back to src/sub/x.cts"
+        );
+    }
+
+    #[test]
+    fn test_try_source_fallback_declaration_copied_from_src() {
+        let src_path = PathBuf::from("/project/packages/lib/src/globals.d.ts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(6));
+
+        let dist_path = PathBuf::from("/project/packages/lib/dist/globals.d.ts");
+        assert_eq!(
+            try_source_fallback(&dist_path, &path_to_id),
+            Some(FileId(6)),
+            "dist/globals.d.ts should fall back to a copied src/globals.d.ts"
+        );
+    }
+
+    #[test]
+    fn test_try_source_fallback_js_with_dotted_name() {
+        let src_path = PathBuf::from("/project/packages/lib/src/x.port.ts");
+        let mut path_to_id = FxHashMap::default();
+        path_to_id.insert(src_path.as_path(), FileId(6));
+
+        let dist_path = PathBuf::from("/project/packages/lib/dist/x.port.js");
+        assert_eq!(
+            try_source_fallback(&dist_path, &path_to_id),
+            Some(FileId(6)),
+            "dist/x.port.js should fall back to src/x.port.ts"
         );
     }
 
@@ -2678,8 +3060,10 @@ mod tests {
         let tsconfig_cache = TsconfigCache::default();
         let canonicalize_cache = CanonicalizeCache::default();
         let root = PathBuf::from("/project");
+        let script_resolver = crate::resolve::specifier::create_script_resolver(&resolver);
         let ctx = ResolveContext {
             resolver: &resolver,
+            script_resolver: &script_resolver,
             style_resolver: &resolver,
             extensions: &[],
             path_to_id: &path_to_id,
@@ -2691,6 +3075,7 @@ mod tests {
             path_aliases: &[],
             scss_include_paths: &[],
             static_dir_mappings: &[],
+            framework_static_dir_mappings: &[],
             root: &root,
             canonical_fallback: None,
             tsconfig_warned: &tsconfig_warned,
@@ -2735,37 +3120,6 @@ mod tests {
             assert!(
                 result.is_none(),
                 "already-partial filename should short-circuit to None"
-            );
-        });
-    }
-
-    // --- try_workspace_package_fallback: bare-specifier guard (lines 967-968) ---
-
-    #[test]
-    fn try_workspace_package_fallback_rejects_relative_specifier() {
-        // Relative specifiers (starting with "./" or "../") are not bare specifiers
-        // and must return None without touching any manifest.
-        let root = PathBuf::from("/project");
-        let pj = fallow_config::PackageJson::default();
-        with_package_map_ctx(root, None, pj, &[], |ctx, _manifest, _r| {
-            let result = try_workspace_package_fallback(ctx, "./local/module");
-            assert!(
-                result.is_none(),
-                "relative specifier should return None from workspace fallback"
-            );
-        });
-    }
-
-    #[test]
-    fn try_workspace_package_fallback_rejects_absolute_path() {
-        // Absolute paths are not bare specifiers either.
-        let root = PathBuf::from("/project");
-        let pj = fallow_config::PackageJson::default();
-        with_package_map_ctx(root, None, pj, &[], |ctx, _manifest, _r| {
-            let result = try_workspace_package_fallback(ctx, "/absolute/path");
-            assert!(
-                result.is_none(),
-                "absolute path should return None from workspace fallback"
             );
         });
     }
