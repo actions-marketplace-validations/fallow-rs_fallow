@@ -3,10 +3,15 @@
 # The hashes cover the Linux x86_64, Linux aarch64 and macOS wheels.
 # Both projects publish wheels only (no sdist). To update, bump both versions
 # and copy the sha256 values from https://pypi.org/pypi/<name>/<version>/json.
-cargo-zigbuild==0.23.4 \
-    --hash=sha256:0a149a2a07b9513d422efa9cc23e1add9741f08abe86845fa418eaeb4cca7931 \
-    --hash=sha256:9f848addf9ca16e8df52b4a86eb41f7555bb4205aea117ad521f501a307129f5 \
-    --hash=sha256:bc39e63ec1b4a34784b9bfcea90b11f42f8cc0b9f31b14e77522bc45dbb72430
+cargo-zigbuild==0.24.1 \
+    --hash=sha256:07c5e3dcddf208500462ec927c556bb306cca2b533b0abe29446bffb63767b85 \
+    --hash=sha256:238a1ab54a95053a4eadc34775c81f795a8ad75f80bfed63f3f445f518102375 \
+    --hash=sha256:46e0ce74fb1bd36486d9fa28e1df33530d390ce2d1cdbab0019d844bdfdfebdf \
+    --hash=sha256:7b832d824bbf852b9a99b02a0dfa2166a00462fc237c2387d15a67c385755795 \
+    --hash=sha256:ae4a1f921d29f59c90202c416d62db227b445ee89649873d6e6b700855235147 \
+    --hash=sha256:dce10004b98abc8813369be8359eda17e707bab5245bdc4427823594795f7399 \
+    --hash=sha256:df45e20fa2221027e8e6074f88beca6746f314859a75158a3f8a1a48837fb637 \
+    --hash=sha256:e1bb2f0d888395161c7e3957d771d5806432728cf6303fdb536d9103b375812c
 ziglang==0.17.0 \
     --hash=sha256:2f1506fbd4080ae55c7f3c5abe99cce226e563827f50e8f143e36decc615310f \
     --hash=sha256:4d910f0e363ddb60a6b8ddb55235617797a8ccbcb6c5c7132a949d9f833eea42 \
